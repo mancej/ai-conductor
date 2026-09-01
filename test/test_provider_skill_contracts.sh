@@ -284,10 +284,11 @@ expect_engineer_host_contract() {
   local file=$3
   local status
 
-  set +e
-  engineer_host_contract_audit "$file"
-  status=$?
-  set -e
+  if engineer_host_contract_audit "$file"; then
+    status=0
+  else
+    status=$?
+  fi
 
   if [ "$status" -eq "$expected" ]; then
     pass "$description"
