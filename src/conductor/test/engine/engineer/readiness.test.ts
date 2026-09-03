@@ -97,4 +97,30 @@ describe('Engineer readiness', () => {
       deps: { run: runner() },
     })).rejects.toMatchObject({ code: 'terminal_run' });
   });
+
+  it('persists blocked readiness when the exact run repository has disappeared', async () => {
+    const store = new EngineerRunStore({ engineerDir, events: new ConductorEventEmitter() });
+    const run = await store.create({ repoRoot, idea: 'Missing repository' });
+    await rm(repoRoot, { recursive: true, force: true });
+
+    const blocked = await recordEngineerReadiness({
+      store,
+      engineerRunId: run.engineerRunId,
+      readiness: { repoRoot, githubHandoff: false },
+      permitInconclusive: false,
+    });
+
+    expect(blocked).toMatchObject({
+      eventRevision: 2,
+      readiness: {
+        status: 'blocked',
+        code: 'workspace_missing',
+        permitted: false,
+        checkedCapabilities: ['repository'],
+      },
+    });
+    await expect(store.replay(run.engineerRunId, 1)).resolves.toMatchObject([
+      { type: 'engineer_readiness_checked', status: 'blocked', code: 'workspace_missing' },
+    ]);
+  });
 });

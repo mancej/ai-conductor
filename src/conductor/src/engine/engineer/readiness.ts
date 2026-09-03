@@ -118,8 +118,17 @@ export async function recordEngineerReadiness(input: {
   deps?: EngineerReadinessDeps;
 }) {
   const snapshot = await input.store.inspectRun(input.engineerRunId);
-  const requestedRoot = await (input.deps?.resolvePath ?? realpath)(input.readiness.repoRoot);
-  if (snapshot.repoRoot !== requestedRoot) {
+  let matchesRun = snapshot.repoRoot === input.readiness.repoRoot;
+  if (!matchesRun) {
+    try {
+      matchesRun = snapshot.repoRoot
+        === await (input.deps?.resolvePath ?? realpath)(input.readiness.repoRoot);
+    } catch {
+      // A missing or inaccessible path can only retain identity through the exact
+      // canonical root already stored on the run. Alternate spellings fail closed.
+    }
+  }
+  if (!matchesRun) {
     throw new EngineerLifecycleError('identity_mismatch', 'Run-scoped readiness repository does not match the exact Engineer run');
   }
   const result = await checkEngineerReadiness(input.readiness, input.deps);

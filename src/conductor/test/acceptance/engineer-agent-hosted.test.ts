@@ -130,6 +130,50 @@ function makeRecord(path: string, name: string, remote?: string) {
   };
 }
 
+async function seedMarkedLandedRun(input: {
+  repoRoot: string;
+  worktree: string;
+  idea: string;
+  branch: string;
+  engineerDir: string;
+}) {
+  const store = new EngineerRunStore({
+    engineerDir: input.engineerDir,
+    events: new ConductorEventEmitter(),
+  });
+  let run = await store.create({ repoRoot: input.repoRoot, idea: input.idea });
+  run = await store.record(run.engineerRunId, {
+    kind: 'readiness_checked',
+    result: {
+      status: 'ready', code: 'ready', summary: 'Ready', checkedCapabilities: ['repository'],
+      retryable: false, remedy: null, diagnostic: null, fingerprint: 'ready-fixture',
+    },
+    permitInconclusive: false,
+  });
+  run = await store.record(run.engineerRunId, { kind: 'run_started' });
+  run = await store.record(run.engineerRunId, {
+    kind: 'worktree_created',
+    worktreePath: input.worktree,
+    branch: input.branch,
+    planSlug: slugOf(input.idea),
+  });
+  run = await store.reconcileLand(run.engineerRunId, {
+    planSlug: slugOf(input.idea),
+    track: 'product',
+    tier: 'S',
+    completed: ['explore', 'complexity', 'prd', 'stories', 'plan'],
+    skipped: ['architecture_diagram', 'architecture_review', 'conflict_check', 'coherence_check'],
+  });
+  await writeEngineerRunMarker(input.worktree, {
+    schemaVersion: 1,
+    engineerRunId: run.engineerRunId,
+    repoRoot: input.repoRoot,
+    planSlug: slugOf(input.idea),
+    branch: input.branch,
+  });
+  return { store, run };
+}
+
 // ─── Shared per-test state ─────────────────────────────────────────────────────
 
 let workDir: string;
@@ -282,7 +326,18 @@ describe('detectEngineerCommand: subcommand dispatch parsing', () => {
     ]);
     expect(result).toMatchObject({
       kind: 'handoff', project: 'myproj', branch: 'spec/my-idea', worktree: '/wt/engineer-my-idea',
+      permitInconclusive: false,
     });
+  });
+
+  it('parses explicit inconclusive-readiness consent for `engineer handoff`', async () => {
+    const { detectEngineerCommand } = await import('../../src/engine/engineer-cli.js');
+    const result = detectEngineerCommand([
+      'node', 'conduct', 'engineer', 'handoff',
+      '--project', 'myproj', '--branch', 'spec/my-idea', '--worktree', '/wt/engineer-my-idea',
+      '--permit-inconclusive',
+    ]);
+    expect(result).toMatchObject({ kind: 'handoff', permitInconclusive: true });
   });
 
   it('non-engineer argv returns null', async () => {
@@ -602,6 +657,91 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(await git(['rev-parse', '--verify', branch], repoPath)).toMatch(/^[0-9a-f]{40}$/);
   });
 
+  it('blocks inconclusive handoff readiness unless the caller explicitly permits it', async () => {
+    const idea = 'guarded handoff';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
+    });
+    const gh = vi.fn(async () => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
+    const err: string[] = [];
+
+    const code = await dispatchEngineer(
+      { kind: 'handoff', project: 'target-repo', branch, worktree },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        printErr: (s) => err.push(s),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.join('\n')).toMatch(/readiness blocked \(push_authorization_unproven\)/);
+    expect(gh).not.toHaveBeenCalled();
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      state: 'failed',
+      readiness: { status: 'inconclusive', permitted: false },
+    });
+  });
+
+  it('opens the PR when inconclusive handoff readiness is explicitly permitted', async () => {
+    const idea = 'permitted handoff';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
+    });
+    const gh = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === 'pr' && args[1] === 'create'
+        ? 'https://github.com/acme/target-repo/pull/42'
+        : '',
+    }));
+    const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
+    const out: string[] = [];
+
+    const code = await dispatchEngineer(
+      {
+        kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        git: async (args) => ({ stdout: args[0] === 'rev-parse' ? retainedCommit : '' }),
+        ensureRunningLaunch: () => undefined,
+        print: (s) => out.push(s),
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join(''))).toEqual({
+      kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
+    });
+    expect(gh).toHaveBeenCalled();
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      state: 'settled',
+      readiness: { status: 'inconclusive', permitted: true },
+    });
+  });
+
   it('resumes an already-persisted handoff without rechecking readiness or reopening the PR', async () => {
     const idea = 'resume handoff';
     await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
@@ -613,31 +753,8 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
       { registryPath, print: (s) => landOut.push(s) },
     )).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch as string;
-    const store = new EngineerRunStore({ engineerDir, events: new ConductorEventEmitter() });
-    let run = await store.create({ repoRoot: repoPath, idea });
-    run = await store.record(run.engineerRunId, {
-      kind: 'readiness_checked',
-      result: {
-        status: 'ready', code: 'ready', summary: 'Ready', checkedCapabilities: ['repository'],
-        retryable: false, remedy: null, diagnostic: null, fingerprint: 'ready-fixture',
-      },
-      permitInconclusive: false,
-    });
-    run = await store.record(run.engineerRunId, { kind: 'run_started' });
-    run = await store.record(run.engineerRunId, {
-      kind: 'worktree_created', worktreePath: worktree, branch, planSlug: slugOf(idea),
-    });
-    run = await store.reconcileLand(run.engineerRunId, {
-      planSlug: slugOf(idea), track: 'product', tier: 'S',
-      completed: ['explore', 'complexity', 'prd', 'stories', 'plan'],
-      skipped: ['architecture_diagram', 'architecture_review', 'conflict_check', 'coherence_check'],
-    });
-    await writeEngineerRunMarker(worktree, {
-      schemaVersion: 1,
-      engineerRunId: run.engineerRunId,
-      repoRoot: repoPath,
-      planSlug: slugOf(idea),
-      branch,
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
     });
     const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
     await store.record(run.engineerRunId, {

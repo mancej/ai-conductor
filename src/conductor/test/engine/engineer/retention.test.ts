@@ -196,6 +196,67 @@ describe('Engineer retained review worktrees', () => {
     expect((await store.inspectRun(run.engineerRunId)).cleanup?.attempts).toBe(2);
   });
 
+  it('persists typed PR-status failure evidence and backs off remote reconciliation', async () => {
+    const run = await settledRun();
+    const readPullRequestState = vi.fn()
+      .mockRejectedValueOnce(new Error('could not resolve host github.com'))
+      .mockResolvedValueOnce('open');
+
+    await reconcileEngineerRetainedWorktrees({
+      store,
+      repoRoot,
+      deps: {
+        now: () => new Date('2026-09-04T00:00:00.000Z'),
+        readPullRequestState,
+      },
+    });
+
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      retirement: null,
+      cleanup: {
+        status: 'failed',
+        stage: 'retirement_status',
+        attempts: 1,
+        nextAttemptAt: '2026-09-04T00:15:00.000Z',
+        failure: {
+          class: 'remote',
+          code: 'remote_unreachable',
+          retryable: true,
+        },
+      },
+    });
+
+    await reconcileEngineerRetainedWorktrees({
+      store,
+      repoRoot,
+      deps: {
+        now: () => new Date('2026-09-04T00:01:00.000Z'),
+        readPullRequestState,
+      },
+    });
+    expect(readPullRequestState).toHaveBeenCalledTimes(1);
+
+    await reconcileEngineerRetainedWorktrees({
+      store,
+      repoRoot,
+      deps: {
+        now: () => new Date('2026-09-04T00:16:00.000Z'),
+        readPullRequestState,
+      },
+    });
+    expect(readPullRequestState).toHaveBeenCalledTimes(2);
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      retirement: null,
+      cleanup: {
+        status: 'pending',
+        stage: 'retirement_status',
+        attempts: 2,
+        nextAttemptAt: null,
+        failure: null,
+      },
+    });
+  });
+
   it('captures retained-commit drift as typed precondition evidence', async () => {
     const run = await settledRun('local_commit');
     await writeFile(join(worktreePath, 'review-change.txt'), 'changed after handoff\n', 'utf-8');

@@ -290,12 +290,16 @@ conduct-ts engineer handoff \
   --project <name> \
   --branch <branch> \
   --worktree <worktreePath> \
+  --permit-inconclusive \
   --source-ref <owner/repo#N>
 ```
 
 `handoff` runs `git push -u origin <branch>` and `gh pr create --label spec` from inside the
 per-idea worktree, so the PR opens for `spec/<slug>` with the `spec` label. On success you should
 see one of:
+
+Use `--permit-inconclusive` only after the operator explicitly accepts that the immediate read-only
+handoff probe cannot prove push authorization.
 
 | Output | Meaning |
 | --- | --- |

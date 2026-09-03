@@ -75,6 +75,15 @@ describe('detectEngineerCommand: unknown-flag rejection (#524 Story 3)', () => {
     expect(detectEngineerCommand(argv('worktree', '--project', 'p'))).toEqual({ kind: 'guide' });
   });
 
+  it('regression: `handoff` defaults inconclusive readiness consent to false', () => {
+    const result = detectEngineerCommand(argv(
+      'handoff', '--project', 'p', '--branch', 'spec/i', '--worktree', '/tmp/i'
+    ));
+    expect(result).toEqual({
+      kind: 'handoff', project: 'p', branch: 'spec/i', worktree: '/tmp/i', permitInconclusive: false,
+    });
+  });
+
   it('rejects an unknown flag on `land`', () => {
     const result = detectEngineerCommand(
       argv('land', '--project', 'p', '--idea', 'i', '--worktree', 'w', '--bogus')
@@ -137,6 +146,7 @@ describe('detectEngineerCommand: unknown-flag rejection (#524 Story 3)', () => {
       branch: 'b',
       worktree: 'w',
       sourceRef: undefined,
+      permitInconclusive: false,
     });
   });
 
@@ -160,6 +170,7 @@ describe('detectEngineerCommand: unknown-flag rejection (#524 Story 3)', () => {
       branch: 'b',
       worktree: 'w',
       sourceRef: 's',
+      permitInconclusive: false,
     });
   });
 

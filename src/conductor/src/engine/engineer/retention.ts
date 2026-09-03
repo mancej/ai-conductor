@@ -181,9 +181,30 @@ export async function reconcileEngineerRetainedWorktrees(input: {
         if (Date.parse(run.retention.retentionDeadline) <= now.getTime()) {
           reason = 'retention_expired';
         } else if (run.handoff?.outcome === 'pr_opened' && run.handoff.prUrl) {
-          const prState = await readPullRequestState(run.handoff.prUrl, run.repoRoot);
+          let prState: EngineerPullRequestState;
+          try {
+            prState = await readPullRequestState(run.handoff.prUrl, run.repoRoot);
+          } catch (error) {
+            await input.store.recordCleanupAttempt(run.engineerRunId, {
+              status: 'failed',
+              stage: 'retirement_status',
+              failure: classifyEngineerFailure(error),
+              nextAttemptAt: cleanupRetryAfter(deps),
+            });
+            throw error;
+          }
           if (prState === 'merged') reason = 'spec_merged';
           if (prState === 'closed') reason = 'spec_closed';
+          if (
+            prState === 'open'
+            && run.cleanup?.status === 'failed'
+            && run.cleanup.stage === 'retirement_status'
+          ) {
+            await input.store.recordCleanupAttempt(run.engineerRunId, {
+              status: 'pending',
+              stage: 'retirement_status',
+            });
+          }
         }
       }
       if (reason) {

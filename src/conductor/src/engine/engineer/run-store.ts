@@ -96,7 +96,7 @@ export interface EngineerCleanupSnapshot {
   schemaVersion: 1;
   engineerRunId: string;
   status: 'pending' | 'failed' | 'complete';
-  stage: 'retirement_precondition' | 'physical_removal';
+  stage: 'retirement_status' | 'retirement_precondition' | 'physical_removal';
   attempts: number;
   lastError: string | null;
   failure: EngineerFailureEvidence | null;
@@ -593,7 +593,7 @@ export class EngineerRunStore {
     engineerRunId: string,
     input: {
       status: 'pending' | 'failed' | 'complete';
-      stage?: 'retirement_precondition' | 'physical_removal';
+      stage?: 'retirement_status' | 'retirement_precondition' | 'physical_removal';
       error?: string | null;
       failure?: EngineerFailureEvidence | null;
       nextAttemptAt?: string | null;
@@ -602,11 +602,12 @@ export class EngineerRunStore {
     return this.withLocks([this.runLockKey(engineerRunId)], async () => {
       const snapshot = await this.inspectRunUnlocked(engineerRunId);
       const stage = input.stage ?? 'physical_removal';
-      const isPreconditionFailure = stage === 'retirement_precondition' && input.status === 'failed';
-      if (!snapshot.retirement && !isPreconditionFailure) {
+      const isPreRetirementStage = stage === 'retirement_status' || stage === 'retirement_precondition';
+      const isPreRetirementFailure = isPreRetirementStage && input.status === 'failed';
+      if (!snapshot.retirement && !isPreRetirementStage) {
         throw new EngineerLifecycleError('retirement_not_allowed', 'Physical cleanup cannot begin before logical retirement');
       }
-      if (isPreconditionFailure && (!snapshot.worktree || !['settled', 'cancelled'].includes(snapshot.state))) {
+      if (isPreRetirementStage && (!snapshot.worktree || !['settled', 'cancelled'].includes(snapshot.state))) {
         throw new EngineerLifecycleError('retirement_not_allowed', 'Retirement failure evidence requires a terminal run with exact worktree identity');
       }
       const previous = await this.readCleanupSnapshot(engineerRunId);
@@ -620,7 +621,7 @@ export class EngineerRunStore {
         engineerRunId,
         status: input.status,
         stage,
-        attempts: (previous?.attempts ?? 0) + (input.status === 'pending' || isPreconditionFailure ? 1 : 0),
+        attempts: (previous?.attempts ?? 0) + (input.status === 'pending' || isPreRetirementFailure ? 1 : 0),
         lastError: failure?.error ?? normalizeBoundedOptional(input.error, 'cleanup error', 2_048),
         failure,
         nextAttemptAt,
@@ -889,7 +890,7 @@ export class EngineerRunStore {
       || !Number.isInteger(parsed.attempts)
       || typeof parsed.updatedAt !== 'string'
       || !(parsed.lastError === null || typeof parsed.lastError === 'string')
-      || !(parsed.stage === undefined || ['retirement_precondition', 'physical_removal'].includes(String(parsed.stage)))
+      || !(parsed.stage === undefined || ['retirement_status', 'retirement_precondition', 'physical_removal'].includes(String(parsed.stage)))
       || !(parsed.nextAttemptAt === undefined || parsed.nextAttemptAt === null || typeof parsed.nextAttemptAt === 'string')
       || (typeof parsed.nextAttemptAt === 'string' && Number.isNaN(Date.parse(parsed.nextAttemptAt)))
       || !(parsed.failure === undefined || parsed.failure === null || isStoredFailureEvidence(parsed.failure))
@@ -898,7 +899,11 @@ export class EngineerRunStore {
     }
     return {
       ...(parsed as unknown as EngineerCleanupSnapshot),
-      stage: parsed.stage === 'retirement_precondition' ? 'retirement_precondition' : 'physical_removal',
+      stage: parsed.stage === 'retirement_status'
+        ? 'retirement_status'
+        : parsed.stage === 'retirement_precondition'
+          ? 'retirement_precondition'
+          : 'physical_removal',
       failure: parsed.failure === undefined ? null : parsed.failure as EngineerFailureEvidence | null,
       nextAttemptAt: parsed.nextAttemptAt === undefined ? null : parsed.nextAttemptAt as string | null,
     };

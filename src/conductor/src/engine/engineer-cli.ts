@@ -133,7 +133,7 @@ export type EngineerDispatch =
   | { kind: 'projects' }
   | { kind: 'worktree'; project: string; idea: string; sourceRef?: string; body?: string; engineerRunId?: string; permitInconclusive?: boolean }
   | { kind: 'land'; project: string; idea: string; worktree: string; sourceRef?: string }
-  | { kind: 'handoff'; project: string; branch: string; worktree: string; sourceRef?: string }
+  | { kind: 'handoff'; project: string; branch: string; worktree: string; sourceRef?: string; permitInconclusive?: boolean }
   | { kind: 'capabilities' }
   | { kind: 'readiness-probe'; repoRoot: string; githubHandoff: boolean; requiredTools: string[] }
   | { kind: 'run-readiness'; runId: string; repoRoot: string; githubHandoff: boolean; requiredTools: string[]; permitInconclusive: boolean }
@@ -433,9 +433,18 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
       return { kind: 'guide' };
     }
     const sourceRef = parseFlag(argv, '--source-ref') ?? undefined;
-    const unk = findUnknownFlag(argv, ['--project', '--branch', '--worktree', '--source-ref']);
+    const unk = findUnknownFlag(argv, [
+      '--project', '--branch', '--worktree', '--source-ref', '--permit-inconclusive',
+    ]);
     if (unk) return { kind: 'reject', sub: 'handoff', flag: unk };
-    return { kind: 'handoff', project, branch, worktree, sourceRef };
+    return {
+      kind: 'handoff',
+      project,
+      branch,
+      worktree,
+      sourceRef,
+      permitInconclusive: argv.includes('--permit-inconclusive'),
+    };
   }
 
   if (subCmd === 'poll') {
@@ -977,8 +986,8 @@ export const SUBCOMMAND_HELP = {
     'Mutates: commits to the worktree, pushes the spec/<slug> branch, opens a PR.\n' +
     'Loop fit: third step — claim → worktree → land → handoff → resolve/forget.',
   handoff:
-    'engineer handoff --project <name> --branch <branch> --worktree <path> [--source-ref <ref>] — hand the landed spec off to the daemon/build phase.\n' +
-    'Flags: --project <name> (required), --branch <branch> (required), --worktree <path> (required), --source-ref <ref> (optional — intake write-back anchor).\n' +
+    'engineer handoff --project <name> --branch <branch> --worktree <path> [--source-ref <ref>] [--permit-inconclusive] - hand the landed spec off to the daemon/build phase.\n' +
+    'Flags: --project <name> (required), --branch <branch> (required), --worktree <path> (required), --source-ref <ref> (optional - intake write-back anchor), --permit-inconclusive (optional - explicitly authorizes handoff when push permission cannot be proven without mutation).\n' +
     'Mutates: notifies/nudges the daemon for the target project; updates ledger write-back state when --source-ref is present.\n' +
     'Loop fit: fourth step — claim → worktree → land → handoff → resolve/forget.',
   poll:
@@ -1032,7 +1041,7 @@ function printGuide(print: (s: string) => void): void {
       '  conduct-ts engineer claim                               — dequeue the oldest pending intake idea (JSON)\n' +
       '  conduct-ts engineer worktree --project <n> --idea "<i>" [--source-ref <ref>] [--permit-inconclusive]  - create the per-idea authoring worktree\n' +
       '  conduct-ts engineer land --project <n> --idea "<i>" --worktree <p> [--source-ref <ref>]    — commit spec artifacts in the worktree\n' +
-      '  conduct-ts engineer handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] - open spec PR + retain review worktree + nudge daemon\n' +
+      '  conduct-ts engineer handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] [--permit-inconclusive] - open spec PR + retain review worktree + nudge daemon\n' +
       '  conduct-ts engineer resolve <ref> --pr-url <url> [--branch <b>]              — mark a claimed entry as delivered (recovery from write-back failure)\n' +
       '  conduct-ts engineer unclaim <owner/repo#N>              — requeue a claimed ledger entry back to pending (single-idea recovery)\n' +
       '  conduct-ts engineer requeue --stale [--older-than <dur>] — bulk-recover stranded claimed ledger entries (e.g. "24h")\n' +
@@ -1709,7 +1718,7 @@ export async function dispatchEngineer(
               requiredTools: await configuredEngineerTools(target.canonicalPath),
               hostPosture: 'engineer-handoff',
             },
-            permitInconclusive: true,
+            permitInconclusive: dispatch.permitInconclusive === true,
             deps: opts.readinessDeps,
           });
           if (!readiness.readiness?.permitted) {

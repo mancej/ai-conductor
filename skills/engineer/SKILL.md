@@ -252,7 +252,7 @@ cancellation or failure and a later retry continue to use the existing successor
 mechanical events with `run-record`.
 
 ### 5. Open the spec PR + nudge the daemon - retain the worktree for review
-`conduct-ts engineer handoff --project <name> --branch <branch> --worktree <worktreePath>` (the
+`conduct-ts engineer handoff --project <name> --branch <branch> --worktree <worktreePath> [--permit-inconclusive]` (the
 `branch` from step 4 and the same `worktreePath`; append `--source-ref <ref>` when the idea came from
 GitHub intake — on a real PR this comments the PR URL on the originating issue, adds a non-closing
 `Refs <ref>` to the spec PR body (links the issue without closing it; the daemon's implementation PR
@@ -264,7 +264,8 @@ you merge it**. On success it records the exact retained commit and bounded revi
 **keeps the per-idea worktree registered and usable for review**. The daemon maintenance sweep retires
 that exact worktree after PR merge, PR close, cancellation, or deadline expiry, and records logical
 retirement before physical removal. A failed removal remains retryable cleanup debt. It never merges
-and never builds.
+and never builds. Use `--permit-inconclusive` only after the operator explicitly accepts that the
+immediate read-only handoff probe cannot prove push authorization.
 
 ### 6. Deliver, then end the session
 The spec PR (or local-commit fallback) is the **final artifact**. Once step 5 reports it, tell the
