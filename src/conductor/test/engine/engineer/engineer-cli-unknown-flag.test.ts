@@ -68,7 +68,7 @@ describe('detectEngineerCommand: unknown-flag rejection (#524 Story 3)', () => {
 
   it('regression: `worktree` with only recognized flags is unchanged', () => {
     const result = detectEngineerCommand(argv('worktree', '--project', 'p', '--idea', 'i'));
-    expect(result).toEqual({ kind: 'worktree', project: 'p', idea: 'i' });
+    expect(result).toEqual({ kind: 'worktree', project: 'p', idea: 'i', permitInconclusive: false });
   });
 
   it('regression: `worktree` missing required flags still guides', () => {

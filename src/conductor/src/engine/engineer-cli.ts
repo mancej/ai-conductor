@@ -131,7 +131,7 @@ export type EngineerDispatch =
   | { kind: 'launch'; idea?: string }
   | { kind: 'guide' }
   | { kind: 'projects' }
-  | { kind: 'worktree'; project: string; idea: string; sourceRef?: string; body?: string; engineerRunId?: string }
+  | { kind: 'worktree'; project: string; idea: string; sourceRef?: string; body?: string; engineerRunId?: string; permitInconclusive?: boolean }
   | { kind: 'land'; project: string; idea: string; worktree: string; sourceRef?: string }
   | { kind: 'handoff'; project: string; branch: string; worktree: string; sourceRef?: string }
   | { kind: 'capabilities' }
@@ -393,9 +393,19 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
     const sourceRef = parseFlag(argv, '--source-ref') ?? undefined;
     const body = parseFlag(argv, '--body') ?? undefined;
     const engineerRunId = parseFlag(argv, '--engineer-run-id') ?? undefined;
-    const unk = findUnknownFlag(argv, ['--project', '--idea', '--source-ref', '--body', '--engineer-run-id']);
+    const unk = findUnknownFlag(argv, [
+      '--project', '--idea', '--source-ref', '--body', '--engineer-run-id', '--permit-inconclusive',
+    ]);
     if (unk) return { kind: 'reject', sub: 'worktree', flag: unk };
-    return { kind: 'worktree', project, idea, sourceRef, body, engineerRunId };
+    return {
+      kind: 'worktree',
+      project,
+      idea,
+      sourceRef,
+      body,
+      engineerRunId,
+      permitInconclusive: argv.includes('--permit-inconclusive'),
+    };
   }
 
   if (subCmd === 'land') {
@@ -957,8 +967,8 @@ export const SUBCOMMAND_HELP = {
     'Mutates: nothing (read-only).\n' +
     'Loop fit: informational only — inspect which projects the engineer can route ideas to; not a step in the claim → worktree → land → handoff → resolve/forget loop.',
   worktree:
-    'engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>] — create the per-idea worktree used to author a spec.\n' +
-    'Flags: --project <name> (required), --idea "<text>" (required), --source-ref <ref> (optional — resolves the claim record for intake-sourced ideas).\n' +
+    'engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>] [--permit-inconclusive] - create the per-idea worktree used to author a spec.\n' +
+    'Flags: --project <name> (required), --idea "<text>" (required), --source-ref <ref> (optional - resolves the claim record for intake-sourced ideas), --permit-inconclusive (optional - explicitly authorizes authoring when push permission cannot be proven without mutation).\n' +
     'Mutates: creates a git worktree and branch on disk for the project.\n' +
     'Loop fit: second step of the loop — claim → worktree → land → handoff → resolve/forget.',
   land:
@@ -1020,7 +1030,7 @@ function printGuide(print: (s: string) => void): void {
       '  conduct-ts engineer --idea "<text>"                     — launch driving a specific idea (skips intake poll)\n' +
       '  conduct-ts engineer projects                            — list registered projects\n' +
       '  conduct-ts engineer claim                               — dequeue the oldest pending intake idea (JSON)\n' +
-      '  conduct-ts engineer worktree --project <n> --idea "<i>" [--source-ref <ref>]  — create the per-idea authoring worktree\n' +
+      '  conduct-ts engineer worktree --project <n> --idea "<i>" [--source-ref <ref>] [--permit-inconclusive]  - create the per-idea authoring worktree\n' +
       '  conduct-ts engineer land --project <n> --idea "<i>" --worktree <p> [--source-ref <ref>]    — commit spec artifacts in the worktree\n' +
       '  conduct-ts engineer handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] - open spec PR + retain review worktree + nudge daemon\n' +
       '  conduct-ts engineer resolve <ref> --pr-url <url> [--branch <b>]              — mark a claimed entry as delivered (recovery from write-back failure)\n' +
@@ -1444,7 +1454,7 @@ export async function dispatchEngineer(
             requiredTools: await configuredEngineerTools(target.canonicalPath),
             hostPosture: 'engineer-worktree',
           },
-          permitInconclusive: true,
+          permitInconclusive: dispatch.permitInconclusive === true,
           deps: opts.readinessDeps,
         });
         if (!lifecycle.readiness?.permitted) {
@@ -1645,6 +1655,11 @@ export async function dispatchEngineer(
         return 1;
       }
       const marker = await readEngineerRunMarker(worktree);
+      let existingHandoff: {
+        result: Awaited<ReturnType<typeof openSpecPr>>;
+        retainedCommit: string;
+        retentionDeadline: string;
+      } | null = null;
       if (marker) {
         if (marker.repoRoot !== target.canonicalPath || marker.branch !== branch) {
           throw new EngineerLifecycleError(
@@ -1652,37 +1667,73 @@ export async function dispatchEngineer(
             `Engineer handoff identity does not match the worktree marker for ${marker.engineerRunId}`,
           );
         }
-        const readiness = await recordEngineerReadiness({
-          store: lifecycleStore,
-          engineerRunId: marker.engineerRunId,
-          readiness: {
-            repoRoot: target.canonicalPath,
-            githubHandoff: target.remote !== undefined,
-            requiredTools: await configuredEngineerTools(target.canonicalPath),
-            hostPosture: 'engineer-handoff',
-          },
-          permitInconclusive: true,
-          deps: opts.readinessDeps,
-        });
-        if (!readiness.readiness?.permitted) {
-          const failure = {
-            error: readiness.readiness?.diagnostic ?? readiness.readiness?.summary ?? 'Engineer handoff readiness failed',
-            class: classifyEngineerFailure(readiness.readiness?.diagnostic ?? '').class,
-            code: readiness.readiness?.code ?? 'unknown_failure',
-            summary: readiness.readiness?.summary ?? 'Engineer handoff readiness failed.',
-            retryable: readiness.readiness?.retryable ?? false,
-            remedy: readiness.readiness?.remedy ?? null,
-            diagnostic: readiness.readiness?.diagnostic ?? null,
-          } as const;
-          await lifecycleStore.record(marker.engineerRunId, { kind: 'run_failed', failure });
-          printErr(`engineer handoff: readiness blocked (${failure.code}): ${failure.summary}`);
-          printErr(`engineer handoff: worktree kept for inspection at "${worktree}".`);
-          return 1;
+        const lifecycle = await lifecycleStore.inspectRun(marker.engineerRunId);
+        if (
+          lifecycle.repoRoot !== target.canonicalPath
+          || lifecycle.worktree?.path !== worktree
+          || lifecycle.worktree.branch !== branch
+          || lifecycle.worktree.planSlug !== marker.planSlug
+        ) {
+          throw new EngineerLifecycleError(
+            'identity_mismatch',
+            `Engineer handoff identity does not match the durable run ${marker.engineerRunId}`,
+          );
+        }
+        if (lifecycle.handoff) {
+          if (
+            !['awaiting_spec_merge', 'settled'].includes(lifecycle.state)
+            || !lifecycle.retention
+            || lifecycle.handoff.branch !== branch
+            || lifecycle.handoff.planSlug !== marker.planSlug
+            || (lifecycle.handoff.outcome === 'pr_opened' && !lifecycle.handoff.prUrl)
+          ) {
+            throw new EngineerLifecycleError(
+              'identity_mismatch',
+              `Engineer run ${marker.engineerRunId} has incomplete or conflicting handoff evidence`,
+            );
+          }
+          existingHandoff = {
+            result: lifecycle.handoff.outcome === 'pr_opened'
+              ? { kind: 'pr-opened', url: lifecycle.handoff.prUrl! }
+              : { kind: 'pr-skipped', reason: 'durable local-commit handoff already recorded' },
+            retainedCommit: lifecycle.retention.retainedCommit,
+            retentionDeadline: lifecycle.retention.retentionDeadline,
+          };
+        } else {
+          const readiness = await recordEngineerReadiness({
+            store: lifecycleStore,
+            engineerRunId: marker.engineerRunId,
+            readiness: {
+              repoRoot: target.canonicalPath,
+              githubHandoff: target.remote !== undefined,
+              requiredTools: await configuredEngineerTools(target.canonicalPath),
+              hostPosture: 'engineer-handoff',
+            },
+            permitInconclusive: true,
+            deps: opts.readinessDeps,
+          });
+          if (!readiness.readiness?.permitted) {
+            const failure = {
+              error: readiness.readiness?.diagnostic ?? readiness.readiness?.summary ?? 'Engineer handoff readiness failed',
+              class: classifyEngineerFailure(readiness.readiness?.diagnostic ?? '').class,
+              code: readiness.readiness?.code ?? 'unknown_failure',
+              summary: readiness.readiness?.summary ?? 'Engineer handoff readiness failed.',
+              retryable: readiness.readiness?.retryable ?? false,
+              remedy: readiness.readiness?.remedy ?? null,
+              diagnostic: readiness.readiness?.diagnostic ?? null,
+            } as const;
+            await lifecycleStore.record(marker.engineerRunId, { kind: 'run_failed', failure });
+            printErr(`engineer handoff: readiness blocked (${failure.code}): ${failure.summary}`);
+            printErr(`engineer handoff: worktree kept for inspection at "${worktree}".`);
+            return 1;
+          }
         }
       }
 
       let handoffResult: Awaited<ReturnType<typeof openSpecPr>>;
-      try {
+      if (existingHandoff) {
+        handoffResult = existingHandoff.result;
+      } else try {
         handoffResult = await openSpecPr(target, branch, {
           gitRunner: git,
           runner: async (args, runnerOpts) => {
@@ -1747,10 +1798,11 @@ export async function dispatchEngineer(
       // The PR opened (or was skipped on no-remote). Persist the exact commit and
       // bounded retention deadline, then leave the worktree available for review.
       const retentionDeadline = marker
-        ? engineerRetentionDeadline(
-            opts.retentionDeps?.now?.() ?? new Date(),
-            opts.retentionMs ?? await configuredEngineerRetentionMs(record.path),
-          )
+        ? existingHandoff?.retentionDeadline
+          ?? engineerRetentionDeadline(
+              opts.retentionDeps?.now?.() ?? new Date(),
+              opts.retentionMs ?? await configuredEngineerRetentionMs(record.path),
+            )
         : null;
       const finalization = marker
         ? (await persistEngineerHandoffRetention({
@@ -1758,7 +1810,7 @@ export async function dispatchEngineer(
             marker,
             prUrl: handoffResult.kind === 'pr-opened' ? handoffResult.url : null,
             outcome: handoffResult.kind === 'pr-opened' ? 'pr_opened' : 'local_commit',
-            retainedCommit: await retainedWorktreeCommit(worktree, git),
+            retainedCommit: existingHandoff?.retainedCommit ?? await retainedWorktreeCommit(worktree, git),
             retentionDeadline: retentionDeadline!,
           }))
         : { persistenceError: null };

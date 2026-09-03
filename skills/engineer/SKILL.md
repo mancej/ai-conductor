@@ -109,14 +109,16 @@ spawned `claude`. Present the proposed target and your rationale, then **confirm
 ### 3. Create the per-idea worktree, then run the REAL DECIDE skills inside it
 **Author in an isolated per-idea worktree — never the target's primary checkout.** First create it:
 
-`conduct-ts engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>]` → prints JSON
+`conduct-ts engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>] [--permit-inconclusive]` → prints JSON
 `{ kind, engineerRunId, slug, branch, worktreePath, reconcile }`. For **intake-claimed ideas**, pass the `sourceRef`
 carried from step 1 as `--source-ref <ref>` — the claim record it resolves lets a later `land`
 auto-resolve the intake body without having to re-thread it by hand. `--source-ref` can be omitted
 for chat/CLI ideas, which have no claim record. This creates a dedicated worktree at
 `<target>/.worktrees/engineer-<slug>` checked out on a fresh `spec/<slug>` branch (based on the
 repo's derived default branch), disjoint from the daemon's own worktrees. **`worktreePath` is your
-working directory for all authoring, `land`, and `handoff`** for this idea.
+working directory for all authoring, `land`, and `handoff`** for this idea. Use
+`--permit-inconclusive` only after the operator explicitly accepts that read-only checks cannot prove
+push authorization.
 
 The command runs the machine readiness gate before authoring. It verifies the exact repository,
 required tools, remote reachability and authentication, and GitHub posture without mutating the

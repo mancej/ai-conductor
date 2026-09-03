@@ -68,7 +68,8 @@ not replace replay.
 For automation, use `conduct-ts engineer readiness-probe --repo-root <path> --github-handoff` before
 reserving a run. It does not create a run or event. A read-only remote probe cannot prove push
 authorization, so success can be `inconclusive` with code `push_authorization_unproven`. For a reserved
-run, `engineer run-readiness` persists the evidence; `--permit-inconclusive` must be explicit.
+run, `engineer run-readiness` persists the evidence; `--permit-inconclusive` must be explicit. The same
+explicit flag is required on `engineer worktree` before an inconclusive run may enter authoring.
 
 Register a repo with `conduct-ts register <path>`, or scaffold a new one with
 `conduct-ts create <name>`. See [cli reference](../reference/cli.md) for both.

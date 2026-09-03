@@ -339,6 +339,14 @@ describe('engineer land — owner-gate wiring (CLI seam)', () => {
 
     const store = new EngineerRunStore({ engineerDir, events: new ConductorEventEmitter() });
     const run = await store.create({ repoRoot: repoPath, idea: 'dep bump', attemptKey: 'land-attempt' });
+    await store.record(run.engineerRunId, {
+      kind: 'readiness_checked',
+      result: {
+        status: 'ready', code: 'ready', summary: 'Ready', checkedCapabilities: ['repository'],
+        retryable: false, remedy: null, diagnostic: null, fingerprint: 'ready-fixture',
+      },
+      permitInconclusive: false,
+    });
     await store.record(run.engineerRunId, { kind: 'run_started' });
     await store.record(run.engineerRunId, {
       kind: 'run_failed',
