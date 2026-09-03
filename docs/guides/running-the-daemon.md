@@ -583,6 +583,31 @@ process contract.
 
 ## Retained worktrees
 
+### Engineer authoring review worktrees
+
+Successful owned Engineer handoffs keep their `spec/<slug>` authoring worktree registered through
+specification review. Each daemon sweep uses a durable per-repository run index and opens only the
+Engineer lifecycle journals owned by that repository. A missing legacy index is backfilled once from
+bounded run metadata without opening other repositories' journals. The sweep retires only the exact
+recorded worktree when the spec PR is merged or closed, the run
+is cancelled, or the configured review deadline expires. A local-commit handoff waits for cancellation
+or expiry because it has no PR state to observe.
+
+Retirement validates the durable run marker, canonical repository, registered worktree path, branch,
+and retained commit. The engine appends `engineer_worktree_retired` before calling the guarded removal
+helper. If identity validation or removal fails, typed failure evidence and the next eligible retry
+time remain visible in the run's `cleanup` projection. The terminal run stays terminal and a retired
+path stays unauthorized; later sweeps honor the retry backoff and never append a second retirement
+event. Use
+`conduct-ts engineer maintenance` for an immediate reconciliation pass, or
+`conduct-ts engineer worktree-cleanup --run-id <id> --reason operator_cleanup` for one explicit run.
+
+The fallback deadline is 14 days. Configure `engineer_review_retention_days` from 1 through 90 in
+the project configuration. These authoring worktrees are separate from implementation feature
+worktrees and their shipped-record gate below.
+
+### Implementation feature worktrees
+
 A feature's worktree is **not** removed when its implementation PR opens. The mergeable sweep
 tears it down only after the PR reaches `MERGED` or `CLOSED` *and* a `.docs/shipped/<slug>.md`
 record is proven present on `origin/main` — the same signal

@@ -21,8 +21,11 @@ that identity first with `conduct-ts engineer run-create`; a direct legacy flow 
 exact association in `.pipeline/engineer-run.json`. The marker carries repository, plan slug, and branch
 identity, so consumers never infer identity from a worktree directory name.
 
-Worktree creation records the mechanical run-started, route-selected, and worktree-created events. A
-host without structured Engineer hooks records each authoring step through `engineer run-record` using
+Before authoring, the engine records a read-only readiness result for the exact run. New runs cannot
+start or record authoring steps until readiness is `ready`, or until an `inconclusive` result is
+explicitly permitted. A blocked result keeps the run out of authoring. Worktree creation records that
+evidence plus the mechanical run-started, route-selected, and worktree-created events. A host without
+structured Engineer hooks records each authoring step through `engineer run-record` using
 the returned run id. Completion requires the owning workflow's accepted result or deterministic
 artifact validation. A tool return alone is not evidence. Land independently validates the final
 artifact set and reconciles any mechanically proven completion or skip without weakening its gates.
@@ -37,10 +40,12 @@ run metadata. Locks are scoped to the affected attempt, correlation, or run, so 
 runs do not block one another.
 
 The lifecycle does not claim spec merge. After the land gate validates track, tier, and the exact DECIDE
-artifact set, handoff records `engineer_spec_handoff` with the final plan slug, spec branch, PR URL or
-local-commit outcome, and `awaiting_spec_merge`. It then records `engineer_run_settled` and only then
-removes the authoring worktree. If durable finalization fails after delivery, the command reports the
-failure and retains the worktree for a retry. The durable journal and spec branch remain after cleanup.
+artifact set, handoff rechecks readiness, then records `engineer_spec_handoff` with the final plan slug,
+spec branch, PR URL or local-commit outcome, retained commit, and review deadline. It records
+`engineer_run_settled` and leaves the authoring worktree available for review. The daemon maintenance
+loop retires it after PR merge, PR close, cancellation, or the bounded deadline. If durable finalization
+fails after delivery, the command reports the failure and retains the worktree for a retry. The durable
+journal and spec branch remain after cleanup.
 The later daemon run keeps its existing `.pipeline/events.jsonl` and BUILD/SHIP semantics.
 
 Land commits the validated artifacts before recording lifecycle reconciliation. If that durable recording
@@ -59,6 +64,11 @@ not replace replay.
 | `claude` on PATH (the loop launches an interactive session) | `claude --version` |
 | At least one registered project | `conduct-ts engineer projects` prints a non-empty JSON array |
 | `gh` authenticated, for intake and PR steps | `gh auth status` |
+
+For automation, use `conduct-ts engineer readiness-probe --repo-root <path> --github-handoff` before
+reserving a run. It does not create a run or event. A read-only remote probe cannot prove push
+authorization, so success can be `inconclusive` with code `push_authorization_unproven`. For a reserved
+run, `engineer run-readiness` persists the evidence; `--permit-inconclusive` must be explicit.
 
 Register a repo with `conduct-ts register <path>`, or scaffold a new one with
 `conduct-ts create <name>`. See [cli reference](../reference/cli.md) for both.
@@ -173,6 +183,9 @@ You should see
   `attached`. A dirty leftover is refused — recreate it.
 - Failure exits 1 and makes **zero** changes to the target's primary tree. Do not fall back to the
   primary checkout; fix the error and retry.
+- Readiness runs before the authoring transition. Missing tools, an invalid repository, unreachable
+  remote, or missing authentication block worktree creation with a stable code, bounded diagnostic,
+  and remedy.
 
 `--source-ref` is optional and only meaningful for intake-claimed ideas. With `--source-ref` and no
 `--body`, the command loads the Desired-outcome body from the claim record written at claim time; a
@@ -288,8 +301,9 @@ see one of:
 | `{"kind":"pr-opened","url":"…"}` | The spec PR exists |
 | `{"kind":"local-commit","branch":"…","repoPath":"…","reason":"no remote configured"}` | No remote; work persists on the branch |
 
-Then it removes the per-idea worktree (the branch and commit persist), and fires
-`ensureRunning(<target>)` so the target repo's daemon is alive to pick the spec up after you merge.
+Then it retains the exact per-idea worktree for specification review, records its immutable commit and
+deadline, and fires `ensureRunning(<target>)` so the target repo's daemon is alive to pick the spec up
+after you merge.
 That last call is fire-and-forget but never silent: on a host without tmux you get
 `⚠ Spec authored, but the build daemon was not started for "<name>": …` on stderr while the command
 still exits 0.
@@ -301,6 +315,39 @@ cleanup; `engineer:handled` marks completion without changing ownership.
 
 On failure `handoff` exits 1, **keeps** the worktree, prints its path, and records branch evidence in
 the ledger so you can recover with `engineer resolve`.
+
+The default review retention is 14 days and can be set from 1 through 90 days with
+`engineer_review_retention_days`. The daemon maintenance sweep removes an owned review worktree only
+after validating its exact run marker, repository, branch, registered worktree path, and retained
+commit. It writes `engineer_worktree_retired` before removal. A failed removal remains cleanup debt and
+is retried without writing a second retirement event. Local-commit handoffs wait for cancellation,
+explicit cleanup, or deadline expiry because they have no PR terminal signal.
+
+To request exact cleanup manually:
+
+```bash
+conduct-ts engineer worktree-cleanup --run-id <engineerRunId> --reason operator_cleanup
+```
+
+## Integration-owned correlations
+
+An orchestrator can reserve a correlation with `run-create --integration-owner <opaque>`. Every direct
+successor must present the same owner. Omitting or changing it is rejected before run metadata, indexes,
+or events are written. To intentionally transfer or release ownership after a terminal attempt, bind the
+decision to its exact current revision:
+
+```bash
+conduct-ts engineer owner-transfer \
+  --repo-root <path> \
+  --correlation-id <id> \
+  --run-id <terminalEngineerRunId> \
+  --current-owner <opaque> \
+  --next-owner <opaque> \
+  --expected-revision <n>
+```
+
+Use `--release` instead of `--next-owner` to authorize an unowned direct successor. A transfer is
+auditable, exact, and one-use. It does not reopen or rewrite the predecessor.
 
 ## Step 7 — Deliver, then end the session
 

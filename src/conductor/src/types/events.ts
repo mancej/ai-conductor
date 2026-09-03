@@ -192,6 +192,45 @@ export type EngineerStepCompletionEvidence =
   | 'artifact_validation'
   | 'land_reconciliation';
 
+export type EngineerReadinessStatus = 'ready' | 'blocked' | 'inconclusive';
+
+export type EngineerFailureClass =
+  | 'authentication'
+  | 'authorization'
+  | 'remote'
+  | 'workspace'
+  | 'tooling'
+  | 'provider'
+  | 'unknown';
+
+export type EngineerWorktreeRetirementReason =
+  | 'spec_merged'
+  | 'spec_closed'
+  | 'task_cancelled'
+  | 'retention_expired'
+  | 'operator_cleanup';
+
+export interface EngineerReadinessEvidence {
+  status: EngineerReadinessStatus;
+  code: string;
+  summary: string;
+  checkedCapabilities: string[];
+  retryable: boolean;
+  remedy: string | null;
+  diagnostic: string | null;
+  fingerprint: string;
+}
+
+export interface EngineerFailureEvidence {
+  error: string;
+  class: EngineerFailureClass;
+  code: string;
+  summary: string;
+  retryable: boolean;
+  remedy: string | null;
+  diagnostic: string | null;
+}
+
 export interface EngineerEventBase {
   schemaVersion: 1;
   engineerRunId: string;
@@ -205,7 +244,16 @@ export interface EngineerEventBase {
 }
 
 export type EngineerLifecycleEvent = EngineerEventBase & (
-  | { type: 'engineer_run_created'; idea: string }
+  | {
+      type: 'engineer_run_created';
+      idea: string;
+      readinessRequired?: true;
+      integrationOwner?: string;
+    }
+  | (EngineerReadinessEvidence & {
+      type: 'engineer_readiness_checked';
+      permitted: boolean;
+    })
   | { type: 'engineer_run_started' }
   | { type: 'engineer_routing_selected'; project: string }
   | { type: 'engineer_worktree_created'; worktreePath: string; branch: string; planSlug: string }
@@ -236,10 +284,21 @@ export type EngineerLifecycleEvent = EngineerEventBase & (
       prUrl: string | null;
       outcome: 'pr_opened' | 'local_commit';
       state: 'awaiting_spec_merge';
+      retainedCommit?: string;
+      retainedAt?: string;
+      retentionDeadline?: string;
     }
   | { type: 'engineer_run_cancelled'; reason: string }
-  | { type: 'engineer_run_failed'; error: string }
+  | ({ type: 'engineer_run_failed'; error: string } & Partial<Omit<EngineerFailureEvidence, 'error'>>)
   | { type: 'engineer_run_settled'; outcome: 'awaiting_spec_merge' }
+  | {
+      type: 'engineer_worktree_retired';
+      worktreePath: string;
+      branch: string;
+      planSlug: string;
+      reason: EngineerWorktreeRetirementReason;
+      retainedCommit: string | null;
+    }
 );
 
 export type ConductorEvent =

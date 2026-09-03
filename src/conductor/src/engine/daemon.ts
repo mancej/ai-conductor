@@ -447,6 +447,12 @@ export interface DaemonDeps {
   sweepProviderScratch?: () => Promise<void>;
 
   /**
+   * Reconcile retained Engineer review worktrees on startup and idle ticks.
+   * Logical retirement is recorded before exact physical cleanup.
+   */
+  reconcileEngineerWorktrees?: () => Promise<void>;
+
+  /**
    * FR-14: sweep mergeable labels on startup (after reconciliation) and once per
    * idle poll tick. The caller binds projectRoot + log when wiring production
    * deps — this core supplies read-only activity context but needs no knowledge
@@ -639,6 +645,11 @@ export async function runDaemon(
       await deps.sweepProviderScratch?.();
     } catch (err) {
       log(`[daemon] sweepProviderScratch error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      await deps.reconcileEngineerWorktrees?.();
+    } catch (err) {
+      log(`[daemon] reconcileEngineerWorktrees error: ${err instanceof Error ? err.message : String(err)}`);
     }
     try {
       await deps.sweepMergeableLabels?.({

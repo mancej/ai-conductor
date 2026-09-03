@@ -34,15 +34,32 @@ import { resolveDaemonOwner } from './owner-gate/identity.js';
 import { openSpecPr } from './engineer/handoff.js';
 import {
   createEngineerWorktree,
-  removeEngineerWorktree,
 } from './engineer/worktree-authoring.js';
 import { recordAuthoredKey } from './engineer/authored-ledger.js';
 import {
   ENGINEER_LIFECYCLE_CAPABILITY,
+  ENGINEER_OWNED_ATTEMPTS_CAPABILITY,
+  ENGINEER_READINESS_CAPABILITY,
+  ENGINEER_RETAINED_REVIEW_WORKTREE_CAPABILITY,
+  ENGINEER_WORKTREE_RETIREMENT_CAPABILITY,
   EngineerLifecycleError,
   EngineerRunStore,
   type EngineerTransition,
 } from './engineer/run-store.js';
+import {
+  checkEngineerReadiness,
+  recordEngineerReadiness,
+  type EngineerReadinessDeps,
+} from './engineer/readiness.js';
+import { classifyEngineerFailure } from './engineer/failure-evidence.js';
+import {
+  engineerRetentionDeadline,
+  reconcileEngineerRetainedWorktrees,
+  retainedWorktreeCommit,
+  retireEngineerWorktree,
+  resolveEngineerRetentionMs,
+  type EngineerRetentionDeps,
+} from './engineer/retention.js';
 import { ConductorEventEmitter } from '../ui/events.js';
 import type { EngineerStepName } from '../types/index.js';
 import { readEngineerRunMarker, writeEngineerRunMarker } from './engineer/run-marker.js';
@@ -118,7 +135,9 @@ export type EngineerDispatch =
   | { kind: 'land'; project: string; idea: string; worktree: string; sourceRef?: string }
   | { kind: 'handoff'; project: string; branch: string; worktree: string; sourceRef?: string }
   | { kind: 'capabilities' }
-  | { kind: 'run-create'; repoRoot: string; idea: string; correlationId?: string; attemptKey?: string }
+  | { kind: 'readiness-probe'; repoRoot: string; githubHandoff: boolean; requiredTools: string[] }
+  | { kind: 'run-readiness'; runId: string; repoRoot: string; githubHandoff: boolean; requiredTools: string[]; permitInconclusive: boolean }
+  | { kind: 'run-create'; repoRoot: string; idea: string; correlationId?: string; attemptKey?: string; integrationOwner?: string }
   | { kind: 'run-inspect'; runId?: string; repoRoot?: string; correlationId?: string }
   | { kind: 'run-replay'; runId: string; afterRevision: number }
   | {
@@ -136,6 +155,17 @@ export type EngineerDispatch =
     }
   | { kind: 'run-cancel'; runId: string; reason: string }
   | { kind: 'run-fail'; runId: string; error: string }
+  | {
+      kind: 'owner-transfer';
+      repoRoot: string;
+      correlationId: string;
+      runId: string;
+      currentOwner: string;
+      nextOwner: string | null;
+      expectedRevision: number;
+    }
+  | { kind: 'worktree-cleanup'; runId: string; reason: string }
+  | { kind: 'maintenance' }
   | { kind: 'poll' }
   | { kind: 'claim' }
   | { kind: 'forget'; sourceRef: string }
@@ -150,7 +180,8 @@ export type EngineerDispatch =
 export const ENGINEER_SUBCOMMANDS = [
   'projects', 'worktree', 'land', 'handoff', 'poll', 'claim', 'forget', 'unclaim', 'requeue',
   'resolve', 'migrate-issue-deps', 'capabilities', 'run-create', 'run-inspect', 'run-replay',
-  'run-record', 'run-cancel', 'run-fail',
+  'readiness-probe', 'run-readiness', 'run-record', 'run-cancel', 'run-fail', 'owner-transfer',
+  'worktree-cleanup', 'maintenance',
 ] as const;
 
 // ── Subcommand detection ──────────────────────────────────────────────────────
@@ -212,7 +243,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
     const repoRoot = parseFlag(argv, '--repo-root');
     const idea = parseFlag(argv, '--idea');
     if (!repoRoot || !idea) return { kind: 'guide' };
-    const unk = findUnknownFlag(argv, ['--repo-root', '--idea', '--correlation-id', '--attempt-key']);
+    const unk = findUnknownFlag(argv, ['--repo-root', '--idea', '--correlation-id', '--attempt-key', '--integration-owner']);
     if (unk) return { kind: 'reject', sub: 'run-create', flag: unk };
     return {
       kind: 'run-create',
@@ -220,6 +251,33 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
       idea,
       correlationId: parseFlag(argv, '--correlation-id') ?? undefined,
       attemptKey: parseFlag(argv, '--attempt-key') ?? undefined,
+      integrationOwner: parseFlag(argv, '--integration-owner') ?? undefined,
+    };
+  }
+
+  if (subCmd === 'readiness-probe' || subCmd === 'run-readiness') {
+    const repoRoot = parseFlag(argv, '--repo-root');
+    const runId = parseFlag(argv, '--run-id');
+    if (!repoRoot || (subCmd === 'run-readiness' && !runId)) return { kind: 'guide' };
+    const unk = findUnknownFlag(argv, [
+      '--repo-root', '--run-id', '--github-handoff', '--local-handoff', '--required-tools', '--permit-inconclusive',
+    ]);
+    if (unk) return { kind: 'reject', sub: subCmd, flag: unk };
+    if (argv.includes('--github-handoff') && argv.includes('--local-handoff')) return { kind: 'guide' };
+    const githubHandoff = !argv.includes('--local-handoff');
+    const requiredTools = (parseFlag(argv, '--required-tools') ?? '')
+      .split(',').map((tool) => tool.trim()).filter(Boolean);
+    if (subCmd === 'readiness-probe') {
+      if (runId || argv.includes('--permit-inconclusive')) return { kind: 'guide' };
+      return { kind: 'readiness-probe', repoRoot, githubHandoff, requiredTools };
+    }
+    return {
+      kind: 'run-readiness',
+      runId: runId!,
+      repoRoot,
+      githubHandoff,
+      requiredTools,
+      permitInconclusive: argv.includes('--permit-inconclusive'),
     };
   }
 
@@ -285,6 +343,39 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
     const unk = findUnknownFlag(argv, ['--run-id', '--error']);
     if (unk) return { kind: 'reject', sub: 'run-fail', flag: unk };
     return { kind: 'run-fail', runId, error };
+  }
+
+  if (subCmd === 'owner-transfer') {
+    const repoRoot = parseFlag(argv, '--repo-root');
+    const correlationId = parseFlag(argv, '--correlation-id');
+    const runId = parseFlag(argv, '--run-id');
+    const currentOwner = parseFlag(argv, '--current-owner');
+    const nextOwner = parseFlag(argv, '--next-owner');
+    const release = argv.includes('--release');
+    const expectedRevision = Number(parseFlag(argv, '--expected-revision'));
+    if (!repoRoot || !correlationId || !runId || !currentOwner || !Number.isInteger(expectedRevision) || expectedRevision < 1 || (Boolean(nextOwner) === release)) {
+      return { kind: 'guide' };
+    }
+    const unk = findUnknownFlag(argv, [
+      '--repo-root', '--correlation-id', '--run-id', '--current-owner', '--next-owner', '--release', '--expected-revision',
+    ]);
+    if (unk) return { kind: 'reject', sub: 'owner-transfer', flag: unk };
+    return { kind: 'owner-transfer', repoRoot, correlationId, runId, currentOwner, nextOwner: release ? null : nextOwner, expectedRevision };
+  }
+
+  if (subCmd === 'worktree-cleanup') {
+    const runId = parseFlag(argv, '--run-id');
+    const reason = parseFlag(argv, '--reason');
+    if (!runId || !reason) return { kind: 'guide' };
+    const unk = findUnknownFlag(argv, ['--run-id', '--reason']);
+    if (unk) return { kind: 'reject', sub: 'worktree-cleanup', flag: unk };
+    return { kind: 'worktree-cleanup', runId, reason };
+  }
+
+  if (subCmd === 'maintenance') {
+    const unk = findUnknownFlag(argv, []);
+    if (unk) return { kind: 'reject', sub: 'maintenance', flag: unk };
+    return { kind: 'maintenance' };
   }
 
   if (subCmd === 'worktree') {
@@ -626,13 +717,26 @@ function lifecycleLandDisposition(
   return { completed, skipped };
 }
 
-export async function persistEngineerHandoffBeforeCleanup(input: {
+async function configuredEngineerTools(repoRoot: string): Promise<string[]> {
+  const config = await loadConfig(repoRoot);
+  if (!config.ok) return [];
+  const command = config.config.mermaid_renderer?.command?.trim();
+  return command ? [command] : [];
+}
+
+async function configuredEngineerRetentionMs(repoRoot: string): Promise<number> {
+  const config = await loadConfig(repoRoot);
+  return resolveEngineerRetentionMs(config.ok ? config.config : undefined);
+}
+
+export async function persistEngineerHandoffRetention(input: {
   store: EngineerRunStore;
   marker: Awaited<ReturnType<typeof readEngineerRunMarker>> & {};
   prUrl: string | null;
   outcome: 'pr_opened' | 'local_commit';
-  cleanup: () => Promise<void>;
-}): Promise<{ persistenceError: unknown | null; cleanupError: unknown | null }> {
+  retainedCommit: string;
+  retentionDeadline: string;
+}): Promise<{ persistenceError: unknown | null }> {
   try {
     let snapshot = await input.store.inspectRun(input.marker.engineerRunId);
     if (snapshot.handoff === null) {
@@ -642,6 +746,8 @@ export async function persistEngineerHandoffBeforeCleanup(input: {
         branch: input.marker.branch,
         prUrl: input.prUrl,
         outcome: input.outcome,
+        retainedCommit: input.retainedCommit,
+        retentionDeadline: input.retentionDeadline,
       });
     } else if (
       snapshot.handoff.planSlug !== input.marker.planSlug
@@ -661,14 +767,9 @@ export async function persistEngineerHandoffBeforeCleanup(input: {
       });
     }
   } catch (error) {
-    return { persistenceError: error, cleanupError: null };
+    return { persistenceError: error };
   }
-  try {
-    await input.cleanup();
-    return { persistenceError: null, cleanupError: null };
-  } catch (error) {
-    return { persistenceError: null, cleanupError: error };
-  }
+  return { persistenceError: null };
 }
 
 // ── Optional IO/deps injection (for tests) ────────────────────────────────────
@@ -693,6 +794,12 @@ export interface DispatchEngineerOpts {
   gh?: (args: string[], opts: { cwd: string }) => Promise<{ stdout: string }>;
   /** Injected git runner (for tests). */
   git?: GitRunner;
+  /** Injected deterministic readiness command dependencies. */
+  readinessDeps?: EngineerReadinessDeps;
+  /** Injected retained-worktree lifecycle dependencies. */
+  retentionDeps?: EngineerRetentionDeps;
+  /** Bounded review-worktree retention timeout. Defaults to 14 days. */
+  retentionMs?: number;
   /** Injected ensureRunning launch spy (for tests). */
   ensureRunningLaunch?: (repoPath: string) => void | Promise<void>;
   /**
@@ -811,8 +918,14 @@ export const SUBCOMMAND_HELP = {
   capabilities:
     'engineer capabilities - print machine-readable Engineer lifecycle capabilities.\n' +
     'Flags: none.\nMutates: nothing (read-only).\nLoop fit: provider capability negotiation.',
+  'readiness-probe':
+    'engineer readiness-probe --repo-root <path> [--github-handoff|--local-handoff] [--required-tools <csv>] - check prerequisites without reserving a run.\n' +
+    'Mutates: nothing.\nLoop fit: before attempt reservation.',
+  'run-readiness':
+    'engineer run-readiness --run-id <id> --repo-root <path> [--github-handoff|--local-handoff] [--required-tools <csv>] [--permit-inconclusive] - record exact-run readiness.\n' +
+    'Mutates: the exact run journal and snapshot.\nLoop fit: after reservation and before authoring.',
   'run-create':
-    'engineer run-create --repo-root <path> --idea "<text>" [--correlation-id <id>] [--attempt-key <key>] - reserve an Engineer run.\n' +
+    'engineer run-create --repo-root <path> --idea "<text>" [--correlation-id <id>] [--attempt-key <key>] [--integration-owner <opaque>] - reserve an Engineer run.\n' +
     'Mutates: durable Engineer lifecycle metadata and event journal.\nLoop fit: before host launch or worktree creation.',
   'run-inspect':
     'engineer run-inspect --run-id <id> OR --repo-root <path> --correlation-id <id> - inspect one run or ordered lineage.\n' +
@@ -829,6 +942,15 @@ export const SUBCOMMAND_HELP = {
   'run-fail':
     'engineer run-fail --run-id <id> --error <text> - terminally fail one Engineer run.\n' +
     'Mutates: the exact run journal and compact snapshot.\nLoop fit: established host failure.',
+  'owner-transfer':
+    'engineer owner-transfer --repo-root <path> --correlation-id <id> --run-id <id> --current-owner <opaque> (--next-owner <opaque>|--release) --expected-revision <n> - authorize one exact direct successor owner.\n' +
+    'Mutates: the correlation ownership record.\nLoop fit: explicit control transfer after a terminal run.',
+  'worktree-cleanup':
+    'engineer worktree-cleanup --run-id <id> --reason <operator_cleanup|task_cancelled|spec_merged|spec_closed|retention_expired> - logically retire and exactly clean one worktree.\n' +
+    'Mutates: the run journal and lifecycle cleanup metadata.\nLoop fit: explicit retained-worktree cleanup.',
+  maintenance:
+    'engineer maintenance - reconcile retained review worktrees.\n' +
+    'Flags: none.\nMutates: eligible retirement journals and cleanup metadata.\nLoop fit: daemon maintenance.',
   projects:
     'engineer projects — list the registered projects from the project registry.\n' +
     'Flags: none.\n' +
@@ -900,7 +1022,7 @@ function printGuide(print: (s: string) => void): void {
       '  conduct-ts engineer claim                               — dequeue the oldest pending intake idea (JSON)\n' +
       '  conduct-ts engineer worktree --project <n> --idea "<i>" [--source-ref <ref>]  — create the per-idea authoring worktree\n' +
       '  conduct-ts engineer land --project <n> --idea "<i>" --worktree <p> [--source-ref <ref>]    — commit spec artifacts in the worktree\n' +
-      '  conduct-ts engineer handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] — open spec PR + remove worktree + nudge daemon\n' +
+      '  conduct-ts engineer handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] - open spec PR + retain review worktree + nudge daemon\n' +
       '  conduct-ts engineer resolve <ref> --pr-url <url> [--branch <b>]              — mark a claimed entry as delivered (recovery from write-back failure)\n' +
       '  conduct-ts engineer unclaim <owner/repo#N>              — requeue a claimed ledger entry back to pending (single-idea recovery)\n' +
       '  conduct-ts engineer requeue --stale [--older-than <dur>] — bulk-recover stranded claimed ledger entries (e.g. "24h")\n' +
@@ -1016,8 +1138,41 @@ export async function dispatchEngineer(
   try {
     switch (dispatch.kind) {
     case 'capabilities': {
-      print(JSON.stringify({ schemaVersion: 1, [ENGINEER_LIFECYCLE_CAPABILITY]: true }));
+      print(JSON.stringify({
+        schemaVersion: 1,
+        [ENGINEER_LIFECYCLE_CAPABILITY]: true,
+        [ENGINEER_READINESS_CAPABILITY]: true,
+        [ENGINEER_WORKTREE_RETIREMENT_CAPABILITY]: true,
+        [ENGINEER_RETAINED_REVIEW_WORKTREE_CAPABILITY]: true,
+        [ENGINEER_OWNED_ATTEMPTS_CAPABILITY]: true,
+      }));
       return 0;
+    }
+
+    case 'readiness-probe': {
+      const result = await checkEngineerReadiness({
+        repoRoot: dispatch.repoRoot,
+        githubHandoff: dispatch.githubHandoff,
+        requiredTools: dispatch.requiredTools,
+      }, opts.readinessDeps);
+      print(JSON.stringify(result));
+      return result.status === 'blocked' ? 1 : 0;
+    }
+
+    case 'run-readiness': {
+      const result = await recordEngineerReadiness({
+        store: lifecycleStore,
+        engineerRunId: dispatch.runId,
+        readiness: {
+          repoRoot: dispatch.repoRoot,
+          githubHandoff: dispatch.githubHandoff,
+          requiredTools: dispatch.requiredTools,
+        },
+        permitInconclusive: dispatch.permitInconclusive,
+        deps: opts.readinessDeps,
+      });
+      print(JSON.stringify(result));
+      return result.readiness?.permitted ? 0 : 1;
     }
 
     case 'run-create': {
@@ -1026,6 +1181,7 @@ export async function dispatchEngineer(
         idea: dispatch.idea,
         correlationId: dispatch.correlationId,
         attemptKey: dispatch.attemptKey,
+        integrationOwner: dispatch.integrationOwner,
       })));
       return 0;
     }
@@ -1077,8 +1233,43 @@ export async function dispatchEngineer(
     case 'run-fail': {
       print(JSON.stringify(await lifecycleStore.record(dispatch.runId, {
         kind: 'run_failed',
-        error: dispatch.error,
+        failure: classifyEngineerFailure(dispatch.error),
       })));
+      return 0;
+    }
+
+    case 'owner-transfer': {
+      print(JSON.stringify(await lifecycleStore.transferOwnership({
+        repoRoot: dispatch.repoRoot,
+        correlationId: dispatch.correlationId,
+        engineerRunId: dispatch.runId,
+        currentOwner: dispatch.currentOwner,
+        nextOwner: dispatch.nextOwner,
+        expectedRevision: dispatch.expectedRevision,
+      })));
+      return 0;
+    }
+
+    case 'worktree-cleanup': {
+      const reasons = new Set(['spec_merged', 'spec_closed', 'task_cancelled', 'retention_expired', 'operator_cleanup']);
+      if (!reasons.has(dispatch.reason)) {
+        throw new EngineerLifecycleError('invalid_transition', `Unknown Engineer retirement reason ${JSON.stringify(dispatch.reason)}`);
+      }
+      print(JSON.stringify(await retireEngineerWorktree({
+        store: lifecycleStore,
+        engineerRunId: dispatch.runId,
+        reason: dispatch.reason as 'spec_merged' | 'spec_closed' | 'task_cancelled' | 'retention_expired' | 'operator_cleanup',
+        deps: { git, gh, ...opts.retentionDeps },
+      })));
+      return 0;
+    }
+
+    case 'maintenance': {
+      await reconcileEngineerRetainedWorktrees({
+        store: lifecycleStore,
+        deps: { git, gh, ...opts.retentionDeps, log: printErr },
+      });
+      print(JSON.stringify({ schemaVersion: 1, reconciled: true }));
       return 0;
     }
 
@@ -1244,6 +1435,22 @@ export async function dispatchEngineer(
         );
       }
       if (lifecycle.state === 'created') {
+        lifecycle = await recordEngineerReadiness({
+          store: lifecycleStore,
+          engineerRunId: lifecycle.engineerRunId,
+          readiness: {
+            repoRoot: target.canonicalPath,
+            githubHandoff: target.remote !== undefined,
+            requiredTools: await configuredEngineerTools(target.canonicalPath),
+            hostPosture: 'engineer-worktree',
+          },
+          permitInconclusive: true,
+          deps: opts.readinessDeps,
+        });
+        if (!lifecycle.readiness?.permitted) {
+          printErr(`engineer worktree: readiness blocked (${lifecycle.readiness?.code ?? 'unknown'}): ${lifecycle.readiness?.summary ?? 'unknown failure'}`);
+          return 1;
+        }
         lifecycle = await lifecycleStore.record(lifecycle.engineerRunId, { kind: 'run_started' });
       }
       if (lifecycle.state !== 'authoring') {
@@ -1288,7 +1495,7 @@ export async function dispatchEngineer(
         try {
           await lifecycleStore.record(lifecycle.engineerRunId, {
             kind: 'run_failed',
-            error: err instanceof Error ? err.message : String(err),
+            failure: classifyEngineerFailure(err),
           });
         } catch {
           // Preserve the original worktree failure; lifecycle diagnostics are best effort here.
@@ -1445,6 +1652,33 @@ export async function dispatchEngineer(
             `Engineer handoff identity does not match the worktree marker for ${marker.engineerRunId}`,
           );
         }
+        const readiness = await recordEngineerReadiness({
+          store: lifecycleStore,
+          engineerRunId: marker.engineerRunId,
+          readiness: {
+            repoRoot: target.canonicalPath,
+            githubHandoff: target.remote !== undefined,
+            requiredTools: await configuredEngineerTools(target.canonicalPath),
+            hostPosture: 'engineer-handoff',
+          },
+          permitInconclusive: true,
+          deps: opts.readinessDeps,
+        });
+        if (!readiness.readiness?.permitted) {
+          const failure = {
+            error: readiness.readiness?.diagnostic ?? readiness.readiness?.summary ?? 'Engineer handoff readiness failed',
+            class: classifyEngineerFailure(readiness.readiness?.diagnostic ?? '').class,
+            code: readiness.readiness?.code ?? 'unknown_failure',
+            summary: readiness.readiness?.summary ?? 'Engineer handoff readiness failed.',
+            retryable: readiness.readiness?.retryable ?? false,
+            remedy: readiness.readiness?.remedy ?? null,
+            diagnostic: readiness.readiness?.diagnostic ?? null,
+          } as const;
+          await lifecycleStore.record(marker.engineerRunId, { kind: 'run_failed', failure });
+          printErr(`engineer handoff: readiness blocked (${failure.code}): ${failure.summary}`);
+          printErr(`engineer handoff: worktree kept for inspection at "${worktree}".`);
+          return 1;
+        }
       }
 
       let handoffResult: Awaited<ReturnType<typeof openSpecPr>>;
@@ -1467,7 +1701,10 @@ export async function dispatchEngineer(
         const msg = err instanceof Error ? err.message : String(err);
         if (marker) {
           try {
-            await lifecycleStore.record(marker.engineerRunId, { kind: 'run_failed', error: msg });
+            await lifecycleStore.record(marker.engineerRunId, {
+              kind: 'run_failed',
+              failure: classifyEngineerFailure(err),
+            });
           } catch {
             // Keep the original handoff failure and its retained worktree actionable.
           }
@@ -1507,22 +1744,24 @@ export async function dispatchEngineer(
         return 1;
       }
 
-      // The PR opened (or was skipped on no-remote) — the cycle succeeded, so remove
-      // the per-idea worktree (FR-5). The spec/<slug> branch + commit persist; a
-      // removal failure is REPORTED, never swallowed (FR-5 negative).
-      const cleanup = () => removeEngineerWorktree(target.canonicalPath, worktree);
+      // The PR opened (or was skipped on no-remote). Persist the exact commit and
+      // bounded retention deadline, then leave the worktree available for review.
+      const retentionDeadline = marker
+        ? engineerRetentionDeadline(
+            opts.retentionDeps?.now?.() ?? new Date(),
+            opts.retentionMs ?? await configuredEngineerRetentionMs(record.path),
+          )
+        : null;
       const finalization = marker
-        ? (await persistEngineerHandoffBeforeCleanup({
+        ? (await persistEngineerHandoffRetention({
             store: lifecycleStore,
             marker,
             prUrl: handoffResult.kind === 'pr-opened' ? handoffResult.url : null,
             outcome: handoffResult.kind === 'pr-opened' ? 'pr_opened' : 'local_commit',
-            cleanup,
+            retainedCommit: await retainedWorktreeCommit(worktree, git),
+            retentionDeadline: retentionDeadline!,
           }))
-        : {
-            persistenceError: null,
-            cleanupError: await cleanup().then(() => null, (error: unknown) => error),
-          };
+        : { persistenceError: null };
       if (finalization.persistenceError !== null) {
         printErr(
           `Spec delivered, but Engineer lifecycle finalization failed: `
@@ -1531,13 +1770,10 @@ export async function dispatchEngineer(
               : String(finalization.persistenceError)}. `
             + `The worktree "${worktree}" was retained for recovery. Repair durable Engineer state and rerun engineer handoff.`,
         );
-      } else if (finalization.cleanupError !== null) {
-        printErr(
-          `⚠ Spec delivered, but the per-idea worktree "${worktree}" could not be removed: ` +
-            `${finalization.cleanupError instanceof Error
-              ? finalization.cleanupError.message
-              : String(finalization.cleanupError)}. Remove it manually.`,
-        );
+      } else if (retentionDeadline) {
+        printErr(`Engineer review worktree retained at "${worktree}" until ${retentionDeadline}.`);
+      } else {
+        printErr(`Engineer review worktree retained at "${worktree}".`);
       }
 
       if (handoffResult.kind === 'pr-opened') {

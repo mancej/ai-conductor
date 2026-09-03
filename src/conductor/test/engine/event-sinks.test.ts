@@ -63,6 +63,7 @@ const BUILD_MEMBER_SETTLE_DECISION_EVENT_TYPES = [
 
 const ENGINEER_LIFECYCLE_EVENT_TYPES = [
   'engineer_run_created',
+  'engineer_readiness_checked',
   'engineer_run_started',
   'engineer_routing_selected',
   'engineer_worktree_created',
@@ -77,6 +78,7 @@ const ENGINEER_LIFECYCLE_EVENT_TYPES = [
   'engineer_run_cancelled',
   'engineer_run_failed',
   'engineer_run_settled',
+  'engineer_worktree_retired',
 ] satisfies Array<ConductorEvent['type']>;
 
 const REMEDIATION_SEALED_ARTIFACT_REDIRECT_EVENT_TYPES = [

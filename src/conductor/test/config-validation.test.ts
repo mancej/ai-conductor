@@ -406,6 +406,22 @@ describe('teardown_timeout_seconds config field', () => {
   });
 });
 
+describe('engineer_review_retention_days config field', () => {
+  it('accepts a bounded integer override', () => {
+    expect(validateConfig({ engineer_review_retention_days: 30 })).toMatchObject({
+      ok: true,
+      config: { engineer_review_retention_days: 30 },
+    });
+  });
+
+  it.each([0, 91, 1.5, '14'])('rejects invalid value %p', (value) => {
+    expect(validateConfig({ engineer_review_retention_days: value })).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/engineer_review_retention_days.*1 through 90/i) },
+    });
+  });
+});
+
 describe('reconcile_parked_auto_cleanup config field', () => {
   it('hard-errors a non-boolean value with the field name', () => {
     expect(validateConfig({ reconcile_parked_auto_cleanup: 'yes' })).toMatchObject({

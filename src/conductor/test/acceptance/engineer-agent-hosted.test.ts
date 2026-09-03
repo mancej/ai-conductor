@@ -456,11 +456,11 @@ describe('dispatchEngineer({kind:"land"})', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// dispatchEngineer({kind:'handoff'}): open spec PR via injected gh, remove worktree
+// dispatchEngineer({kind:'handoff'}): open spec PR via injected gh, retain worktree
 // ═════════════════════════════════════════════════════════════════════════════
 
 describe('dispatchEngineer({kind:"handoff"})', () => {
-  it('gh pr create runs in the worktree, PR reported, worktree removed on success (FR-4/FR-5)', async () => {
+  it('gh pr create runs in the worktree, PR reported, worktree retained on success (FR-4/FR-5)', async () => {
     const idea = 'add csv export';
     await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://example.invalid/repo.git')]);
     const worktree = await worktreeWithDocs(repoPath, idea);
@@ -511,12 +511,12 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(ghCalls.some((c) => c.args.includes('merge'))).toBe(false);
     // ensureRunning fired against the MAIN checkout (not the worktree).
     expect(launchCalls[0]).toBe(repoPath);
-    // Remove-on-success: the worktree is gone, spec branch still reachable (FR-5).
-    expect(await pathExists(worktree)).toBe(false);
+    // Retain-on-success: review can continue in the exact authored worktree (FR-5).
+    expect(await pathExists(worktree)).toBe(true);
     expect(await git(['rev-parse', '--verify', branch], repoPath)).toMatch(/^[0-9a-f]{40}$/);
   });
 
-  it('no-remote target → local-commit fallback, returns 0, worktree removed but branch reachable', async () => {
+  it('no-remote target → local-commit fallback, returns 0, worktree retained and branch reachable', async () => {
     const idea = 'offline idea';
     await writeRegistry([makeRecord(repoPath, 'target-repo')]); // no remote
     const worktree = await worktreeWithDocs(repoPath, idea);
@@ -541,8 +541,8 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(code).toBe(0);
     const result = JSON.parse(handoffOut.join(''));
     expect(['pr-opened', 'local-commit', 'pr-skipped']).toContain(result.kind);
-    // The local-only spec commit remains reachable after worktree removal (FR-5 negative).
-    expect(await pathExists(worktree)).toBe(false);
+    // The local-only spec commit and review worktree remain available (FR-5 negative).
+    expect(await pathExists(worktree)).toBe(true);
     expect(await git(['rev-parse', '--verify', branch], repoPath)).toMatch(/^[0-9a-f]{40}$/);
   });
 

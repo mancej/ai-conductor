@@ -122,6 +122,25 @@ describe('engine/daemon — runDaemon', () => {
     expect(logs).toContain('[daemon] sweepProviderScratch error: scratch sweep failed');
   });
 
+  it('runs Engineer retention reconciliation and contains a rejected sweep', async () => {
+    const logs: string[] = [];
+    const runFeature = vi.fn(async (item: BacklogItem) => ({ slug: item.slug, status: 'done' as const }));
+    const reconcileEngineerWorktrees = vi.fn(async () => {
+      throw new Error('retention store unavailable');
+    });
+
+    await runDaemon({
+      discoverBacklog: staticBacklog(items(1)),
+      runFeature,
+      reconcileEngineerWorktrees,
+      log: (line) => logs.push(line),
+    }, { concurrency: 1, once: true });
+
+    expect(reconcileEngineerWorktrees).toHaveBeenCalled();
+    expect(runFeature).toHaveBeenCalledOnce();
+    expect(logs).toContain('[daemon] reconcileEngineerWorktrees error: retention store unavailable');
+  });
+
   it('exposes live feature ownership to mergeable sweeps', async () => {
     let resolveFeature: ((outcome: FeatureOutcome) => void) | undefined;
     const featureRun = new Promise<FeatureOutcome>((resolve) => {
