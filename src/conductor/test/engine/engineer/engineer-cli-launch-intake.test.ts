@@ -176,7 +176,7 @@ describe('detectEngineerCommand: idea sources, claim, --source-ref', () => {
       kind: 'land', project: 'p', idea: 'i', worktree: '/w', sourceRef: 'o/a#1',
     });
     expect(detectEngineerCommand(argv('handoff', '--project', 'p', '--branch', 'spec/x', '--worktree', '/w', '--source-ref', 'o/a#1'))).toEqual({
-      kind: 'handoff', project: 'p', branch: 'spec/x', worktree: '/w', sourceRef: 'o/a#1',
+      kind: 'handoff', project: 'p', branch: 'spec/x', worktree: '/w', sourceRef: 'o/a#1', permitInconclusive: false,
     });
   });
   it('land without --source-ref leaves it undefined', () => {
