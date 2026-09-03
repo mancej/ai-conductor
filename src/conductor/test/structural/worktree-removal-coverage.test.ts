@@ -27,6 +27,10 @@ const WORKTREE_REMOVAL_EXEMPTIONS = [
     reason: 'Does not call prepareWorktree, so it provisions nothing.',
   },
   {
+    module: 'engine/engineer/retention.ts',
+    reason: 'Removes Engineer worktrees that never run project setup, so no project teardown is owed.',
+  },
+  {
     module: 'engine/worktree.ts',
     reason: 'Does not call prepareWorktree, so it provisions nothing.',
   },
@@ -209,6 +213,7 @@ describe('structural: worktree-removal coverage', () => {
       'engine/autoresolve.ts',
       'engine/daemon-deps.ts',
       'engine/daemon-park-cli.ts',
+      'engine/engineer/retention.ts',
       'engine/engineer/worktree-authoring.ts',
       'engine/park-reconciliation.ts',
       'engine/worktree-shared.ts',
@@ -304,6 +309,10 @@ describe('structural: worktree-removal coverage', () => {
       {
         module: 'engine/engineer/worktree-authoring.ts',
         reason: 'Does not call prepareWorktree, so it provisions nothing.',
+      },
+      {
+        module: 'engine/engineer/retention.ts',
+        reason: 'Removes Engineer worktrees that never run project setup, so no project teardown is owed.',
       },
       {
         module: 'engine/worktree.ts',
