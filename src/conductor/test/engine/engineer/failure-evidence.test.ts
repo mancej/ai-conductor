@@ -29,10 +29,15 @@ describe('Engineer failure evidence', () => {
   });
 
   it('redacts credentials and bounds persisted diagnostics', () => {
-    const value = `Authorization: Bearer secret-value github_pat_abcdefghijklmnopqrstuvwxyz123456 ${'x'.repeat(4_000)}`;
+    const value = `Authorization: Bearer secret-value github_pat_abcdefghijklmnopqrstuvwxyz123456 `
+      + `DEPLOY_TOKEN=deploy-secret AWS_SECRET_ACCESS_KEY: 'aws-secret-value' ${'x'.repeat(4_000)}`;
     const redacted = redactEngineerDiagnostic(value);
     expect(redacted).not.toContain('secret-value');
     expect(redacted).not.toContain('github_pat_');
+    expect(redacted).not.toContain('deploy-secret');
+    expect(redacted).not.toContain('aws-secret-value');
+    expect(redacted).toContain('DEPLOY_TOKEN=[REDACTED]');
+    expect(redacted).toContain('AWS_SECRET_ACCESS_KEY: [REDACTED]');
     expect(redacted.length).toBeLessThanOrEqual(2_048);
     expect(redacted).toContain('[REDACTED');
   });

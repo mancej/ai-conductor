@@ -199,7 +199,9 @@ describe('Engineer retained review worktrees', () => {
   it('persists typed PR-status failure evidence and backs off remote reconciliation', async () => {
     const run = await settledRun();
     const readPullRequestState = vi.fn()
-      .mockRejectedValueOnce(new Error('could not resolve host github.com'))
+      .mockRejectedValueOnce(new Error(
+        'could not resolve host github.com; CODEX_API_KEY=codex-secret-value PASSWORD="password-secret-value"',
+      ))
       .mockResolvedValueOnce('open');
 
     await reconcileEngineerRetainedWorktrees({
@@ -211,7 +213,8 @@ describe('Engineer retained review worktrees', () => {
       },
     });
 
-    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+    const failed = await store.inspectRun(run.engineerRunId);
+    expect(failed).toMatchObject({
       retirement: null,
       cleanup: {
         status: 'failed',
@@ -225,6 +228,10 @@ describe('Engineer retained review worktrees', () => {
         },
       },
     });
+    expect(JSON.stringify(failed.cleanup?.failure)).not.toContain('codex-secret-value');
+    expect(JSON.stringify(failed.cleanup?.failure)).not.toContain('password-secret-value');
+    expect(failed.cleanup?.failure?.diagnostic).toContain('CODEX_API_KEY=[REDACTED]');
+    expect(failed.cleanup?.failure?.diagnostic).toContain('PASSWORD=[REDACTED]');
 
     await reconcileEngineerRetainedWorktrees({
       store,
