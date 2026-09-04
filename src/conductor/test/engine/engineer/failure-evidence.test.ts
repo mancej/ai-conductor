@@ -41,4 +41,20 @@ describe('Engineer failure evidence', () => {
     expect(redacted.length).toBeLessThanOrEqual(2_048);
     expect(redacted).toContain('[REDACTED');
   });
+
+  it('redacts JSON-quoted credential keys before producing durable failure evidence', () => {
+    const value = 'provider response: {"access_token":"json-token-secret",'
+      + '"client_secret":"json-client-secret","api-key":"json-api-key","safe":"visible"}';
+
+    const redacted = redactEngineerDiagnostic(value);
+    const evidence = classifyEngineerFailure(value);
+
+    expect(redacted).toContain('"access_token":[REDACTED]');
+    expect(redacted).toContain('"client_secret":[REDACTED]');
+    expect(redacted).toContain('"api-key":[REDACTED]');
+    expect(redacted).toContain('"safe":"visible"');
+    expect(JSON.stringify({ redacted, evidence })).not.toMatch(
+      /json-token-secret|json-client-secret|json-api-key/,
+    );
+  });
 });
