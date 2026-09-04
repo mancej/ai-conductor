@@ -81,6 +81,7 @@ export async function retireEngineerWorktree(input: {
   }
 
   const worktreePath = snapshot.retirement?.worktreePath ?? snapshot.worktree.path;
+  const worktreeBranch = snapshot.worktree.branch;
   if (!snapshot.retirement) {
     try {
       const canonicalRepo = await resolvePath(snapshot.repoRoot);
@@ -125,8 +126,24 @@ export async function retireEngineerWorktree(input: {
     stage: 'physical_removal',
   });
   try {
-    if (await pathExists(worktreePath)) {
+    const exists = await pathExists(worktreePath);
+    const listing = await git(['worktree', 'list', '--porcelain'], { cwd: snapshot.repoRoot });
+    const registered = worktreeListingContainsPath(listing.stdout, worktreePath);
+    if (exists || registered) {
+      if (!worktreeListingMatches(listing.stdout, worktreePath, worktreeBranch)) {
+        throw new EngineerLifecycleError(
+          'identity_mismatch',
+          'Engineer cleanup target is no longer the registered worktree for the retained branch',
+        );
+      }
       await removeWorktree(snapshot.repoRoot, worktreePath);
+      const remaining = await git(['worktree', 'list', '--porcelain'], { cwd: snapshot.repoRoot });
+      if (worktreeListingContainsPath(remaining.stdout, worktreePath) || await pathExists(worktreePath)) {
+        throw new EngineerLifecycleError(
+          'identity_mismatch',
+          'Engineer worktree cleanup did not remove the exact retained registration and path',
+        );
+      }
     }
     await input.store.recordCleanupAttempt(input.engineerRunId, { status: 'complete' });
   } catch (error) {
@@ -250,9 +267,18 @@ async function defaultPathExists(path: string): Promise<boolean> {
 }
 
 function worktreeListingMatches(output: string, path: string, branch: string): boolean {
-  const records = output.trim().split(/\n\n+/);
-  return records.some((record) => {
+  const record = worktreeListingRecord(output, path);
+  return record?.includes(`branch refs/heads/${branch}`) ?? false;
+}
+
+function worktreeListingContainsPath(output: string, path: string): boolean {
+  return worktreeListingRecord(output, path) !== null;
+}
+
+function worktreeListingRecord(output: string, path: string): string[] | null {
+  for (const record of output.trim().split(/\n\n+/)) {
     const lines = record.split('\n');
-    return lines.includes(`worktree ${path}`) && lines.includes(`branch refs/heads/${branch}`);
-  });
+    if (lines.includes(`worktree ${path}`)) return lines;
+  }
+  return null;
 }

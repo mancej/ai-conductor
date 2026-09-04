@@ -689,8 +689,33 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(err.join('\n')).toMatch(/readiness blocked \(push_authorization_unproven\)/);
     expect(gh).not.toHaveBeenCalled();
     expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
-      state: 'failed',
+      state: 'authoring',
       readiness: { status: 'inconclusive', permitted: false },
+    });
+
+    const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
+    const retryOut: string[] = [];
+    expect(await dispatchEngineer(
+      {
+        kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        git: async (args) => ({ stdout: args[0] === 'rev-parse' ? retainedCommit : '' }),
+        ensureRunningLaunch: () => undefined,
+        print: (s) => retryOut.push(s),
+      },
+    )).toBe(0);
+    expect(JSON.parse(retryOut.join(''))).toEqual({
+      kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
+    });
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      state: 'settled',
+      readiness: { status: 'inconclusive', permitted: true },
     });
   });
 

@@ -1,5 +1,5 @@
 import { execFile as execFileCb } from 'node:child_process';
-import { access, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -304,6 +304,31 @@ describe('Engineer retained review worktrees', () => {
     });
     expect(second.cleanup).toMatchObject({ status: 'complete', attempts: 2 });
     expect((await store.replay(run.engineerRunId, 0)).filter((event) => event.type === 'engineer_worktree_retired')).toHaveLength(1);
+  });
+
+  it('removes a stale Git registration before completing cleanup for an externally missing path', async () => {
+    const run = await settledRun('local_commit');
+    const retainedCommit = (await git(worktreePath, ['rev-parse', 'HEAD'])).stdout.trim();
+    await store.retireWorktree(run.engineerRunId, {
+      reason: 'operator_cleanup',
+      retainedCommit,
+    });
+    await rename(worktreePath, join(base, 'externally-moved-worktree'));
+    const remove = vi.fn(async (root: string, path: string) => {
+      await git(root, ['worktree', 'remove', '--force', path]);
+    });
+
+    const cleaned = await retireEngineerWorktree({
+      store,
+      engineerRunId: run.engineerRunId,
+      reason: 'operator_cleanup',
+      deps: { git: gitRunner, removeWorktree: remove },
+    });
+
+    expect(remove).toHaveBeenCalledWith(repoRoot, worktreePath);
+    expect(cleaned.cleanup).toMatchObject({ status: 'complete', stage: 'physical_removal' });
+    expect((await git(repoRoot, ['worktree', 'list', '--porcelain'])).stdout)
+      .not.toContain(`worktree ${worktreePath}`);
   });
 
   it('retires local commits on the bounded timeout without consulting a PR', async () => {

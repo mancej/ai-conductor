@@ -1722,17 +1722,7 @@ export async function dispatchEngineer(
             deps: opts.readinessDeps,
           });
           if (!readiness.readiness?.permitted) {
-            const failure = {
-              error: readiness.readiness?.diagnostic ?? readiness.readiness?.summary ?? 'Engineer handoff readiness failed',
-              class: classifyEngineerFailure(readiness.readiness?.diagnostic ?? '').class,
-              code: readiness.readiness?.code ?? 'unknown_failure',
-              summary: readiness.readiness?.summary ?? 'Engineer handoff readiness failed.',
-              retryable: readiness.readiness?.retryable ?? false,
-              remedy: readiness.readiness?.remedy ?? null,
-              diagnostic: readiness.readiness?.diagnostic ?? null,
-            } as const;
-            await lifecycleStore.record(marker.engineerRunId, { kind: 'run_failed', failure });
-            printErr(`engineer handoff: readiness blocked (${failure.code}): ${failure.summary}`);
+            printErr(`engineer handoff: readiness blocked (${readiness.readiness?.code ?? 'unknown_failure'}): ${readiness.readiness?.summary ?? 'Engineer handoff readiness failed.'}`);
             printErr(`engineer handoff: worktree kept for inspection at "${worktree}".`);
             return 1;
           }

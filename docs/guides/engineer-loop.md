@@ -300,6 +300,8 @@ see one of:
 
 Use `--permit-inconclusive` only after the operator explicitly accepts that the immediate read-only
 handoff probe cannot prove push authorization.
+If handoff readiness is blocked, the durable run remains in its authoring state and the worktree is
+retained. Fix the reported condition and rerun handoff with the same run marker, branch, and path.
 
 | Output | Meaning |
 | --- | --- |
