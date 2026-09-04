@@ -767,6 +767,45 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     });
   });
 
+  it('captures the retained commit before creating a remote PR', async () => {
+    const idea = 'capture commit before delivery';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    await seedMarkedLandedRun({ repoRoot: repoPath, worktree, idea, branch, engineerDir });
+    const gh = vi.fn(async () => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
+    const failingGit = vi.fn(async (args: string[]) => {
+      if (args[0] === 'rev-parse') throw new Error('temporary object database failure');
+      return { stdout: '' };
+    });
+    const err: string[] = [];
+
+    const code = await dispatchEngineer(
+      {
+        kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        git: failingGit,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        printErr: (s) => err.push(s),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.join('\n')).toMatch(/temporary object database failure/);
+    expect(failingGit).toHaveBeenCalledWith(['rev-parse', 'HEAD'], { cwd: worktree });
+    expect(gh).not.toHaveBeenCalled();
+  });
+
   it('resumes an already-persisted handoff without rechecking readiness or reopening the PR', async () => {
     const idea = 'resume handoff';
     await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);

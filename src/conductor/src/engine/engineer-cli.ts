@@ -1730,9 +1730,14 @@ export async function dispatchEngineer(
       }
 
       let handoffResult: Awaited<ReturnType<typeof openSpecPr>>;
+      let retainedCommit = existingHandoff?.retainedCommit ?? null;
       if (existingHandoff) {
         handoffResult = existingHandoff.result;
       } else try {
+        // Capture the immutable review identity before creating the remote PR.
+        // Once PR creation succeeds, no fallible Git lookup may precede durable
+        // handoff evidence or a retry could attempt duplicate delivery.
+        if (marker) retainedCommit = await retainedWorktreeCommit(worktree, git);
         handoffResult = await openSpecPr(target, branch, {
           gitRunner: git,
           runner: async (args, runnerOpts) => {
@@ -1809,7 +1814,7 @@ export async function dispatchEngineer(
             marker,
             prUrl: handoffResult.kind === 'pr-opened' ? handoffResult.url : null,
             outcome: handoffResult.kind === 'pr-opened' ? 'pr_opened' : 'local_commit',
-            retainedCommit: existingHandoff?.retainedCommit ?? await retainedWorktreeCommit(worktree, git),
+            retainedCommit: retainedCommit!,
             retentionDeadline: retentionDeadline!,
           }))
         : { persistenceError: null };
