@@ -323,11 +323,12 @@ cleanup; `engineer:handled` marks completion without changing ownership.
 On failure `handoff` exits 1, **keeps** the worktree, prints its path, and records branch evidence in
 the ledger so you can recover with `engineer resolve`.
 
-The default review retention is 14 days and can be set from 1 through 90 days with
-`engineer_review_retention_days`. The daemon maintenance sweep removes an owned review worktree only
-after validating its exact run marker, repository, branch, registered worktree path, and retained
-commit. It writes `engineer_worktree_retired` before removal. A failed removal remains cleanup debt and
-is retried without writing a second retirement event. Local-commit handoffs wait for cancellation,
+The exact review-retention default and supported range are defined by
+[`engineer_review_retention_days`](../reference/configuration.md#engineer_review_retention_days).
+The daemon maintenance sweep removes an owned review worktree only after validating its exact run
+marker, repository, branch, registered worktree path, and retained commit. It writes
+`engineer_worktree_retired` before removal. A failed removal remains cleanup debt and is retried
+without writing a second retirement event. Local-commit handoffs wait for cancellation,
 explicit cleanup, or deadline expiry because they have no PR terminal signal.
 
 To request exact cleanup manually:

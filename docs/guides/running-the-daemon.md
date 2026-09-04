@@ -602,9 +602,10 @@ event. Use
 `conduct-ts engineer maintenance` for an immediate reconciliation pass, or
 `conduct-ts engineer worktree-cleanup --run-id <id> --reason operator_cleanup` for one explicit run.
 
-The fallback deadline is 14 days. Configure `engineer_review_retention_days` from 1 through 90 in
-the project configuration. These authoring worktrees are separate from implementation feature
-worktrees and their shipped-record gate below.
+The exact fallback default and supported range are defined by
+[`engineer_review_retention_days`](../reference/configuration.md#engineer_review_retention_days).
+These authoring worktrees are separate from implementation feature worktrees and their
+shipped-record gate below.
 
 ### Implementation feature worktrees
 
