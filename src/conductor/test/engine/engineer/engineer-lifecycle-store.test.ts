@@ -34,6 +34,26 @@ describe('EngineerRunStore', () => {
     return new EngineerRunStore({ engineerDir, events });
   }
 
+  async function markReady(
+    run: EngineerRunSnapshot,
+    status: 'ready' | 'inconclusive' = 'ready',
+  ): Promise<EngineerRunSnapshot> {
+    return store().record(run.engineerRunId, {
+      kind: 'readiness_checked',
+      result: {
+        status,
+        code: status === 'ready' ? 'ready' : 'push_authorization_unproven',
+        summary: status === 'ready' ? 'Engineer prerequisites are ready' : 'Push authorization is unproven',
+        checkedCapabilities: ['repository', 'git', 'remote'],
+        retryable: status !== 'ready',
+        remedy: status === 'ready' ? null : 'Retry the handoff authorization check before push.',
+        diagnostic: status === 'ready' ? null : 'Read-only remote probe succeeded.',
+        fingerprint: 'readiness-fingerprint',
+      },
+      permitInconclusive: status === 'inconclusive',
+    });
+  }
+
   async function create(
     overrides: Partial<{ correlationId: string; attemptKey: string; idea: string }> = {},
   ): Promise<EngineerRunSnapshot> {
@@ -126,6 +146,14 @@ describe('EngineerRunStore', () => {
       correlationId: 'corr-persist-failure',
       attemptKey: 'launch-persist-failure',
     });
+    await durableStore.record(run.engineerRunId, {
+      kind: 'readiness_checked',
+      result: {
+        status: 'ready', code: 'ready', summary: 'Ready', checkedCapabilities: ['repository'],
+        retryable: false, remedy: null, diagnostic: null, fingerprint: 'ready-fixture',
+      },
+      permitInconclusive: false,
+    });
     type PersistTarget = {
       persist: (event: EngineerLifecycleEvent) => void | Promise<void>;
     };
@@ -143,9 +171,9 @@ describe('EngineerRunStore', () => {
       persistSpy.mockRestore();
     }
 
-    expect(await durableStore.replay(run.engineerRunId, 0)).toHaveLength(1);
+    expect(await durableStore.replay(run.engineerRunId, 0)).toHaveLength(2);
     expect(await durableStore.inspectRun(run.engineerRunId)).toMatchObject({
-      eventRevision: 1,
+      eventRevision: 2,
       state: 'created',
     });
   });
@@ -172,8 +200,20 @@ describe('EngineerRunStore', () => {
 
   it('creates an immutable correlated successor with its own revision cursor', async () => {
     const first = await create();
+    await markReady(first);
     await store().record(first.engineerRunId, { kind: 'run_started' });
-    await store().record(first.engineerRunId, { kind: 'run_failed', error: 'host exited' });
+    await store().record(first.engineerRunId, {
+      kind: 'run_failed',
+      failure: {
+        error: 'host exited',
+        class: 'provider',
+        code: 'provider_failed',
+        summary: 'Provider host exited',
+        retryable: true,
+        remedy: 'Retry with a new reserved attempt.',
+        diagnostic: null,
+      },
+    });
 
     const second = await create({ attemptKey: 'launch-2' });
     expect(second).toMatchObject({
@@ -187,12 +227,13 @@ describe('EngineerRunStore', () => {
     await expect(store().record(first.engineerRunId, { kind: 'run_started' })).rejects.toMatchObject({
       code: 'terminal_run',
     });
-    expect(await store().replay(first.engineerRunId, 0)).toHaveLength(3);
+    expect(await store().replay(first.engineerRunId, 0)).toHaveLength(4);
     expect(await store().replay(second.engineerRunId, 0)).toHaveLength(1);
   });
 
   it('allocates strictly monotonic revisions under concurrent appends', async () => {
     const run = await create();
+    await markReady(run);
     await store().record(run.engineerRunId, { kind: 'run_started' });
 
     await Promise.all([
@@ -202,8 +243,8 @@ describe('EngineerRunStore', () => {
     ]);
 
     const replay = await store().replay(run.engineerRunId, 0);
-    expect(replay.map((event) => event.revision)).toEqual([1, 2, 3, 4, 5]);
-    expect((await store().inspectRun(run.engineerRunId)).eventRevision).toBe(5);
+    expect(replay.map((event) => event.revision)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect((await store().inspectRun(run.engineerRunId)).eventRevision).toBe(6);
   });
 
   it('does not scan unrelated historical metadata when creating a run', async () => {
@@ -228,6 +269,8 @@ describe('EngineerRunStore', () => {
   it('does not serialize lifecycle writes for unrelated runs', async () => {
     const first = await create();
     const second = await create({ correlationId: 'corr-2', attemptKey: 'launch-2', idea: 'Other work' });
+    await markReady(first);
+    await markReady(second);
     await store().record(first.engineerRunId, { kind: 'run_started' });
     await store().record(second.engineerRunId, { kind: 'run_started' });
 
@@ -248,7 +291,7 @@ describe('EngineerRunStore', () => {
       await expect(Promise.race([
         store().record(second.engineerRunId, { kind: 'step_started', step: 'explore' }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('unrelated write stayed blocked')), 500)),
-      ])).resolves.toMatchObject({ engineerRunId: second.engineerRunId, eventRevision: 3 });
+      ])).resolves.toMatchObject({ engineerRunId: second.engineerRunId, eventRevision: 4 });
     } finally {
       releaseFirst();
       await firstWrite;
@@ -268,6 +311,7 @@ describe('EngineerRunStore', () => {
 
   it('requires accepted completion and validates step retry and terminal transitions', async () => {
     const run = await create();
+    await markReady(run);
     await store().record(run.engineerRunId, { kind: 'run_started' });
     await store().record(run.engineerRunId, {
       kind: 'step_started',
@@ -302,12 +346,13 @@ describe('EngineerRunStore', () => {
 
   it('replays strictly after the caller revision and refuses regression', async () => {
     const run = await create();
+    await markReady(run);
     await store().record(run.engineerRunId, { kind: 'run_started' });
     await store().record(run.engineerRunId, { kind: 'routing_selected', project: 'api' });
 
-    expect((await store().replay(run.engineerRunId, 1)).map((event) => event.revision)).toEqual([2, 3]);
+    expect((await store().replay(run.engineerRunId, 2)).map((event) => event.revision)).toEqual([3, 4]);
     await expect(store().replay(run.engineerRunId, -1)).rejects.toMatchObject({ code: 'revision_regression' });
-    await expect(store().replay(run.engineerRunId, 4)).rejects.toMatchObject({ code: 'revision_ahead' });
+    await expect(store().replay(run.engineerRunId, 5)).rejects.toMatchObject({ code: 'revision_ahead' });
   });
 
   it('refuses run identities that could escape the durable runs directory', async () => {
@@ -323,6 +368,7 @@ describe('EngineerRunStore', () => {
     'reconciles artifact-proven %s tier %s completion and skip combinations',
     async (track, tier, completed, skipped) => {
       const run = await create({ correlationId: `${track}-${tier}`, attemptKey: `${track}-${tier}` });
+      await markReady(run);
       await store().record(run.engineerRunId, { kind: 'run_started' });
       const reconciled = await store().reconcileLand(run.engineerRunId, {
         planSlug: `${track}-${tier}`,
@@ -340,13 +386,36 @@ describe('EngineerRunStore', () => {
 
   it('recovers the snapshot from the append-only journal when the compact snapshot is absent', async () => {
     const run = await create();
+    await markReady(run);
     await store().record(run.engineerRunId, { kind: 'run_started' });
     const snapshotPath = join(engineerDir, 'lifecycle', 'runs', run.engineerRunId, 'snapshot.json');
     await rm(snapshotPath);
 
     const recovered = await store().inspectRun(run.engineerRunId);
-    expect(recovered).toMatchObject({ engineerRunId: run.engineerRunId, eventRevision: 2, state: 'authoring' });
-    expect(JSON.parse(await readFile(snapshotPath, 'utf-8'))).toMatchObject({ eventRevision: 2 });
+    expect(recovered).toMatchObject({ engineerRunId: run.engineerRunId, eventRevision: 3, state: 'authoring' });
+    expect(JSON.parse(await readFile(snapshotPath, 'utf-8'))).toMatchObject({ eventRevision: 3 });
+  });
+
+  it('loads legacy cleanup snapshots before typed failure and retry fields existed', async () => {
+    const run = await create();
+    const cleanupPath = join(engineerDir, 'lifecycle', 'runs', run.engineerRunId, 'cleanup.json');
+    await writeFile(cleanupPath, JSON.stringify({
+      schemaVersion: 1,
+      engineerRunId: run.engineerRunId,
+      status: 'failed',
+      attempts: 2,
+      lastError: 'legacy cleanup failure',
+      updatedAt: '2026-09-03T00:00:00.000Z',
+    }), 'utf-8');
+
+    expect((await store().inspectRun(run.engineerRunId)).cleanup).toMatchObject({
+      status: 'failed',
+      stage: 'physical_removal',
+      attempts: 2,
+      lastError: 'legacy cleanup failure',
+      failure: null,
+      nextAttemptAt: null,
+    });
   });
 
   it('refuses corrupt journals and unsupported schema versions explicitly', async () => {
@@ -360,5 +429,180 @@ describe('EngineerRunStore', () => {
     const raw = await readFile(schemaJournal, 'utf-8');
     await writeFile(schemaJournal, raw.replace('"schemaVersion":1', '"schemaVersion":2'), 'utf-8');
     await expect(store().inspectRun(schemaRun.engineerRunId)).rejects.toMatchObject({ code: 'schema_mismatch' });
+  });
+
+  it('gates authoring on the latest bounded readiness evidence', async () => {
+    const run = await create();
+    await expect(store().record(run.engineerRunId, { kind: 'run_started' }))
+      .rejects.toMatchObject({ code: 'readiness_required' });
+
+    await store().record(run.engineerRunId, {
+      kind: 'readiness_checked',
+      result: {
+        status: 'blocked',
+        code: 'tool_missing',
+        summary: 'Required tool is unavailable',
+        checkedCapabilities: ['git', 'gh'],
+        retryable: true,
+        remedy: 'Install gh and retry readiness.',
+        diagnostic: 'gh was not found on PATH',
+        fingerprint: 'blocked-fingerprint',
+      },
+      permitInconclusive: false,
+    });
+    await expect(store().record(run.engineerRunId, { kind: 'run_started' }))
+      .rejects.toMatchObject({ code: 'readiness_blocked' });
+
+    const ready = await markReady(run, 'inconclusive');
+    expect(ready.readiness).toMatchObject({ status: 'inconclusive', permitted: true });
+    await expect(store().record(run.engineerRunId, { kind: 'run_started' }))
+      .resolves.toMatchObject({ state: 'authoring' });
+  });
+
+  it('preserves owner identity and rejects unowned or differently owned successors without partial state', async () => {
+    const owned = await store().create({
+      repoRoot,
+      idea: 'Owned work',
+      correlationId: 'owned-correlation',
+      attemptKey: 'owned-attempt-1',
+      integrationOwner: 'commission-123',
+    });
+    await store().record(owned.engineerRunId, {
+      kind: 'run_failed',
+      failure: {
+        error: 'host exited',
+        class: 'provider',
+        code: 'provider_failed',
+        summary: 'Provider host exited',
+        retryable: true,
+        remedy: 'Retry with a new reserved attempt.',
+        diagnostic: null,
+      },
+    });
+
+    await expect(store().create({
+      repoRoot,
+      idea: 'Owned work',
+      correlationId: 'owned-correlation',
+      attemptKey: 'owned-attempt-2',
+    })).rejects.toMatchObject({ code: 'integration_owner_mismatch' });
+    await expect(store().create({
+      repoRoot,
+      idea: 'Owned work',
+      correlationId: 'owned-correlation',
+      attemptKey: 'owned-attempt-2',
+      integrationOwner: 'different-commission',
+    })).rejects.toMatchObject({ code: 'integration_owner_mismatch' });
+    expect(await store().inspectCorrelation({ repoRoot, correlationId: 'owned-correlation' })).toHaveLength(1);
+
+    const successor = await store().create({
+      repoRoot,
+      idea: 'Owned work',
+      correlationId: 'owned-correlation',
+      attemptKey: 'owned-attempt-2',
+      integrationOwner: 'commission-123',
+    });
+    expect(successor).toMatchObject({ integrationOwner: 'commission-123', attempt: 2 });
+  });
+
+  it('uses an exact auditable one-use transfer for the next direct successor', async () => {
+    const first = await store().create({
+      repoRoot,
+      idea: 'Transfer work',
+      correlationId: 'transfer-correlation',
+      attemptKey: 'transfer-attempt-1',
+      integrationOwner: 'commission-old',
+    });
+    await store().record(first.engineerRunId, {
+      kind: 'run_failed',
+      failure: {
+        error: 'host exited',
+        class: 'provider',
+        code: 'provider_failed',
+        summary: 'Provider host exited',
+        retryable: true,
+        remedy: 'Transfer ownership before an intentional successor.',
+        diagnostic: null,
+      },
+    });
+    const terminal = await store().inspectRun(first.engineerRunId);
+    const transfer = await store().transferOwnership({
+      repoRoot,
+      correlationId: 'transfer-correlation',
+      engineerRunId: first.engineerRunId,
+      currentOwner: 'commission-old',
+      nextOwner: 'commission-new',
+      expectedRevision: terminal.eventRevision,
+    });
+    expect(transfer).toMatchObject({ previousOwner: 'commission-old', nextOwner: 'commission-new', consumedBy: null });
+
+    const second = await store().create({
+      repoRoot,
+      idea: 'Transfer work',
+      correlationId: 'transfer-correlation',
+      attemptKey: 'transfer-attempt-2',
+      integrationOwner: 'commission-new',
+    });
+    expect(second).toMatchObject({ previousEngineerRunId: first.engineerRunId, integrationOwner: 'commission-new' });
+
+    await store().record(second.engineerRunId, {
+      kind: 'run_failed',
+      failure: {
+        error: 'host exited again',
+        class: 'provider',
+        code: 'provider_failed',
+        summary: 'Provider host exited',
+        retryable: true,
+        remedy: 'Retry with the current owner.',
+        diagnostic: null,
+      },
+    });
+    await expect(store().create({
+      repoRoot,
+      idea: 'Transfer work',
+      correlationId: 'transfer-correlation',
+      attemptKey: 'transfer-attempt-3',
+      integrationOwner: 'commission-old',
+    })).rejects.toMatchObject({ code: 'integration_owner_mismatch' });
+  });
+
+  it('allows one exact post-terminal retirement without changing the terminal outcome', async () => {
+    const run = await create();
+    await markReady(run);
+    await store().record(run.engineerRunId, { kind: 'run_started' });
+    await store().record(run.engineerRunId, { kind: 'worktree_created', worktreePath: join(repoRoot, '.worktrees', 'engineer-plan'), branch: 'spec/plan', planSlug: 'plan' });
+    await store().reconcileLand(run.engineerRunId, {
+      planSlug: 'plan',
+      track: 'technical',
+      tier: 'S',
+      completed: ['explore', 'complexity', 'stories', 'plan'],
+      skipped: ['prd', 'architecture_diagram', 'architecture_review', 'conflict_check', 'coherence_check'],
+    });
+    await store().record(run.engineerRunId, {
+      kind: 'spec_handoff',
+      planSlug: 'plan',
+      branch: 'spec/plan',
+      prUrl: 'https://github.com/example/repo/pull/1',
+      outcome: 'pr_opened',
+      retainedCommit: 'a'.repeat(40),
+      retentionDeadline: '2026-09-17T00:00:00.000Z',
+    });
+    const terminal = await store().record(run.engineerRunId, { kind: 'run_settled', outcome: 'awaiting_spec_merge' });
+    const retired = await store().retireWorktree(run.engineerRunId, {
+      reason: 'spec_merged',
+      retainedCommit: 'a'.repeat(40),
+    });
+
+    expect(retired).toMatchObject({
+      state: 'settled',
+      terminalReason: terminal.terminalReason,
+      retirement: { reason: 'spec_merged', retainedCommit: 'a'.repeat(40) },
+    });
+    await expect(store().retireWorktree(run.engineerRunId, {
+      reason: 'spec_closed',
+      retainedCommit: 'a'.repeat(40),
+    })).rejects.toMatchObject({ code: 'retirement_conflict' });
+    await expect(store().record(run.engineerRunId, { kind: 'run_cancelled', reason: 'too late' }))
+      .rejects.toMatchObject({ code: 'terminal_run' });
   });
 });

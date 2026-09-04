@@ -428,6 +428,8 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   recorded. Worktree creation owns the mechanical start, route, and worktree events. A no-hook host
   owns live authoring transitions through `engineer run-record`, using only accepted-result or
   deterministic-artifact evidence for completion; land owns final reconciliation and refusal.
+  New runs are machine-gated on readiness before authoring. Successful handoff retains the exact
+  worktree for review until lifecycle-owned retirement and cleanup.
   See [engineer-loop](../guides/engineer-loop.md).
 
 ## BUILD-phase skills

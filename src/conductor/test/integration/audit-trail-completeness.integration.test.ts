@@ -54,6 +54,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   'friction-mapped' | 'not-audited-by-design'
 > = {
   engineer_run_created: 'not-audited-by-design',
+  engineer_readiness_checked: 'not-audited-by-design',
   engineer_run_started: 'not-audited-by-design',
   engineer_routing_selected: 'not-audited-by-design',
   engineer_worktree_created: 'not-audited-by-design',
@@ -68,6 +69,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   engineer_run_cancelled: 'not-audited-by-design',
   engineer_run_failed: 'not-audited-by-design',
   engineer_run_settled: 'not-audited-by-design',
+  engineer_worktree_retired: 'not-audited-by-design',
   config_deprecated_key: 'not-audited-by-design',
   contained_live_checkout_drift: 'not-audited-by-design',
   self_host_containment_verdict: 'not-audited-by-design',
@@ -197,6 +199,19 @@ const ENGINEER_EVENT_BASE = {
 
 const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, { type: K }> } = {
   engineer_run_created: { ...ENGINEER_EVENT_BASE, type: 'engineer_run_created', idea: 'feature' },
+  engineer_readiness_checked: {
+    ...ENGINEER_EVENT_BASE,
+    type: 'engineer_readiness_checked',
+    status: 'ready',
+    code: 'ready',
+    summary: 'Engineer prerequisites are ready.',
+    checkedCapabilities: ['repository', 'git'],
+    retryable: false,
+    remedy: null,
+    diagnostic: null,
+    fingerprint: 'fixture-fingerprint',
+    permitted: true,
+  },
   engineer_run_started: { ...ENGINEER_EVENT_BASE, type: 'engineer_run_started' },
   engineer_routing_selected: { ...ENGINEER_EVENT_BASE, type: 'engineer_routing_selected', project: 'repo' },
   engineer_worktree_created: {
@@ -239,6 +254,15 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
   engineer_run_cancelled: { ...ENGINEER_EVENT_BASE, type: 'engineer_run_cancelled', reason: 'operator cancelled' },
   engineer_run_failed: { ...ENGINEER_EVENT_BASE, type: 'engineer_run_failed', error: 'host failed' },
   engineer_run_settled: { ...ENGINEER_EVENT_BASE, type: 'engineer_run_settled', outcome: 'awaiting_spec_merge' },
+  engineer_worktree_retired: {
+    ...ENGINEER_EVENT_BASE,
+    type: 'engineer_worktree_retired',
+    worktreePath: '/repo/.worktrees/engineer-feature',
+    branch: 'spec/feature',
+    planSlug: 'feature',
+    reason: 'spec_merged',
+    retainedCommit: 'a'.repeat(40),
+  },
   config_deprecated_key: {
     type: 'config_deprecated_key',
     key: 'build_review.rubrics.scope',

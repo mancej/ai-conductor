@@ -547,6 +547,12 @@ export interface HarnessConfig {
    */
   stale_claim_window_hours?: number;
   /**
+   * Maximum number of days to retain a successful Engineer authoring
+   * worktree for specification review. Must be an integer from 1 through 90.
+   * Omitted uses 14 days.
+   */
+  engineer_review_retention_days?: number;
+  /**
    * Maximum number of validation-phase tasks the engine fans out
    * concurrently. Absent → engine default. Non-numeric values are rejected
    * at validation time (see validateConfig).

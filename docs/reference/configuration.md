@@ -154,7 +154,7 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 
 ## Key index
 
-41 top-level keys are allow-listed (plus one retired, no-op key — `wiring`, see
+42 top-level keys are allow-listed (plus one retired, no-op key - `wiring`, see
 [build_review](#build_review)). Everything else fails the load.
 
 | Key | Type | Default | Section |
@@ -202,6 +202,7 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 | `teardown_timeout_seconds` | number | `120` | [teardown_timeout_seconds](#teardown_timeout_seconds) |
 | `step_heartbeat_stall_minutes` | number | deprecated no-op | [step_heartbeat_stall_minutes](#step_heartbeat_stall_minutes) |
 | `stale_claim_window_hours` | number | `24` | [stale_claim_window_hours](#stale_claim_window_hours) |
+| `engineer_review_retention_days` | integer | `14` | [engineer_review_retention_days](#engineer_review_retention_days) |
 
 ## harness_version
 
@@ -1251,6 +1252,18 @@ treated as stranded. It governs claim-time auto-heal and the default window for
 `conduct-ts engineer requeue --stale`; `--older-than` overrides it for one invocation.
 
 The default is `24` hours. Non-positive and non-numeric values fall back to that default.
+
+## engineer_review_retention_days
+
+Controls the fallback deadline for a successful Engineer specification handoff worktree. The
+worktree remains registered and usable during review, and the Engineer maintenance reconciler retires
+it when the recorded PR merges or closes, the run is cancelled, an operator requests exact cleanup,
+or this deadline expires. Local-commit handoffs have no PR signal, so they remain until cancellation,
+explicit cleanup, or expiry.
+
+The default is `14` days. Set a whole number from `1` through `90`. Other values are hard validation
+errors. Logical retirement is recorded before physical removal, and failed removal remains retryable
+cleanup debt rather than making the path available again.
 
 ## Keys the type declares but the loader rejects
 

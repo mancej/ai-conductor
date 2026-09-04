@@ -30,8 +30,9 @@ Implementation runs retain their existing event path and worktree journal:
 `ConductorEventEmitter` to `EventPersister` to `<worktree>/.pipeline/events.jsonl`, with registered
 visualizers observing the same emitter. Engineer authoring uses the same event types, emitter,
 persister, and visualizer lifecycle, but routes its journal to durable Engineer state at
-`$AI_CONDUCTOR_ENGINEER_DIR/lifecycle/runs/<engineerRunId>/events.jsonl`. The separate storage scope is
-required because successful spec handoff removes the authoring worktree.
+`$AI_CONDUCTOR_ENGINEER_DIR/lifecycle/runs/<engineerRunId>/events.jsonl`. The separate storage scope
+keeps readiness, terminal status, retention, and retirement durable beyond the finite authoring
+worktree lifetime.
 
 This is one telemetry spine, not a second event bus. Product integrations consume the generic event
 family and own their projections outside core. Core does not know task ids, UI state, HTTP routes, or a

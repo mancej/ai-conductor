@@ -467,6 +467,8 @@ export function validateConfig(
     'step_heartbeat_stall_minutes',
     // Stale-claim reap window override (engineer-unclaim-requeue-verb-stale-claimed-ledger).
     'stale_claim_window_hours',
+    // Bounded lifetime for retained Engineer specification-review worktrees.
+    'engineer_review_retention_days',
     // Provider lifecycle preparation deadline.
     'provider_preparation_timeout_minutes',
     // Bounded grace period for project-supplied worktree teardown hooks.
@@ -821,6 +823,17 @@ export function validateConfig(
     }
   } else if (materializeDefaults) {
     obj.reconcile_parked_auto_cleanup = true;
+  }
+
+  if (obj.engineer_review_retention_days !== undefined) {
+    if (
+      typeof obj.engineer_review_retention_days !== 'number'
+      || !Number.isInteger(obj.engineer_review_retention_days)
+      || obj.engineer_review_retention_days < 1
+      || obj.engineer_review_retention_days > 90
+    ) {
+      return errVal('engineer_review_retention_days must be an integer from 1 through 90');
+    }
   }
 
   // mergeable_autoresolve

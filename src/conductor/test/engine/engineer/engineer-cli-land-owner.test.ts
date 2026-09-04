@@ -20,6 +20,7 @@ import {
 import { createEngineerWorktree } from '../../../src/engine/engineer/worktree-authoring.js';
 import { writeEngineerRunMarker } from '../../../src/engine/engineer/run-marker.js';
 import { EngineerRunStore } from '../../../src/engine/engineer/run-store.js';
+import { classifyEngineerFailure } from '../../../src/engine/engineer/failure-evidence.js';
 import type { GhRunner } from '../../../src/engine/owner-gate/identity.js';
 import { ConductorEventEmitter } from '../../../src/ui/events.js';
 
@@ -338,8 +339,19 @@ describe('engineer land — owner-gate wiring (CLI seam)', () => {
 
     const store = new EngineerRunStore({ engineerDir, events: new ConductorEventEmitter() });
     const run = await store.create({ repoRoot: repoPath, idea: 'dep bump', attemptKey: 'land-attempt' });
+    await store.record(run.engineerRunId, {
+      kind: 'readiness_checked',
+      result: {
+        status: 'ready', code: 'ready', summary: 'Ready', checkedCapabilities: ['repository'],
+        retryable: false, remedy: null, diagnostic: null, fingerprint: 'ready-fixture',
+      },
+      permitInconclusive: false,
+    });
     await store.record(run.engineerRunId, { kind: 'run_started' });
-    await store.record(run.engineerRunId, { kind: 'run_failed', error: 'host stopped before reconciliation' });
+    await store.record(run.engineerRunId, {
+      kind: 'run_failed',
+      failure: classifyEngineerFailure('host stopped before reconciliation'),
+    });
     await writeEngineerRunMarker(worktree, {
       schemaVersion: 1,
       engineerRunId: run.engineerRunId,

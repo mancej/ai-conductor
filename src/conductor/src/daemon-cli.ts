@@ -159,6 +159,9 @@ import { isPaused } from './engine/pause-marker.js';
 import { readRestartPending, consumeOnBoot, type RestartIntent } from './engine/restart-marker.js';
 import { create as createRateLimitEpisode } from './engine/rate-limit-episode.js';
 import { createEpisodeHaltTracker } from './engine/episode-halt-tracker.js';
+import { resolveEngineerDir } from './engine/engineer-store.js';
+import { EngineerRunStore } from './engine/engineer/run-store.js';
+import { reconcileEngineerRetainedWorktrees } from './engine/engineer/retention.js';
 
 const execFile = promisify(execFileCb);
 
@@ -1499,6 +1502,11 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<void> {
         events,
         log,
         startFeatureEventScope: (worktreePath) => startFeatureEventPersistence(worktreePath, events),
+      }),
+      reconcileEngineerWorktrees: () => reconcileEngineerRetainedWorktrees({
+        store: new EngineerRunStore({ engineerDir: resolveEngineerDir({}), events }),
+        repoRoot: projectRoot,
+        deps: { log },
       }),
       // Task 14: wire the filesystem watcher for HALT marker removal.
       // When watch is false, the watcher is undefined and the daemon falls

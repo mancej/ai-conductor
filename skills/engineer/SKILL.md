@@ -109,14 +109,21 @@ spawned `claude`. Present the proposed target and your rationale, then **confirm
 ### 3. Create the per-idea worktree, then run the REAL DECIDE skills inside it
 **Author in an isolated per-idea worktree — never the target's primary checkout.** First create it:
 
-`conduct-ts engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>]` → prints JSON
+`conduct-ts engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>] [--permit-inconclusive]` → prints JSON
 `{ kind, engineerRunId, slug, branch, worktreePath, reconcile }`. For **intake-claimed ideas**, pass the `sourceRef`
 carried from step 1 as `--source-ref <ref>` — the claim record it resolves lets a later `land`
 auto-resolve the intake body without having to re-thread it by hand. `--source-ref` can be omitted
 for chat/CLI ideas, which have no claim record. This creates a dedicated worktree at
 `<target>/.worktrees/engineer-<slug>` checked out on a fresh `spec/<slug>` branch (based on the
 repo's derived default branch), disjoint from the daemon's own worktrees. **`worktreePath` is your
-working directory for all authoring, `land`, and `handoff`** for this idea.
+working directory for all authoring, `land`, and `handoff`** for this idea. Use
+`--permit-inconclusive` only after the operator explicitly accepts that read-only checks cannot prove
+push authorization.
+
+The command runs the machine readiness gate before authoring. It verifies the exact repository,
+required tools, remote reachability and authentication, and GitHub posture without mutating the
+remote. A read-only remote result may be explicitly permitted as `push_authorization_unproven`;
+a blocked result stops before worktree creation and reports a stable code and remedy.
 
 #### Authoritative run context
 
@@ -244,8 +251,8 @@ cancellation or failure and a later retry continue to use the existing successor
 `land` itself records deterministic refusal or reconciliation events; do not duplicate those
 mechanical events with `run-record`.
 
-### 5. Open the spec PR + nudge the daemon — remove the worktree on success
-`conduct-ts engineer handoff --project <name> --branch <branch> --worktree <worktreePath>` (the
+### 5. Open the spec PR + nudge the daemon - retain the worktree for review
+`conduct-ts engineer handoff --project <name> --branch <branch> --worktree <worktreePath> [--permit-inconclusive]` (the
 `branch` from step 4 and the same `worktreePath`; append `--source-ref <ref>` when the idea came from
 GitHub intake — on a real PR this comments the PR URL on the originating issue, adds a non-closing
 `Refs <ref>` to the spec PR body (links the issue without closing it; the daemon's implementation PR
@@ -253,9 +260,12 @@ is what closes it on merge), applies the `engineer:handled` label, and advances 
 It runs `gh pr create` **from the worktree** (so the PR opens for `spec/<slug>`), opens a spec PR to
 the target repo (no-remote → local-commit fallback), records the authored-ledger entry, and calls
 `ensureRunning(repoPath)` fire-and-forget so that repo's daemon is alive to pick the spec up **after
-you merge it**. On success it **removes the per-idea worktree** (the `spec/<slug>` branch + commit
-persist and stay reachable); a removal failure is reported, not swallowed. It never merges and never
-builds.
+you merge it**. On success it records the exact retained commit and bounded review deadline, then
+**keeps the per-idea worktree registered and usable for review**. The daemon maintenance sweep retires
+that exact worktree after PR merge, PR close, cancellation, or deadline expiry, and records logical
+retirement before physical removal. A failed removal remains retryable cleanup debt. It never merges
+and never builds. Use `--permit-inconclusive` only after the operator explicitly accepts that the
+immediate read-only handoff probe cannot prove push authorization.
 
 ### 6. Deliver, then end the session
 The spec PR (or local-commit fallback) is the **final artifact**. Once step 5 reports it, tell the
@@ -315,7 +325,8 @@ behavior is deferred to #759.
       worktree — `gh pr create` fails on an unpushed branch and handoff falls back to a
       local-commit result that opens no PR)
 - [ ] Spec PR opened to the target repo; nothing built, nothing merged
-- [ ] On success the per-idea worktree was removed and `spec/<slug>` stayed reachable; on failure it
-      was kept for inspection; a recoverable land refusal was repaired in the same run and worktree
+- [ ] On success the per-idea worktree was retained for review with its exact commit and deadline; on
+      failure it was kept for inspection; a recoverable land refusal was repaired in the same run and
+      worktree
 - [ ] `ensureRunning` nudged the target daemon fire-and-forget (no lifecycle ownership)
 - [ ] Sibling repos left byte-for-byte unchanged

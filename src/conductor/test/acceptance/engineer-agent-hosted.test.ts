@@ -19,6 +19,9 @@ import { tmpdir } from 'os';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
 import { createEngineerWorktree } from '../../src/engine/engineer/worktree-authoring.js';
+import { writeEngineerRunMarker } from '../../src/engine/engineer/run-marker.js';
+import { EngineerRunStore } from '../../src/engine/engineer/run-store.js';
+import { ConductorEventEmitter } from '../../src/ui/events.js';
 
 const execFile = promisify(execFileCb);
 
@@ -93,6 +96,29 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+function inconclusiveReadinessDeps(root: string) {
+  return {
+    run: async (command: string, args: string[]) => {
+      if (command === 'git' && args.join(' ') === 'rev-parse --show-toplevel') {
+        return { exitCode: 0, stdout: `${root}\n`, stderr: '' };
+      }
+      if (command === 'git' && args.join(' ') === 'remote get-url origin') {
+        return { exitCode: 0, stdout: 'https://github.com/acme/target-repo.git\n', stderr: '' };
+      }
+      if (command === 'git' && args[0] === 'ls-remote') {
+        return { exitCode: 0, stdout: 'abc\tHEAD\n', stderr: '' };
+      }
+      if (command === 'gh' && args[0] === '--version') {
+        return { exitCode: 0, stdout: 'gh version 2.0.0\n', stderr: '' };
+      }
+      if (command === 'gh' && args.join(' ') === 'auth status') {
+        return { exitCode: 0, stdout: 'authenticated\n', stderr: '' };
+      }
+      return { exitCode: 1, stdout: '', stderr: `unexpected command: ${command} ${args.join(' ')}` };
+    },
+  };
+}
+
 function makeRecord(path: string, name: string, remote?: string) {
   return {
     schemaVersion: 1,
@@ -102,6 +128,50 @@ function makeRecord(path: string, name: string, remote?: string) {
     status: 'registered',
     registeredAt: '2026-06-26T00:00:00.000Z',
   };
+}
+
+async function seedMarkedLandedRun(input: {
+  repoRoot: string;
+  worktree: string;
+  idea: string;
+  branch: string;
+  engineerDir: string;
+}) {
+  const store = new EngineerRunStore({
+    engineerDir: input.engineerDir,
+    events: new ConductorEventEmitter(),
+  });
+  let run = await store.create({ repoRoot: input.repoRoot, idea: input.idea });
+  run = await store.record(run.engineerRunId, {
+    kind: 'readiness_checked',
+    result: {
+      status: 'ready', code: 'ready', summary: 'Ready', checkedCapabilities: ['repository'],
+      retryable: false, remedy: null, diagnostic: null, fingerprint: 'ready-fixture',
+    },
+    permitInconclusive: false,
+  });
+  run = await store.record(run.engineerRunId, { kind: 'run_started' });
+  run = await store.record(run.engineerRunId, {
+    kind: 'worktree_created',
+    worktreePath: input.worktree,
+    branch: input.branch,
+    planSlug: slugOf(input.idea),
+  });
+  run = await store.reconcileLand(run.engineerRunId, {
+    planSlug: slugOf(input.idea),
+    track: 'product',
+    tier: 'S',
+    completed: ['explore', 'complexity', 'prd', 'stories', 'plan'],
+    skipped: ['architecture_diagram', 'architecture_review', 'conflict_check', 'coherence_check'],
+  });
+  await writeEngineerRunMarker(input.worktree, {
+    schemaVersion: 1,
+    engineerRunId: run.engineerRunId,
+    repoRoot: input.repoRoot,
+    planSlug: slugOf(input.idea),
+    branch: input.branch,
+  });
+  return { store, run };
 }
 
 // ─── Shared per-test state ─────────────────────────────────────────────────────
@@ -215,7 +285,18 @@ describe('detectEngineerCommand: subcommand dispatch parsing', () => {
     const result = detectEngineerCommand([
       'node', 'conduct', 'engineer', 'worktree', '--project', 'myproj', '--idea', 'add csv export',
     ]);
-    expect(result).toMatchObject({ kind: 'worktree', project: 'myproj', idea: 'add csv export' });
+    expect(result).toMatchObject({
+      kind: 'worktree', project: 'myproj', idea: 'add csv export', permitInconclusive: false,
+    });
+  });
+
+  it('parses explicit inconclusive-readiness consent for `engineer worktree`', async () => {
+    const { detectEngineerCommand } = await import('../../src/engine/engineer-cli.js');
+    const result = detectEngineerCommand([
+      'node', 'conduct', 'engineer', 'worktree', '--project', 'myproj', '--idea', 'add csv export',
+      '--permit-inconclusive',
+    ]);
+    expect(result).toMatchObject({ kind: 'worktree', permitInconclusive: true });
   });
 
   it('"engineer land" requires --worktree — without it, falls back to guide', async () => {
@@ -245,7 +326,18 @@ describe('detectEngineerCommand: subcommand dispatch parsing', () => {
     ]);
     expect(result).toMatchObject({
       kind: 'handoff', project: 'myproj', branch: 'spec/my-idea', worktree: '/wt/engineer-my-idea',
+      permitInconclusive: false,
     });
+  });
+
+  it('parses explicit inconclusive-readiness consent for `engineer handoff`', async () => {
+    const { detectEngineerCommand } = await import('../../src/engine/engineer-cli.js');
+    const result = detectEngineerCommand([
+      'node', 'conduct', 'engineer', 'handoff',
+      '--project', 'myproj', '--branch', 'spec/my-idea', '--worktree', '/wt/engineer-my-idea',
+      '--permit-inconclusive',
+    ]);
+    expect(result).toMatchObject({ kind: 'handoff', permitInconclusive: true });
   });
 
   it('non-engineer argv returns null', async () => {
@@ -341,6 +433,55 @@ describe('dispatchEngineer({kind:"worktree"})', () => {
     expect(await git(['rev-parse', '--abbrev-ref', 'HEAD'], result.worktreePath)).toBe('spec/add-csv-export');
     // The primary tree is still on main.
     expect(await git(['rev-parse', '--abbrev-ref', 'HEAD'], repoPath)).toBe('main');
+  });
+
+  it('blocks inconclusive remote readiness unless the caller explicitly permits it', async () => {
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const err: string[] = [];
+    const code = await dispatchEngineer(
+      { kind: 'worktree', project: 'target-repo', idea: 'guarded authoring' },
+      {
+        registryPath,
+        engineerDir,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        printErr: (s) => err.push(s),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.join('\n')).toMatch(/readiness blocked \(push_authorization_unproven\)/);
+    const [run] = await new EngineerRunStore({ engineerDir, events: new ConductorEventEmitter() }).listRuns({ repoRoot: repoPath });
+    expect(run).toMatchObject({
+      state: 'created',
+      readiness: { status: 'inconclusive', permitted: false },
+      worktree: null,
+    });
+  });
+
+  it('creates the worktree when inconclusive remote readiness is explicitly permitted', async () => {
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const out: string[] = [];
+    const code = await dispatchEngineer(
+      {
+        kind: 'worktree',
+        project: 'target-repo',
+        idea: 'permitted authoring',
+        permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        print: (s) => out.push(s),
+      },
+    );
+
+    expect(code).toBe(0);
+    const result = JSON.parse(out.join(''));
+    expect(result).toMatchObject({ kind: 'worktree' });
+    expect(await pathExists(result.worktreePath)).toBe(true);
   });
 
   it('unknown project → error on stderr, returns 1', async () => {
@@ -456,11 +597,11 @@ describe('dispatchEngineer({kind:"land"})', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// dispatchEngineer({kind:'handoff'}): open spec PR via injected gh, remove worktree
+// dispatchEngineer({kind:'handoff'}): open spec PR via injected gh, retain worktree
 // ═════════════════════════════════════════════════════════════════════════════
 
 describe('dispatchEngineer({kind:"handoff"})', () => {
-  it('gh pr create runs in the worktree, PR reported, worktree removed on success (FR-4/FR-5)', async () => {
+  it('gh pr create runs in the worktree, PR reported, worktree retained on success (FR-4/FR-5)', async () => {
     const idea = 'add csv export';
     await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://example.invalid/repo.git')]);
     const worktree = await worktreeWithDocs(repoPath, idea);
@@ -511,12 +652,210 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(ghCalls.some((c) => c.args.includes('merge'))).toBe(false);
     // ensureRunning fired against the MAIN checkout (not the worktree).
     expect(launchCalls[0]).toBe(repoPath);
-    // Remove-on-success: the worktree is gone, spec branch still reachable (FR-5).
-    expect(await pathExists(worktree)).toBe(false);
+    // Retain-on-success: review can continue in the exact authored worktree (FR-5).
+    expect(await pathExists(worktree)).toBe(true);
     expect(await git(['rev-parse', '--verify', branch], repoPath)).toMatch(/^[0-9a-f]{40}$/);
   });
 
-  it('no-remote target → local-commit fallback, returns 0, worktree removed but branch reachable', async () => {
+  it('blocks inconclusive handoff readiness unless the caller explicitly permits it', async () => {
+    const idea = 'guarded handoff';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
+    });
+    const gh = vi.fn(async () => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
+    const err: string[] = [];
+
+    const code = await dispatchEngineer(
+      { kind: 'handoff', project: 'target-repo', branch, worktree },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        printErr: (s) => err.push(s),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.join('\n')).toMatch(/readiness blocked \(push_authorization_unproven\)/);
+    expect(gh).not.toHaveBeenCalled();
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      state: 'authoring',
+      readiness: { status: 'inconclusive', permitted: false },
+    });
+
+    const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
+    const retryOut: string[] = [];
+    expect(await dispatchEngineer(
+      {
+        kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        git: async (args) => ({ stdout: args[0] === 'rev-parse' ? retainedCommit : '' }),
+        ensureRunningLaunch: () => undefined,
+        print: (s) => retryOut.push(s),
+      },
+    )).toBe(0);
+    expect(JSON.parse(retryOut.join(''))).toEqual({
+      kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
+    });
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      state: 'settled',
+      readiness: { status: 'inconclusive', permitted: true },
+    });
+  });
+
+  it('opens the PR when inconclusive handoff readiness is explicitly permitted', async () => {
+    const idea = 'permitted handoff';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
+    });
+    const gh = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === 'pr' && args[1] === 'create'
+        ? 'https://github.com/acme/target-repo/pull/42'
+        : '',
+    }));
+    const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
+    const out: string[] = [];
+
+    const code = await dispatchEngineer(
+      {
+        kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        git: async (args) => ({ stdout: args[0] === 'rev-parse' ? retainedCommit : '' }),
+        ensureRunningLaunch: () => undefined,
+        print: (s) => out.push(s),
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join(''))).toEqual({
+      kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
+    });
+    expect(gh).toHaveBeenCalled();
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
+      state: 'settled',
+      readiness: { status: 'inconclusive', permitted: true },
+    });
+  });
+
+  it('captures the retained commit before creating a remote PR', async () => {
+    const idea = 'capture commit before delivery';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    await seedMarkedLandedRun({ repoRoot: repoPath, worktree, idea, branch, engineerDir });
+    const gh = vi.fn(async () => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
+    const failingGit = vi.fn(async (args: string[]) => {
+      if (args[0] === 'rev-parse') throw new Error('temporary object database failure');
+      return { stdout: '' };
+    });
+    const err: string[] = [];
+
+    const code = await dispatchEngineer(
+      {
+        kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
+      },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        git: failingGit,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        printErr: (s) => err.push(s),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.join('\n')).toMatch(/temporary object database failure/);
+    expect(failingGit).toHaveBeenCalledWith(['rev-parse', 'HEAD'], { cwd: worktree });
+    expect(gh).not.toHaveBeenCalled();
+  });
+
+  it('resumes an already-persisted handoff without rechecking readiness or reopening the PR', async () => {
+    const idea = 'resume handoff';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
+    });
+    const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
+    await store.record(run.engineerRunId, {
+      kind: 'spec_handoff',
+      planSlug: slugOf(idea),
+      branch,
+      prUrl: 'https://github.com/acme/target-repo/pull/42',
+      outcome: 'pr_opened',
+      retainedCommit,
+      retentionDeadline: '2026-09-17T00:00:00.000Z',
+    });
+
+    const gh = vi.fn(async () => { throw new Error('PR must not be reopened'); });
+    const readinessRun = vi.fn(async () => { throw new Error('readiness must not be rewritten'); });
+    const out: string[] = [];
+    const code = await dispatchEngineer(
+      { kind: 'handoff', project: 'target-repo', branch, worktree },
+      {
+        registryPath,
+        engineerDir,
+        gh,
+        readinessDeps: { run: readinessRun },
+        ensureRunningLaunch: () => undefined,
+        print: (s) => out.push(s),
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join(''))).toEqual({
+      kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
+    });
+    expect(gh).not.toHaveBeenCalled();
+    expect(readinessRun).not.toHaveBeenCalled();
+    expect(await store.inspectRun(run.engineerRunId)).toMatchObject({ state: 'settled' });
+  });
+
+  it('no-remote target → local-commit fallback, returns 0, worktree retained and branch reachable', async () => {
     const idea = 'offline idea';
     await writeRegistry([makeRecord(repoPath, 'target-repo')]); // no remote
     const worktree = await worktreeWithDocs(repoPath, idea);
@@ -541,8 +880,8 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(code).toBe(0);
     const result = JSON.parse(handoffOut.join(''));
     expect(['pr-opened', 'local-commit', 'pr-skipped']).toContain(result.kind);
-    // The local-only spec commit remains reachable after worktree removal (FR-5 negative).
-    expect(await pathExists(worktree)).toBe(false);
+    // The local-only spec commit and review worktree remain available (FR-5 negative).
+    expect(await pathExists(worktree)).toBe(true);
     expect(await git(['rev-parse', '--verify', branch], repoPath)).toMatch(/^[0-9a-f]{40}$/);
   });
 
