@@ -21,7 +21,7 @@ report it as untested rather than presenting an assumption as a result.
 
 **Runs at SHIP as a member of the concurrent validation group — fanned out alongside
 `/prd-audit` and `/architecture-review --as-built` in daemon/auto runs. In interactive
-runs it runs serially, AFTER `/finish` and BEFORE `/retro`, with its post-step
+runs it stays in the configured SHIP sequence, with its post-step
 checkpoint unchanged.**
 
 ## Practices
@@ -35,7 +35,7 @@ Before starting manual testing, check the stories in `.docs/stories/` for this f
 - Display the skip reason to the user, then **record it via the CLI** — this is the sole
   way the step is marked done; there is no hand-written marker path:
   ```
-  conduct-ts manual-test-record --skip --reason "<reason>" --pipeline-dir /abs/path/to/.pipeline
+  ai-conductor manual-test-record --skip --reason "<reason>" --pipeline-dir /abs/path/to/.pipeline
   ```
   Use the absolute worktree `.pipeline` path supplied in the step's system prompt (see the
   "Daemon mode" note under Step 5 for why it must be absolute, not relative).
@@ -121,7 +121,7 @@ Use browser automation (Chrome MCP if configured, otherwise manual Capybara-styl
 1. Navigate to each page referenced in stories
 2. Perform the actions described in Given/When/Then
 3. Verify visible output matches expected behavior
-4. Take screenshots of key states for the retro
+4. Take screenshots of key states as manual-test evidence
 
 ### 5. Display Results
 
@@ -135,7 +135,7 @@ Record the run by piping (or pointing at) the results content and the absolute w
 `.pipeline` path supplied in the step's system prompt:
 
 ```
-conduct-ts manual-test-record --results - --pipeline-dir /abs/path/to/.pipeline <<'EOF'
+ai-conductor manual-test-record --results - --pipeline-dir /abs/path/to/.pipeline <<'EOF'
 <results table + bugs section, in the format below>
 EOF
 ```
@@ -143,7 +143,7 @@ EOF
 or, if the results were written to a file first:
 
 ```
-conduct-ts manual-test-record --results /path/to/results.md --pipeline-dir /abs/path/to/.pipeline
+ai-conductor manual-test-record --results /path/to/results.md --pipeline-dir /abs/path/to/.pipeline
 ```
 
 `manual-test-record` handles the append semantics (new `## Attempt N — <ISO timestamp>`
@@ -233,10 +233,10 @@ genuinely self-evident from the failure.
 3. Commit
 4. Re-run the manual test for that story to verify
 
-**Do NOT proceed to `/retro` with known bugs.** The manual test gate must be clean.
+**Do NOT proceed to `/finish` with known bugs.** The manual test gate must be clean.
 
 ```
-/finish → /manual-test → bugs found? → /debugging (discover cause, if not obvious) → /tdd (fix each bug) → /manual-test (re-verify) → /retro
+/manual-test → bugs found? → /debugging (discover cause, if not obvious) → /tdd (fix each bug) → /manual-test (re-verify) → /finish
 ```
 
 The loop continues until all stories pass manual testing.
@@ -260,7 +260,7 @@ docker compose down
 - [ ] Browser automation availability was checked without installing dependencies; unavailable or
       unlaunchable browser criteria were recorded as WARN with the error and recovery command
 - [ ] Every exit path (Step 0 SKIP or Step 5 real-run PASS/FAIL/WARN) ended by actually invoking
-      `conduct-ts manual-test-record` (`--skip --reason ...` or `--results ...`) against the
+      `ai-conductor manual-test-record` (`--skip --reason ...` or `--results ...`) against the
       absolute worktree `.pipeline` path — not a hand-written or fabricated marker
 - [ ] All bugs fixed via TDD loop
 - [ ] Re-verification passed after bug fixes

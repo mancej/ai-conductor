@@ -222,8 +222,6 @@ describe('conductor auth-park: daemon-token mode', () => {
       ...READY_STATE,
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     });
@@ -744,7 +742,7 @@ describe('conductor auth-park: daemon-token mode', () => {
     {
       label: 'judged adapter',
       step: 'build_review' as const,
-      completed: { build: 'done', wiring_check: 'done', test_suite: 'done' } as Partial<ConductState>,
+      completed: { build: 'done',  test_suite: 'done' } as Partial<ConductState>,
     },
   ])('keeps the selected source and actual non-auth result authoritative after a probe-failed $label', async ({ step, completed }) => {
     await writeState(statePath, { ...READY_STATE, ...completed });
@@ -806,7 +804,7 @@ describe('conductor auth-park: daemon-token mode', () => {
 
   it('grouped dispatch timeout preserves completed siblings and never redispatches or falls back', async () => {
     await writeState(statePath, {
-      ...READY_STATE, build: 'done', build_review: 'done', wiring_check: 'done', test_suite: 'done',
+      ...READY_STATE, build: 'done', build_review: 'done',  test_suite: 'done',
     });
     const { runtimes, selectedReadiness, alternateReadiness } = timeoutRuntimes();
     const calls: StepName[] = [];
@@ -845,8 +843,8 @@ describe('conductor auth-park: daemon-token mode', () => {
   it('returns a successful grouped recovery trial while leaving completed siblings undispatched', async () => {
     await writeState(statePath, {
       ...READY_STATE,
-      build: 'done', build_review: 'done', wiring_check: 'done',
-      retro: 'done', rebase: 'done', finish: 'done',
+      build: 'done', build_review: 'done',
+      rebase: 'done', finish: 'done',
     });
     const readiness = vi.fn().mockResolvedValue({
       provider: 'codex', source: 'cached-login', state: 'probe-failed',
@@ -900,8 +898,8 @@ describe('conductor auth-park: daemon-token mode', () => {
   it('routes a non-auth failed grouped recovery trial through the ordinary group result path', async () => {
     await writeState(statePath, {
       ...READY_STATE,
-      build: 'done', build_review: 'done', wiring_check: 'done',
-      retro: 'done', rebase: 'done', finish: 'done',
+      build: 'done', build_review: 'done',
+      rebase: 'done', finish: 'done',
     });
     const readiness = vi.fn().mockResolvedValue({
       provider: 'codex', source: 'cached-login', state: 'probe-failed',
@@ -950,8 +948,8 @@ describe('conductor auth-park: daemon-token mode', () => {
     async (parserRejection) => {
     await writeState(statePath, {
       ...READY_STATE,
-      build: 'done', build_review: 'done', wiring_check: 'done',
-      retro: 'done', rebase: 'done', finish: 'done',
+      build: 'done', build_review: 'done',
+      rebase: 'done', finish: 'done',
     });
     const readiness = vi.fn()
       .mockResolvedValueOnce({
@@ -1011,8 +1009,8 @@ describe('conductor auth-park: daemon-token mode', () => {
   it('authorizes only one grouped member invocation after a shared failed readiness probe', async () => {
     await writeState(statePath, {
       ...READY_STATE,
-      build: 'done', build_review: 'done', wiring_check: 'done',
-      retro: 'done', rebase: 'done', finish: 'done',
+      build: 'done', build_review: 'done',
+      rebase: 'done', finish: 'done',
     });
     const readiness = vi.fn().mockResolvedValue({
       provider: 'codex', source: 'cached-login', state: 'probe-failed',
@@ -1057,8 +1055,8 @@ describe('conductor auth-park: daemon-token mode', () => {
   ] as const)('consumes one grouped recovery trial when the first trial %s', async (_case, trialResult) => {
     await writeState(statePath, {
       ...READY_STATE,
-      build: 'done', build_review: 'done', wiring_check: 'done',
-      retro: 'done', rebase: 'done', finish: 'done',
+      build: 'done', build_review: 'done',
+      rebase: 'done', finish: 'done',
     });
     const readiness = vi.fn().mockResolvedValue({
       provider: 'codex', source: 'cached-login', state: 'probe-failed',
@@ -1106,7 +1104,7 @@ describe('conductor auth-park: daemon-token mode', () => {
     ['succeeds', { success: true }, [1, 1]],
     ['returns a non-auth failure to ordinary retry handling', { success: false, output: 'ordinary judged failure' }, [1, 1, 2]],
   ] as const)('judged build_review recovery trial %s', async (_case, trialResult, expectedAttempts) => {
-    await writeState(statePath, { ...READY_STATE, build: 'done', wiring_check: 'done', test_suite: 'done' });
+    await writeState(statePath, { ...READY_STATE, build: 'done',  test_suite: 'done' });
     const readiness = vi.fn().mockResolvedValue({
       provider: 'codex', source: 'cached-login', state: 'probe-failed',
       probeFailure: { kind: 'timeout', facts: { timeoutMs: 10_000 } },
@@ -1143,7 +1141,7 @@ describe('conductor auth-park: daemon-token mode', () => {
   it.each(['invalid-json', 'unsupported-schema'] as const)(
     'halts a judged recovery trial with the originating %s classification',
     async (parserRejection) => {
-    await writeState(statePath, { ...READY_STATE, build: 'done', wiring_check: 'done', test_suite: 'done' });
+    await writeState(statePath, { ...READY_STATE, build: 'done',  test_suite: 'done' });
     const readiness = vi.fn().mockResolvedValue({
       provider: 'codex', source: 'cached-login', state: 'probe-failed',
       probeFailure: { kind: 'unparseable-output', facts: { parserRejection } },
@@ -1206,8 +1204,7 @@ describe('conductor auth-park: daemon-token mode', () => {
     await writeState(statePath, {
       ...READY_STATE,
       build: 'done',
-      wiring_check: 'done',
-      test_suite: 'done',
+       test_suite: 'done',
     });
     const { runtimes, selectedReadiness, alternateReadiness } = timeoutRuntimes();
     const runner: StepRunner = { run: vi.fn(async () => codexCachedLoginFailure()) };
@@ -1862,11 +1859,10 @@ describe('conductor auth-park: daemon-token mode', () => {
     await writeState(statePath, {
       ...READY_STATE,
       build_review: 'done',
-      wiring_check: 'done',
+      test_suite: 'done',
       manual_test: 'done',
       prd_audit: 'done',
       architecture_review_as_built: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState);

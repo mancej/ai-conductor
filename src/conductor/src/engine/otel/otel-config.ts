@@ -1,8 +1,78 @@
 import { join } from 'node:path';
+import { hostname } from 'node:os';
 import type { HarnessConfig } from '../../types/config.js';
 
 const VALID_EXPORTERS = ['otlp', 'file'] as const;
 const DEFAULT_FILE = 'otel.jsonl';
+const MAX_ATTRIBUTES = 16;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object') return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasHeaderEntries(headers: unknown): boolean {
+  return headers !== undefined && (!isPlainObject(headers) || Object.keys(headers).length > 0);
+}
+
+function renderedHeaderName(header: string): string {
+  return header === '' ? "''" : JSON.stringify(header);
+}
+
+function unsupportedHeaderTransportError(headers: unknown, transport: string): string {
+  const firstHeader = isPlainObject(headers) ? Object.entries(headers)[0] : undefined;
+  if (!firstHeader) return `otel headers are unsupported with the ${transport}.`;
+
+  const [header, reference] = firstHeader;
+  const environmentVariable = isPlainObject(reference) && typeof reference.env === 'string'
+    ? reference.env
+    : undefined;
+  return `otel header ${renderedHeaderName(header)}${environmentVariable ? ` references environment variable '${environmentVariable}' and` : ''} is unsupported with the ${transport}.`;
+}
+
+function renderedAttributeKey(key: string): string {
+  return key === '' ? "''" : JSON.stringify(key);
+}
+
+function resolveAttributes(attributes: unknown): {
+  attributes: Record<string, string>;
+  warnings: string[];
+} | undefined {
+  if (attributes === undefined) return undefined;
+  if (!isPlainObject(attributes)) {
+    return {
+      attributes: {},
+      warnings: ['otel.attributes must be a mapping from namespaced attribute keys to literal string values.'],
+    };
+  }
+  if (Object.keys(attributes).length === 0) return undefined;
+
+  const resolved: Array<[string, string]> = [];
+  const warnings: string[] = [];
+  for (const [rawKey, rawValue] of Object.entries(attributes)) {
+    const key = rawKey.trim();
+    const renderedKey = renderedAttributeKey(key);
+    if (resolved.length + warnings.length >= MAX_ATTRIBUTES) {
+      warnings.push(`otel attribute ${renderedKey} was dropped because at most ${MAX_ATTRIBUTES} attributes may be declared.`);
+    } else if (key === '') {
+      warnings.push(`otel attribute ${renderedKey} was dropped because attribute keys must be non-empty.`);
+    } else if (!key.includes('.')) {
+      warnings.push(`otel attribute ${renderedKey} was dropped because attribute keys must be namespaced with a dot.`);
+    } else if (['service.', 'conductor.', 'host.'].some((prefix) => key.startsWith(prefix))) {
+      const prefix = ['service.', 'conductor.', 'host.'].find((candidate) => key.startsWith(candidate));
+      warnings.push(`otel attribute ${renderedKey} was dropped because the ${prefix} prefix is reserved.`);
+    } else if (typeof rawValue !== 'string') {
+      warnings.push(`otel attribute ${renderedKey} was dropped because attribute values must be literal strings.`);
+    } else if (rawValue.trim() === '') {
+      warnings.push(`otel attribute ${renderedKey} was dropped because attribute values must be non-empty.`);
+    } else {
+      resolved.push([key, rawValue.trim()]);
+    }
+  }
+
+  return { attributes: Object.fromEntries(resolved), warnings };
+}
 
 /**
  * Resolved OTel config. A discriminated union:
@@ -13,8 +83,26 @@ const DEFAULT_FILE = 'otel.jsonl';
  */
 export type ResolvedOtelConfig =
   | { enabled: false; error?: string }
-  | { enabled: true; exporter: 'otlp'; endpoint: string; protocol?: 'http/protobuf' | 'grpc' }
-  | { enabled: true; exporter: 'file'; file: string };
+  | {
+      enabled: true;
+      exporter: 'otlp';
+      endpoint: string;
+      protocol?: 'http/protobuf' | 'grpc';
+      headers?: Record<string, string>;
+      projectName?: string;
+      workerName?: string;
+      attributes?: Record<string, string>;
+      attributeWarnings?: string[];
+    }
+  | {
+      enabled: true;
+      exporter: 'file';
+      file: string;
+      projectName?: string;
+      workerName?: string;
+      attributes?: Record<string, string>;
+      attributeWarnings?: string[];
+    };
 
 /**
  * Parse and validate the `otel:` block from `config`. Returns a discriminated
@@ -34,7 +122,10 @@ export function resolveOtelConfig(
     return { enabled: false };
   }
 
-  const { exporter, endpoint, file, protocol } = otel;
+  const { exporter, endpoint, file, protocol, headers, project_name, worker_name, attributes } = otel;
+  const projectName = project_name?.trim() || undefined;
+  const workerName = worker_name?.trim() || undefined;
+  const resolvedAttributes = resolveAttributes(attributes);
 
   // Unknown exporter → disabled + named error listing valid options.
   if (!VALID_EXPORTERS.includes(exporter as (typeof VALID_EXPORTERS)[number])) {
@@ -54,19 +145,100 @@ export function resolveOtelConfig(
           'No endpoint was provided.',
       };
     }
+    if (headers !== undefined && !isPlainObject(headers)) {
+      return {
+        enabled: false,
+        error: 'otel headers must be a mapping from header names to { env: <variable name> } references.',
+      };
+    }
+
+    if (hasHeaderEntries(headers) && protocol === 'grpc') {
+      return {
+        enabled: false,
+        error: unsupportedHeaderTransportError(headers, 'grpc protocol'),
+      };
+    }
+
+    const resolvedHeaders: Record<string, string> = Object.create(null);
+    if (headers && hasHeaderEntries(headers)) {
+      for (const [header, reference] of Object.entries(headers)) {
+        const headerName = renderedHeaderName(header);
+        // Story 3's negative criterion binds every header-related resolution
+        // error for a reference-bearing entry, including one whose NAME is
+        // malformed. Parse the reference before validating the name so the
+        // variable is available to name here; the value itself is still never
+        // read on this path.
+        const environmentVariable = isPlainObject(reference) && typeof reference.env === 'string'
+          ? reference.env
+          : undefined;
+        const referencedVariableClause = environmentVariable
+          ? ` (referencing environment variable '${environmentVariable}')`
+          : '';
+        if (header === '' || /[\x00-\x1F\x7F]/.test(header)) {
+          return {
+            enabled: false,
+            error: `otel header ${headerName}${referencedVariableClause} must be a non-empty name without control characters.`,
+          };
+        }
+        if (typeof reference === 'string') {
+          return {
+            enabled: false,
+            error: `otel header ${headerName} refuses a literal credential in configuration; use { env: <variable name> }.`,
+          };
+        }
+        if (!isPlainObject(reference) || Object.keys(reference).length !== 1 || !('env' in reference) || environmentVariable === undefined || environmentVariable === '') {
+          return {
+            enabled: false,
+            error: `otel header ${headerName}${environmentVariable ? ` references environment variable '${environmentVariable}',` : ''} must use the supported reference form { env: <variable name> }.`,
+          };
+        }
+        const value = process.env[environmentVariable];
+        if (!value) {
+          return {
+            enabled: false,
+            error: `otel header ${headerName} references environment variable '${environmentVariable}', which is unset or empty.`,
+          };
+        }
+        resolvedHeaders[header] = value;
+      }
+    }
+
     return {
       enabled: true,
       exporter: 'otlp',
       endpoint,
       ...(protocol ? { protocol } : {}),
+      ...(hasHeaderEntries(headers) ? { headers: resolvedHeaders } : {}),
+      ...(projectName ? { projectName } : {}),
+      ...(workerName ? { workerName } : {}),
+      ...(resolvedAttributes ? { attributes: resolvedAttributes.attributes, attributeWarnings: resolvedAttributes.warnings } : {}),
     };
   }
 
   // exporter === 'file'
+  if (hasHeaderEntries(headers)) {
+    return {
+      enabled: false,
+      error: unsupportedHeaderTransportError(headers, 'file exporter'),
+    };
+  }
   const resolvedFile = file ?? join(pipelineDir, DEFAULT_FILE);
   return {
     enabled: true,
     exporter: 'file',
     file: resolvedFile,
+    ...(projectName ? { projectName } : {}),
+    ...(workerName ? { workerName } : {}),
+    ...(resolvedAttributes ? { attributes: resolvedAttributes.attributes, attributeWarnings: resolvedAttributes.warnings } : {}),
   };
+}
+
+/** Resolve a stable worker label without allowing host lookup failures to disable telemetry. */
+export function resolveWorkerName(config: Pick<ResolvedOtelConfig, 'enabled'> & { workerName?: string }): string {
+  if (typeof config.workerName === 'string' && config.workerName.trim()) return config.workerName.trim();
+  try {
+    return hostname().trim() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }

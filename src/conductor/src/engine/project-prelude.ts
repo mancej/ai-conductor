@@ -1,4 +1,4 @@
-// Project-level prelude: runs once at the start of every conduct-ts invocation
+// Project-level prelude: runs once at the start of every ai-conductor invocation
 // before the per-feature loop. Handles bootstrap + assess — both are
 // project-scoped concerns (not per-feature) and have their own trigger rules.
 //
@@ -22,6 +22,7 @@ import {
   executeProviderCandidates,
   type ProviderExecutionContext,
 } from './provider-execution.js';
+import { dispatchMemorySetup } from './memory-cli.js';
 
 const exec = promisify(execCb);
 
@@ -62,7 +63,7 @@ export interface PreludeOptions {
   hasMigration?: (from: string, to: string) => boolean;
   /**
    * If true, bypass the "already assessed" and staleness checks and re-run
-   * assess. Used for `conduct-ts assess --force`.
+   * assess. Used for `ai-conductor assess --force`.
    */
   forceAssess?: boolean;
   /**
@@ -95,6 +96,18 @@ export async function runProjectPrelude(
     bootstrapExecuted: false,
     assessExecuted: false,
   };
+
+  try {
+    const setupExit = await dispatchMemorySetup({ kind: 'setup', dir: projectRoot });
+    if (setupExit !== 0) {
+      console.warn('[prelude] memory-store setup failed; continuing');
+    }
+  } catch (error) {
+    console.warn(
+      '[prelude] memory-store setup failed; continuing: ' +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
 
   // --- Bootstrap -----------------------------------------------------------
   const bootstrapMarker = await readBootstrapMarker(projectRoot);

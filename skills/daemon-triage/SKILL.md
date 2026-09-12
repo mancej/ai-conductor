@@ -68,7 +68,7 @@ The marker is advisory because it can survive a daemon crash. Check it first,
 then run this read-only liveness corroboration:
 
 ```bash
-conduct-ts daemon status
+ai-conductor daemon status
 ```
 
 Read-only triage always continues, even when the marker or daemon status appears live.
@@ -97,7 +97,7 @@ inside a feature worktree — the daemon-level evidence (`.daemon/`) only exists
 the root.
 
 ```bash
-conduct-ts daemon status
+ai-conductor daemon status
 ```
 
 If the operator did not name a slug, list the halted and in-progress features from
@@ -116,8 +116,8 @@ for `<base-branch>` throughout.
 
 ```bash
 # Daemon-level: liveness, last activity, what it thinks the state is
-conduct-ts daemon status
-conduct-ts daemon logs --lines 200 | grep -F "<slug>"
+ai-conductor daemon status
+ai-conductor daemon logs --lines 200 | grep -F "<slug>"
 
 # The halt and its class — the single most decisive signal
 head -1 .worktrees/<slug>/.pipeline/HALT 2>/dev/null
@@ -168,6 +168,7 @@ take the first that matches.
 | `.worktrees/<slug>` missing, or state says past `worktree` with no directory | Worktree / evidence loss | `runbooks/worktree-and-evidence-recovery.md` |
 | `HALT.class` is `needs-human` | Needs-human halt — an operator decision is required; clearing it without deciding just re-halts | `runbooks/stalled-or-stuck-feature.md` |
 | `HALT.class` is `over-scope` | Edit every desired entry in the fenced `over-scope-decisions` block to `accept` or `refuse` and add a rationale before clearing; pending entries are inert | `runbooks/stalled-or-stuck-feature.md` |
+| `HALT.class` is `plan-gap` | Plan-gap halt — the approved design is the ceiling and no plan task owns the repair; amend the plan or story, reseal, and rewind, or clearing the marker just re-halts | `runbooks/stalled-or-stuck-feature.md` |
 | `HALT` body reads `heartbeat stalled: no provider activity in …` | Watchdog kill (already handled; `mechanical`) | `runbooks/stalled-or-stuck-feature.md` |
 | `HALT.class` is `mechanical`, or absent/unrecognized | Mechanical halt — daemon may retry; clears on base-branch advance | `runbooks/stalled-or-stuck-feature.md` |
 | `credentials_park` event, or `build-auth-status` exits non-zero | Auth park — waiting on a credential, not on your code | `runbooks/stalled-or-stuck-feature.md` |
@@ -232,6 +233,8 @@ Distinguish clearly in the report: **feature-side** problems get fixed in the
 feature's own worktree; **harness-side** problems get an issue and a park, because
 patching around them per-feature hides the defect.
 
+For work that should not continue, follow [the abandonment runbook](../../docs/runbooks/abandoning-a-spec.md): record the decision on a closed issue and delete the DECIDE artifacts.
+
 ### 6. Write the triage report
 
 Write to the **daemon** directory, not the feature's `.pipeline/` — triage output
@@ -286,7 +289,7 @@ wrong midway, the record must already show what had actually run.
 ## Verification
 
 - [ ] The skill was directly operator-invoked, never auto-dispatched
-- [ ] `.pipeline/phase-active` was checked **first**, then `conduct-ts daemon
+- [ ] `.pipeline/phase-active` was checked **first**, then `ai-conductor daemon
       status` supplied advisory liveness context
 - [ ] Read-only triage continued for every marker/status combination; an
       apparently live step produced a warning, while stale/stopped daemon or

@@ -35,12 +35,11 @@ Run everything from `src/conductor` unless stated otherwise.
 From the repository root, `make check` installs the lockfile-pinned Conductor dependencies when they
 are missing or stale, then runs both TypeScript checks above.
 
-`npm test` expands to:
+`npm test` with no selectors runs:
 
 ```bash
 node scripts/run-vitest.mjs run --reporter=dot --silent --slowTestThreshold=1800000 &&
 npm run test:node &&
-node scripts/run-vitest.mjs run --config vitest.signal.config.ts --reporter=dot --slowTestThreshold=1800000 &&
 echo 'AGGREGATE_TEST_SUITE_PASS'
 ```
 
@@ -51,12 +50,12 @@ before Vitest loads, so use `npm test -- <selectors>` rather than invoking `vite
 
 New Engineer lifecycle CLI behavior tests use `node:test` with `node:assert/strict` and live directly
 under `test/`. `vitest.config.ts` excludes that file to prevent dual discovery, while the no-argument
-`npm test` aggregate runs it between the main Vitest suite and the signal suite. Use `npm run test:node`
+`npm test` aggregate runs it after the main Vitest suite. Use `npm run test:node`
 for a focused run.
 
 ### The engine-dist guard
 
-Thirteen test files spawn the real `bin/conduct-ts`, which exits 1 when `src/conductor/dist` is
+Thirteen test files spawn the real `bin/ai-conductor`, which exits 1 when `src/conductor/dist` is
 missing or its symlink dangles. `dist` is gitignored, so it does not exist in a fresh clone or
 `git worktree` after `npm ci`, and there is no `pretest` hook — nothing built it before the tests
 ran. It appeared only partway through a run, whenever some test happened to publish an engine, and
@@ -98,9 +97,14 @@ via `test/fixtures/step-command-preflight.ts`. An unresolved skill fails before
 any provider dispatch or token spend. Each leg asserts the same successful
 terminal state (`DONE`, with no `HALT` or park marker), fixture commit, and
 `Task: 1` trailer, and reports its observed spend under the shared
-`DAEMON_E2E_LIVE_TOKEN_CAP` (default `100000`). On failure, both use the shared
+`DAEMON_E2E_LIVE_TOKEN_CAP` (default `300000`). On failure, both use the shared
 `dumpPipelineDiagnostics` helper to print the daemon log, halt reason, task
 status, task evidence, and park markers.
+
+CI sources that cap from the repository Actions variable named
+`DAEMON_E2E_LIVE_TOKEN_CAP`, falling back to `300000` when the variable is
+unset. Change the repository variable to recalibrate the release gate without
+editing the workflow; the same value continues to govern both provider legs.
 
 Each leg needs its matching binary and credential: `claude` with
 `CLAUDE_CODE_OAUTH_TOKEN`, or `codex` with `CODEX_API_KEY`. Set
@@ -116,8 +120,10 @@ npm run smoke -- test/engine/daemon-e2e-live-claude.smoke.test.ts
 
 The reusable [Live daemon E2E workflow](../../.github/workflows/live-daemon-e2e.yml)
 runs one matrix leg per provider, selecting only that provider's smoke file.
-An absent matrix credential records a provider-named non-gating skip, while a
-credential-present leg remains gate-enforced. The separate
+Each leg records its result independently, and the release gate requires at
+least one provider leg to pass; a failure from one provider remains visible but
+does not block publication when the other provider succeeds. The non-provider
+smoke tier remains independently mandatory. The separate
 `require-live-provider-credential` job requires at least one provider
 credential overall. To add a provider, add its descriptor, its provider-specific
 smoke file, and its matrix entry in the same change; do not create a parallel
@@ -177,19 +183,19 @@ runners, so every tier below except smoke remains part of the default gate.
 
 | Directory | Files | Covers | Run just this tier |
 | --- | --- | --- | --- |
-| `test/engine/` | 371 | Mirrors `src/engine/`, including subdirectories for `engineer/`, `engineer/intake/`, `self-host/`, `otel/`, `halt-issues/`, `owner-gate/`. | `npm test -- test/engine` |
-| `test/acceptance/` | 96 | Observable story and gate behavior across the minimum real internal path, with third-party boundaries faked. | `npm test -- test/acceptance` |
-| `test/` (top level) | 41 | Cross-cutting suites not owned by one layer: `wiring-*`, `build-progress-*`, `backlog-priority`, `config-validation`, and tests of the leak guards themselves. | `npm test -- 'test/*.test.ts'` |
-| `test/integration/` | 39 | Real collaboration between internal components; real temp files or local git only where git semantics are the subject. | `npm test -- test/integration` |
+| `test/engine/` | 494 | Mirrors `src/engine/`, including subdirectories for `engineer/`, `engineer/intake/`, `self-host/`, `otel/`, `halt-issues/`, `owner-gate/`. | `npm test -- test/engine` |
+| `test/acceptance/` | 175 | Observable story and gate behavior across the minimum real internal path, with third-party boundaries faked. | `npm test -- test/acceptance` |
+| `test/` (top level) | 71 | Cross-cutting suites not owned by one layer: `wiring-*`, `build-progress-*`, `backlog-priority`, `config-validation`, and tests of the leak guards themselves. | `npm test -- 'test/*.test.ts'` |
+| `test/integration/` | 41 | Real collaboration between internal components; real temp files or local git only where git semantics are the subject. | `npm test -- test/integration` |
 | `test/ui/` | 14 | Renderers, subscribers, dashboard snapshot and text, live region, prompt host. | `npm test -- test/ui` |
-| `test/execution/` | 11 | Provider adapters, the `LLMProvider` contract, token usage, rate-limit parsing, sessions. | `npm test -- test/execution` |
-| `test/smoke/` | 5 | Real binaries and real third parties. Excluded by default. | See [Smoke tests](#smoke-tests). |
-| `test/cli/` | 3 | `index.test.ts`, `mode-derivation.test.ts`, `report-flag.test.ts`. | `npm test -- test/cli` |
-| `test/structural/` | 2 | Meta-tests that parse the suite itself. See [Structural meta-tests](#structural-meta-tests). | `npm test -- test/structural` |
-| `test/types/` | 2 | Type-level contracts: `plugin-kind.test.ts`, `test-suite-config-type.test.ts`. | `npm test -- test/types` |
-| `test/fixtures/` | 1 test + helpers | `git-repo.ts` and its test, plus child-process scripts and recorded session-hook payloads. | `npm test -- test/fixtures` |
+| `test/execution/` | 25 | Provider adapters, the `LLMProvider` contract, token usage, rate-limit parsing, sessions. | `npm test -- test/execution` |
+| `test/smoke/` | 4 | Real binaries and real third parties. Excluded by default; seven additional `*.smoke.test.ts` files live beside the subsystem they exercise. | See [Smoke tests](#smoke-tests). |
+| `test/cli/` | 6 | CLI entry-point and argument behavior. | `npm test -- test/cli` |
+| `test/structural/` | 8 | Meta-tests that parse the suite itself. See [Structural meta-tests](#structural-meta-tests). | `npm test -- test/structural` |
+| `test/types/` | 3 | Type-level contracts. | `npm test -- test/types` |
+| `test/fixtures/` | 5 | Fixture helpers and their executable contract tests. | `npm test -- test/fixtures` |
 
-Runner shape (`src/conductor/vitest.config.ts`): `pool: 'forks'` with top-level `maxWorkers: 3`,
+Runner shape (`src/conductor/vitest.config.ts`): `pool: 'forks'` with top-level `maxWorkers: 2`,
 `testTimeout: 20000`, `hookTimeout: 30000`, `environment: 'node'`. No reporter is configured in the file
 — it comes from the command line. Vitest 4 removed `poolOptions` and `minWorkers`; isolated generated
 smoke fixtures set `maxWorkers: 1`.
@@ -271,13 +277,21 @@ all depends on is proven rather than assumed.
 
 None of this excuses a fixture from cleaning up after itself — it bounds the damage when one does not.
 
+Before it takes the real-tmpdir baseline, `global-setup.ts` also reaps stale
+`ai-conductor-vitest-run-*` roots left by an interrupted earlier run. Each live root has an owner
+marker refreshed every minute; marked roots are eligible after three hours, while legacy unmarked
+roots wait 24 hours. The sweep retains its own root, live roots, unreadable markers, and every
+non-directory prefixed entry (including symlinks), and reports but does not fail the new run when it
+cannot remove a candidate. This keeps abandoned test artifacts from accumulating without risking a
+live run or a symlink target.
+
 ### setup.ts
 
 `src/conductor/test/setup.ts` runs before every test file (`setupFiles`) and sets three process-wide
 kill-switches:
 
 - `NO_AUTOLAUNCH_ENV=1` — the engineer handoff's default launch path becomes a no-op, so no test spawns a
-  real `tmux new-session -d 'conduct-ts daemon --continuous'` that outlives its tmpdir.
+  real `tmux new-session -d 'ai-conductor daemon --continuous'` that outlives its tmpdir.
 - `AI_CONDUCTOR_NO_REAL_EXEC=1` — `makeProductionGh` and `makeProductionGit` refuse to exec. A test once
   added a `needs-remediation` label and a `boom` comment to a live PR; this is the guard against that.
 - `AI_CONDUCTOR_ENGINEER_DIR` — redirected to a fresh `mkdtempSync` directory unless a test already set
@@ -394,6 +408,16 @@ execute smoke tests.
   suite as check 17. `test_docs_navigation.sh` in turn shells out to `test/check_docs_navigation.sh`,
   the offline contract checker it validates against fixture and real-tree cases.
 
+### ripgrep is optional, and skipping is silent
+
+`rg` is not required to run the suite, but three scripts scope their own coverage on it and say so
+only in their output: `test/test_bin_migrate_approval.sh` and
+`test/test_bin_migrate_multi_version_jump.sh` print `SKIP` and exit 0, and integrity check 12b
+records a pass while skipping `test/test_release_pr_workflow.sh`. On a checkout without ripgrep the
+suite therefore runs smaller than CI does — CI installs it (`.github/workflows/ci.yml`) — while still
+reporting green. `bin/install --check` warns when `rg` is missing; nothing the harness ships at
+runtime needs it.
+
 `test/docs_pages.smoke.test.sh` is a real, opt-in Pages probe — run it by hand after a default-branch
 deployment; it is never invoked from integrity or CI. `test/run_browsable_documentation_site_acceptance.sh`
 runs `test_docs_navigation.sh` and `test_docs_pages_smoke.sh` together as the deterministic acceptance
@@ -409,7 +433,7 @@ suite for the hosted documentation site story; nothing invokes it automatically.
 > gate. Run the relevant script by hand (`bash test/test_bin_update.sh`) when you change those surfaces.
 > Tracked in [#1021](https://github.com/jstoup111/ai-conductor/issues/1021).
 
-`examples/` holds runnable end-to-end scenarios (`inline.sh`, `interactive.sh`, `daemon.sh`,
+`examples/` holds runnable end-to-end scenarios (`interactive.sh`, `daemon.sh`,
 `engineer.sh`, `intake-loop.sh`, each taking a tier `s|m|l`). Each creates a throwaway sandbox via
 `sandbox_up` and tears it down on exit. They invoke real flows, are not run by CI, and are not a scored
 regression suite.

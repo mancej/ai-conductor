@@ -1,3 +1,4 @@
+// Covers: task:1, task:3
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, readFile, access, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -19,6 +20,7 @@ import {
   emitRebaseEvent,
   emitGateInvalidationEvents,
   makeGitRunner,
+  changedPathsSinceMergeBase,
   performRebase,
   type GitRunner,
   type GitResult,
@@ -50,6 +52,35 @@ function fakeGit(
   };
   return { git, calls };
 }
+
+describe('changedPathsSinceMergeBase (Task 1)', () => {
+  it('diffs the branch from its resolved merge base, never from the base tip', async () => {
+    const { git, calls } = fakeGit([
+      { match: ['merge-base', 'main', 'spec/sibling'], result: { stdout: 'fork-sha\n' } },
+      {
+        match: ['diff', '--name-only', 'fork-sha', 'spec/sibling'],
+        result: { stdout: 'branch-only.ts\n' },
+      },
+    ]);
+
+    await expect(changedPathsSinceMergeBase(git, 'main', 'spec/sibling')).resolves.toEqual([
+      'branch-only.ts',
+    ]);
+    expect(calls).not.toContainEqual(['diff', '--name-only', 'main', 'spec/sibling']);
+  });
+
+  it.each([
+    { name: 'fails', result: { exitCode: 1, stderr: 'unrelated histories' } },
+    { name: 'prints no merge-base', result: { stdout: ' \n' } },
+  ])('returns null when merge-base $name', async ({ result }) => {
+    const { git, calls } = fakeGit([
+      { match: ['merge-base', 'main', 'spec/sibling'], result },
+    ]);
+
+    await expect(changedPathsSinceMergeBase(git, 'main', 'spec/sibling')).resolves.toBeNull();
+    expect(calls).toEqual([['merge-base', 'main', 'spec/sibling']]);
+  });
+});
 
 describe('engine/rebase — finish-only mergeability policy (Task 2)', () => {
   it('takes both branches of the markdown classifier: docs/base-only.txt skips, while root base-only.txt rebases', async () => {
@@ -658,6 +689,42 @@ describe('engine/rebase — HALT (FR-8)', () => {
     expect(cls).toBe('needs-human');
   });
 
+  it('writes a completed-rebase recovery procedure without conflict-resolution steps', async () => {
+    expect(
+      await writeHalt(dir, [], 'feature content needs review', undefined, 'completed-rebase'),
+    ).toEqual({ status: 'written' });
+    const [note, cls] = await Promise.all([
+      readFile(join(dir, '.pipeline/HALT'), 'utf-8'),
+      readFile(join(dir, '.pipeline/HALT.class'), 'utf-8'),
+    ]);
+    expect({ note, cls }).toEqual({
+      note:
+        `rebase completed — parked for human review\n` +
+        `feature content needs review\n\n` +
+        `Resume procedure:\n` +
+        `  1. Review the completed rebase and restore any missing feature content.\n` +
+        `  2. Confirm the working tree is clean.\n` +
+        `  3. rm .pipeline/HALT\n` +
+        `  4. Re-queue the feature for the daemon.\n`,
+      cls: 'needs-human',
+    });
+  });
+
+  it('uses the byte-identical paused-rebase procedure when no shape is supplied', async () => {
+    await writeHalt(dir, ['src/feature.ts'], 'feature content needs review');
+    const note = await readFile(join(dir, '.pipeline/HALT'), 'utf-8');
+    expect(note).toBe(
+      `rebase conflict — parked for human resolution\n` +
+        `feature content needs review\n` +
+        `Conflicted files: src/feature.ts\n\n` +
+        `Resume procedure:\n` +
+        `  1. Resolve the conflicts in the listed file(s).\n` +
+        `  2. git rebase --continue\n` +
+        `  3. rm .pipeline/HALT\n` +
+        `  4. Re-queue the feature for the daemon.\n`,
+    );
+  });
+
   it('returns the marker write result for seal HALTs without an emitter', async () => {
     expect(await writeSealHalt(dir, 'protected artifact changed')).toEqual({ status: 'written' });
   });
@@ -750,8 +817,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     expect(r.satisfied).toBe(true);
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -766,8 +834,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     const r = await applyRebaseVerdicts(dir, outcome, false);
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'prd_audit',
       'architecture_review_as_built',
     ]);
@@ -790,8 +859,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     expect(r.satisfied).toBe(true);
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -828,8 +898,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     // build is reverified, NOT in kickedBack (featureSurface uncomputable —
     // fail-closed set, includes the judged audits per the ADR amendment)
     expect(r.kickedBack).toEqual([
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -870,8 +941,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     // fail-closed set, includes the judged audits per the ADR amendment)
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -914,8 +986,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     // uncomputable here too — fail-closed set includes the judged audits)
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -958,8 +1031,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     // uncomputable here too, so the fail-closed set still includes the
     // judged audits (ADR amendment) regardless of ranManualTest.
     expect(r.kickedBack).toEqual([
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'prd_audit',
       'architecture_review_as_built',
     ]);
@@ -999,8 +1073,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     // audits (featureSurface uncomputable, ADR amendment).
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'prd_audit',
       'architecture_review_as_built',
     ]);
@@ -1144,11 +1219,12 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
 
     const byGate = Object.fromEntries(preserved.map((e) => [e.gate, e]));
     expect(Object.keys(byGate).sort()).toEqual(
-      ['prd_audit', 'architecture_review_as_built'].sort(),
+      ['coverage_binding', 'prd_audit', 'architecture_review_as_built'].sort(),
     );
     // prd_audit now has a document-input surface as well as feature runtime,
     // so its non-enumerable declaration uses the broad surface sentinel.
     expect(byGate.prd_audit.surface).toEqual(['<all runtime source>']);
+    expect(byGate.coverage_binding.surface).toEqual(['<all runtime source>']);
     // The as-built review remains feature-runtime scoped; its test path is
     // excluded from the declared source surface.
     expect(byGate.architecture_review_as_built.surface).toEqual(['src/feature.ts']);
@@ -1159,12 +1235,117 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
       'src/feature.test.ts',
       'src/foreign.ts',
     ]);
+    expect(byGate.coverage_binding.deltaConsidered).toEqual([
+      'src/feature.test.ts',
+      'src/foreign.ts',
+    ]);
     // The as-built review only considers feature runtime source and sees no
     // matching delta.
     expect(byGate.architecture_review_as_built.deltaConsidered).toEqual([]);
     // Invalidated gates must not appear in the preserved set.
     expect(byGate.build_review).toBeUndefined();
     expect(byGate.manual_test).toBeUndefined();
+  });
+
+  it('preserves a within-budget test-suite PASS through the rebase-preserved event', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'changed',
+      changedCodePaths: ['src/feature.ts'],
+      featureSurface: ['src/feature.ts'],
+    };
+    const verdict = await applyRebaseVerdicts(dir, outcome, false, async (step) =>
+      step === 'test_suite'
+        ? { done: true, preservationBasis: 'test_suite_drift_budget' }
+        : { done: false },
+    );
+    const events = new ConductorEventEmitter();
+    const preserved: Array<Record<string, unknown>> = [];
+    const invalidated: string[] = [];
+    events.on('rebase_gate_preserved', (event) => {
+      if (event.type === 'rebase_gate_preserved') preserved.push(event);
+    });
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') invalidated.push(event.gate);
+    });
+
+    await emitGateInvalidationEvents(events, outcome, false, verdict.preserved ?? []);
+
+    expect(verdict).toEqual(expect.objectContaining({
+      kickedBack: expect.not.arrayContaining(['test_suite']),
+      preserved: [{ gate: 'test_suite', basis: 'test_suite_drift_budget' }],
+    }));
+    expect(preserved).toContainEqual(expect.objectContaining({
+      gate: 'test_suite',
+      basis: 'test_suite_drift_budget',
+    }));
+    expect(invalidated).not.toContain('test_suite');
+  });
+
+  /**
+   * S7.5: when `featureSurface` is uncomputable, `applyRebaseVerdicts` falls
+   * back to legacy invalidate-all — but its pre-verify still runs, so a
+   * `test_suite` PASS can be preserved within budget on that very lap. The
+   * emitter returned before reading `preverifiedPreserved`, so that
+   * preservation reached the spine as nothing at all: no invalidation (it was
+   * not invalidated) and no preservation event either. The classification-
+   * derived events genuinely cannot be computed without F, but a
+   * pre-verified preservation is known independently of F and must still be
+   * observable with its budget basis.
+   */
+  it('S7.5: emits the preserved event with its basis when featureSurface is uncomputable', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'changed',
+      changedCodePaths: ['src/feature.ts'],
+      featureSurface: undefined,
+    };
+    const verdict = await applyRebaseVerdicts(dir, outcome, false, async (step) =>
+      step === 'test_suite'
+        ? { done: true, preservationBasis: 'test_suite_drift_budget' }
+        : { done: false },
+    );
+    const events = new ConductorEventEmitter();
+    const preserved: Array<Record<string, unknown>> = [];
+    const invalidated: string[] = [];
+    events.on('rebase_gate_preserved', (event) => {
+      if (event.type === 'rebase_gate_preserved') preserved.push(event);
+    });
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') invalidated.push(event.gate);
+    });
+
+    await emitGateInvalidationEvents(events, outcome, false, verdict.preserved ?? []);
+
+    expect(preserved).toContainEqual(expect.objectContaining({
+      gate: 'test_suite',
+      basis: 'test_suite_drift_budget',
+    }));
+    // A preserved gate is never also reported invalidated.
+    expect(invalidated).not.toContain('test_suite');
+  });
+
+  /**
+   * S7.5 negative: with no pre-verified preservation there is nothing knowable
+   * without F, so the uncomputable-surface path stays the documented no-op —
+   * the fix must not start inventing classification events.
+   */
+  it('S7.5: stays a no-op on an uncomputable surface with no pre-verified preservation', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'changed',
+      changedCodePaths: ['src/feature.ts'],
+      featureSurface: undefined,
+    };
+    const events = new ConductorEventEmitter();
+    const seen: string[] = [];
+    events.on('rebase_gate_preserved', (event) => {
+      if (event.type === 'rebase_gate_preserved') seen.push(event.gate);
+    });
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') seen.push(event.gate);
+    });
+
+    await emitGateInvalidationEvents(events, outcome, false, []);
+
+    expect(seen).toEqual([]);
   });
 
   it('Task 6: delta-aware — feature runtime source changed → all judged gates invalidated including audits', async () => {
@@ -1186,6 +1367,7 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     expect(r.satisfied).toBe(true);
     expect(r.kickedBack).toEqual([
       'build',
+      'coverage_binding',
       'build_review',
       'test_suite',
       'manual_test',
@@ -1225,8 +1407,9 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
 
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -1821,7 +2004,7 @@ describe('engine/rebase — performRebase translateAfterRebase capability (Task 
     });
     if (outcome.kind === 'changed' && outcome.featureSurface) {
       expect(classifyGateInvalidation(outcome.changedCodePaths, outcome.featureSurface, true)).toEqual({
-        invalidated: ['build_review', 'test_suite', 'manual_test', 'prd_audit', 'architecture_review_as_built'],
+        invalidated: ['coverage_binding', 'build_review', 'test_suite', 'manual_test', 'prd_audit', 'architecture_review_as_built'],
         preserved: [],
       });
     }
@@ -1894,8 +2077,9 @@ describe('engine/rebase — Task 10: fail-closed on uncomputable F (real git)', 
     // audits, not just the pre-#655 fixed four.
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -1948,8 +2132,9 @@ describe('engine/rebase — Task 10: fail-closed on uncomputable F (real git)', 
     // audits, not just the pre-#655 fixed four.
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
@@ -2037,8 +2222,9 @@ describe('engine/rebase — Task 11: fail-closed on uncomputable D (real git)', 
     // audits, not just the pre-#655 fixed four.
     expect(r.kickedBack).toEqual([
       'build',
-      'test_suite',
+      'coverage_binding',
       'build_review',
+      'test_suite',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',

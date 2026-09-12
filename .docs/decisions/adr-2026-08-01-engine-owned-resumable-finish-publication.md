@@ -58,6 +58,11 @@ The coordinator never guesses a ship outcome.
 - Interactive conduct supplies operator-confirmed intent through the FINISH interaction.
 - Daemon mode supplies the existing authorized PR-only policy.
 - Foreground automatic mode supplies its existing safe PR-or-keep policy based on configured remote and authenticated publication capability.
+
+> **Amended 2026-08-26 by #1436:** foreground automatic mode is no longer reachable from
+> the CLI — `inline --auto` rejects and exits 1 since #1509. The `mode: 'auto'` PR-or-keep
+> policy above survives solely as daemon-dispatched behavior (`daemon-cli.ts` constructs the
+> Conductor with `mode: 'auto'`); the policy itself is unchanged.
 - Merge-local, discard, merge, and any ambiguous or destructive choice require operator authority and cannot be synthesized unattended.
 
 An absent or refused intent produces a typed human-decision result and leaves the final marker unwritten. This replaces marker absence as an overloaded refusal signal with an explicit refusal/halt disposition while preserving fail-closed completion.
@@ -78,6 +83,13 @@ Each transition is observe-before-act and verify-after-write. A retry resumes at
 ### D4 — Judgment remains authoritative for reader-facing prose
 
 The provider session receives a bounded PR-title/body task against the already-known PR and final branch content. It does not push, finalize the changelog, create shipped evidence, or write completion markers. Existing prose-quality checks remain blocking, with their bounded fallback policy unchanged unless a later ADR explicitly changes it.
+
+> **Amended 2026-08-28 by #2006:** the escape clause above is exercised by the 2026-08-28 amendment
+> to `adr-2026-08-13-a-publication-transition-advances-only-when-it-moves-the-dimension-it-owns`:
+> the closed publication snapshot's prose vocabulary gains a `revision_required` member, derived at
+> observation time from the persisted judgment store, so a judged-deficient body routes back to the
+> authoring transition instead of deadlocking. D1's observation-derived routing is unchanged — the
+> new member widens what observation can express; no disposition steers routing.
 
 Interactive Claude conduct remains conversational: the host gathers intent and can discuss prose or blockers, while the coordinator performs only the resulting deterministic actions.
 

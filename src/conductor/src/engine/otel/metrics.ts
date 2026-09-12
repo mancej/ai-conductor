@@ -1,99 +1,271 @@
 /**
- * MetricsRecorder — step duration/retry/token metrics for the OTel visualizer.
+ * MetricsRecorder — run, dispatch, step, and feature metrics for the OTel visualizer.
  *
  * Instruments (FR-5):
  *  - conductor.step.duration  — Histogram (ms, per step)
  *  - conductor.step.retries   — Counter (per step, only when retryCount > 0)
- *  - conductor.step.tokens    — Counter (per step × kind, only when tokenUsage present)
+ *  - conductor.step.dispatches — Counter (per authoritative dispatch)
+ *  - conductor.feature.cost   — Gauge (authoritative cumulative feature total)
+ *  - conductor.feature.step.cost — Gauge (cumulative feature cost per dimension)
+ *  - conductor.feature.step.tokens — Gauge (cumulative feature tokens per dimension)
+ *  - conductor.run.outcomes   — Counter (once per opened run, by terminal outcome)
  *
  * All record/add calls are synchronous (enqueue to PeriodicExportingMetricReader).
- * TokenUsage absent → no data points (no NaN / zero-fill). Partial kinds
- * (input/output only) → only present kinds recorded.
+ * Snapshot token buckets with absent kinds → no data points (no NaN / zero-fill).
  */
-import type { Meter, Counter, Histogram } from '@opentelemetry/api';
+import type { Attributes, Meter, Counter, Gauge, Histogram } from '@opentelemetry/api';
 import type { TokenUsage } from '../../execution/llm-provider.js';
 import type { ConductorEvent } from '../../types/events.js';
+import type { RunOutcome } from './span-manager.js';
+import { classifyMetering } from '../metering.js';
+import type { DispatchMeteringObservation } from '../dispatch-metering.js';
+
+/** Explicit duration histogram boundaries, from 10 ms through 8 hours. */
+export const DURATION_BUCKET_BOUNDARIES_MS = [
+  10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000,
+  30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+  3_600_000, 7_200_000, 14_400_000, 28_800_000,
+];
+
+/** Labels owned by Conductor rather than an operator-supplied attribute map. */
+export const RESERVED_CONDUCTOR_LABEL_KEYS = ['project', 'worker', 'feature', 'step'] as const;
+
+export interface DispatchDimensions {
+  model?: string;
+  effort?: string;
+  provider?: string;
+  tier?: string;
+  fallback?: boolean;
+}
+
+const STEP_DIMENSION_KEYS = ['model', 'effort', 'provider', 'tier'] as const;
+const DISPATCH_DIMENSION_KEYS = [...STEP_DIMENSION_KEYS, 'fallback'] as const;
+type DimensionKeys = readonly (keyof DispatchDimensions)[];
+
+type DispatchDimensionEvent = Extract<ConductorEvent, {
+  type: 'provider_attempt' | 'step_completed' | 'step_failed' | 'step_retry';
+}>;
+
+/** Project event and dispatch-observation fields into metric-safe dimensions. */
+export function dispatchDimensionsFrom(
+  event: DispatchDimensionEvent,
+  observation?: DispatchMeteringObservation,
+): DispatchDimensions {
+  const eventModel = 'model' in event ? event.model : undefined;
+  const eventProvider = event.type === 'step_completed'
+    ? event.actualProvider
+    : 'provider' in event ? event.provider : undefined;
+  const provider = eventProvider ?? observation?.provider;
+  const preferredProvider = 'preferredProvider' in event
+    ? event.preferredProvider ?? observation?.preferredProvider
+    : observation?.preferredProvider;
+  return {
+    ...(eventModel !== undefined || observation?.model !== undefined
+      ? { model: eventModel ?? observation?.model }
+      : {}),
+    ...('effort' in event && event.effort !== undefined ? { effort: event.effort } : {}),
+    ...(provider !== undefined ? { provider } : {}),
+    ...('tier' in event && event.tier !== undefined ? { tier: event.tier } : {}),
+    ...(preferredProvider !== undefined && provider !== undefined
+      ? { fallback: preferredProvider !== provider }
+      : {}),
+  };
+}
 
 export class MetricsRecorder {
-  private readonly durationHistogram: Histogram;
-  private readonly retriesCounter: Counter;
-  private readonly tokensCounter: Counter;
-  private readonly closeoutDurationHistogram: Histogram;
+  private readonly instruments: MetricInstruments;
+  private readonly customAttrs: Attributes;
 
-  constructor(meter: Meter) {
-    this.durationHistogram = meter.createHistogram('conductor.step.duration', {
-      description: 'Duration of conductor steps in milliseconds',
-      unit: 'ms',
-    });
-    this.retriesCounter = meter.createCounter('conductor.step.retries', {
-      description: 'Number of retries per conductor step',
-    });
-    this.tokensCounter = meter.createCounter('conductor.step.tokens', {
-      description: 'Token usage per conductor step',
-    });
-    this.closeoutDurationHistogram = meter.createHistogram('conductor.pipeline.closeout.duration', {
-      description: 'Duration of pipeline closeout obligations in milliseconds',
-      unit: 'ms',
-    });
+  constructor(
+    meter: Meter,
+    private readonly identityAttrs: { project: string; worker: string; feature?: string } = {
+      project: 'unknown',
+      worker: 'unknown',
+    },
+    customAttrs: Attributes = {},
+    instruments?: MetricInstruments,
+  ) {
+    this.instruments = instruments ?? createInstruments(meter);
+    this.customAttrs = Object.fromEntries(
+      Object.entries(customAttrs).filter(([key]) => !RESERVED_CONDUCTOR_LABEL_KEYS.includes(key as typeof RESERVED_CONDUCTOR_LABEL_KEYS[number])),
+    );
   }
 
-  /**
-   * Record metrics when a step closes (completed or failed).
-   *
-   * @param step       - Step name (for metric attributes).
-   * @param durationMs - Wall-clock duration from step_started to close (milliseconds).
-   * @param retryCount - Number of retries for this step execution.
-   * @param tokenUsage - Optional token usage from step_completed; absent → skip.
-   * @param model      - Optional model name from step_completed; when present,
-   *                     tagged onto each token data point's attributes.
-   */
+  /** Bind a feature without creating a second set of OTel instruments. */
+  forFeature(feature: string): MetricsRecorder {
+    return new MetricsRecorder({} as Meter, { ...this.identityAttrs, feature }, this.customAttrs, this.instruments);
+  }
+
   onStepClose(
-    step: string,
-    durationMs: number,
-    retryCount: number,
-    tokenUsage?: TokenUsage,
-    model?: string,
+    step: string, durationMs: number, retryCount: number, tokenUsage?: TokenUsage,
+    recordDispatch?: boolean, dimensions?: DispatchDimensions,
+  ): void;
+  /** @deprecated Pass `recordDispatch` and `dimensions` without a model argument. */
+  onStepClose(
+    step: string, durationMs: number, retryCount: number, tokenUsage?: TokenUsage,
+    legacyModel?: string, recordDispatch?: boolean, dimensions?: DispatchDimensions,
+  ): void;
+  onStepClose(
+    step: string, durationMs: number, retryCount: number, tokenUsage?: TokenUsage,
+    recordDispatchOrLegacyModel?: boolean | string,
+    dimensionsOrRecordDispatch?: DispatchDimensions | boolean,
+    legacyDimensions?: DispatchDimensions,
   ): void {
-    // Duration: always record (even 0 ms is a valid observation).
-    this.durationHistogram.record(durationMs, { step });
-
-    // Retries: skip when zero to avoid meaningless zero data points.
-    if (retryCount > 0) {
-      this.retriesCounter.add(retryCount, { step });
-    }
-
-    // Tokens: only when tokenUsage is present; only present kinds recorded.
-    if (tokenUsage !== undefined && tokenUsage !== null) {
-      this.recordTokens(step, tokenUsage, model);
-    }
-    // tokenUsage absent → no token points (no NaN / zero-fill).
+    const legacySignature = typeof dimensionsOrRecordDispatch === 'boolean';
+    const recordDispatch = typeof recordDispatchOrLegacyModel === 'boolean'
+      ? recordDispatchOrLegacyModel
+      : legacySignature ? dimensionsOrRecordDispatch : true;
+    const dimensions = typeof recordDispatchOrLegacyModel === 'boolean'
+      ? dimensionsOrRecordDispatch as DispatchDimensions | undefined
+      : legacySignature ? legacyDimensions : dimensionsOrRecordDispatch as DispatchDimensions | undefined;
+    const attrs = this.withDimensions({ step }, dimensions, STEP_DIMENSION_KEYS);
+    this.instruments.durationHistogram.record(durationMs, this.withIdentity(attrs));
+    if (retryCount > 0) this.instruments.retriesCounter.add(retryCount, this.withIdentity(attrs));
+    if (recordDispatch) this.onDispatch(step, tokenUsage, dimensions);
   }
 
-  /** Record a pipeline-owned closeout obligation as it is re-emitted on the bus. */
-  onPipelineCloseout(event: Extract<ConductorEvent, { type: 'pipeline_closeout' }>): void {
-    this.closeoutDurationHistogram.record(event.endedAt - event.startedAt, {
-      obligation: event.obligation,
-    });
+  onDispatch(step: string, tokenUsage?: TokenUsage, dimensions?: DispatchDimensions): void;
+  /** @deprecated Pass `dimensions` without a model argument. */
+  onDispatch(step: string, tokenUsage?: TokenUsage, legacyModel?: string, dimensions?: DispatchDimensions): void;
+  onDispatch(
+    step: string, tokenUsage?: TokenUsage, dimensionsOrLegacyModel?: DispatchDimensions | string,
+    legacyDimensions?: DispatchDimensions,
+  ): void {
+    const dimensions = legacyDimensions ?? (
+      typeof dimensionsOrLegacyModel === 'string' ? undefined : dimensionsOrLegacyModel
+    );
+    this.instruments.dispatchesCounter.add(1, this.withIdentity(this.withDimensions(
+      { step, metering: classifyMetering(tokenUsage) }, dimensions, DISPATCH_DIMENSION_KEYS,
+    )));
+  }
+  onRetry(step: string, dimensions?: DispatchDimensions): void {
+    this.instruments.retriesCounter.add(1, this.withIdentity(this.withDimensions(
+      { step }, dimensions, STEP_DIMENSION_KEYS,
+    )));
   }
 
-  /**
-   * Only the four true token-count fields are recorded as "kind" data points.
-   * costUsd/numTurns/durationMs (added to TokenUsage for cost rollup, Task 1)
-   * are NOT token counts and must not be double-counted as counter kinds here.
-   */
-  private static readonly TOKEN_KINDS = [
-    'input',
-    'output',
-    'cacheRead',
-    'cacheCreation',
-  ] as const;
-
-  private recordTokens(step: string, usage: TokenUsage, model?: string): void {
-    for (const kind of MetricsRecorder.TOKEN_KINDS) {
-      const value = usage[kind];
-      if (typeof value === 'number' && !Number.isNaN(value)) {
-        this.tokensCounter.add(value, model ? { step, kind, model } : { step, kind });
+  onFeatureCostSnapshot(event: Extract<ConductorEvent, { type: 'feature_cost_snapshot' }>): void {
+    if (!Number.isFinite(event.costUsd)) return;
+    this.instruments.featureCostGauge.record(event.costUsd, this.withIdentity({ cost_complete: event.costComplete }));
+    for (const bucket of event.byDimension) {
+      if (!Number.isFinite(bucket.costUsd)) continue;
+      const attributes: Record<string, string> = { step: bucket.step };
+      if (bucket.model !== undefined) attributes.model = bucket.model;
+      if (bucket.source !== undefined) attributes.source = bucket.source;
+      this.instruments.featureStepCostGauge.record(bucket.costUsd, this.withIdentity(attributes));
+    }
+    for (const bucket of event.tokensByDimension) {
+      for (const kind of MetricsRecorder.TOKEN_KINDS) {
+        const value = bucket.tokens[kind];
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          const attributes: Record<string, string> = { step: bucket.step, kind };
+          if (bucket.model !== undefined) attributes.model = bucket.model;
+          this.instruments.featureStepTokensGauge.record(value, this.withIdentity(attributes));
+        }
       }
     }
   }
+
+  onFeatureUsageTotal(event: Extract<ConductorEvent, { type: 'feature_usage_total' }>): void {
+    if (Number.isFinite(event.costUsd)) this.instruments.featureCostGauge.record(event.costUsd, this.withIdentity({
+      cost_complete: event.unmeteredDispatches === 0 && (event.costUnmeteredDispatches ?? 0) === 0,
+    }));
+  }
+
+  onPipelineCloseout(event: Extract<ConductorEvent, { type: 'pipeline_closeout' }>): void {
+    this.instruments.closeoutDurationHistogram.record(event.endedAt - event.startedAt, this.withIdentity({ obligation: event.obligation }));
+  }
+
+  onRunClose(outcome: RunOutcome): void { this.instruments.runOutcomesCounter.add(1, this.withIdentity({ outcome })); }
+
+  onMemorySetup(event: Extract<ConductorEvent, { type: 'memory_setup' }>): void {
+    this.instruments.memorySetupCounter.add(1, this.withIdentity({ before: event.before, canonical: event.canonical }));
+  }
+
+  onDaemonBacklog(snapshot: Extract<ConductorEvent, { type: 'daemon_backlog_snapshot' }>): void {
+    for (const state of BACKLOG_STATES) {
+      this.instruments.daemonBacklogGauge.record(snapshot.counts[state], this.withIdentity({ state }));
+      const age = snapshot.oldestAgeSeconds[state];
+      if (typeof age === 'number' && Number.isFinite(age)) this.instruments.daemonOldestAgeGauge.record(age, this.withIdentity({ state }));
+    }
+    this.instruments.daemonSlotsGauge.record(snapshot.slots.busy, this.withIdentity({ state: 'busy' }));
+    this.instruments.daemonSlotsGauge.record(snapshot.slots.free, this.withIdentity({ state: 'free' }));
+    for (const feature of snapshot.inFlight) this.instruments.daemonInflightGauge.record(1, this.withIdentity({ feature }));
+    for (const reason of BLOCK_REASONS) this.instruments.daemonBlockedGauge.record(snapshot.blocked[reason] ? 1 : 0, this.withIdentity({ reason }));
+    this.instruments.daemonPollHistogram.record(snapshot.pollDurationMs, this.withIdentity({}));
+    this.instruments.daemonUpGauge.record(1, this.withIdentity({}));
+  }
+
+  onFeatureDispatch(kind: string): void { this.instruments.featureDispatchesCounter.add(1, this.withIdentity({ kind })); }
+  onFeatureHalt(haltClass: string, step: string): void { this.instruments.featureHaltsCounter.add(1, this.withIdentity({ haltClass, step })); }
+  onFeatureShipped(): void { this.instruments.featureShippedCounter.add(1, this.withIdentity({})); }
+  onFeatureDuration(wallMs?: number, activeMs?: number): void {
+    if (typeof wallMs === 'number' && Number.isFinite(wallMs)) this.instruments.featureWallHistogram.record(wallMs, this.withIdentity({}));
+    if (typeof activeMs === 'number' && Number.isFinite(activeMs)) this.instruments.featureActiveHistogram.record(activeMs, this.withIdentity({}));
+  }
+  onGateVerdict(step: string, outcome: 'pass' | 'fail'): void { this.instruments.gateVerdictsCounter.add(1, this.withIdentity({ step, outcome })); }
+  onKickback(from: string, to: string): void { this.instruments.gateKickbacksCounter.add(1, this.withIdentity({ from, to })); }
+  onStall(reason: string): void { this.instruments.daemonStallsCounter.add(1, this.withIdentity({ reason })); }
+
+  private static readonly TOKEN_KINDS = ['input', 'output', 'cacheRead', 'cacheCreation'] as const;
+  private withDimensions(
+    attrs: Attributes,
+    dimensions: DispatchDimensions | undefined,
+    keys: DimensionKeys,
+  ): Attributes {
+    if (dimensions === undefined) return attrs;
+    const merged = { ...attrs } as Attributes;
+    for (const key of keys) {
+      const value = dimensions[key];
+      if (value !== undefined) merged[key] = value;
+    }
+    return merged;
+  }
+  private withIdentity(attrs: Attributes): Attributes { return { ...this.customAttrs, ...attrs, ...this.identityAttrs }; }
+}
+
+const BACKLOG_STATES = ['eligible', 'waiting', 'blocked', 'gated', 'parked'] as const;
+const BLOCK_REASONS = ['paused', 'build_auth_missing', 'gh_version', 'episode_active'] as const;
+
+interface MetricInstruments {
+  memorySetupCounter: Counter;
+  durationHistogram: Histogram; retriesCounter: Counter; dispatchesCounter: Counter;
+  featureCostGauge: Gauge; featureStepCostGauge: Gauge; featureStepTokensGauge: Gauge;
+  closeoutDurationHistogram: Histogram; runOutcomesCounter: Counter;
+  daemonBacklogGauge: Gauge; daemonOldestAgeGauge: Gauge; daemonSlotsGauge: Gauge; daemonInflightGauge: Gauge;
+  daemonUpGauge: Gauge; daemonBlockedGauge: Gauge; daemonPollHistogram: Histogram; daemonStallsCounter: Counter;
+  featureDispatchesCounter: Counter; featureHaltsCounter: Counter; featureShippedCounter: Counter;
+  featureWallHistogram: Histogram; featureActiveHistogram: Histogram; gateVerdictsCounter: Counter; gateKickbacksCounter: Counter;
+}
+
+function createInstruments(meter: Meter): MetricInstruments {
+  const histogram = (name: string, description: string, unit = 'ms') => meter.createHistogram(name, { description, unit, advice: { explicitBucketBoundaries: DURATION_BUCKET_BOUNDARIES_MS } });
+  const counter = (name: string, description: string) => meter.createCounter(name, { description });
+  const gauge = (name: string, description: string, unit?: string) => meter.createGauge(name, { description, ...(unit ? { unit } : {}) });
+  return {
+    memorySetupCounter: counter('conductor.memory.setup', 'Memory setup observations by prior state and canonical placement'),
+    durationHistogram: histogram('conductor.step.duration', 'Duration of conductor steps in milliseconds; quantiles saturate above 8 h (largest finite bucket boundary)'),
+    retriesCounter: counter('conductor.step.retries', 'Number of retries per conductor step'),
+    dispatchesCounter: counter('conductor.step.dispatches', 'Number of conductor step dispatches classified by metering status'),
+    featureCostGauge: gauge('conductor.feature.cost', 'Authoritative shipped-record cost for a conductor feature', 'usd'),
+    featureStepCostGauge: gauge('conductor.feature.step.cost', 'Authoritative cumulative feature cost by dimension', 'usd'),
+    featureStepTokensGauge: gauge('conductor.feature.step.tokens', 'Authoritative cumulative feature tokens by dimension'),
+    closeoutDurationHistogram: histogram('conductor.pipeline.closeout.duration', 'Duration of pipeline closeout obligations in milliseconds; quantiles saturate above 8 h (largest finite bucket boundary)'),
+    runOutcomesCounter: counter('conductor.run.outcomes', 'Number of conductor runs by terminal outcome'),
+    daemonBacklogGauge: gauge('conductor.daemon.backlog', 'Backlog entries by state'),
+    daemonOldestAgeGauge: gauge('conductor.daemon.backlog.oldest_age', 'Oldest backlog age by state', 's'),
+    daemonSlotsGauge: gauge('conductor.daemon.slots', 'Daemon worker slots by state'),
+    daemonInflightGauge: gauge('conductor.daemon.inflight', 'Daemon features in flight'),
+    daemonUpGauge: gauge('conductor.daemon.up', 'Daemon liveness'),
+    daemonBlockedGauge: gauge('conductor.daemon.blocked_reason', 'Daemon dispatch blockers by reason'),
+    daemonPollHistogram: histogram('conductor.daemon.poll.duration', 'Daemon discovery duration in milliseconds'),
+    daemonStallsCounter: counter('conductor.daemon.stalls', 'Daemon build stalls'),
+    featureDispatchesCounter: counter('conductor.feature.dispatches', 'Feature dispatches'),
+    featureHaltsCounter: counter('conductor.feature.halts', 'Feature halts'),
+    featureShippedCounter: counter('conductor.feature.shipped', 'Feature shipments'),
+    featureWallHistogram: histogram('conductor.feature.duration.wall', 'Feature wall duration in milliseconds'),
+    featureActiveHistogram: histogram('conductor.feature.duration.active', 'Feature active duration in milliseconds'),
+    gateVerdictsCounter: counter('conductor.gate.verdicts', 'Gate verdicts'),
+    gateKickbacksCounter: counter('conductor.gate.kickbacks', 'Gate kickbacks'),
+  };
 }

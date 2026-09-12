@@ -26,10 +26,11 @@ truth and the outcomes are inspectable in the spec PR.
 - Given an idea claimed from GitHub intake with a `Source-Ref` and a `## Desired
   outcome` section, when the per-idea worktree flow begins authoring, then a staged
   intake-outcomes file exists in the worktree's gitignored `.pipeline/` carrying the
-  `Source-Ref` and the verbatim Desired-outcome bullets, before any DECIDE artifact is
-  authored.
+  `Source-Ref` and the Desired-outcome bullets exactly as carried by the claimed Envelope
+  text (the inbound-sanitized projection, adr-2026-09-06-inbound-intake-trust-boundary),
+  before any DECIDE artifact is authored.
 - Given the staged outcomes, when `engineer land` writes the committed
-  `.docs/intake/<plan-stem>.md` marker, then the marker carries the Desired-outcome
+  `.docs/intake/<plan-stem>.md` marker, then the marker carries the staged Desired-outcome
   bullets byte-for-byte alongside `Source-Ref:`/`Owner:`, and no idea-slug-named intake
   file is created.
 - Given a marker rewrite (e.g. owner re-stamp), when `writeIntakeMarker` runs again,
@@ -369,7 +370,7 @@ where it isn't needed and nothing on the happy path.
   new prompt, confirmation, or warning is emitted by the coherence rung (silent pass).
 - Given an S-tier spec (per its `.docs/complexity/` tier), when the DECIDE flow runs,
   then the coherence-check step is skipped, and when land validates, then no coherence
-  artifact is required and no coherence validation runs.
+  artifact is required and only the plan-carried criterion layer runs.
 
 #### Negative Paths
 - Given an S-tier spec with no coherence artifact, when land validates, then land
@@ -380,7 +381,7 @@ where it isn't needed and nothing on the happy path.
 
 ### Done When
 - [ ] Coherence step registered as skippable for tier S; `getSkippableSteps('S')` pinned test updated in the same diff
-- [ ] Land validator engages only when tier ≠ S (tier read from `.docs/complexity/`, same source as the existing tier/artifact check)
+- [ ] Land validator engages the full layer set only when tier ≠ S, and exactly the criterion layer over the plan carrier at S (tier read from `.docs/complexity/`, same source as the existing tier/artifact check)
 - [ ] Coherent-path M/L land output is unchanged except for the validator's silent pass
 
 ## Story 14 — Missing or unreadable evidence blocks exactly like incoherence

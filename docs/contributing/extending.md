@@ -13,6 +13,34 @@ gate, a hook, and a CLI command.
 Paths are relative to the repository root. Engine source lives under `src/conductor/src/`; see
 [code organization](code-organization.md) for the layer map.
 
+## Add a visualizer plugin
+
+Place a plugin in either `~/.ai-conductor/plugins/<name>/` or
+`<project>/.ai-conductor/plugins/<name>/`. The project-local plugin takes precedence when both use
+the same name. Its `plugin.yml` needs `kind: visualizer`, a lowercase-hyphenated `name`, and an
+`entrypoint`; `harness_version` is optional.
+
+The entrypoint's default export may be a `VisualizerPlugin` object or a factory. A factory receives
+`VisualizerFactoryContext` and returns a `VisualizerPlugin` for that run, or `null` when disabled.
+The context supplies the resolved harness config, pipeline directory, shared event emitter, and
+`startContext` identity (`runId`, `project`, `branch`, `feature`, `engineVersion`, and
+`pipelineDir` when available). A plugin object must expose its `name`, `start(emitter, context)`,
+and async `stop()` methods. `start` subscribes to the shared emitter; `stop` unsubscribes and
+flushes any pending export.
+
+Select it in the project configuration:
+
+```yaml
+visualizers:
+  - <name>
+```
+
+Invalid configured names warn and are skipped. A failing factory, malformed factory product, or
+failing `start` also leaves the run running while skipping that visualizer. The built-in `otel`
+visualizer is configured through the separate [`otel`](../reference/configuration.md#otel) block,
+not this list. See [configuration](../reference/configuration.md#visualizers) for selection and
+validation behavior.
+
 ## Add a skill
 
 ### Skill files to change
@@ -22,7 +50,7 @@ Paths are relative to the repository root. Engine source lives under `src/conduc
 2. `src/conductor/src/engine/model-table-metadata.ts` — one of `SKILL_STEP_MAP` (`:72`) when the skill
    maps to a step, `PIN_EXEMPT_SKILLS` (`:87`) when it should never be pin-checked, or
    `EXTRA_MODEL_TABLE_ROWS` (`:126`) for a row with no step behind it.
-3. `HARNESS.md` — regenerated, not hand-edited. Run `bin/generate-model-table` and commit the rewritten
+3. `ARCHITECTURE.md` — regenerated, not hand-edited. Run `bin/generate-model-table` and commit the rewritten
    region between `<!-- BEGIN GENERATED: model-selection-table -->` and
    `<!-- END GENERATED: model-selection-table -->`.
 
@@ -91,7 +119,7 @@ interface VisualizerPlugin {
 
 Register handlers synchronously with `emitter.on(type, handler)` inside `start()`. Do not add emission
 sites or write a parallel event stream. `stop()` must unregister local resources and flush pending
-exports. Both `conduct-ts inline` and `conduct-ts daemon` start every compatible registered visualizer;
+exports. Both `ai-conductor inline` and `ai-conductor daemon` start every compatible registered visualizer;
 there is no visualizer-selection config. Inline also starts the built-in OTel visualizer when OTel is
 enabled. The daemon attaches plugins to its daemon-wide bus, which receives the existing events
 forwarded from feature-scoped buses.
@@ -124,7 +152,7 @@ checklist: add the name first, then fix every type error `npm run typecheck` rep
 | 3 | `src/conductor/src/engine/artifacts.ts:39` | An entry in `STEP_ARTIFACT_GLOBS`. |
 | 4 | `src/conductor/src/engine/provider-model-policy.ts` | `CLAUDE_STEP_MODELS` (`:32`), `CODEX_STEP_MODELS` (`:61`), `STEP_EFFORTS` (`:90`). The composed policies at `:139` and `:155` are deep-frozen. |
 | 5 | `src/conductor/src/engine/resolved-config.ts` | `DEFAULT_STEP_RETRIES` (`:24`), `DEFAULT_STEP_REVIEW` (`:58`), and the mapping in `phaseForStep` (`:397`). |
-| 6 | `src/conductor/src/engine/model-table-metadata.ts` | `STEP_RATIONALE` (`:14`) and, if a skill drives the step, `SKILL_STEP_MAP` (`:72`). Then regenerate HARNESS.md. |
+| 6 | `src/conductor/src/engine/model-table-metadata.ts` | `STEP_RATIONALE` (`:14`) and, if a skill drives the step, `SKILL_STEP_MAP` (`:72`). Then regenerate ARCHITECTURE.md. |
 | 7 | `src/conductor/src/engine/skill-invocation.ts:11` | A `SkillInvocationDescriptor` in `STEP_SKILL_INVOCATIONS` — either `{ kind: 'skill', skillName, arguments }` or `{ kind: 'engine-native' }`. Path resolution happens in `engine/skill-resolver.ts:65`. |
 | 8 (optional) | `src/conductor/src/engine/artifacts.ts` | `CUSTOM_COMPLETION_PREDICATES` (`:1306`) when file globs cannot express completion, and `GATE_ONLY_PREDICATES` (`:2394`) when the step is a gate-loop-only check. Both are `Partial`, so neither errors if you skip it. |
 | 9 (optional) | `src/conductor/src/engine/step-runners.ts:322` | Dispatch behavior in `DefaultStepRunner`. The `StepRunner` interface is `engine/conductor.ts:527`, with `StepRunOptions` at `:477` and `StepRunResult` at `:363`. |
@@ -152,7 +180,7 @@ Use this for a project-specific step. Use the engine path only for a step every 
 ### What catches a step mistake
 
 `npm run typecheck` catches every missed exhaustive record — that is the point of the design. Integrity
-check 5a catches a stale HARNESS.md model table. Nothing catches a missing
+check 5a catches a stale ARCHITECTURE.md model table. Nothing catches a missing
 `CUSTOM_COMPLETION_PREDICATES` entry, because that map is deliberately partial: the step will simply
 complete on artifact globs alone.
 
@@ -233,7 +261,7 @@ nothing else.
 regenerated `.sh`. Editing the `.sh` directly is drift and check 5c will fail.
 
 Hook assets must be plain bash plus inline `node -e` only, with zero references to `dist/` or
-`conduct-ts` — a generated hook has to keep working while the engine is mid-rebuild.
+`ai-conductor` — a generated hook has to keep working while the engine is mid-rebuild.
 
 ### What catches a hook mistake
 

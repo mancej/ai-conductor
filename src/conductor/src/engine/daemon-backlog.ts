@@ -21,8 +21,10 @@ import type { BlockerResolver, BlockerVerdict } from './blocker-resolver.js';
 import { announceWaitingForRoot } from './daemon-waiting-announce.js';
 import { listShippedRecords, parseShippedRecord, specHash } from './shipped-record.js';
 import type { BacklogTreeSource } from './backlog-tree-source.js';
+import { readGitBlobs, type GitBlobBatchRunner } from './git-blob-batch.js';
 import { resolvePlanStoriesPath } from './plan-stories-reference.js';
 import { isOperatorParked as readOperatorParkMarker } from './park-marker.js';
+import { parseCoherenceArtifact } from './coherence-parse.js';
 import {
   healPlan,
   enumerateCandidates,
@@ -59,15 +61,42 @@ export type { BacklogTreeSource } from './backlog-tree-source.js';
  * and artifacts that live only on an unmerged `spec/<slug>` branch are invisible
  * — the daemon builds a spec only once its PR is merged onto `baseBranch`.
  */
-export function gitTreeSource(projectRoot: string, baseBranch: string): BacklogTreeSource {
+export interface GitTreeSourceOptions {
+  /** Test seam for observing the one batched committed-blob read per scan. */
+  blobRunner?: GitBlobBatchRunner;
+  /** Test seam for observing committed-tree Git reads outside the batch reader. */
+  gitRunner?: (args: string[]) => Promise<{ stdout: string }>;
+}
+
+export function gitTreeSource(
+  projectRoot: string,
+  baseBranch: string,
+  options: GitTreeSourceOptions = {},
+): BacklogTreeSource {
+  let prefetchedDocs: Promise<Map<string, string>> | undefined;
+  const runGit = options.gitRunner ?? (async (args: string[]) => {
+    const { stdout } = await execFile('git', args, { cwd: projectRoot });
+    return { stdout: stdout.toString() };
+  });
+
+  const prefetchDocs = () => {
+    prefetchedDocs ??= (async () => {
+      try {
+        const { stdout } = await runGit(['ls-tree', '-r', '-z', '--name-only', baseBranch, '--', '.docs']);
+        const paths = stdout.split('\0').filter(Boolean);
+        const blobs = await readGitBlobs(projectRoot, baseBranch, paths, { runner: options.blobRunner });
+        return new Map([...blobs].map(([path, content]) => [path, content.toString('utf8')]));
+      } catch {
+        return new Map<string, string>();
+      }
+    })();
+    return prefetchedDocs;
+  };
+
   return {
     async listPlanFiles() {
       try {
-        const { stdout } = await execFile(
-          'git',
-          ['ls-tree', '--name-only', `${baseBranch}:.docs/plans`],
-          { cwd: projectRoot },
-        );
+        const { stdout } = await runGit(['ls-tree', '--name-only', `${baseBranch}:.docs/plans`]);
         return stdout
           .split('\n')
           .map((l) => l.trim())
@@ -81,11 +110,7 @@ export function gitTreeSource(projectRoot: string, baseBranch: string): BacklogT
     },
     async listShippedFiles() {
       try {
-        const { stdout } = await execFile(
-          'git',
-          ['ls-tree', '--name-only', `${baseBranch}:.docs/shipped`],
-          { cwd: projectRoot },
-        );
+        const { stdout } = await runGit(['ls-tree', '--name-only', `${baseBranch}:.docs/shipped`]);
         return stdout
           .split('\n')
           .map((l) => l.trim())
@@ -97,11 +122,7 @@ export function gitTreeSource(projectRoot: string, baseBranch: string): BacklogT
     },
     async listAdrFiles() {
       try {
-        const { stdout } = await execFile(
-          'git',
-          ['ls-tree', '--name-only', `${baseBranch}:.docs/decisions`],
-          { cwd: projectRoot },
-        );
+        const { stdout } = await runGit(['ls-tree', '--name-only', `${baseBranch}:.docs/decisions`]);
         return stdout
           .split('\n')
           .map((l) => l.trim())
@@ -112,13 +133,14 @@ export function gitTreeSource(projectRoot: string, baseBranch: string): BacklogT
       }
     },
     async readFile(relPath) {
+      const docs = await prefetchDocs();
+      if (relPath.startsWith('.docs/')) return docs.get(relPath) ?? null;
+
       try {
-        const { stdout } = await execFile('git', ['show', `${baseBranch}:${relPath}`], {
-          cwd: projectRoot,
-        });
+        const { stdout } = await runGit(['show', `${baseBranch}:${relPath}`]);
         return stdout;
       } catch {
-        return null; // absent from the base-branch tree
+        return null;
       }
     },
   };
@@ -178,10 +200,10 @@ async function probeBehindOrigin(
  * from a possibly-stale working tree (which diverged whenever local lagged
  * origin), the daemon keeps its local default branch current and builds from it.
  *
- * Called on the daemon's idle poll ONLY (`refresh === true`) — never while
- * features are in flight — so an in-flight build is never advanced mid-run. It
- * also never touches worktree checkouts: those are separate working trees, so a
- * fast-forward of the main checkout cannot disturb a running feature.
+ * Called through the dispatcher maintenance policy when `refresh === true`,
+ * including a free slot while other executors run. In-flight orders pin their
+ * base SHA and this operation never touches worktree checkouts, so advancing
+ * the main checkout cannot re-base or otherwise disturb a running feature.
  *
  * SAFE by construction — side-effecting but it never clobbers operator state and
  * NEVER throws:
@@ -382,6 +404,22 @@ export async function fastForwardRoot(
 
         // Emit full WARN if fingerprint changed or if this is the first call
         if (shouldEmitFull) {
+          if (plan.reason === 'no common candidate branch explains all files') {
+            const dirtyEntries = plan.classifications?.map(({ path }) => path).sort() ?? [];
+            const candidateBranches = [
+              ...new Set(
+                plan.classifications?.flatMap(({ allExplainedBy, explainedBy }) =>
+                  allExplainedBy?.length ? allExplainedBy : explainedBy ? [explainedBy] : [],
+                ) ?? [],
+              ),
+            ].sort();
+            log(
+              `WARN FAST_FORWARD_REFUSED_MULTI_BRANCH_LEAK: all-or-nothing heal refused; ` +
+                `dirty entries: ${dirtyEntries.join(', ')}; ` +
+                `candidate branches: ${candidateBranches.join(', ')}; ` +
+                `no files restored or deleted; skipping fast-forward.`,
+            );
+          }
           const warnMsg = renderLeakSuspectWarn(status.stdout, plan);
           log(warnMsg);
         } else {
@@ -682,44 +720,6 @@ export function undatedStem(stem: string): string {
   return stem.replace(/^\d{4}-\d{2}-\d{2}-(?=.)/, '');
 }
 
-/**
- * Discovery deliberately performs only the shallow coherence-artifact check:
- * a Markdown table needs a header, separator, and at least one data row. Deep
- * coverage and claim validation belongs to `coherence-validator` at land.
- */
-function hasCoherenceTableDataRow(content: string | null): boolean {
-  if (content === null || content.trim().length === 0) return false;
-
-  const rows = content.split(/\r?\n/).map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) return null;
-    return trimmed
-      .slice(1, -1)
-      .split('|')
-      .map((cell) => cell.trim());
-  });
-
-  for (let index = 0; index + 2 < rows.length; index += 1) {
-    const header = rows[index];
-    const separator = rows[index + 1];
-    const data = rows[index + 2];
-    if (
-      header === null ||
-      separator === null ||
-      data === null ||
-      header.length === 0 ||
-      header.length !== separator.length ||
-      header.length !== data.length ||
-      !separator.every((cell) => /^:?-{2,}:?$/.test(cell))
-    ) {
-      continue;
-    }
-    return true;
-  }
-
-  return false;
-}
-
 export async function discoverBacklog(
   projectRoot: string,
   isProcessed: (slug: string) => Promise<boolean> = async () => false,
@@ -927,7 +927,7 @@ export async function discoverBacklog(
     const storiesRel = storiesRef.path;
 
     // Carry the engineer-assessed complexity tier so the daemon build honors it
-    // (Small skips acceptance_specs/retro). Resolve it before vetting so those
+    // (Small skips acceptance_specs). Resolve it before vetting so those
     // checks can use it. The marker is committed at
     // `.docs/complexity/<plan-stem>.md` — the SAME stem as the plan — and
     // `slug` plus the base-branch tree source are unchanged through the vetting
@@ -1012,24 +1012,25 @@ export async function discoverBacklog(
       continue;
     }
 
-    // The coherence artifact is mandatory for every non-S tier. This remains
-    // intentionally shallow: discovery has only the base-branch tree, while
-    // the semantic validator needs a change set and runs at land.
+    // The coherence artifact is mandatory for every non-S tier. Discovery
+    // shares the structural parser with land; semantic validation still needs
+    // a change set and runs at land.
     const coherenceContent = await tree.readFile(`.docs/coherence/${slug}.md`);
-    if (
-      tier !== 'S' &&
-      !hasCoherenceTableDataRow(coherenceContent)
-    ) {
+    const coherence = parseCoherenceArtifact(coherenceContent);
+    if (tier !== 'S' && !coherence.ok) {
+      const detail = coherence.detail
+        ? ` Detail: line ${coherence.detail.line}: ${coherence.detail.message}.`
+        : '';
       blockedItems.push({
         slug,
         reason: 'missing-coherence',
-        remedy: `Author a valid coherence table in .docs/coherence/${slug}.md on the default branch.`,
+        remedy: `Author a valid coherence table in .docs/coherence/${slug}.md on the default branch.${detail}`,
       });
       await warnOnce(
         slug,
         `skip ${slug}: merged spec cannot build — missing or unparseable coherence artifact ` +
           `(.docs/coherence/${slug}.md) required for tier ${tier ?? 'unresolved'}. ` +
-          'Author it on the default branch; logged once.',
+          `Author it on the default branch; logged once.${detail}`,
       );
       continue;
     }
@@ -1171,7 +1172,14 @@ export async function discoverBacklog(
     // A fresh worktree is cut from the (now fast-forwarded) default branch, so the
     // vetted stories/plan physically exist in it already — the item only needs to
     // carry the slug (+ tier + sourceRef + track); no working-tree paths to copy.
-    items.push({ slug, tier, ...(sourceRef ? { sourceRef } : {}), ...(track ? { track } : {}) });
+    items.push({
+      slug,
+      planPath: planRel,
+      storiesPath: storiesRel,
+      tier,
+      ...(sourceRef ? { sourceRef } : {}),
+      ...(track ? { track } : {}),
+    });
   }
 
   // Dependency gate — the final gauntlet step, run AFTER content eligibility and

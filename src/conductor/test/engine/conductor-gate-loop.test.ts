@@ -22,6 +22,198 @@ const FIXTURES = join(
   'rebase-invalidated-test-suite-proof-halts-build-review',
 );
 
+describe('Conductor test-suite member evidence events', () => {
+  async function runTestSuiteStep(
+    verification: Awaited<ReturnType<FullSuiteVerifier['ensure']>>,
+    inspection: Awaited<ReturnType<FullSuiteVerifier['inspect']>> = {
+      status: 'CURRENT',
+      evidence: {} as never,
+    },
+  ) {
+    const events = new ConductorEventEmitter();
+    const emitted: unknown[] = [];
+    const recordPreservation = vi.fn(async () => undefined);
+    events.on('test_suite_verification', (event) => { emitted.push(event); });
+    events.on('build_member_evidence_reused', (event) => { emitted.push(event); });
+    events.on('build_member_evidence_recomputed', (event) => { emitted.push(event); });
+    const conductor = new Conductor({
+      projectRoot: '/test-suite-member-evidence-events',
+      stateFilePath: '/test-suite-member-evidence-events/conduct-state.json',
+      stepRunner: { run: async () => ({ success: true }) },
+      events,
+      fullSuiteVerifier: {
+        inspect: async () => inspection,
+        ensure: async () => verification,
+        recordPreservation,
+      },
+    });
+
+    const result = await (conductor as unknown as {
+      runTestSuiteStep: () => Promise<unknown>;
+    }).runTestSuiteStep();
+
+    return { emitted, result };
+  }
+
+  it.each([
+    {
+      verification: { status: 'REUSED', evidence: {} as never },
+      event: {
+        type: 'build_member_evidence_reused',
+        member: 'test_suite',
+        decision: 'reuse',
+        basis: 'fingerprint-match',
+        mode: 'aggregate',
+      },
+    },
+    {
+      verification: {
+        status: 'EXECUTED',
+        freshness: { status: 'STALE', reason: 'fingerprint_mismatch' },
+        evidence: {} as never,
+      },
+      event: {
+        type: 'build_member_evidence_recomputed',
+        member: 'test_suite',
+        decision: 'recompute',
+        basis: 'fingerprint-mismatch',
+      },
+    },
+    {
+      verification: {
+        status: 'EXECUTED',
+        freshness: { status: 'STALE', reason: 'source_changed' },
+        evidence: {} as never,
+      },
+      event: {
+        type: 'build_member_evidence_recomputed',
+        member: 'test_suite',
+        decision: 'recompute',
+        basis: 'fresh-evidence-required',
+      },
+    },
+  ] as const)('emits the settled BUILD-member outcome for $verification.status evidence', async ({ verification, event }) => {
+    const { emitted } = await runTestSuiteStep(verification);
+
+    expect(emitted).toEqual([event]);
+  });
+
+  it('emits the scoped-empty aggregate route on the existing verification event', async () => {
+    const { emitted } = await runTestSuiteStep(
+      {
+        status: 'EXECUTED',
+        freshness: { status: 'STALE', reason: 'source_changed' },
+        evidence: {
+          mode: 'scoped',
+          selectors: [],
+          executionBasis: 'scoped-empty-selection-aggregate',
+        } as never,
+      },
+      { status: 'STALE', reason: 'source_changed' },
+    );
+
+    expect(emitted).toEqual([
+      {
+        type: 'test_suite_verification',
+        freshness: { status: 'STALE', reason: 'source_changed' },
+        mode: 'scoped',
+        executionBasis: 'scoped-empty-selection-aggregate',
+      },
+      {
+        type: 'build_member_evidence_recomputed',
+        member: 'test_suite',
+        decision: 'recompute',
+        basis: 'fresh-evidence-required',
+      },
+    ]);
+  });
+
+  it('emits the preserved-within-budget verdict with its drift categories', async () => {
+    const categories = { source: 3 };
+    const { emitted } = await runTestSuiteStep(
+      {
+        status: 'REUSED',
+        evidence: { mode: 'scoped', driftLedger: [{ categories }] } as never,
+      },
+      {
+        status: 'PRESERVED_WITHIN_BUDGET',
+        evidence: { driftLedger: [{ categories }] } as never,
+      },
+    );
+
+    expect(emitted).toEqual([
+      {
+        type: 'test_suite_verification',
+        freshness: { status: 'CURRENT' },
+        mode: 'scoped',
+        budgetVerdict: { outcome: 'preserved_within_budget', categories },
+      },
+      {
+        type: 'build_member_evidence_reused',
+        member: 'test_suite',
+        decision: 'reuse',
+        basis: 'fingerprint-match',
+        mode: 'scoped',
+      },
+    ]);
+  });
+
+  it('emits the budget category that forced an exhausted rerun', async () => {
+    const inspection = {
+      status: 'STALE',
+      reason: 'drift_budget_exceeded',
+      category: 'source',
+      count: 6,
+      bound: 5,
+    } as const;
+    const { emitted } = await runTestSuiteStep(
+      {
+        status: 'EXECUTED',
+        freshness: inspection,
+        evidence: { mode: 'aggregate' } as never,
+      },
+      inspection,
+    );
+
+    expect(emitted).toEqual([
+      {
+        type: 'test_suite_verification',
+        freshness: inspection,
+        mode: 'aggregate',
+        budgetVerdict: {
+          outcome: 'rerun_required',
+          reason: 'drift_budget_exceeded',
+          category: 'source',
+          count: 6,
+          bound: 5,
+        },
+      },
+      {
+        type: 'build_member_evidence_recomputed',
+        member: 'test_suite',
+        decision: 'recompute',
+        basis: 'fresh-evidence-required',
+      },
+    ]);
+  });
+
+  it.each([
+    {
+      status: 'FAILED',
+      reason: 'execution_failed',
+      message: 'suite failed',
+    },
+    {
+      status: 'UNEXPECTED',
+      message: 'suite returned an invalid status',
+    },
+  ] as const)('does not emit a settled BUILD-member outcome for $status evidence', async (verification) => {
+    const { emitted } = await runTestSuiteStep(verification as never);
+
+    expect(emitted).toEqual([]);
+  });
+});
+
 describe('conductor gate loop: stale test-suite proof after rebase', () => {
   let projectRoot: string;
 
@@ -36,7 +228,10 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
   async function installFixture(name: 'unsatisfied-verdict' | 'satisfied-verdict'): Promise<string> {
     const source = join(FIXTURES, name);
     await cp(source, projectRoot, { recursive: true });
-    return join(projectRoot, 'conduct-state.json');
+    const stateFilePath = join(projectRoot, 'conduct-state.json');
+    const state = JSON.parse(await readFile(stateFilePath, 'utf8')) as ConductState;
+    await writeFile(stateFilePath, JSON.stringify({ ...state, coverage_binding: 'done' }));
+    return stateFilePath;
   }
 
   function staleSuiteVerifier(
@@ -93,9 +288,9 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
       complexity_tier: 'S',
       track: 'technical',
       worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
-      conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
+      conflict_check: 'skipped', plan: 'done', coherence_check: 'done', coverage_binding: 'done', architecture_diagram: 'skipped',
       architecture_review: 'skipped', acceptance_specs: 'skipped',
-      build: 'done', wiring_check: 'skipped', test_suite: 'done', build_review: 'pending',
+      build: 'done',  test_suite: 'done', build_review: 'pending',
     } satisfies Partial<ConductState>));
     return { stateFilePath, head };
   }
@@ -149,7 +344,11 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
         ensure: async () => {
           observed.push('test_suite');
           current = true;
-          return { status: 'EXECUTED', evidence: {} as never } as never;
+          return {
+            status: 'EXECUTED',
+            freshness: { status: 'STALE', reason: 'fingerprint_mismatch' },
+            evidence: {} as never,
+          } as never;
         },
       },
     });
@@ -184,7 +383,11 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
         ensure: async () => {
           observed.push('test_suite');
           current = true;
-          return { status: 'EXECUTED', evidence: {} as never } as never;
+          return {
+            status: 'EXECUTED',
+            freshness: { status: 'STALE', reason: 'fingerprint_mismatch' },
+            evidence: {} as never,
+          } as never;
         },
       },
     });
@@ -223,6 +426,54 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
     expect(observed).toEqual(['build_review']);
     expect(inspect).toHaveBeenCalledTimes(1);
     expect(ensure).not.toHaveBeenCalled();
+  });
+
+  it('records and emits a preserved completion recheck once, but neither for CURRENT', async () => {
+    const events = new ConductorEventEmitter();
+    const verificationEvents: unknown[] = [];
+    events.on('test_suite_verification', (event) => { verificationEvents.push(event); });
+
+    for (const inspection of [
+      { status: 'PRESERVED_WITHIN_BUDGET' as const, evidence: { driftLedger: [{ categories: { source: 1 } }] } as never },
+      { status: 'CURRENT' as const, evidence: {} as never },
+    ]) {
+      const stateFilePath = await installFixture('unsatisfied-verdict');
+      const inspect = vi.fn(async () => inspection);
+      const recordPreservation = vi.fn(async () => undefined);
+      const conductor = new Conductor({
+        projectRoot,
+        stateFilePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'build_review') throw new Error('stop after completion recheck');
+            return { success: true };
+          },
+        },
+        events,
+        resume: true,
+        verifyArtifacts: true,
+        fullSuiteVerifier: {
+          inspect,
+          ensure: vi.fn(async () => ({ status: 'REUSED' as const, evidence: {} as never })),
+          recordPreservation,
+        },
+      });
+
+      await conductor.run();
+
+      expect(inspect).toHaveBeenCalledTimes(1);
+      expect(recordPreservation).toHaveBeenCalledTimes(
+        inspection.status === 'PRESERVED_WITHIN_BUDGET' ? 1 : 0,
+      );
+    }
+
+    expect(verificationEvents).toEqual([
+      expect.objectContaining({
+        type: 'test_suite_verification',
+        freshness: { status: 'CURRENT' },
+        budgetVerdict: { outcome: 'preserved_within_budget', categories: { source: 1 } },
+      }),
+    ]);
   });
 
   it('keeps an all-satisfied resume at its existing no-dispatch endpoint', async () => {
@@ -278,7 +529,7 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
         },
       },
       events: new ConductorEventEmitter(),
-      fromStep: 'wiring_check',
+      fromStep: 'build_review',
       verifyArtifacts: true,
       fullSuiteVerifier: { inspect, ensure: vi.fn() },
     });
@@ -344,12 +595,12 @@ describe('conductor gate loop: stale test-suite proof after rebase', () => {
         },
       },
       events: new ConductorEventEmitter(),
-      fromStep: 'wiring_check',
+      fromStep: 'build_review',
       verifyArtifacts: true,
       config: {
         steps: {
           non_attesting_gate: {
-            after: 'wiring_check',
+            after: 'build_review',
             skill: 'skills/test/SKILL.md',
           },
         },

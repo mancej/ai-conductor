@@ -6,7 +6,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { dispatchEngineer } from '../../../src/engine/engineer-cli.js';
-import { access, mkdir, rm, readFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLedger } from '../../../src/engine/engineer/intake/ledger.js';
 
@@ -19,13 +20,14 @@ describe('engineer unclaim: negative paths (Task 9, 10)', () => {
     const opts = (extra: Partial<Parameters<typeof dispatchEngineer>[1]>): Parameters<typeof dispatchEngineer>[1] => ({
       print: (s) => out.push(s),
       printErr: (s) => err.push(s),
+      probeGhVersion: async () => ({ kind: 'ok', version: { major: 2, minor: 73, patch: 0 } }),
       ...extra,
     });
     return { out, err, opts };
   }
 
   it('Task 9: unclaim on a `done` entry refuses, entry unchanged, exit 0, no stderr', async () => {
-    const testDir = `/tmp/unclaim-neg-test-${Date.now()}-${Math.random()}`;
+    const testDir = await mkdtemp(join(tmpdir(), 'unclaim-neg-test-'));
     try {
       const engDir = join(testDir, 'engineer');
       await mkdir(engDir, { recursive: true });
@@ -66,7 +68,7 @@ describe('engineer unclaim: negative paths (Task 9, 10)', () => {
   });
 
   it('refuses a claimed entry that already has a PR, preserving the ledger and inbox', async () => {
-    const testDir = `/tmp/unclaim-neg-test-${Date.now()}-${Math.random()}`;
+    const testDir = await mkdtemp(join(tmpdir(), 'unclaim-neg-test-'));
     try {
       const engDir = join(testDir, 'engineer');
       await mkdir(engDir, { recursive: true });
@@ -97,7 +99,7 @@ describe('engineer unclaim: negative paths (Task 9, 10)', () => {
   });
 
   it('Task 10: unclaim on an unknown ref reports not-found as a non-error', async () => {
-    const testDir = `/tmp/unclaim-neg-test-${Date.now()}-${Math.random()}`;
+    const testDir = await mkdtemp(join(tmpdir(), 'unclaim-neg-test-'));
     try {
       const engDir = join(testDir, 'engineer');
       await mkdir(engDir, { recursive: true });

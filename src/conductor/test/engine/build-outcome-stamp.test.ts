@@ -54,6 +54,7 @@ describe('conductor build-outcome baseline capture', () => {
       conflict_check: 'done',
       plan: 'done',
       coherence_check: 'done',
+      coverage_binding: 'done',
       architecture_diagram: 'done',
       architecture_review: 'done',
       acceptance_specs: 'done',
@@ -177,7 +178,6 @@ describe('conductor build-outcome baseline capture', () => {
     expect(started).toContainEqual(expect.objectContaining({ step: 'build' }));
     expect(dispatched).toContain('build_review');
     expect(dispatched.indexOf('build_review')).toBeGreaterThan(dispatched.indexOf('test_suite'));
-    expect(dispatched).not.toContain('wiring_check');
     expect(failed).not.toContainEqual(expect.objectContaining({ step: 'test_suite' }));
     expect(failed).not.toContainEqual(expect.objectContaining({ step: 'build' }));
     expect(completed).toContainEqual(expect.objectContaining({ step: 'build', status: 'done' }));

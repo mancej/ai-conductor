@@ -1,5 +1,5 @@
-import { join } from 'node:path';
-import { rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { mkdir, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 
 export interface TautologyPathClassification {
@@ -47,6 +47,13 @@ export interface TautologyPreflightDependencies {
   readonly writeFile: (path: string, content: string) => Promise<void>;
   /** Removes an added path from the disposable HEAD checkout. */
   readonly removeFile?: (path: string) => Promise<void>;
+  /**
+   * Creates the parent directory of a path about to be written inside the
+   * disposable checkout. A diff that DELETES a directory leaves no parent for
+   * the merge-base file being restored into the counterfactual, so the bare
+   * write fails ENOENT and takes the whole preflight down (#1961).
+   */
+  readonly ensureDir?: (path: string) => Promise<void>;
   /** Executes precisely the supplied changed-test selectors; never an aggregate fallback. */
   readonly runScoped: (cwd: string, selectors: readonly string[], signal: AbortSignal) => Promise<TautologyScopedRunResult>;
   /** Removes the disposable checkout on every outcome. */
@@ -59,6 +66,12 @@ export interface TautologyPreflightDependencies {
   readonly removalMaintenanceSelectors?: RemovalMaintenanceSelectors;
   /** Exact scoped-command template used for the counterfactual. */
   readonly scopedCommand?: string | null;
+  /**
+   * Conservative file selectors chosen by frozen scope analysis. These name
+   * files to execute, not the subset of declarations the reviewer may judge.
+   * When absent, preserve the legacy diff-derived selector behavior.
+   */
+  readonly counterfactualFileSelectors?: readonly string[];
   /** Identity of the CURRENT aggregate green proof this preflight relies on. */
   readonly currentGreenProofIdentity?: string | null;
   /** Cancels the isolated command only; the disposable checkout is still cleaned up. */
@@ -98,12 +111,14 @@ export interface TautologyScopedRunEvidence {
 }
 
 export interface TautologyCompletedPreflight {
-      readonly classification: 'red' | 'stayed-green' | 'approved-exception';
+      readonly classification: 'nonzero-exit' | 'stayed-green' | 'approved-exception';
       readonly exception?: 'empty-test-set' | 'removal-maintenance';
       readonly cacheable: true;
       readonly cacheProvenance: 'hit' | 'miss';
       readonly changedPaths: readonly string[];
       readonly changedTestSelectors: readonly string[];
+      /** Conservative file union actually selected for counterfactual execution. */
+      readonly counterfactualFileSelectors?: readonly string[];
       /** Content-free manifest of the reverted production files. */
       readonly revertedProductionManifest: readonly RevertedProductionFileReference[];
       /** Exact per-selector removal evidence used to exclude a changed test. */
@@ -300,6 +315,9 @@ function cacheKey(deps: TautologyPreflightDependencies, paths: readonly string[]
     removalMaintenanceSelectors: [...(deps.removalMaintenanceSelectors ?? [])].sort(),
     eligibleSelectorRemovals: deps.removalMaintenanceSelectors?.eligibleSelectorRemovals ?? [],
     scopedCommand: deps.scopedCommand ?? null,
+    counterfactualFileSelectors: deps.counterfactualFileSelectors === undefined
+      ? null
+      : [...new Set(deps.counterfactualFileSelectors)].sort(),
     currentGreenProofIdentity: deps.currentGreenProofIdentity ?? null,
   })).digest('hex')}`;
 }
@@ -346,10 +364,17 @@ export async function materializeTautologyPreflight(
   if (cached) return { ...cached, cacheProvenance: 'hit' };
   const eligibleSelectorRemovals = deps.removalMaintenanceSelectors?.eligibleSelectorRemovals ?? [];
   const eligibleRemovalSelectors = new Set(eligibleSelectorRemovals.map(({ selector }) => selector));
-  if (classified.tests.length === 0) return failure('no-changed-tests', paths, classified.tests, sourceIdentities);
+  // The scoped command executes a conservative, frozen file union. It may
+  // include an affected concrete candidate whose file is not itself an
+  // established review target. Keep the diff-derived list as evidence rather
+  // than conflating the two selections.
+  const selectedCounterfactualFiles = deps.counterfactualFileSelectors === undefined
+    ? classified.tests
+    : [...new Set(deps.counterfactualFileSelectors)].sort();
+  if (selectedCounterfactualFiles.length === 0) return failure('no-changed-tests', paths, classified.tests, sourceIdentities);
   const counterfactualSelectors = deps.approvedException === 'removal-maintenance'
-    ? classified.tests.filter((selector) => !eligibleRemovalSelectors.has(selector))
-    : classified.tests;
+    ? selectedCounterfactualFiles.filter((selector) => !eligibleRemovalSelectors.has(selector))
+    : selectedCounterfactualFiles;
   if (deps.approvedException === 'empty-test-set' && classified.tests.length === 0) {
     const completed: TautologyCompletedPreflight = {
       classification: 'approved-exception', exception: deps.approvedException, cacheable: true, cacheProvenance: 'miss',
@@ -372,6 +397,12 @@ export async function materializeTautologyPreflight(
   if (classified.production.length === 0) return failure('no-production-changes', paths, classified.tests, sourceIdentities);
 
   const checkout = join(deps.scopedWorkingDirectory, '.pipeline', 'build-review-preflight', deps.headSha);
+  // Best effort by construction: the write that follows is the authority on
+  // whether a file could be materialized, and it reports the real errno.
+  // Preparing the parent must never become a failure mode of its own.
+  const ensureDir = deps.ensureDir ?? (async (target: string) => {
+    try { await mkdir(dirname(target), { recursive: true }); } catch { /* the write reports the real failure */ }
+  });
   let result: TautologyPreflightResult | undefined;
   try {
     await deps.createCheckout(checkout, deps.headSha);
@@ -400,6 +431,7 @@ export async function materializeTautologyPreflight(
             break;
           }
           manifest.push({ path: renamedFrom, mergeBaseBlobSha: gitBlobSha(oldContent) });
+          await ensureDir(join(checkout, renamedFrom));
           await deps.writeFile(join(checkout, renamedFrom), oldContent);
           await (deps.removeFile ?? ((target) => rm(target, { force: true })))(join(checkout, path));
           continue;
@@ -412,6 +444,7 @@ export async function materializeTautologyPreflight(
         continue;
       }
       manifest.push({ path, mergeBaseBlobSha: gitBlobSha(mergeBaseContent) });
+      await ensureDir(join(checkout, path));
       await deps.writeFile(join(checkout, path), mergeBaseContent);
       if (aborted(signal)) {
         result = failure('aborted', paths, classified.tests, sourceIdentities);
@@ -421,7 +454,7 @@ export async function materializeTautologyPreflight(
     if (!result) {
       try {
         const execution = await deps.runScoped(checkout, counterfactualSelectors, signal);
-        // Exit code zero stays green and any nonzero exit is counterfactual RED.
+        // Exit code zero stays green and any nonzero exit is recorded neutrally.
         // Per #1593, a reverted-tree collection failure is evidence that the
         // changed production matters, not output-derived infrastructure. Only
         // launch, timeout, and signal outcomes remain infrastructure failures.
@@ -437,11 +470,12 @@ export async function materializeTautologyPreflight(
         else if (aborted(signal)) result = failure('aborted', paths, classified.tests, sourceIdentities);
         else {
           result = {
-            classification: execution.exitCode === 0 ? 'stayed-green' : 'red',
+            classification: execution.exitCode === 0 ? 'stayed-green' : 'nonzero-exit',
             cacheable: true,
             cacheProvenance: 'miss',
             changedPaths: paths,
             changedTestSelectors: classified.tests,
+            counterfactualFileSelectors: selectedCounterfactualFiles,
             revertedProductionManifest: manifest,
             eligibleSelectorRemovals,
             sourceIdentities,
@@ -455,12 +489,24 @@ export async function materializeTautologyPreflight(
             },
           };
         }
-      } catch {
-        result = failure(aborted(signal) ? 'aborted' : 'scoped-run-failed', paths, classified.tests, sourceIdentities);
+      } catch (err) {
+        result = failure(
+          aborted(signal) ? 'aborted' : 'scoped-run-failed',
+          paths,
+          classified.tests,
+          sourceIdentities,
+          boundedHeadTailExcerpt(String((err as Error)?.stack ?? err)),
+        );
       }
     }
-  } catch {
-    result = failure(aborted(signal) ? 'aborted' : 'materialization-failed', paths, classified.tests, sourceIdentities);
+  } catch (err) {
+    result = failure(
+      aborted(signal) ? 'aborted' : 'materialization-failed',
+      paths,
+      classified.tests,
+      sourceIdentities,
+      boundedHeadTailExcerpt(String((err as Error)?.stack ?? err)),
+    );
   } finally {
     try {
       await deps.removeCheckout(checkout);

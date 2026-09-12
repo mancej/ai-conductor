@@ -53,6 +53,18 @@ stale-artifact sweep — #817 D4). No reader keeps a private freshness conventio
 routes through `checkStepCompletion` — no peer satisfaction authority is added
 (adr-2026-07-11-verdict-aware-resume-entry D5).
 
+> **Amended 2026-09-06 (hotfix, jstoup111/ai-conductor#2381 follow-up):** D5 is narrowed. A
+> prior-identity artifact is scored `absent` only when its code stamp cannot vouch for it. The
+> `prd_audit` and `architecture_review_as_built` predicates, and the stale-artifact sweep, run the
+> adr-2026-07-22 code-validity check BEFORE the identity check: a verdict whose stamped baseline is
+> reachable (or translates through the engine's own `.pipeline/rebase-rewrites.json` to a reachable
+> rewritten commit) and whose delta misses the gate's surface is preserved across run identities.
+> A halt/resume, or the SHIP-tail `rebase` step replaying the reviewed commits onto a new base, no
+> longer re-runs a review of code that did not change. Identity mismatch still governs any
+> artifact the stamp cannot explain (missing, unstamped, orphaned by an amend/reset, or a surface
+> hit). D3's write handshake and D4's single reader are unchanged. `manual_test` keeps its
+> identity-first order because of the #367 whitewash guard.
+
 **D5 — Mismatch means "no verdict", typed, never routed-on-text.** A missing or
 prior-identity artifact is scored `routeClass: 'absent'` → **rerun** within the existing
 step-retry budget (adr-2026-07-13-retry-classify-rerun-vs-route D1); its findings are never
@@ -81,7 +93,23 @@ condition.
 `verdict_freshness` StepEvent `floorSource` vocabulary (e.g. `run-identity`) and the
 `retry_decision` signal vocabulary. No new event member, no parallel channel.
 
+**D9 amendment (2026-08-26, operator James Stoup).** `retry_decision` carries no enabled
+sink: `event-sinks.ts` has scored it `{ render: false, persist: false, audit: false }` for
+every signal since before this ADR was written, and this feature did not change that file.
+Extending its signal vocabulary therefore adds an *internal typed facet*, not a persisted
+one, and the original clause's promise that the new signal would reach `.pipeline/events.jsonl`
+was mistaken about the channel, not about the design. The persisted, operator-visible surface
+of the identity decision is `verdict_freshness` (`{ render: true, persist: true, audit: true }`),
+which the stale path populates with `floorSource: 'run-identity'` and
+`outcome: 'stale_invalidated'`, alongside the existing `step_retry` event; between them the
+spine already carries which artifact was rejected, why, and both run identities. This ADR
+makes no claim on `retry_decision`'s sink policy — enabling it would change telemetry volume
+for every retry decision in every step and is a separate decision about that channel.
+
 ## Supersessions and amendments
+
+- **Amended 2026-08-26 by operator (James Stoup):** D9's `retry_decision` clause — see the
+  amendment note under the decision. D1–D8 stand unchanged.
 
 - **Supersedes in part:** adr-2026-07-13-session-fresh-verdict-artifacts — its non-goals
   "no session-id stamp inside the artifact" and the manual_test deferral. Its per-attempt

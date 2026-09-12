@@ -7,6 +7,7 @@ import type { StepRunner, StepRunResult } from '../../src/engine/conductor.js';
 import { ConductorEventEmitter } from '../../src/ui/events.js';
 import { readState, writeState } from '../../src/engine/state.js';
 import { buildStepRegistry, ALL_STEPS } from '../../src/engine/steps.js';
+import { validateConfig } from '../../src/engine/config.js';
 import { resolveSkill } from '../../src/engine/skill-resolver.js';
 import { runWithHooks } from '../../src/engine/hooks.js';
 import type { HarnessConfig } from '../../src/types/config.js';
@@ -58,12 +59,12 @@ describe('Integration: config flow', () => {
       complexity_tier: 'L',
       architecture_review: 'pending',
       architecture_review_as_built: 'pending',
-      retro: 'pending',
+      rebase: 'pending',
     } as ConductState);
 
     const config: HarnessConfig = {
       steps: {
-        retro: { disable: true },
+        rebase: { disable: true },
         architecture_review: { disable: true },
       },
     };
@@ -81,7 +82,7 @@ describe('Integration: config flow', () => {
     await conductor.run();
 
     // Disabled steps should not appear in runner calls
-    expect(runner.calls).not.toContain('retro');
+    expect(runner.calls).not.toContain('rebase');
     expect(runner.calls).not.toContain('architecture_review');
     // The as-built sweep is independent of DECIDE-time architecture review and
     // runs even when that earlier review was explicitly disabled.
@@ -94,7 +95,7 @@ describe('Integration: config flow', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.value.retro).toBe('skipped');
+    expect(result.value.rebase).toBe('skipped');
     expect(result.value.architecture_review).toBe('skipped');
     expect(result.value.architecture_review_as_built).toBe('done');
 
@@ -102,7 +103,7 @@ describe('Integration: config flow', () => {
     const skipEvents = collectedEvents.filter((e) => e.type === 'config_skip');
     expect(skipEvents).toHaveLength(2);
     const skippedSteps = skipEvents.map((e) => (e as { step: string }).step);
-    expect(skippedSteps).toContain('retro');
+    expect(skippedSteps).toContain('rebase');
     expect(skippedSteps).toContain('architecture_review');
     expect(skippedSteps).not.toContain('architecture_review_as_built');
   });
@@ -129,8 +130,8 @@ describe('Integration: config flow', () => {
     const manualTestIdx = registry.findIndex((s) => s.name === 'manual_test');
 
     expect(customIdx).toBe(buildIdx + 1);
-    // build_review, wiring_check, and test_suite are between custom step and manual_test.
-    expect(manualTestIdx).toBe(customIdx + 4);
+    // test_suite and build_review are between the custom step and manual_test.
+    expect(manualTestIdx).toBe(customIdx + 3);
 
     const customStep = registry[customIdx];
     expect(customStep.phase).toBe('BUILD');
@@ -140,6 +141,48 @@ describe('Integration: config flow', () => {
 
     // Registry length = ALL_STEPS count + 1 custom
     expect(registry).toHaveLength(ALL_STEPS.length + 1);
+  });
+
+  // Covers: task:2
+  it('flows validated custom gate and kickback settings into the step registry', () => {
+    const validated = validateConfig({
+      steps: {
+        custom_gate_and_kickback: {
+          after: 'build',
+          skill: 'custom-gate-and-kickback',
+          gate: false,
+          kickback_target: true,
+        },
+        custom_gate_only: {
+          after: 'build',
+          skill: 'custom-gate-only',
+          gate: false,
+        },
+        custom_inherits_target_gate: {
+          after: 'build',
+          skill: 'custom-inherits-target-gate',
+        },
+      },
+    });
+
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+
+    const registry = buildStepRegistry(validated.config);
+    const step = (name: string) => registry.find((candidate) => candidate.name === name);
+
+    expect(step('custom_gate_and_kickback')).toMatchObject({
+      loopGate: false,
+      kickbackTarget: true,
+    });
+    expect(step('custom_gate_only')).toMatchObject({
+      loopGate: false,
+      kickbackTarget: false,
+    });
+    expect(step('custom_inherits_target_gate')).toMatchObject({
+      loopGate: true,
+      kickbackTarget: false,
+    });
   });
 
   it('custom step after a reordered step (plan) inserts correctly', () => {
@@ -160,10 +203,10 @@ describe('Integration: config flow', () => {
 
     expect(archIdx).toBeLessThan(planIdx); // architecture precedes plan (reorder)
     expect(customIdx).toBe(planIdx + 1); // custom step lands right after plan
-    // coherence_check (built-in, S-skippable) sits between the custom step
-    // and acceptance_specs — it's inserted immediately after plan in
-    // ALL_STEPS and the custom "after: plan" insertion lands ahead of it.
-    expect(specsIdx).toBe(customIdx + 2);
+    // coherence_check (built-in, S-skippable) and coverage_binding sit
+    // between the custom step and acceptance_specs — the custom insertion
+    // lands ahead of both built-ins immediately after plan.
+    expect(specsIdx).toBe(customIdx + 3);
     expect(registry[customIdx].prerequisites).toEqual(['plan']);
   });
 

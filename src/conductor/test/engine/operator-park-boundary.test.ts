@@ -1,3 +1,4 @@
+// Covers: task:1
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 
 import { Conductor } from '../test-conductor.js';
 import { writeState, readState } from '../../src/engine/state.js';
-import { ALL_STEPS, BUILD_VERIFICATION_GROUP, VALIDATION_GROUP } from '../../src/engine/steps.js';
+import { ALL_STEPS, VALIDATION_GROUP } from '../../src/engine/steps.js';
 import { CLAUDE_MODEL_POLICY } from '../../src/engine/provider-model-policy.js';
 import { resolveGroupMembership } from '../../src/engine/conductor.js';
 import { isOperatorParked } from '../../src/engine/park-marker.js';
@@ -46,6 +47,14 @@ function noExternalIo(): Pick<ConductorOptions, 'gh' | 'git' | 'runGh'> {
     git: vi.fn(async () => result),
     runGh: vi.fn(async () => result),
   };
+}
+
+async function terminalMarkerNames(root: string): Promise<string[]> {
+  return Promise.all(
+    ['HALT', 'HALT.class'].map(async (name) =>
+      readFile(join(root, '.pipeline', name), 'utf8').then(() => name).catch(() => undefined),
+    ),
+  ).then((names) => names.filter((name): name is string => name !== undefined));
 }
 
 describe('operator park boundary contract', () => {
@@ -124,17 +133,16 @@ describe('operator park boundary contract', () => {
       guard: serialGuard,
       end: serialDispatch + 'this.stepRunner.run('.length,
     });
-    const reviewedHelperDispatchAllowlist = [
+    const reviewedHelperDispatchAllowlist: Array<string | RegExp> = [
       "await this.stepRunner.run('remediate', state, { retryReason: dispatchContext });",
-      'return this.stepRunner.run(name, state, { retryReason: retryHint });',
-      'return await this.stepRunner.run(name, state, { retryReason: retryHint });',
-      "return this.stepRunner.run('wiring_check', state);",
+      'return this.stepRunner.run(name, state, { retryReason: retryHint, ...identityOption });',
+      'return await this.stepRunner.run(name, state, { retryReason: retryHint, ...identityOption });',
       'return runGroupBranch(member, state, { stepRunner: this.stepRunner }, 1);',
       "return this.stepRunner.run('finish', state, options);",
       // The two bounded FINISH prose passes. Both are reached only from inside
       // the already-park-guarded FINISH dispatch.
       "this.stepRunner.run('finish', state, { ...options, finishProsePass: 'judge' })",
-      "this.stepRunner.run('finish', state, { ...options, finishProsePass: 'author' })",
+      /this\.stepRunner\.run\(\s*'finish',\s*state,\s*\{\s*\.\.\.options,\s*finishProsePass:\s*'author',\s*\.\.\.\(request\.revisionGuidance\s*===\s*undefined\s*\?\s*\{\}\s*:\s*\{\s*revisionGuidance:\s*request\.revisionGuidance\s*\}\s*\),\s*\}\s*\)/,
     ];
     const dispatchPrimitives = [
       'this.stepRunner.run(',
@@ -150,11 +158,12 @@ describe('operator park boundary contract', () => {
       const guarded = guardedSegments.some(
         (segment) => offset > segment.guard && offset < segment.end,
       );
-      const reviewedHelper = reviewedHelperDispatchAllowlist.some((allowed) =>
-        conductorSource
-          .slice(Math.max(0, offset - 40), offset + allowed.length + 40)
-          .includes(allowed),
-      );
+      const reviewedHelper = reviewedHelperDispatchAllowlist.some((allowed) => {
+        const sourceAtDispatch = conductorSource.slice(Math.max(0, offset - 40));
+        return typeof allowed === 'string'
+          ? sourceAtDispatch.slice(0, allowed.length + 80).includes(allowed)
+          : allowed.test(sourceAtDispatch);
+      });
       return !guarded && !reviewedHelper;
     });
 
@@ -186,12 +195,41 @@ describe('operator park boundary contract', () => {
 
     const result = await conductor.run();
 
-    expect({ result, runnerCalls: run.mock.calls }).toEqual({
+    expect({ result, runnerCalls: run.mock.calls, terminalMarkers: await terminalMarkerNames(projectRoot) }).toEqual({
       result: {
         kind: 'operator-parked',
         boundary: { kind: 'pre-first-unit' },
       },
       runnerCalls: [],
+      terminalMarkers: [],
+    });
+  });
+
+  it('parks before the first pending serial unit when the boundary reader rejects', async () => {
+    await writeState(statePath, stateWithPending('memory'));
+    const run = vi.fn<StepRunner['run']>(async () => ({ success: true }));
+    const conductor = new Conductor({
+      projectRoot,
+      stateFilePath: statePath,
+      stepRunner: { run },
+      events: new ConductorEventEmitter(),
+      fromStep: 'memory',
+      mode: 'auto',
+      daemon: true,
+      verifyArtifacts: false,
+      featureSlug: 'operator-park-boundary',
+      operatorParkBoundary: async () => { throw new Error('park boundary unreadable'); },
+    });
+
+    const result = await conductor.run();
+
+    expect({ result, runnerCalls: run.mock.calls, terminalMarkers: await terminalMarkerNames(projectRoot) }).toEqual({
+      result: {
+        kind: 'operator-parked',
+        boundary: { kind: 'pre-first-unit' },
+      },
+      runnerCalls: [],
+      terminalMarkers: [],
     });
   });
 
@@ -361,7 +399,6 @@ describe('operator park boundary contract', () => {
       persisted: persisted.ok
         ? {
             buildReview: persisted.value.build_review,
-            wiringCheck: persisted.value.wiring_check,
           }
         : persisted,
     }).toEqual({
@@ -375,7 +412,7 @@ describe('operator park boundary contract', () => {
         },
       ],
       parkedBoundaries: [],
-      persisted: { buildReview: 'failed', wiringCheck: 'done' },
+      persisted: { buildReview: 'failed' },
     });
   });
 
@@ -930,29 +967,19 @@ describe('operator park boundary contract', () => {
     });
   });
 
-  it('joins the deterministic BUILD verification group before parking and blocks build review', async () => {
+  it('parks before serial test-suite verification and blocks build review', async () => {
     const state: ConductState = {
       ...stateWithPending('test_suite', 'build_review'),
       track: 'technical',
       complexity_tier: 'M',
     };
-    // Bind this fixture to the production BUILD topology instead of merely
-    // hand-seeding compatible states: retired wiring_check is resolved, the
-    // live verification member is test_suite, and build_review remains the
-    // next semantic owner after the join.
-    const buildTopology = resolveGroupMembership(
-      BUILD_VERIFICATION_GROUP,
-      state,
-      'technical',
-      CLAUDE_MODEL_POLICY,
-    );
+    // test_suite is the serial BUILD verifier and build_review is the next
+    // semantic owner.
     const buildReview = ALL_STEPS.find(({ name }) => name === 'build_review');
     expect({
-      dispatchable: buildTopology.dispatchable.map(({ name }) => name),
       reviewPrerequisites: buildReview?.prerequisites,
     }).toEqual({
-      dispatchable: ['test_suite'],
-      reviewPrerequisites: ['wiring_check', 'test_suite'],
+      reviewPrerequisites: ['test_suite'],
     });
     await writeState(statePath, state);
     const members = ['test_suite'] as const;
@@ -1004,7 +1031,6 @@ describe('operator park boundary contract', () => {
       : {};
 
     expect({
-      buildTopology: buildTopology.dispatchable.map(({ name }) => name),
       result,
       settled,
       memberStatuses: Object.fromEntries(members.map((member) => [member, raw[member]])),
@@ -1017,7 +1043,6 @@ describe('operator park boundary contract', () => {
       buildReviewDispatches: run.mock.calls.filter(([step]) => step === 'build_review').length,
       suiteEnsureCalls: ensure.mock.calls.length,
     }).toEqual({
-      buildTopology: ['test_suite'],
       result: {
         kind: 'operator-parked',
         boundary: { kind: 'step', name: 'test_suite' },
@@ -1064,13 +1089,6 @@ describe('operator park boundary contract', () => {
       },
       runnerCalls: [],
     });
-    // build_review is the pending semantic gate. Parking must not dispatch the
-    // retired wiring_check compatibility step; its deterministic completion is
-    // persisted before the pending review boundary.
-    if (pending.length === 1 && pending[0] === 'build_review') {
-      expect(persisted.ok && persisted.value.wiring_check).toBe('done');
-      expect(run.mock.calls.map(([step]) => step)).not.toContain('wiring_check');
-    }
   });
 
   it('keeps interactive dispatch and checkpoint sequences identical with a repo-root park marker', async () => {
@@ -1078,7 +1096,7 @@ describe('operator park boundary contract', () => {
       const caseRoot = join(projectRoot, parked ? 'parked' : 'baseline');
       const caseStatePath = join(caseRoot, 'conduct-state.json');
       await mkdir(caseRoot, { recursive: true });
-      await writeState(caseStatePath, stateWithPending('build', 'wiring_check'));
+      await writeState(caseStatePath, stateWithPending('build', 'test_suite'));
       if (parked) {
         const markerDir = join(caseRoot, '.daemon', 'parked');
         await mkdir(markerDir, { recursive: true });

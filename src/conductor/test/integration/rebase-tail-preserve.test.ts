@@ -70,6 +70,7 @@ const FRONT_DONE_M: ConductState = {
   conflict_check: 'skipped',
   plan: 'done',
   coherence_check: 'done',
+  coverage_binding: 'done',
   architecture_diagram: 'skipped',
   architecture_review: 'done',
   acceptance_specs: 'skipped',
@@ -172,6 +173,9 @@ describe('integration/rebase-tail-preserve (Task 7, #655)', () => {
         join(dir, '.pipeline/task-status.json'),
         JSON.stringify({ tasks: [{ id: 't1', status: 'completed' }] }),
       );
+    } else if (step === 'coverage_binding') {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline/coverage-binding.json'), JSON.stringify({ version: 1, slug: 'add-foo', runId: 'test-run', status: 'disabled', entries: [] }));
     } else if (step === 'build_review') {
       await mkdir(join(dir, '.pipeline'), { recursive: true });
       await writeFile(
@@ -257,10 +261,8 @@ describe('integration/rebase-tail-preserve (Task 7, #655)', () => {
     // Re-run gates: the foreign runtime delta touches their surface, so each
     // must have been re-dispatched a second time after the rebase kickback.
     // (build_review is disabled by default config in this fixture, so it
-    // never dispatches at all here, and wiring_check is a deprecated no-op
-    // that settles in-process — manual_test is what proves the invalidated
+    // never dispatches at all here; manual_test is what proves the invalidated
     // set actually re-runs while the preserved judged gates above do not.)
-    expect(counts.wiring_check ?? 0).toBe(0);
     expect(counts.manual_test).toBeGreaterThanOrEqual(2);
 
     // Final state confirms the preserved gates never left 'done' (no

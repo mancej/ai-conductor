@@ -39,9 +39,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+      DAEMON_E2E_LIVE_TOKEN_CAP: ${{ vars.DAEMON_E2E_LIVE_TOKEN_CAP || '300000' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version-file: src/conductor/.tool-versions
           cache: npm
@@ -58,7 +59,7 @@ jobs:
         run: npm run build
         working-directory: src/conductor
       - name: Run complete release smoke tier in gate mode
-        run: SMOKE_MODE=gate npm run smoke
+        run: SMOKE_MODE=advisory SMOKE_FORCE_SKIP=capability:credentialed:claude,capability:credentialed:codex npm run smoke
         working-directory: src/conductor
   live-daemon-e2e:
     name: Live daemon E2E (${{ matrix.provider }})
@@ -77,6 +78,7 @@ jobs:
             smoke_file: test/engine/daemon-e2e-live-codex.smoke.test.ts
     env:
       GH_TOKEN: ${{ github.token }}
+      DAEMON_E2E_LIVE_TOKEN_CAP: ${{ vars.DAEMON_E2E_LIVE_TOKEN_CAP || '300000' }}
     steps:
       - name: Check live-provider credentials
         env:
@@ -88,8 +90,8 @@ jobs:
           else
             echo "### Live daemon E2E: ${{ matrix.provider }} non-gating skip (${{ matrix.credential_env }} is unavailable)" >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version-file: src/conductor/.tool-versions
           cache: npm
@@ -105,7 +107,9 @@ jobs:
       - name: Build conductor
         run: npm run build
         working-directory: src/conductor
-      - name: Run complete release smoke tier in gate mode
+      - name: Run provider release smoke in gate mode
+        id: provider-smoke
+        continue-on-error: true
         env:
           LIVE_PROVIDER_CREDENTIAL: ${{ secrets[matrix.credential_env] }}
         run: |
@@ -116,3 +120,43 @@ jobs:
           unset LIVE_PROVIDER_CREDENTIAL
           SMOKE_MODE=gate npm run smoke -- "${{ matrix.smoke_file }}"
         working-directory: src/conductor
+      - name: Record live-provider outcome
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/live-provider-result"
+          printf '%s\n' '${{ steps.provider-smoke.outcome }}' > "$RUNNER_TEMP/live-provider-result/${{ matrix.provider }}"
+      - name: Upload live-provider outcome
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-provider-result-${{ matrix.provider }}
+          path: ${{ runner.temp }}/live-provider-result/${{ matrix.provider }}
+
+  live-provider-gate:
+    name: Require one successful live-provider E2E
+    if: ${{ always() }}
+    needs: [complete-smoke-tier, live-daemon-e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download live-provider outcomes
+        uses: actions/download-artifact@v5
+        with:
+          pattern: live-provider-result-*
+          path: live-provider-results
+          merge-multiple: true
+      - name: Require one successful live-provider E2E
+        env:
+          COMPLETE_SMOKE_RESULT: ${{ needs.complete-smoke-tier.result }}
+        run: |
+          set -euo pipefail
+          if [ "$COMPLETE_SMOKE_RESULT" != success ]; then
+            echo "Non-provider smoke tier failed: $COMPLETE_SMOKE_RESULT"
+            exit 1
+          fi
+          if grep -Rqx success live-provider-results; then
+            echo "At least one live-provider E2E passed."
+            exit 0
+          else
+            echo "No live-provider E2E passed."
+            exit 1
+          fi

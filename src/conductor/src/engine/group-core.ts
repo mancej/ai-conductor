@@ -404,58 +404,14 @@ export interface BranchExecutorDeps {
    * existing callers that don't pass it see no behavior change.
    */
   onMemberEvent?: (event: GroupMemberStepEvent) => void | Promise<void>;
-}
-
-/** Dependencies for an engine-native group branch (no step/provider dispatch). */
-export interface NativeBranchExecutorDeps {
-  onMemberEvent?: (event: GroupMemberStepEvent) => void | Promise<void>;
-}
-
-const NATIVE_BRANCH_FAILURE_REASON_LIMIT = 1_024;
-
-function nativeBranchFailureReason(error: unknown): string {
-  const detail = error instanceof Error
-    ? error.message
-    : typeof error === "string"
-      ? error
-      : "unknown error";
-  return detail.length <= NATIVE_BRANCH_FAILURE_REASON_LIMIT
-    ? detail
-    : `${detail.slice(0, NATIVE_BRANCH_FAILURE_REASON_LIMIT - 3)}...`;
-}
-
-/**
- * Executes one injected engine-native branch and maps its result through the
- * shared branch-outcome/event contracts used by dispatched group members.
- */
-export async function runNativeGroupBranch(
-  member: GroupMember,
-  execute: () => Promise<StepRunResult>,
-  deps: NativeBranchExecutorDeps = {},
-): Promise<BranchOutcome> {
-  await deps.onMemberEvent?.({
-    type: "group_member_step",
-    member: member.name,
-    skill: member.skill,
-    phase: "dispatch",
-  });
-  let outcome: BranchOutcome;
-  try {
-    const result = await execute();
-    outcome = result.success
-      ? makeVerdictOutcome("pass", result.authentication)
-      : makeNoVerdictOutcome(result.output ?? "native branch failed", result.authentication);
-  } catch (error) {
-    outcome = makeNoVerdictOutcome(nativeBranchFailureReason(error));
-  }
-  await deps.onMemberEvent?.({
-    type: "group_member_step",
-    member: member.name,
-    skill: member.skill,
-    phase: "result",
-    outcome: classifyOutcome(outcome),
-  });
-  return outcome;
+  /**
+   * adr-2026-08-25-engine-stamped-ship-tail-verdict-run-identity D1: this
+   * branch dispatch's engine-owned run identity, threaded verbatim into
+   * `stepRunner.run` so the branch's provider-lifecycle `attempt.id` is the
+   * same value the join stamps into its verdict sidecar. Absent for callers
+   * outside the identity seam.
+   */
+  runId?: string;
 }
 
 /**
@@ -608,8 +564,14 @@ async function runGroupBranchInner(
         memberStep,
         state,
         providerSessions
-          ? { providerSessions, attempt, escalate }
-          : { sessionId: mintSessionId(), resume: false, attempt, escalate },
+          ? { providerSessions, attempt, escalate, runId: deps.runId }
+          : {
+              sessionId: mintSessionId(),
+              resume: false,
+              attempt,
+              escalate,
+              runId: deps.runId,
+            },
       );
     } catch (err) {
       // A THROW from the step runner is an infra failure of THIS branch

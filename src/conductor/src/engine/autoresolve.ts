@@ -24,6 +24,7 @@ import {
   type RebaseResolver,
   type GitRunner,
   featureCommitsPreserved,
+  formatFeatureCommitPreservationRejection,
   isBranchCurrent,
   rebaseStateActive,
   conflictedFiles,
@@ -32,6 +33,7 @@ import {
   makeGitRunner,
 } from './rebase.js';
 import { execa } from 'execa';
+import type { WorktreeLifecycleQueue } from './worktree.js';
 import { rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
@@ -224,7 +226,7 @@ async function evaluateEligibilityGates(
   if (await isFeatureInFlight(entry.slug)) {
     return {
       eligible: false,
-      reason: `active feature run for ${entry.slug}; resolution deferred`,
+      reason: `active work claim for ${entry.slug}; resolution worktree deferred`,
     };
   }
 
@@ -263,6 +265,17 @@ export function isResolutionInFlight(): boolean {
 }
 
 /**
+ * Read-only daemon ownership seam for transient resolution-worktree cleanup.
+ * The lifecycle checks it again at removal time so an eligibility-to-cleanup
+ * race cannot delete a worktree a feature executor has since claimed.
+ */
+export interface ResolveWorktreeLiveness {
+  isFeatureInFlight?: IsFeatureInFlight;
+  log?: (message: string) => void;
+  worktreeLifecycle?: WorktreeLifecycleQueue;
+}
+
+/**
  * Provision a transient worktree for conflict resolution, run the provided
  * function inside it, and always tear it down (even on failure).
  *
@@ -296,7 +309,21 @@ export async function withResolveWorktree<T>(
   repoCwd: string,
   fn: (worktreePath: string) => Promise<T>,
   prepareWorktree?: (worktreePath: string) => Promise<void>,
+  liveness: ResolveWorktreeLiveness = {},
 ): Promise<T> {
+  const removalRefused = async (): Promise<boolean> => {
+    if (!(await liveness.isFeatureInFlight?.(slug))) return false;
+    liveness.log?.(`[autoresolve] worktree removal refused ${slug} — reason: active work claim`);
+    return true;
+  };
+
+  // A crashed resolution can leave a stale transient path behind. Do not reap
+  // it if the daemon claimed this slug between sweep eligibility and lifecycle
+  // setup; continuing would turn that race into a destructive remove.
+  if (await removalRefused()) {
+    throw new Error(`active work claim for ${slug}; resolution worktree removal refused`);
+  }
+
   // Serial guard: prevent concurrent operations on the same slug
   if (inFlightSlugs.has(slug)) {
     throw new Error(`resolution already in flight for slug ${slug}; concurrent worktree add rejected`);
@@ -308,8 +335,20 @@ export async function withResolveWorktree<T>(
   // (any slug) until this attempt's finally clears it below.
   resolutionInFlight = true;
   const worktreePath = join(repoCwd, '.worktrees', `resolve-${slug}`);
+  const lifecycle = liveness.worktreeLifecycle;
+  const mutateWorktree = <T>(work: () => Promise<T>): Promise<T> =>
+    lifecycle ? lifecycle.run(work) : work();
 
   try {
+    // Reap this attempt's stale registration before removing its directory.
+    // A crashed attempt may have lost either the directory or both its
+    // checkout contents and metadata, so an absent registration is harmless.
+    try {
+      await mutateWorktree(() => execa('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoCwd }));
+    } catch {
+      // No prior registration is the usual case.
+    }
+
     // Remove stale worktree directory if it exists (crashed prior run)
     await rm(worktreePath, { recursive: true, force: true });
 
@@ -319,7 +358,7 @@ export async function withResolveWorktree<T>(
     // A retained feature worktree may already have `branch` checked out. A
     // detached transient checkout still starts at that exact branch tip while
     // avoiding Git's one-worktree-per-branch restriction.
-    await execa('git', ['worktree', 'add', '--detach', worktreePath, branch], { cwd: repoCwd });
+    await mutateWorktree(() => execa('git', ['worktree', 'add', '--detach', worktreePath, branch], { cwd: repoCwd }));
 
     // Prepare the worktree using the injected prepareWorktree function (or default)
     const prepare = prepareWorktree ?? defaultPrepareWorktree;
@@ -334,12 +373,14 @@ export async function withResolveWorktree<T>(
     // (thrown error / escalation), so the next tick can dispatch again.
     resolutionInFlight = false;
 
-    try {
-      await execa('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoCwd });
-    } catch (err) {
-      // Log but don't throw on cleanup failure; the primary goal is to remove
-      // the in-flight marker so future attempts aren't blocked
-      console.error(`failed to remove resolution worktree at ${worktreePath}:`, err);
+    if (!(await removalRefused())) {
+      try {
+        await mutateWorktree(() => execa('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoCwd }));
+      } catch (err) {
+        // Log but don't throw on cleanup failure; the primary goal is to remove
+        // the in-flight marker so future attempts aren't blocked
+        console.error(`failed to remove resolution worktree at ${worktreePath}:`, err);
+      }
     }
   }
 }
@@ -454,13 +495,11 @@ export async function runAcceptanceGuards(
 
   // Guard 3: all feature commits (by subject) must be preserved
   const preserved = await featureCommitsPreserved(git, baseRef, subjectsBefore);
-  if (!preserved) {
-    const displaySubjects = subjectsBefore.slice(0, 3).join(', ');
-    const more = subjectsBefore.length > 3 ? `... (+${subjectsBefore.length - 3} more)` : '';
+  if (preserved.kind === 'rejected') {
     return {
       ok: false,
       guard: 'featureCommitsPreserved',
-      reason: `feature commit(s) lost during resolution: expected ${displaySubjects}${more}`,
+      reason: formatFeatureCommitPreservationRejection(preserved),
     };
   }
 
@@ -842,7 +881,7 @@ export async function escalate(
  *   1. Create isolated worktree at the feature branch tip (withResolveWorktree)
  *   2. Determine the base to rebase onto (resolveBase, auto-discovers origin/main)
  *   3. Capture pre-rebase feature commit subjects (for work-preservation guards)
- *   4. Start the rebase; if no conflicts → return refreshed (already current)
+ *   4. Start the rebase; clean rebases skip resolution, not verification or publication
  *   5. Run Tier1 (deterministic .docs/ resolution)
  *   6. If conflicts remain, run Tier2 (bounded assistant dispatch via resolver)
  *   7. Run acceptance guards (rebase state, branch current, commits preserved)
@@ -867,6 +906,9 @@ export async function resolveConflictingPr(
     runSuite: (projectRoot: string) => Promise<{ exitCode: number; durationMs: number; configured: boolean }>;
     resolver: RebaseResolver;
     log: (msg: string) => void;
+    /** Re-check active daemon ownership at each resolution-worktree removal. */
+    isFeatureInFlight?: IsFeatureInFlight;
+    worktreeLifecycle?: WorktreeLifecycleQueue;
   },
 ): Promise<{ kind: 'refreshed' | 'escalated' }> {
   const { prUrl, slug, repoCwd } = entry;
@@ -890,56 +932,54 @@ export async function resolveConflictingPr(
     // Start the rebase; this will fail with conflicts if base and feature diverged
     const rebaseAttempt = await git(['rebase', '--autostash', baseRef]);
     if (rebaseAttempt.exitCode === 0) {
-      // No conflicts — branch is already current or cleanly rebased
-      log(`${prUrl}: rebase completed without conflicts, no resolution needed`);
-      logOutcome(log, prUrl, 'rebase-clean', 'refreshed');
-      return { kind: 'refreshed' };
-    }
-
-    // Check for actual conflicted files
-    const conflicts = await conflictedFiles(git);
-    if (conflicts.length === 0) {
-      // Rebase failed but no unmerged files — treat as escalation-worthy error
-      log(`${prUrl}: rebase failed without conflicts; escalating`);
-      await escalate(prUrl, 'rebase-error', rebaseAttempt.stderr.trim(), {
-        runGh: deps.runGh,
-        cwd: repoCwd,
-        log,
-      });
-      logOutcome(log, prUrl, 'rebase-error', 'escalated');
-      return { kind: 'escalated' };
-    }
-
-    // Rebase paused with conflicts — enter resolution pipeline
-
-    // Stage 1: Deterministic .docs/ resolution
-    const tier1Result = await runTier1(git, worktreePath);
-    log(`${prUrl}: tier1 resolved ${tier1Result.resolved.length} file(s); ${tier1Result.remaining.length} remain`);
-
-    // Stage 2: Assistant dispatch for remaining conflicts
-    let tier2Outcome: RebaseOutcome | null = null;
-    if (tier1Result.remaining.length > 0) {
-      tier2Outcome = await runTier2(
-        git,
-        worktreePath,
-        baseRef,
-        tier1Result.remaining,
-        config.attemptCap,
-        deps.resolver,
-      );
-      log(`${prUrl}: tier2 outcome: ${tier2Outcome.kind}`);
-
-      // If tier2 failed (unresolved conflicts), escalate immediately
-      if (tier2Outcome.kind === 'conflict_halt') {
-        const reason = tier2Outcome.reason || 'could not resolve remaining conflicts';
-        await escalate(prUrl, 'tier2-resolve', reason, {
+      log(`${prUrl}: rebase completed without conflicts; verifying before publication`);
+    } else {
+      // Check for actual conflicted files
+      const conflicts = await conflictedFiles(git);
+      if (conflicts.length === 0) {
+        // Rebase failed but no unmerged files — treat as escalation-worthy error
+        log(`${prUrl}: rebase failed without conflicts; escalating`);
+        await escalate(prUrl, 'rebase-error', rebaseAttempt.stderr.trim(), {
           runGh: deps.runGh,
           cwd: repoCwd,
           log,
         });
-        logOutcome(log, prUrl, 'tier2-resolve', 'escalated');
+        logOutcome(log, prUrl, 'rebase-error', 'escalated');
         return { kind: 'escalated' };
       }
+
+      // Rebase paused with conflicts — enter resolution pipeline
+
+      // Stage 1: Deterministic .docs/ resolution
+      const tier1Result = await runTier1(git, worktreePath);
+      log(`${prUrl}: tier1 resolved ${tier1Result.resolved.length} file(s); ${tier1Result.remaining.length} remain`);
+
+      // Stage 2: Assistant dispatch for remaining conflicts
+      let tier2Outcome: RebaseOutcome | null = null;
+      if (tier1Result.remaining.length > 0) {
+        tier2Outcome = await runTier2(
+          git,
+          worktreePath,
+          baseRef,
+          tier1Result.remaining,
+          config.attemptCap,
+          deps.resolver,
+        );
+        log(`${prUrl}: tier2 outcome: ${tier2Outcome.kind}`);
+
+        // If tier2 failed (unresolved conflicts), escalate immediately
+        if (tier2Outcome.kind === 'conflict_halt') {
+          const reason = tier2Outcome.reason || 'could not resolve remaining conflicts';
+          await escalate(prUrl, 'tier2-resolve', reason, {
+            runGh: deps.runGh,
+            cwd: repoCwd,
+            log,
+          });
+          logOutcome(log, prUrl, 'tier2-resolve', 'escalated');
+          return { kind: 'escalated' };
+        }
+      }
+
     }
 
     // Work-preservation guards: verify the rebase succeeded correctly
@@ -995,5 +1035,5 @@ export async function resolveConflictingPr(
     // Success
     logOutcome(log, prUrl, 'lease-push', 'refreshed');
     return { kind: 'refreshed' };
-  });
+  }, undefined, { isFeatureInFlight: deps.isFeatureInFlight, log, worktreeLifecycle: deps.worktreeLifecycle });
 }

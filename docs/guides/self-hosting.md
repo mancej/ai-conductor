@@ -1,7 +1,7 @@
 ---
 title: Self-hosting the harness
 parent: Guides
-nav_order: 6
+nav_order: 8
 ---
 
 # Self-hosting the harness
@@ -39,15 +39,28 @@ Every gate toggle defaults to enabled, and an unknown key under `harness_self_ho
 error rather than a silently disabled guardrail. See
 [configuration reference](../reference/configuration.md) for every key.
 
+## Open-PR recovery
+
+This repository explicitly enables `mergeable_autoresolve` and `ci_watch` in
+`.ai-conductor/config.yml`, each with a 60-minute retry cooldown. The daemon repairs
+conflicts on watched, eligible open PRs before attempting CI-failure repair. Both
+paths use `npm --prefix src/conductor test` from their isolated worktree root
+before publishing a repair. Existing attempt limits, draft/label exclusions, and
+the CI-fix startup preflight still apply; enabling the settings does not bypass them.
+
+Restart the daemon after landing this configuration to activate it. Consumer
+defaults are unchanged: conflict auto-resolution remains opt-in, and CI watch
+defaults to enabled. See the [configuration reference](../reference/configuration.md#mergeable_autoresolve).
+
 ## Prerequisites
 
 | Requirement | Check |
 | --- | --- |
 | A clone of the harness, installed | `bin/install --check` exits 0 or 2 — the freshness gate accepts both |
-| `conduct-ts` on PATH resolving to this checkout | `readlink -f "$(command -v conduct-ts)"` |
+| `ai-conductor` on PATH resolving to this checkout | `readlink -f "$(command -v ai-conductor)"` |
 | `tmux` installed | `tmux -V` |
 | `gh` authenticated | `gh auth status` |
-| A daemon build token | `conduct-ts build-auth-status` prints `state=valid` |
+| A daemon build token | `ai-conductor build-auth-status` prints `state=valid` |
 
 `bin/install --check` exit codes: `0` clean, `1` drift, `2` everything else clean but the build-auth
 check failed.
@@ -56,11 +69,11 @@ check failed.
 
 ```bash
 ./bin/install
-conduct-ts register .
+ai-conductor register .
 ```
 
 `bin/install` symlinks the skill catalogs, builds the engine into `src/conductor/dist-versions/<id>/`
-and flips the `dist` symlink, links `~/.local/bin/conduct-ts`, and writes the harness permission and
+and flips the `dist` symlink, links `~/.local/bin/ai-conductor`, and writes the harness permission and
 hook entries into `~/.claude/settings.json`.
 
 Nothing under `src/conductor/dist` is committed, so a fresh clone has **no engine** until
@@ -75,7 +88,7 @@ token from `~/.ai-conductor/build-auth`.
 
 ```bash
 claude setup-token
-conduct-ts build-auth-status
+ai-conductor build-auth-status
 ```
 
 Run the mint command in an interactive terminal — its output may not appear otherwise. Then:
@@ -112,7 +125,7 @@ silently applies to every project you self-host afterward, even one whose own co
 ## Step 3 — Start the daemon
 
 ```bash
-conduct-ts daemon start
+ai-conductor daemon start
 ```
 
 Everything in [running the daemon](running-the-daemon.md) applies unchanged: park before touching git
@@ -375,7 +388,7 @@ dispatch:
    in-flight build.
 
 The restart gate needs all four of: continuous mode, self-host active, the config flag enabled, and
-the checker armed. A bare `conduct-ts daemon` drain (`--once` semantics) never auto-restarts.
+the checker armed. A bare `ai-conductor daemon` drain (`--once` semantics) never auto-restarts.
 
 `npm run build` is the only supported entry point. Running `tsup` directly is refused:
 `Refusing to run tsup directly: the engine build now uses a versioned dist-versions/<id> + dist
@@ -385,7 +398,7 @@ Because the config is read at daemon startup, a change to `.ai-conductor/config.
 to take effect:
 
 ```bash
-conduct-ts daemon restart
+ai-conductor daemon restart
 ```
 
 ## The self-host finish gates
@@ -454,7 +467,7 @@ whatever changed, then unpark.
 stale install leaves newly added skills unregistered, and daemon-dispatched skills then fail
 silently.
 
-**The daemon is running a different engine than the one you just built.** `conduct-ts daemon status`
+**The daemon is running a different engine than the one you just built.** `ai-conductor daemon status`
 prints `version:<engine-version-id>` per repo. Compare it against
 `readlink src/conductor/dist`. A restart picks up the new version; see
 [daemon recovery](../runbooks/daemon-recovery.md).

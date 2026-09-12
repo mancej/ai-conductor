@@ -19,7 +19,6 @@ export default defineConfig({
     exclude: [
       'test/smoke/**',
       '**/*.smoke.test.ts',
-      'test/engine/deterministic-build-verification-group.test.ts',
       'test/engineer-lifecycle-cli.test.ts',
     ],
     environment: 'node',

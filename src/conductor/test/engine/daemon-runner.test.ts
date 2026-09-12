@@ -152,7 +152,7 @@ function deps(
 }
 
 describe('engine/daemon-runner — makeRunFeature', () => {
-  it('reports a failed auto-park write loudly without crashing the daemon', async () => {
+  it('does not write an auto-park marker from the executor', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-auto-park-write-failure-'));
     const worktreePath = join(projectRoot, '.worktrees', ITEM.slug);
     const logs: string[] = [];
@@ -165,6 +165,7 @@ describe('engine/daemon-runner — makeRunFeature', () => {
         projectRoot,
         reason: 'runtime dispatch failure',
         park: true,
+        deferAutoPark: true,
         slug: ITEM.slug,
         log: (message) => logs.push(message),
       })).resolves.toBeUndefined();
@@ -173,16 +174,16 @@ describe('engine/daemon-runner — makeRunFeature', () => {
       expect({
         haltFirstLine: halt.split('\n', 1)[0],
         containsWriteFailure: halt.includes('EACCES: permission denied writing auto-park marker'),
-        containsRemedy: halt.includes(`conduct-ts daemon park ${ITEM.slug}`),
+        containsRemedy: halt.includes(`ai-conductor daemon park ${ITEM.slug}`),
         containsParkedClaim: halt.includes('feature parked — will not re-dispatch on the next scan'),
         parkFailureLogs: logs.filter((line) => line.includes(ITEM.slug) && /park.*write.*fail/i.test(line)),
         haltVerificationLogs: logs.filter((line) => line.includes('HALT marker write failed')),
       }).toEqual({
-        haltFirstLine: 'feature errored — automatic park failed: EACCES: permission denied writing auto-park marker; run conduct-ts daemon park feat-x',
-        containsWriteFailure: true,
-        containsRemedy: true,
-        containsParkedClaim: false,
-        parkFailureLogs: ['[daemon-runner] auto-park write failed for feat-x: EACCES: permission denied writing auto-park marker'],
+        haltFirstLine: 'feature parked — will not re-dispatch on the next scan',
+        containsWriteFailure: false,
+        containsRemedy: false,
+        containsParkedClaim: true,
+        parkFailureLogs: [],
         haltVerificationLogs: [],
       });
     } finally {
@@ -191,7 +192,7 @@ describe('engine/daemon-runner — makeRunFeature', () => {
     }
   });
 
-  it('terminateFeature writes the settled auto-park outcome before its parked HALT, including EEXIST', async () => {
+  it('terminateFeature records a deferred auto-park request without touching the root marker', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-auto-park-marker-'));
     try {
       const worktreePath = join(projectRoot, '.worktrees', ITEM.slug);
@@ -204,49 +205,20 @@ describe('engine/daemon-runner — makeRunFeature', () => {
         projectRoot,
         reason: 'runtime dispatch failure',
         park: true,
+        deferAutoPark: true,
         slug: ITEM.slug,
       });
 
-      const marker = await readFile(join(projectRoot, '.daemon', 'parked', ITEM.slug), 'utf-8');
       const halt = await readFile(join(worktreePath, '.pipeline', 'HALT'), 'utf-8');
 
-      expect(marker).toMatch(/^auto-parked: runtime dispatch failure\ntimestamp: .+\n$/);
       expect(halt.split('\n', 1)[0]).toBe('feature parked — will not re-dispatch on the next scan');
-      expect(filesystemWriteOrder.events).toEqual([
-        'park-marker:issued',
-        'park-marker:settled',
-        'halt:issued',
-        'park-marker:present-at-halt',
-        'halt:settled',
-      ]);
-
-      const originalMarker = marker;
-      filesystemWriteOrder.events.length = 0;
-      filesystemWriteOrder.markerPath = '';
-      await terminateFeature({
-        worktreePath,
-        projectRoot,
-        reason: 'new reason must not replace an existing park',
-        park: true,
-        slug: ITEM.slug,
-      });
-
-      expect(await readFile(join(projectRoot, '.daemon', 'parked', ITEM.slug), 'utf-8')).toBe(originalMarker);
-      expect((await readFile(join(worktreePath, '.pipeline', 'HALT'), 'utf-8')).split('\n', 1)[0])
-        .toBe('feature parked — will not re-dispatch on the next scan');
-      expect(filesystemWriteOrder.events).toEqual([
-        'park-marker:issued',
-        'park-marker:already-parked',
-        'halt:issued',
-        'park-marker:present-at-halt',
-        'halt:settled',
-      ]);
+      await expect(readFile(join(projectRoot, '.daemon', 'parked', ITEM.slug), 'utf-8')).rejects.toMatchObject({ code: 'ENOENT' });
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
   });
 
-  it('terminateFeature with park true writes a worktree marker at the main repository root', async () => {
+  it('terminateFeature with park true leaves root marker ownership to the dispatcher', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-auto-park-worktree-'));
     const worktreePath = join(projectRoot, '.worktrees', ITEM.slug);
     try {
@@ -270,7 +242,7 @@ describe('engine/daemon-runner — makeRunFeature', () => {
       ).then(() => true).catch(() => false);
 
       expect({ markerAtMainRoot, markerAtWorktree }).toEqual({
-        markerAtMainRoot: true,
+        markerAtMainRoot: false,
         markerAtWorktree: false,
       });
     } finally {
@@ -313,10 +285,12 @@ describe('engine/daemon-runner — makeRunFeature', () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-terminate-feature-evidence-'));
     const withQuarantine = join(projectRoot, '.worktrees', 'with-quarantine');
     const withoutQuarantine = join(projectRoot, '.worktrees', 'without-quarantine');
+    const preservationFailed = join(projectRoot, '.worktrees', 'preservation-failed');
     try {
       await Promise.all([
         mkdir(withQuarantine, { recursive: true }),
         mkdir(withoutQuarantine, { recursive: true }),
+        mkdir(preservationFailed, { recursive: true }),
       ]);
 
       await terminateFeature({
@@ -344,11 +318,24 @@ describe('engine/daemon-runner — makeRunFeature', () => {
           preservedPaths: ['src/still-needed.ts'],
         } satisfies TriageOutcome,
       });
+      await terminateFeature({
+        worktreePath: preservationFailed,
+        reason: 'setup triage requires intervention',
+        park: false,
+        slug: 'preservation-failed',
+        triageEvidence: {
+          kind: 'park',
+          outputTail: 'could not preserve rejected repair ref: branch is checked out',
+          contractOutcome: 'preservation-failed',
+          preservedPaths: [],
+        } satisfies TriageOutcome,
+      });
 
-      const [withQuarantineHalt, withQuarantineClass, withoutQuarantineHalt] = await Promise.all([
+      const [withQuarantineHalt, withQuarantineClass, withoutQuarantineHalt, preservationFailedHalt] = await Promise.all([
         readFile(join(withQuarantine, '.pipeline', 'HALT'), 'utf-8'),
         readFile(join(withQuarantine, '.pipeline', 'HALT.class'), 'utf-8'),
         readFile(join(withoutQuarantine, '.pipeline', 'HALT'), 'utf-8'),
+        readFile(join(preservationFailed, '.pipeline', 'HALT'), 'utf-8'),
       ]);
 
       expect(withQuarantineClass).toBe('needs-human');
@@ -362,6 +349,10 @@ describe('engine/daemon-runner — makeRunFeature', () => {
       expect(withoutQuarantineHalt).toContain('No quarantine ref exists (clean-HEAD case)');
       expect(withoutQuarantineHalt).toContain('Contract outcome: clean-head-contract-failed');
       expect(withoutQuarantineHalt).toContain('src/still-needed.ts');
+      expect(preservationFailedHalt).toContain('could not preserve rejected repair ref: branch is checked out');
+      expect(preservationFailedHalt).toContain('Contract outcome: preservation-failed');
+      expect(preservationFailedHalt).toContain('No quarantine ref was created because preserving the attempted repair failed');
+      expect(preservationFailedHalt).not.toContain('No quarantine ref exists (clean-HEAD case)');
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
@@ -422,6 +413,38 @@ describe('engine/daemon-runner — makeRunFeature', () => {
       enrollWatch: 0,
       stop: 1,
     });
+  });
+
+  it('hands setup triage the feature emitter so forced setup re-runs ride the feature spine', async () => {
+    // adr-2026-08-26-setup-once-per-worktree-marker decision 3: triage's forced
+    // `prepareWorktree` emits `project_setup`, and it must land on the emitter
+    // `beginFeatureRun` opened for THIS feature — the one whose persister is
+    // writing the worktree's `events.jsonl` — not be dropped to a raw log line.
+    const featureEvents = new ConductorEventEmitter();
+    const featureDeps = deps({ done: false, halted: true, reason: 'paused' });
+    featureDeps.beginFeatureRun = () => ({
+      events: featureEvents,
+      providerExecution: {
+        configuredProviders: ['claude'],
+        runtimes: new ProviderRuntimeSet([]),
+        sessions: new ProviderSessionStore(),
+      },
+      stop: () => {},
+    });
+    featureDeps.prepareWorktree = async () => {
+      throw new SetupFailureError('setup failed', 'diagnostic output');
+    };
+    let receivedEvents: unknown = 'runSetupTriage never ran';
+    featureDeps.runSetupTriage = async (_error, _worktree, _item, _execution, _log, events) => {
+      receivedEvents = events;
+      return { kind: 'pass', outputTail: '' };
+    };
+    featureDeps.runConductor = async () => {};
+    featureDeps.daemon = true;
+
+    await makeRunFeature(featureDeps)({ slug: 'feature-a' });
+
+    expect(receivedEvents).toBe(featureEvents);
   });
 
   it('routes setup, triage, and conductor execution through the feature logger', async () => {
@@ -645,7 +668,8 @@ describe('engine/daemon-runner — makeRunFeature', () => {
     const run = makeRunFeature(featureDeps);
     await Promise.all([run({ slug: 'feature-a' }), run({ slug: 'feature-b' })]);
 
-    expect(lines).toEqual([
+    // Concurrent completion order is unspecified; ownership and multiplicity are not.
+    expect([...lines].sort()).toEqual([
       '[feature-a] ✋ feature-a halted — worktree kept (paused)',
       '[feature-b] ✋ feature-b halted — worktree kept (paused)',
     ]);
@@ -774,9 +798,16 @@ describe('engine/daemon-runner — makeRunFeature', () => {
       );
       await execFile('git', ['add', '.'], { cwd: wt });
       await execFile('git', ['commit', '-m', 'test: add local durable shipment record'], { cwd: wt });
+      const { stdout: localHeadStdout } = await execFile('git', ['rev-parse', 'HEAD'], { cwd: wt });
+      const localHead = localHeadStdout.trim();
 
       const rec: TestRecorder = {};
       const ghCalls: string[][] = [];
+      const events = new ConductorEventEmitter();
+      const refusals: unknown[] = [];
+      events.on('shipment_evidence_refused', (event) => {
+        refusals.push(event);
+      });
       const run = makeRunFeature({
         ...deps(
           {
@@ -789,6 +820,15 @@ describe('engine/daemon-runner — makeRunFeature', () => {
         ),
         createWorktree: async (slug) => ({ path: wt, branch: `feat/${slug}` }),
         shipmentEvidence: undefined,
+        beginFeatureRun: () => ({
+          events,
+          providerExecution: {
+            configuredProviders: ['claude'],
+            runtimes: new ProviderRuntimeSet([]),
+            sessions: new ProviderSessionStore(),
+          },
+          stop: () => {},
+        }),
         runGh: async (args) => {
           ghCalls.push(args);
           return { stdout: JSON.stringify({ url: prUrl, headRefOid: remoteHead }) };
@@ -797,20 +837,103 @@ describe('engine/daemon-runner — makeRunFeature', () => {
 
       const out = await run(ITEM);
 
+      // #2008: the two commits the refusal compared must survive the halt.
+      // The branch moves on afterwards, so a bare refusal code leaves an
+      // operator with nothing to re-derive them from.
       expect({
         status: out.status,
         reason: out.reason,
         ghCalls,
+        refusals,
         processedCalls: rec.processedCalls,
         enrollCalls: rec.enrollCalls,
         teardownKeep: rec.teardownKeep,
       }).toEqual({
         status: 'halted',
-        reason: 'durable shipment evidence refused ship: shipment-candidate-not-on-implementation-head',
+        reason:
+          'durable shipment evidence refused ship: shipment-candidate-not-on-implementation-head'
+          + ` (expected ${remoteHead}, observed ${localHead})`,
         ghCalls: [['pr', 'view', prUrl, '--json', 'url,headRefOid']],
+        refusals: [
+          {
+            type: 'shipment_evidence_refused',
+            slug: ITEM.slug,
+            pr: prUrl,
+            code: 'shipment-candidate-not-on-implementation-head',
+            expected: remoteHead,
+            observed: localHead,
+          },
+        ],
         processedCalls: [],
         enrollCalls: [],
         teardownKeep: true,
+      });
+      await expect(readFile(join(wt, '.pipeline', 'HALT'), 'utf-8')).resolves.toContain(
+        `(expected ${remoteHead}, observed ${localHead})`,
+      );
+    } finally {
+      await rm(wt, { recursive: true, force: true });
+    }
+  });
+
+  // #2008. The incident: FINISH published the PR at the record-bearing commit,
+  // the conductor's post-finish cost refresh committed a second shipped-record
+  // commit, and the audit read `headRefOid` ~1s after that push — before
+  // GitHub had reflected it. The worktree was legitimately ahead of the head
+  // the PR reported, and the ship was real.
+  it('ships a candidate that advanced past the head the PR still reports', async () => {
+    const wt = await mkdtemp(join(tmpdir(), 'wt-durable-post-finish-refresh-'));
+    const prUrl = 'https://github.com/owner/repo/pull/2004';
+    try {
+      await initTestRepo(wt);
+      await mkdir(join(wt, '.docs/plans'), { recursive: true });
+      await mkdir(join(wt, '.docs/shipped'), { recursive: true });
+      const plan = '# Durable daemon evidence\n';
+      const recordPath = join(wt, `.docs/shipped/${ITEM.slug}.md`);
+      const record = renderShippedRecord({
+        slug: ITEM.slug,
+        specHash: specHash(Buffer.from(plan), null).digest,
+        pr: prUrl,
+        shipped: '2026-08-28',
+      });
+      await writeFile(join(wt, `.docs/plans/${ITEM.slug}.md`), plan, 'utf-8');
+      await writeFile(recordPath, `${record}\n## Time\nstate: partial\n`, 'utf-8');
+      await execFile('git', ['add', '.'], { cwd: wt });
+      await execFile('git', ['commit', '-m', `shipped record: ${ITEM.slug}`], { cwd: wt });
+      const { stdout: publishedStdout } = await execFile('git', ['rev-parse', 'HEAD'], { cwd: wt });
+      const publishedHead = publishedStdout.trim();
+
+      await writeFile(recordPath, `${record}\n## Time\nstate: measured\n`, 'utf-8');
+      await execFile('git', ['add', '.'], { cwd: wt });
+      await execFile('git', ['commit', '-m', `shipped record: ${ITEM.slug}`], { cwd: wt });
+
+      const rec: TestRecorder = {};
+      const run = makeRunFeature({
+        ...deps({ done: true, halted: false, finishChoice: 'pr', prUrl }, rec),
+        createWorktree: async (slug) => ({ path: wt, branch: `feat/${slug}` }),
+        shipmentEvidence: undefined,
+        cleanupHaltPresentation: async () => 'confirmed' as const,
+        runGh: async () => ({
+          stdout: JSON.stringify({ url: prUrl, headRefOid: publishedHead }),
+        }),
+      });
+
+      const out = await run(ITEM);
+
+      expect({
+        status: out.status,
+        reason: out.reason,
+        processedCalls: rec.processedCalls,
+        enrollCalls: rec.enrollCalls,
+        teardownKeep: rec.teardownKeep,
+      }).toEqual({
+        status: 'done',
+        reason: undefined,
+        processedCalls: [{ slug: ITEM.slug, prUrl }],
+        enrollCalls: [{ slug: ITEM.slug, prUrl }],
+        // A PR ship retains the worktree until the human merge — teardown is
+        // never called on this path.
+        teardownKeep: undefined,
       });
     } finally {
       await rm(wt, { recursive: true, force: true });
@@ -891,7 +1014,7 @@ describe('engine/daemon-runner — makeRunFeature', () => {
         haltClass: 'needs-human',
         status: 'error',
         teardownKeep: true,
-        parkMarkerExists: true,
+        parkMarkerExists: false,
         containsParkedClaim: true,
       },
     },
@@ -1021,33 +1144,33 @@ describe('engine/daemon-runner — makeRunFeature', () => {
     return { outcome: await makeRunFeature(featureDeps)(item), runConductorCalls };
   }
 
-  it('keeps the first automatic marker bytes when triage parks the same slug twice', async () => {
+  it('returns the same declarative auto-park request when triage parks the same slug twice', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-triage-park-idempotent-'));
     try {
-      await runSetupTriageOutcome(projectRoot, ITEM, { kind: 'park', outputTail: 'first failure' });
-      const markerPath = join(projectRoot, '.daemon', 'parked', ITEM.slug);
-      const firstMarker = await readFile(markerPath, 'utf-8');
+      const first = await runSetupTriageOutcome(projectRoot, ITEM, { kind: 'park', outputTail: 'first failure' });
+      const second = await runSetupTriageOutcome(projectRoot, ITEM, { kind: 'park', outputTail: 'second failure' });
 
-      await runSetupTriageOutcome(projectRoot, ITEM, { kind: 'park', outputTail: 'second failure' });
-
-      await expect(readFile(markerPath, 'utf-8')).resolves.toBe(firstMarker);
+      expect([first.outcome.terminalEffects, second.outcome.terminalEffects]).toEqual([
+        { autoPark: { reason: 'first failure' } },
+        { autoPark: { reason: 'second failure' } },
+      ]);
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
   });
 
-  it('writes distinct main-root automatic markers and reasons for separately triaged slugs', async () => {
+  it('returns distinct auto-park requests and reasons for separately triaged slugs', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-triage-park-distinct-'));
     const first: BacklogItem = { slug: 'first-feature' };
     const second: BacklogItem = { slug: 'second-feature' };
     try {
-      await runSetupTriageOutcome(projectRoot, first, { kind: 'park', outputTail: 'first setup failure' });
-      await runSetupTriageOutcome(projectRoot, second, { kind: 'park', outputTail: 'second setup failure' });
+      const firstOutcome = await runSetupTriageOutcome(projectRoot, first, { kind: 'park', outputTail: 'first setup failure' });
+      const secondOutcome = await runSetupTriageOutcome(projectRoot, second, { kind: 'park', outputTail: 'second setup failure' });
 
-      await expect(readFile(join(projectRoot, '.daemon', 'parked', first.slug), 'utf-8'))
-        .resolves.toContain('first setup failure');
-      await expect(readFile(join(projectRoot, '.daemon', 'parked', second.slug), 'utf-8'))
-        .resolves.toContain('second setup failure');
+      expect([firstOutcome.outcome.terminalEffects, secondOutcome.outcome.terminalEffects]).toEqual([
+        { autoPark: { reason: 'first setup failure' } },
+        { autoPark: { reason: 'second setup failure' } },
+      ]);
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
@@ -2382,5 +2505,84 @@ describe('engine/daemon-runner — makeRunFeature', () => {
       expect(rec.processedCalls![0]).toEqual({ slug: ITEM.slug, prUrl: PR_URL });
       expect(rec.processedCalls![1]).toEqual({ slug: ITEM.slug, prUrl: PR_URL });
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// rem-as-built-rem-ab3-1 (adr-2026-08-27 D1): the engineer-store write leaves
+// the executor lifetime. The executor only CAPTURES the signal (outcome +
+// pre-teardown events.jsonl content) as a declarative terminal effect; the
+// dispatcher performs the cross-project write at collection
+// (daemon-cli.test.ts covers that side of the seam).
+// ─────────────────────────────────────────────────────────────────────────────
+describe('engine/daemon-runner — engineer signal crosses the dispatcher-executor seam', () => {
+  it('deferred daemon completion captures events content before teardown and performs zero writes under root/.daemon or the engineer dir', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-engineer-signal-'));
+    const engineerDir = await mkdtemp(join(tmpdir(), 'daemon-runner-engineer-dir-'));
+    const savedEnv = process.env.AI_CONDUCTOR_ENGINEER_DIR;
+    process.env.AI_CONDUCTOR_ENGINEER_DIR = engineerDir;
+    const worktreePath = join(projectRoot, '.worktrees', ITEM.slug);
+    const eventsLine =
+      '{"type":"kickback","from":"build","to":"plan","count":1,"ts":"2026-06-25T00:00:02.000Z"}\n';
+    try {
+      const featureDeps = deps({ done: false, halted: true, reason: 'needs human', costTokens: 7 });
+      featureDeps.daemon = true;
+      featureDeps.deferTerminalEffects = true;
+      featureDeps.projectRoot = projectRoot;
+      featureDeps.createWorktree = async (slug) => {
+        await mkdir(join(worktreePath, '.pipeline'), { recursive: true });
+        await writeFile(join(worktreePath, '.pipeline', 'events.jsonl'), eventsLine, 'utf-8');
+        return { path: worktreePath, branch: `feat/${slug}` };
+      };
+      // Teardown destroys the events log — the captured content must predate it.
+      featureDeps.teardownWorktree = async () => {
+        await rm(join(worktreePath, '.pipeline', 'events.jsonl'), { force: true });
+      };
+
+      const outcome = await makeRunFeature(featureDeps)(ITEM);
+
+      expect(outcome.terminalEffects?.engineerSignal).toEqual({
+        outcome: {
+          slug: ITEM.slug,
+          status: 'halted',
+          reason: 'needs human',
+          prUrl: undefined,
+          costTokens: 7,
+        },
+        eventsContent: eventsLine,
+      });
+      // Executor lifetime performed the capture only — zero engineer-store,
+      // root-checkout, or `.daemon` writes.
+      await expect(readFile(join(engineerDir, 'signals.jsonl'), 'utf-8'))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(readFile(join(projectRoot, '.daemon', 'parked', ITEM.slug), 'utf-8'))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      if (savedEnv === undefined) delete process.env.AI_CONDUCTOR_ENGINEER_DIR;
+      else process.env.AI_CONDUCTOR_ENGINEER_DIR = savedEnv;
+      await rm(projectRoot, { recursive: true, force: true });
+      await rm(engineerDir, { recursive: true, force: true });
+    }
+  });
+
+  it('manual (daemon=false) deferred completion requests no engineer signal', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-runner-engineer-manual-'));
+    const worktreePath = join(projectRoot, '.worktrees', ITEM.slug);
+    try {
+      const featureDeps = deps({ done: false, halted: true, reason: 'needs human' });
+      featureDeps.daemon = false;
+      featureDeps.deferTerminalEffects = true;
+      featureDeps.projectRoot = projectRoot;
+      featureDeps.createWorktree = async (slug) => {
+        await mkdir(join(worktreePath, '.pipeline'), { recursive: true });
+        return { path: worktreePath, branch: `feat/${slug}` };
+      };
+
+      const outcome = await makeRunFeature(featureDeps)(ITEM);
+
+      expect(outcome.terminalEffects).toEqual({ sweep: true });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -1,3 +1,4 @@
+// Covers: S1.1, S1.2, S1.3, S1.4, S1.5, S2.1, S2.2, S2.3, S2.4, task:1, task:2, task:4
 /**
  * Acceptance (RED) spec for the gated rebase-conflict resolution sub-loop.
  *
@@ -25,7 +26,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile as execFileCb } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
@@ -37,10 +38,14 @@ import {
   resolveRebaseConflicts,
   runGatedRebaseResolution,
   featureCommitsPreserved,
+  formatFeatureCommitPreservationRejection,
+  supersededByBase,
+  type GitRunner,
   type ResolutionAttempt,
   type RebaseOutcome,
   runTier1,
   conflictedFiles,
+  writeHalt,
 } from '../../src/engine/rebase.js';
 
 const execFile = promisify(execFileCb);
@@ -118,6 +123,7 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
     expect(outcome.kind).toBe('conflict_halt');
     if (outcome.kind === 'conflict_halt') {
       expect(outcome.reason).toContain('human needed');
+      expect(outcome.resumeShape).toBeUndefined();
     }
   });
 
@@ -153,11 +159,15 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
 
     expect(calls).toBe(1); // no unsafe retry after a completed-but-bad rebase
     expect(outcome.kind).toBe('conflict_halt');
+    if (outcome.kind === 'conflict_halt') {
+      expect(outcome.resumeShape).toBe('completed-rebase');
+    }
     // branch is genuinely NOT current — base still has a commit the branch lacks
     expect((await g(['rev-list', '--count', 'HEAD..main'])).stdout.trim()).not.toBe('0');
   });
 
   it('FR-9: a resolution that drops the feature commit (--skip) is rejected → HALT', async () => {
+    const preRebaseSha = (await g(['rev-parse', 'HEAD'])).stdout.trim();
     const { git, pre } = await intoConflict();
     let calls = 0;
     // `--skip` drops the conflicting feature commit and completes the rebase: branch
@@ -173,7 +183,7 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
     expect(calls).toBe(1);
     expect(outcome.kind).toBe('conflict_halt');
     if (outcome.kind === 'conflict_halt') {
-      expect(outcome.reason).toMatch(/commit/i); // dropped-commit reason
+      expect(outcome.reason).toContain(`feat: change a (${preRebaseSha.slice(0, 12)}; added content absent: a.ts)`);
     }
     // sanity: the branch WOULD have looked "current" (the trap FR-9 guards against)
     expect((await g(['rev-list', '--count', 'HEAD..main'])).stdout.trim()).toBe('0');
@@ -507,6 +517,38 @@ describe('engine/rebase — runGatedRebaseResolution (shared gate, real git)', (
     expect(settled).toBe('succeeded');
   });
 
+  it('Task 4: a resolver that completes the rebase by dropping feature content HALTs with completed-rebase resume shape', async () => {
+    const { git, pre } = await intoConflict();
+    let calls = 0;
+
+    const out = await runGatedRebaseResolution({
+      git,
+      projectRoot: repo,
+      outcome: pre,
+      cap: 3,
+      resolve: async (): Promise<ResolutionAttempt> => {
+        calls++;
+        await gc(['rebase', '--skip']);
+        return { resolved: true };
+      },
+    });
+
+    expect(calls).toBe(1);
+    const rebasedContent = (await g(['show', 'HEAD:a.ts'])).stdout;
+    expect(rebasedContent).toBe('mainchange\n');
+    expect(rebasedContent).not.toContain('feature');
+    expect(out).toMatchObject({
+      kind: 'conflict_halt',
+      resumeShape: 'completed-rebase',
+    });
+    if (out.kind === 'conflict_halt') {
+      await writeHalt(repo, out.conflicts, out.reason, undefined, out.resumeShape);
+    }
+    const halt = await readFile(join(repo, '.pipeline/HALT'), 'utf8');
+    expect(halt).toContain('Review the completed rebase and restore any missing feature content.');
+    expect(halt).not.toContain('git rebase --continue');
+  });
+
   it('resolver throws → caught as {resolved:false}, short-circuits to HALT, onSettled(exhausted)', async () => {
     const { git, pre } = await intoConflict();
     const attempts: number[] = [];
@@ -582,7 +624,7 @@ describe('engine/rebase — featureCommitsPreserved (real git)', () => {
     const subjectsBefore = ['feat: change a'];
 
     const ok = await featureCommitsPreserved(makeGitRunner(repo), 'main', subjectsBefore);
-    expect(ok).toBe(true);
+    expect(ok).toMatchObject({ kind: 'preserved' });
   });
 
   it('returns false when a feature commit subject is missing (dropped)', async () => {
@@ -592,12 +634,12 @@ describe('engine/rebase — featureCommitsPreserved (real git)', () => {
       'main',
       ['feat: change a'],
     );
-    expect(ok).toBe(false);
+    expect(ok).toMatchObject({ kind: 'rejected' });
   });
 
   it('does not false-positive on a legitimately-empty feature (no prior commits to lose)', async () => {
     const ok = await featureCommitsPreserved(makeGitRunner(repo), 'main', []);
-    expect(ok).toBe(true);
+    expect(ok).toMatchObject({ kind: 'preserved' });
   });
 
   // Regression (observed on `interrupted-self-host-runs-leak-provider-homes-unt`,
@@ -626,7 +668,7 @@ describe('engine/rebase — featureCommitsPreserved (real git)', () => {
     await g(['reset', '-q', '--hard', 'main']);
 
     const ok = await featureCommitsPreserved(makeGitRunner(repo), 'main', [droppedSubject]);
-    expect(ok).toBe(true);
+    expect(ok).toMatchObject({ kind: 'preserved' });
   });
 
   it('still returns false when a vanished commit applies cleanly and its work is genuinely absent', async () => {
@@ -641,7 +683,78 @@ describe('engine/rebase — featureCommitsPreserved (real git)', () => {
     await g(['reset', '-q', '--hard', 'main']);
 
     const ok = await featureCommitsPreserved(makeGitRunner(repo), 'main', [droppedSubject]);
-    expect(ok).toBe(false);
+    expect(ok).toMatchObject({ kind: 'rejected' });
+  });
+
+  it('renders every independently missing commit in pre-rebase order with stable, repo-relative evidence', async () => {
+    await g(['checkout', '-q', '-b', 'feat']);
+    await writeFile(join(repo, 'first.ts'), 'first lost content\n');
+    await g(['add', 'first.ts']);
+    await g(['commit', '-q', '-m', 'feat: first lost change']);
+    await writeFile(join(repo, 'second.ts'), 'second lost content\n');
+    await g(['add', 'second.ts']);
+    await g(['commit', '-q', '-m', 'feat: second lost change']);
+
+    await g(['reset', '-q', '--hard', 'main']);
+    const verdict = await featureCommitsPreserved(makeGitRunner(repo), 'main', [
+      'feat: first lost change',
+      'feat: second lost change',
+    ]);
+
+    expect(verdict).toMatchObject({
+      kind: 'rejected',
+      missing: [
+        { subject: 'feat: first lost change', cause: 'added content absent', path: 'first.ts' },
+        { subject: 'feat: second lost change', cause: 'added content absent', path: 'second.ts' },
+      ],
+    });
+    if (verdict.kind === 'rejected') {
+      const rendered = formatFeatureCommitPreservationRejection(verdict);
+      expect(rendered).toBe(formatFeatureCommitPreservationRejection(verdict));
+      expect(rendered.indexOf('feat: first lost change')).toBeLessThan(rendered.indexOf('feat: second lost change'));
+      expect(rendered).not.toContain(repo);
+    }
+  });
+
+  it('states how many further missing subjects the bound omitted', () => {
+    const verdict = {
+      kind: 'rejected' as const,
+      missing: [1, 2, 3, 4, 5].map((n) => ({
+        subject: `feat: lost change ${n}`,
+        cause: 'added content absent' as const,
+        path: `lost-${n}.ts`,
+      })),
+    };
+
+    const rendered = formatFeatureCommitPreservationRejection(verdict);
+
+    expect(rendered).toBe(formatFeatureCommitPreservationRejection(verdict));
+    expect(rendered.split('\n')).toHaveLength(1);
+    expect(rendered).toContain('feat: lost change 1');
+    expect(rendered).toContain('feat: lost change 2');
+    expect(rendered).toContain('feat: lost change 3');
+    expect(rendered).not.toContain('feat: lost change 4');
+    expect(rendered).not.toContain('feat: lost change 5');
+    expect(rendered.indexOf('feat: lost change 1')).toBeLessThan(rendered.indexOf('feat: lost change 2'));
+    expect(rendered.indexOf('feat: lost change 2')).toBeLessThan(rendered.indexOf('feat: lost change 3'));
+    expect(rendered).toContain('; and 2 more missing subject(s) omitted');
+  });
+
+  it('states no omitted count when every missing subject fits inside the bound', () => {
+    const verdict = {
+      kind: 'rejected' as const,
+      missing: [1, 2, 3].map((n) => ({
+        subject: `feat: lost change ${n}`,
+        cause: 'added content absent' as const,
+        path: `lost-${n}.ts`,
+      })),
+    };
+
+    const rendered = formatFeatureCommitPreservationRejection(verdict);
+
+    expect(rendered).toContain('feat: lost change 3');
+    expect(rendered).not.toContain('omitted');
+    expect(rendered).not.toContain('more');
   });
 
   it('fails closed on a vanished empty commit, which offers no evidence of supersession', async () => {
@@ -652,12 +765,267 @@ describe('engine/rebase — featureCommitsPreserved (real git)', () => {
     await g(['reset', '-q', '--hard', 'main']);
 
     const ok = await featureCommitsPreserved(makeGitRunner(repo), 'main', [droppedSubject]);
-    expect(ok).toBe(false);
+    expect(ok).toMatchObject({ kind: 'rejected' });
   });
 
   it('fails closed when the vanished commit cannot be resolved against the pre-rebase tip', async () => {
     const ok = await featureCommitsPreserved(makeGitRunner(repo), 'main', ['feat: never existed']);
-    expect(ok).toBe(false);
+    expect(ok).toEqual({
+      kind: 'rejected',
+      missing: [{ subject: 'feat: never existed', cause: 'could not resolve pre-rebase commit', path: null }],
+    });
+    if (ok.kind === 'rejected') {
+      expect(formatFeatureCommitPreservationRejection(ok)).toContain(
+        'feat: never existed (could not resolve pre-rebase commit)',
+      );
+    }
+  });
+});
+
+describe('engine/rebase — supersededByBase rejection evidence (real git)', () => {
+  let repo: string;
+  const g = (args: string[]) => execFile('git', args, { cwd: repo });
+
+  beforeEach(async () => {
+    repo = await mkdtemp(join(tmpdir(), 'superseded-by-base-'));
+    await initTestRepo(repo);
+    await writeFile(join(repo, 'a.ts'), 'base\n');
+    await g(['add', '.']);
+    await g(['commit', '-q', '-m', 'init']);
+  });
+
+  afterEach(async () => {
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  it('reports an unreadable commit diff', async () => {
+    await expect(supersededByBase(makeGitRunner(repo), 'not-a-commit')).resolves.toEqual({
+      kind: 'rejected', cause: 'unreadable commit diff', path: null,
+    });
+  });
+
+  it('reports a binary commit diff with its path', async () => {
+    await g(['checkout', '-q', '-b', 'feat']);
+    await writeFile(join(repo, 'asset.bin'), Buffer.from([0, 1, 2]));
+    await g(['add', 'asset.bin']);
+    await g(['commit', '-q', '-m', 'feat: add binary asset']);
+    const { stdout: sha } = await g(['rev-parse', 'HEAD']);
+    await g(['checkout', '-q', 'main']);
+
+    await expect(supersededByBase(makeGitRunner(repo), sha.trim())).resolves.toEqual({
+      kind: 'rejected', cause: 'binary commit diff', path: 'asset.bin',
+    });
+  });
+
+  it('reports an empty commit diff', async () => {
+    await g(['checkout', '-q', '-b', 'feat']);
+    await g(['commit', '-q', '--allow-empty', '-m', 'feat: empty marker']);
+    const { stdout: sha } = await g(['rev-parse', 'HEAD']);
+    await g(['checkout', '-q', 'main']);
+
+    await expect(supersededByBase(makeGitRunner(repo), sha.trim())).resolves.toEqual({
+      kind: 'rejected', cause: 'empty commit diff', path: null,
+    });
+  });
+
+  it('reports a deletion whose file remains in the resulting tree', async () => {
+    await g(['checkout', '-q', '-b', 'feat']);
+    await g(['rm', '-q', 'a.ts']);
+    await g(['commit', '-q', '-m', 'feat: delete a']);
+    const { stdout: sha } = await g(['rev-parse', 'HEAD']);
+    await g(['checkout', '-q', 'main']);
+
+    await expect(supersededByBase(makeGitRunner(repo), sha.trim())).resolves.toEqual({
+      kind: 'rejected', cause: 'deleted file still present', path: 'a.ts',
+    });
+  });
+
+  it('reports added content absent from the resulting tree', async () => {
+    await g(['checkout', '-q', '-b', 'feat']);
+    await writeFile(join(repo, 'added.ts'), 'feature-only content\n');
+    await g(['add', 'added.ts']);
+    await g(['commit', '-q', '-m', 'feat: add content']);
+    const { stdout: sha } = await g(['rev-parse', 'HEAD']);
+    await g(['checkout', '-q', 'main']);
+
+    await expect(supersededByBase(makeGitRunner(repo), sha.trim())).resolves.toEqual({
+      kind: 'rejected', cause: 'added content absent', path: 'added.ts',
+    });
+  });
+
+  it('reports removed content that reappeared relative to the commit parent', async () => {
+    await writeFile(join(repo, 'a.ts'), 'keep\nremoved\n');
+    await g(['commit', '-q', '-am', 'seed removable content']);
+    await g(['checkout', '-q', '-b', 'feat']);
+    await writeFile(join(repo, 'a.ts'), 'keep\n');
+    await g(['commit', '-q', '-am', 'feat: remove content']);
+    const { stdout: sha } = await g(['rev-parse', 'HEAD']);
+    await g(['checkout', '-q', 'main']);
+
+    await expect(supersededByBase(makeGitRunner(repo), sha.trim())).resolves.toEqual({
+      kind: 'rejected', cause: 'removed content reappeared', path: 'a.ts',
+    });
+  });
+});
+
+describe('engine/rebase — featureCommitsPreserved dropped-diff headers', () => {
+  const sha = 'a'.repeat(40);
+  const subject = 'feat: vanished SQL edit';
+
+  function vanishedCommitGit(diff: string, files: Record<string, string>, parentFiles: Record<string, string>) {
+    const calls: string[][] = [];
+    const git: GitRunner = async (args) => {
+      calls.push(args);
+      if (args[0] === 'log' && args[2] === 'main..HEAD') return { exitCode: 0, stdout: '', stderr: '' };
+      if (args[0] === 'log' && args[2] === 'main..ORIG_HEAD') {
+        return { exitCode: 0, stdout: `${sha}\0${subject}\n`, stderr: '' };
+      }
+      if (args.join(' ') === `show --format= --unified=0 --no-renames ${sha}`) {
+        return { exitCode: 0, stdout: diff, stderr: '' };
+      }
+      if (args[0] === 'show' && args[1]?.startsWith('HEAD:')) {
+        const path = args[1].slice('HEAD:'.length);
+        return path in files
+          ? { exitCode: 0, stdout: files[path]!, stderr: '' }
+          : { exitCode: 128, stdout: '', stderr: `missing ${path}` };
+      }
+      if (args[0] === 'show' && args[1]?.startsWith(`${sha}^:`)) {
+        const path = args[1].slice(`${sha}^:`.length);
+        return path in parentFiles
+          ? { exitCode: 0, stdout: parentFiles[path]!, stderr: '' }
+          : { exitCode: 128, stdout: '', stderr: `missing ${path}` };
+      }
+      if (args[0] === 'cat-file') return { exitCode: 1, stdout: '', stderr: '' };
+      throw new Error(`unexpected git call: ${args.join(' ')}`);
+    };
+    return { git, calls };
+  }
+
+  it('keeps a removed -- comment associated with its header path alongside ordinary removals', async () => {
+    const { git, calls } = vanishedCommitGit(
+      'diff --git a/schema.sql b/schema.sql\n--- a/schema.sql\n+++ b/schema.sql\n@@ -1,2 +0,0 @@\n--- comment\n-ordinary removal\n',
+      { 'schema.sql': '' },
+      { 'schema.sql': '-- comment\nordinary removal\n' },
+    );
+
+    await expect(featureCommitsPreserved(git, 'main', [subject])).resolves.toMatchObject({ kind: 'preserved' });
+    expect(calls.map((args) => args.join(' '))).toContain(`show HEAD:schema.sql`);
+    expect(calls.map((args) => args.join(' '))).toContain(`show ${sha}^:schema.sql`);
+    expect(calls.map((args) => args.join(' '))).not.toContain(`show ${sha}^:comment`);
+  });
+
+  it.each([
+    ['present', '++ value\n', true],
+    ['absent', '', false],
+  ])('accepts an added ++ value only when it is %s in HEAD', async (_state, head, expected) => {
+    const { git, calls } = vanishedCommitGit(
+      'diff --git a/values.sql b/values.sql\n--- a/values.sql\n+++ b/values.sql\n@@ -0,0 +1 @@\n+++ value\n',
+      { 'values.sql': head },
+      { 'values.sql': '' },
+    );
+
+    expect((await featureCommitsPreserved(git, 'main', [subject])).kind === 'preserved').toBe(expected);
+    expect(calls.map((args) => args.join(' '))).toContain('show HEAD:values.sql');
+    expect(calls.map((args) => args.join(' '))).not.toContain('show HEAD:value');
+  });
+
+  it.each([
+    ['absorbed', '', true],
+    ['skipped', '-- comment\n', false],
+  ])('accepts a comment-only deletion only when it is %s', async (_state, head, expected) => {
+    const { git, calls } = vanishedCommitGit(
+      'diff --git a/schema.sql b/schema.sql\n--- a/schema.sql\n+++ b/schema.sql\n@@ -1 +0,0 @@\n--- comment\n',
+      { 'schema.sql': head },
+      { 'schema.sql': '-- comment\n' },
+    );
+
+    expect((await featureCommitsPreserved(git, 'main', [subject])).kind === 'preserved').toBe(expected);
+    expect(calls.map((args) => args.join(' '))).toContain(`show ${sha}^:schema.sql`);
+    expect(calls.map((args) => args.join(' '))).not.toContain(`show ${sha}^:comment`);
+  });
+
+  it('checks each file and hunk independently while ignoring the no-newline marker', async () => {
+    const { git, calls } = vanishedCommitGit(
+      [
+        'diff --git a/schema.sql b/schema.sql',
+        '--- a/schema.sql',
+        '+++ b/schema.sql',
+        '@@ -1 +0,0 @@',
+        '--- comment',
+        '\\ No newline at end of file',
+        '@@ -4,0 +4 @@',
+        '+++ value',
+        'diff --git a/later.sql b/later.sql',
+        '--- a/later.sql',
+        '+++ b/later.sql',
+        '@@ -1 +1 @@',
+        '-lost later edit',
+      ].join('\n'),
+      { 'schema.sql': '++ value\n', 'later.sql': 'lost later edit\n' },
+      { 'schema.sql': '-- comment\n', 'later.sql': 'lost later edit\n' },
+    );
+
+    await expect(featureCommitsPreserved(git, 'main', [subject])).resolves.toMatchObject({ kind: 'rejected' });
+    expect(calls.map((args) => args.join(' '))).toContain('show HEAD:schema.sql');
+    expect(calls.map((args) => args.join(' '))).toContain('show HEAD:later.sql');
+    expect(calls.map((args) => args.join(' '))).not.toContain('show HEAD:value');
+  });
+
+  it('retains whole-file deletion and fails closed for empty, binary, and unreadable-parent diffs', async () => {
+    const deleted = vanishedCommitGit(
+      'diff --git a/deleted.sql b/deleted.sql\n--- a/deleted.sql\n+++ /dev/null\n@@ -1 +0,0 @@\n-old content\n',
+      {},
+      { 'deleted.sql': 'old content\n' },
+    );
+    await expect(featureCommitsPreserved(deleted.git, 'main', [subject])).resolves.toMatchObject({ kind: 'preserved' });
+    expect(deleted.calls.map((args) => args.join(' '))).toContain('cat-file -e HEAD:deleted.sql');
+
+    for (const diff of ['', 'diff --git a/blob.bin b/blob.bin\nBinary files a/blob.bin and b/blob.bin differ\n']) {
+      const rejected = vanishedCommitGit(diff, {}, {});
+      await expect(featureCommitsPreserved(rejected.git, 'main', [subject])).resolves.toMatchObject({ kind: 'rejected' });
+    }
+
+    const unreadableParent = vanishedCommitGit(
+      'diff --git a/schema.sql b/schema.sql\n--- a/schema.sql\n+++ b/schema.sql\n@@ -1 +0,0 @@\n-removed\n',
+      { 'schema.sql': '' },
+      {},
+    );
+    await expect(featureCommitsPreserved(unreadableParent.git, 'main', [subject])).resolves.toMatchObject({ kind: 'rejected' });
+  });
+});
+
+describe('engine/rebase — featureCommitsPreserved SQL comment deletion (real git)', () => {
+  let repo: string;
+  const g = (args: string[]) => execFile('git', args, { cwd: repo });
+
+  beforeEach(async () => {
+    repo = await mkdtemp(join(tmpdir(), 'commits-preserved-sql-'));
+    await initTestRepo(repo);
+    await writeFile(join(repo, 'schema.sql'), '-- comment\nSELECT 1;\n');
+    await g(['add', '.']);
+    await g(['commit', '-q', '-m', 'init schema']);
+  });
+
+  afterEach(async () => {
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['absorbed', '-- comment\nSELECT 1;\n', 'SELECT 1;\n', true],
+    ['skipped', '-- comment\nSELECT 1;\n', '-- comment\nSELECT 1;\n', false],
+  ])('returns %s when a real .sql comment-only deletion vanished', async (_state, initial, main, expected) => {
+    expect(initial).toBe('-- comment\nSELECT 1;\n');
+    await g(['checkout', '-q', '-b', 'feat']);
+    await writeFile(join(repo, 'schema.sql'), 'SELECT 1;\n');
+    await g(['commit', '-q', '-am', 'feat: remove SQL comment']);
+    const featureTip = (await g(['rev-parse', 'HEAD'])).stdout.trim();
+
+    await g(['checkout', '-q', 'main']);
+    await writeFile(join(repo, 'schema.sql'), main);
+    if (main !== initial) await g(['commit', '-q', '-am', 'main: remove SQL comment']);
+    await g(['update-ref', 'ORIG_HEAD', featureTip]);
+
+    expect((await featureCommitsPreserved(makeGitRunner(repo), 'main', ['feat: remove SQL comment'])).kind === 'preserved').toBe(expected);
   });
 });
 

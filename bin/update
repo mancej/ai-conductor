@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# update — Standalone self-update/channel CLI for the harness, ported out of
-# bin/conduct's update block (see .docs/plans/port-self-update-flow.md and
-# .docs/stories/port-self-update-flow.md). bin/conduct still retains its own
-# copy of the update flow until #226 removes it.
-#
-# Sequencing note for #226: that follow-up issue must delete the update block
-# (check_harness_update/apply_harness_update/set_update_channel/etc., plus
-# any duplicated helper copy still inline in bin/conduct rather than sourced
-# from bin/lib/harness-common.sh) from bin/conduct. #226 must NOT remove this
-# file (bin/update) or bin/lib/harness-common.sh — they are the new permanent
-# homes for this logic.
+# update — Standalone self-update/channel CLI for the harness.
+# bin/update and bin/lib/harness-common.sh are the permanent homes for this
+# shell-side maintenance flow.
 #
 # Usage:
 #   update                          — force an update check now, bypassing the autoCheck gate
@@ -20,6 +12,10 @@ set -euo pipefail
 #   update -h|--help                — usage
 
 HARNESS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# True only under `--auto`, the advisory startup check. A major upgrade is
+# reported but never applied from there — see major_update_gate.
+UPDATE_AUTO_MODE=false
 
 # Not a git checkout — nothing to check/update/configure. Bail before even
 # sourcing harness-common.sh so a harness install missing bin/lib (or any
@@ -31,7 +27,7 @@ fi
 # shellcheck source=bin/lib/harness-common.sh
 source "${HARNESS_DIR}/bin/lib/harness-common.sh"
 
-# ─── Update check functions (ported verbatim from bin/conduct) ────────────
+# ─── Update check functions ───────────────────────────────────────────────
 
 # Render the CHANGELOG.md blocks strictly between from_ver (exclusive) and
 # to_ver (inclusive) using the user's configured markdown viewer. Writes to
@@ -42,7 +38,7 @@ render_changelog_range() {
   local changelog="${HARNESS_DIR}/CHANGELOG.md"
   [ -f "$changelog" ] || return 0
   local preview
-  preview=$(FROM_VER="$from_ver" TO_VER="$to_ver" python3 - "$changelog" <<'PY'
+  preview=$(FROM_VER="$from_ver" TO_VER="$to_ver" conductor_python - "$changelog" <<'PY'
 import os, re, sys
 from pathlib import Path
 
@@ -103,6 +99,51 @@ semver_lt() {
   local hi
   hi=$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -1)
   [ "$hi" = "$b" ]
+}
+
+# True when moving from $1 to $2 crosses a semver MAJOR boundary. Per this
+# harness's own semver rules a MAJOR is a breaking change to skill contracts,
+# the CLI, or the settings.json schema, so it is the one upgrade that must not
+# be accepted by reflex. `0.x → 1.0` counts: the leading component differs.
+# Anything not shaped vX.Y.Z (an undeterminable baseline, a main@<sha>
+# identity) is not a major crossing — those channels have no semver to compare.
+is_major_upgrade() {
+  local from="${1#v}" to="${2#v}"
+  [[ "$from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$to" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [ "${from%%.*}" != "${to%%.*}" ]
+}
+
+# Approval gate for a MAJOR upgrade. Returns 0 to proceed, 1 to stop.
+#
+# A non-major upgrade returns 0 immediately and keeps the ordinary [y/n] flow
+# below it untouched. A major upgrade is never applied from the startup
+# auto-check (`--auto`) — it is reported and left for a deliberate `bin/update`
+# — and an interactive run must type the target version rather than one key.
+# $3 is the manual command a non-interactive caller should run instead.
+major_update_gate() {
+  local from=$1 to=$2 manual_hint=$3 typed=""
+
+  is_major_upgrade "$from" "$to" || return 0
+
+  echo ""
+  warn "MAJOR update ${from} → ${to} — may break skill contracts, the CLI, or the settings.json schema."
+
+  if [ "$UPDATE_AUTO_MODE" = true ]; then
+    info "Not applied automatically. Run: cd ${HARNESS_DIR} && bin/update"
+    return 1
+  fi
+  if [ ! -t 0 ]; then
+    warn "No TTY — run: ${manual_hint}"
+    return 1
+  fi
+
+  read -r -p "  Type ${to} to confirm this major update (or 'n' to skip): " typed
+  if [ "${typed#v}" = "${to#v}" ] && [ -n "$typed" ]; then
+    return 0
+  fi
+  log "Skipping update"
+  return 1
 }
 
 # Run bin/migrate for the accepted update, then write the new currentVersion
@@ -186,16 +227,22 @@ check_harness_update_tagged() {
   render_changelog_range "$baseline" "$latest_tag"
   echo ""
 
-  if [ ! -t 0 ]; then
-    warn "No TTY — run: cd ${HARNESS_DIR} && git checkout ${latest_tag} && bin/migrate"
-    return 0
+  local manual_hint="cd ${HARNESS_DIR} && git checkout ${latest_tag} && bin/migrate"
+  if is_major_upgrade "$baseline" "$latest_tag"; then
+    # The typed confirmation inside the gate IS this update's approval; the
+    # ordinary [y/n] must not also run and re-ask with one key.
+    major_update_gate "$baseline" "$latest_tag" "$manual_hint" || return 0
+  else
+    if [ ! -t 0 ]; then
+      warn "No TTY — run: ${manual_hint}"
+      return 0
+    fi
+    read -r -p "  Update to ${latest_tag}? [y/n]: " choice
+    case "$choice" in
+      [yY]) ;;
+      *) log "Skipping update"; return 0 ;;
+    esac
   fi
-
-  read -r -p "  Update to ${latest_tag}? [y/n]: " choice
-  case "$choice" in
-    [yY]) ;;
-    *) log "Skipping update"; return 0 ;;
-  esac
 
   local rollback_ref
   rollback_ref=$(git -C "$HARNESS_DIR" rev-parse HEAD 2>/dev/null || echo "HEAD")
@@ -218,19 +265,41 @@ restore_stable_checkout() {
 check_harness_update_stable() {
   timeout 5 git -C "$HARNESS_DIR" fetch --tags --quiet origin stable 2>/dev/null || return 0
 
-  local branch local_head remote_head target_version
+  local branch local_head remote_head target_version detached=false
   branch=$(git -C "$HARNESS_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  [ "$branch" = "stable" ] || return 0
+  if [ "$branch" != "stable" ]; then
+    # A stable install updated by a pre-v1 bin/update was moved with
+    # `git checkout vX.Y.Z`, which leaves it in detached HEAD and off the
+    # branch. Returning here would silently and permanently end every later
+    # stable update for that install, so a detached HEAD is recovered onto the
+    # stable branch once the ancestry test below proves it is that lineage.
+    # Any other branch is still left alone.
+    [ "$branch" = "HEAD" ] || return 0
+    detached=true
+  fi
 
   local_head=$(git -C "$HARNESS_DIR" rev-parse HEAD 2>/dev/null || echo "")
   remote_head=$(git -C "$HARNESS_DIR" rev-parse origin/stable 2>/dev/null || echo "")
   [ -z "$remote_head" ] && return 0
+
+  # Ancestry is what makes a detached HEAD *this install's* stable lineage. It
+  # is tested before the tag guard below so a deliberate, unrelated detached
+  # checkout stays silent instead of inheriting stable's refusals.
+  if [ "$detached" = true ] &&
+    ! git -C "$HARNESS_DIR" merge-base --is-ancestor HEAD origin/stable 2>/dev/null; then
+    return 0
+  fi
+
   target_version=$(git -C "$HARNESS_DIR" describe --tags --exact-match "$remote_head" --match 'v*.*.*' 2>/dev/null || echo "")
   if ! [[ "$target_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     fail "Stable update refused: origin/stable must point to an exact semver vX.Y.Z tag"
     return 1
   fi
-  [ "$local_head" = "$remote_head" ] && return 0
+  # Already at the release: nothing to apply — unless HEAD is still detached,
+  # where re-attaching the branch is itself the whole repair.
+  if [ "$local_head" = "$remote_head" ] && [ "$detached" != true ]; then
+    return 0
+  fi
 
   if ! git -C "$HARNESS_DIR" merge-base --is-ancestor HEAD origin/stable 2>/dev/null; then
     return 0
@@ -241,17 +310,39 @@ check_harness_update_stable() {
   fi
 
   echo ""
-  warn "Harness stable update available"
-  if [ ! -t 0 ]; then
-    warn "No TTY — run: cd ${HARNESS_DIR} && git pull --ff-only origin stable && bin/migrate"
-    return 0
+  local prompt="  Pull latest stable release? [y/n]: "
+  if [ "$detached" = true ]; then
+    warn "Stable checkout is detached from the stable branch — recovery available at ${target_version}"
+    prompt="  Re-attach the stable branch at ${target_version}? [y/n]: "
+  else
+    warn "Harness stable update available"
+  fi
+  local manual_hint="cd ${HARNESS_DIR} && git pull --ff-only origin stable && bin/migrate"
+  if [ "$detached" = true ]; then
+    manual_hint="cd ${HARNESS_DIR} && git checkout -B stable ${remote_head} && bin/migrate"
   fi
 
-  read -r -p "  Pull latest stable release? [y/n]: " choice
-  case "$choice" in
-    [yY]) ;;
-    *) log "Skipping update"; return 0 ;;
-  esac
+  # The installed release this move starts from. A detached recovery has
+  # local_head == remote_head, so from == to and the gate correctly no-ops:
+  # re-attaching the branch is not a version change.
+  local stable_from
+  stable_from=$(git -C "$HARNESS_DIR" describe --tags --exact-match "$local_head" --match 'v*.*.*' 2>/dev/null || echo "")
+  [ -n "$stable_from" ] || stable_from=$(conductor_cfg_get currentVersion "" 2>/dev/null || echo "")
+
+  if is_major_upgrade "$stable_from" "$target_version"; then
+    # The typed confirmation inside the gate IS this update's approval.
+    major_update_gate "$stable_from" "$target_version" "$manual_hint" || return 0
+  else
+    if [ ! -t 0 ]; then
+      warn "No TTY — run: ${manual_hint}"
+      return 0
+    fi
+    read -r -p "$prompt" choice
+    case "$choice" in
+      [yY]) ;;
+      *) log "Skipping update"; return 0 ;;
+    esac
+  fi
 
   local rollback_ref prior_version prior_checked_at
   rollback_ref=$local_head
@@ -260,7 +351,15 @@ check_harness_update_stable() {
     return 1
   fi
   prior_checked_at=$(conductor_cfg_get lastCheckedAt "" 2>/dev/null || true)
-  if ! git -C "$HARNESS_DIR" merge --ff-only "$remote_head" >/dev/null 2>&1; then
+  # Both branches apply the SHA approved above, never a re-read of
+  # origin/stable, so a remote advance during the prompt cannot be picked up.
+  if [ "$detached" = true ]; then
+    if ! git -C "$HARNESS_DIR" checkout -B stable "$remote_head" >/dev/null 2>&1; then
+      fail "Re-attaching the stable branch failed — recover manually: cd ${HARNESS_DIR} && git checkout -B stable ${remote_head}"
+      return 1
+    fi
+    git -C "$HARNESS_DIR" branch --set-upstream-to=origin/stable stable >/dev/null 2>&1 || true
+  elif ! git -C "$HARNESS_DIR" merge --ff-only "$remote_head" >/dev/null 2>&1; then
     fail "Fast-forward to approved stable commit failed — update manually: cd ${HARNESS_DIR} && git merge --ff-only ${remote_head}"
     return 1
   fi
@@ -345,7 +444,13 @@ check_harness_update_main() {
 dispatch_update_channel() {
   local channel
   if ! channel=$(conductor_cfg_get updateChannel tagged); then
-    if ! command -v conduct-ts &>/dev/null; then
+    # A failed read means either the CLI is absent (decline) or the config is
+    # unreadable while the CLI works (degrade to the default channel). Probe
+    # the CLI `conductor_cfg_get` actually resolves — probing the retired
+    # `conduct-ts` name made the degrade path depend on a stale global install.
+    local cli
+    cli="$(conductor_cli)"
+    if ! command -v "$cli" &>/dev/null; then
       warn "Update check declined: conductor configuration could not be read."
       return 1
     fi
@@ -408,14 +513,20 @@ EOF
 
 if [ "$#" -eq 0 ]; then
   check_harness_update
-  exit $?
+  rc=$?
+  # Ensure the ~/.ai-conductor global-fallback symlink to the checkout's
+  # committed rate card exists (repair after a moved checkout or old install).
+  sync_global_rate_card "$HARNESS_DIR"
+  exit $rc
 fi
 
 case "${1:-}" in
   --auto)
     # Automatic checks are advisory: report an unavailable prerequisite but
     # never make the embedding startup path fail.
+    UPDATE_AUTO_MODE=true
     check_harness_update_auto || true
+    sync_global_rate_card "$HARNESS_DIR"
     exit 0
     ;;
   --set-channel)

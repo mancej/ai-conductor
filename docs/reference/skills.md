@@ -50,12 +50,17 @@ The 13 implicit-required shipped skills are:
 
 | Skill group | Skills | Why they cannot be explicit-only in the distributed catalog |
 | --- | --- | --- |
-| `/engineer` DECIDE composition | `explore`, `prd`, `architecture-diagram`, `architecture-review`, `stories`, `conflict-check`, `plan`, `coherence-check` | `/engineer` must run the real workflows directly in its current chat; it does not launch a second CLI session for them |
+| `/composer` DECIDE composition | `explore`, `prd`, `architecture-diagram`, `architecture-review`, `stories`, `conflict-check`, `plan`, `coherence-check` | `/composer` must run the real workflows directly in its current chat; it does not launch a second CLI session for them |
 | Other same-session handoffs | `intake`, `debugging`, `simplify`, `verify-claims`, `code-removal` | Called from an active skill: issue authoring, fresh debugging, batch simplification, load-bearing claim verification, or removal-shaped build work — `/pipeline` dispatches `/code-removal` in place of a RED cycle |
 
-The 18 explicit-only shipped skills are `assess`, `bootstrap`, `build-review-test-quality`, `code-review`, `conduct`,
+Because these skills remain visible for same-session composition, each description carries a closed
+activation boundary: the active lifecycle/caller state that qualifies, plus nearby requests that do
+not. A generic feature, change, plan, review, bug, or question is not sufficient by itself. Explicit
+operator invocation remains available regardless of these implicit-selection boundaries.
+
+The 18 explicit-only shipped skills are `assess`, `bootstrap`, `build-review-test-quality`, `code-review`, `composer`, `conduct`,
 `daemon-triage`, `engineer`, `finish`, `manual-test`, `memory`, `pipeline`, `prd-audit`, `rebase`,
-`remediate`, `retro`, `pr`, `tdd`, and `writing-system-tests`. The five repository-local skills are also
+`remediate`, `pr`, `tdd`, and `writing-system-tests`. The five repository-local skills are also
 explicit-only: `event-spine`, `maintain-documentation`, `release-disposition`, `scope-check`, and
 `write-tests`.
 
@@ -105,6 +110,7 @@ policy across both catalogs and both host metadata formats.
 | `plan` | gating | decide | — | `plan` (9) | Blocking |
 | `coherence-check` | gating | decide | — | `coherence_check` (10) | Blocking |
 | `intake` | gating | decide | — | none — operator-invoked | Neither |
+| `composer` | advisory | decide | opus | none — operator-invoked | Neither as a step; the land gate blocks |
 | `engineer` | advisory | decide | opus | none — operator-invoked | Neither as a step; the land gate blocks |
 | `writing-system-tests` | gating | build | — | `acceptance_specs` (11) | Blocking |
 | `pipeline` | structural | build | — | `build` (12) | Blocking; cannot be disabled |
@@ -115,9 +121,8 @@ policy across both catalogs and both host metadata formats.
 | `manual-test` | gating | ship | — | `manual_test` (16) | Blocking |
 | `prd-audit` | gating | ship | opus | `prd_audit` (17) | Blocking |
 | `remediate` | gating | ship | — | `remediate` (out-of-band) | Advisory — it is the unblocker |
-| `retro` | advisory | ship | — | `retro` (19) | Advisory |
-| `rebase` | advisory | ship | — | `rebase` (20) — on conflict only | Blocking via the structural step |
-| `finish` | gating | ship | — | `finish` (21) | Blocking |
+| `rebase` | advisory | ship | — | `rebase` (19) — on conflict only | Blocking via the structural step |
+| `finish` | gating | ship | — | `finish` (20) | Blocking |
 | `pr` | advisory | ship | — | none — operator-invoked; `/finish` inlines it rather than calling it | Neither |
 | `maintain-documentation` | (none) | (none) | — | custom step after `rebase` | Blocking, this repository only |
 | `release-disposition` | (none) | (none) | — | custom step after `maintain-documentation` | Blocking, this repository only |
@@ -144,7 +149,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### verify-claims
 
-> Use whenever a statement, theory, or assumption is about to become load-bearing for a spec, plan, ADR, or code. Attaches grounded confidence estimates to claims, always surfaces assumptions, and HARD-BLOCKS work built on unconfirmed assumptions until the operator approves them.
+> Use only when an active workflow is about to rely on a nontrivial factual claim or assumption for a spec, plan, ADR, finding, or code decision. Do not invoke for casual questions, status reports, restatements, or trivially verifiable mechanics.
 
 - **Frontmatter** — `enforcement: gating`, `phase: all`, `standalone: true`, `requires: []`, no model pin.
 - **Engine step** — none. It is a discipline applied inside the calling skill's context and model, not
@@ -168,7 +173,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   The skill treats `.pipeline/phase-active` and daemon status as advisory context: an apparently live
   step produces a warning, while read-only triage always continues. Recovery mutations remain
   individually operator-approved.
-- **Inputs** — read-only evidence only: `conduct-ts daemon status`, `.daemon/daemon.log`, and the
+- **Inputs** — read-only evidence only: `ai-conductor daemon status`, `.daemon/daemon.log`, and the
   feature's `.pipeline/` state (`HALT` + `HALT.class`, `events.jsonl`, `task-status.json`,
   `step-heartbeat`, `phase-active`, `gates/<step>.json`), plus the branch's commit log.
 - **Outputs** — a triage report at `.daemon/triage/<slug>-<timestamp>.md`. Deliberately **not** under
@@ -185,7 +190,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### architecture-diagram
 
-> Generate and maintain C4 architecture diagrams using Mermaid in Markdown. Runs at bootstrap, plan, and post-implementation. Gating — diagrams must reflect current architecture.
+> Use only within an active harness lifecycle when its architecture-diagram step is current. Generates and maintains C4 Mermaid diagrams; do not invoke for ordinary code changes or general architecture questions.
 
 - **Frontmatter** — `enforcement: gating`, `phase: all`, `standalone: true`, `requires: []`, `model: sonnet`.
 - **Engine step** — `architecture_diagram` (index 5, DECIDE, skipped at tier S). Engine enforcement is
@@ -250,7 +255,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### explore
 
-> Use at the start of any new feature or change. Explores context, asks clarifying questions one at a time, proposes 2-3 approaches with trade-offs, and decides the work track (product vs technical). Divergent half of the old brainstorm — produces no committed design doc; the product-track PRD is authored by /prd.
+> Use only within an active engineer/conduct DECIDE workflow when approach selection and product-versus-technical track classification are still unresolved. Do not invoke for ordinary implementation, review, explanation, or an already-decided change or hotfix.
 
 - **Frontmatter** — `enforcement: advisory`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -270,7 +275,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### prd
 
-> Use on the PRODUCT track after /explore, when a feature has user-facing requirements. Authors a product-only design doc (PRD) with enumerated functional requirements. Convergent half of the old brainstorm. Skipped on the technical track (no product requirements to spec).
+> Use only within active engineer/conduct DECIDE after explore confirmed the product track, when a committed product requirements document is required. Do not invoke for technical-track work, ordinary specifications, or general product discussion.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -285,28 +290,33 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### architecture-review
 
-> Use before implementation to review stories through a technical feasibility and architectural alignment lens. Also use at batch boundaries to catch architectural drift.
+> Use only within an active harness lifecycle when pre-stories feasibility review, a pipeline batch drift check, or the SHIP as-built review is current. Do not invoke for ordinary implementation, code review, or general architecture questions.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
 - **Engine step** — two: `architecture_review` (index 6, DECIDE, engine enforcement `advisory`) and
   `architecture_review_as_built` (index 18, SHIP, engine enforcement `gating`), the latter invoked as
-  `/architecture-review --as-built`. Both skip at tier S.
+  `/architecture-review --as-built`. The DECIDE-time step skips at tier S; the as-built step runs at
+  every tier.
 - **Inputs** — `.docs/decisions/`, `.docs/architecture/`, `CLAUDE.md`, `.memory/decisions/`, existing
-  code, and the PRD's FRs or the explore output. As-built mode reads only `Status: APPROVED` ADRs plus
-  the feature diff.
+  code, and the PRD's FRs or the explore output. As-built mode reads only `Status: APPROVED` ADRs, the
+  feature diff, and the sealed `.docs/stories/` criteria that anchor its plan-gap outcome judgement.
 - **Outputs** — `.docs/decisions/architecture-review-<date>-<feature>.md`; ADRs under
   `.docs/decisions/`; `.pipeline/architecture-review-as-built.md`, which must be rewritten on every
   invocation or the engine reads it as stale and halts the SHIP tail.
-- **Gate role** — the as-built half is blocking and fail-closed: only `APPROVED` or `APPROVED WITH
-  DRIFT NOTES` passes. The DECIDE half is advisory at the step level; its DRAFT-ADR hard gate is
-  enforced by the `conduct` state machine and by the land-time spec gate instead. The as-built
-  half's production reachability sweep derives root-to-caller-to-export chains from current shipped
-  source, never from plan-declared callers.
+- **Gate role** — the as-built half is blocking and fail-closed: `APPROVED`, `APPROVED WITH DRIFT
+  NOTES`, and `PLAN_GAP` with `Outcome delivered: yes` satisfy it. A `BLOCKED` artifact contains exactly
+  one `## Blocking Findings` table with `Finding`, `Class`, `Governing clause`, and `Summary` columns.
+  `Class` is `REMEDIABLE` or `DESIGN`; every `REMEDIABLE` row cites an approved ADR decision or an active
+  plan task. An all-`REMEDIABLE` report can use the enabled, bounded remediation route; `DESIGN`, invalid,
+  disabled, or exhausted reports halt needs-human. The DECIDE half is advisory at the step level; its
+  DRAFT-ADR hard gate is enforced by the `conduct` state machine and by the land-time spec gate instead.
+  The as-built half's production reachability sweep derives root-to-caller-to-export chains from current
+  shipped source, never from plan-declared callers.
 
 ### stories
 
-> Use after architecture-review, when the design is approved. Generates user stories with mandatory happy and negative paths as Given/When/Then scenarios — from the PRD's FRs (product track) or the technical intent (technical track).
+> Use only within active engineer/conduct DECIDE after architecture approval, when a committed `.docs/stories` acceptance artifact is required. Do not invoke for general user-story examples, requirements discussion, or direct implementation requests.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -322,7 +332,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### conflict-check
 
-> Use after writing stories, before creating an implementation plan, or when adding features to an existing system. Detects contradictions, overlaps, state conflicts, resource contention, and oscillating requirements that are individually satisfiable but mutually exclusive in practice — the pair that sends work round a kickback loop that never terminates.
+> Use only within active engineer/conduct DECIDE after accepted stories and before plan, or when that workflow explicitly rechecks remediated stories. Detects story interactions; do not invoke for Git conflicts, merge conflicts, or general requirements discussion.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -340,7 +350,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### plan
 
-> Use after stories are written and conflict-check has passed clean. Converts user stories into a step-by-step implementation plan with 2-5 minute task granularity.
+> Use only within active engineer/conduct DECIDE after accepted stories and a clean conflict-check, when a committed `.docs/plans` implementation artifact is required. Do not invoke for conversational planning, implementation checklists, or direct coding requests.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: false`,
   `requires: [".docs/stories/ with both paths", ".docs/conflicts/ clean pass or no blocking conflicts", verify-claims]`,
@@ -351,9 +361,15 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   `## Wiring Surface` section at tiers M and L.
 - **Outputs** — `.docs/plans/<date>-<feature>.md`.
 - **Gate role** — blocking. It refuses to produce a plan without stories, dependency lines, both paths,
-  and a clean conflict-check; every acceptance criterion must map to at least one task; 41 or more tasks
-  is a hard stop. Every task carries a `Done when:` block with two to five nonblank, falsifiable
-  completion checks. At land time, a missing, empty, underspecified, or oversized block rejects the
+  and a clean conflict-check; every acceptance criterion must map to at least one task, and every
+  citable decision in a non-deleted land-accepted ADR (`APPROVED` or `SUPERSEDED`) in the current
+  change set must have one Architecture
+  Obligation Coverage disposition (`task`, `existing`, or `no-change`). Forty-one or more tasks is a
+  hard stop; 21–40 warns. Every task carries a `Done when:` block with two to five nonblank, falsifiable
+  completion checks, each on one physical line and naming a mechanism plus its observable assertion
+  rather than merely restating the mapped criterion. Each changed cross-boundary behavior has exactly one integration-owning task whose
+  checks state observable behavior through an appropriate project entry point; internal tasks do not
+  each acquire an integration-test obligation. At land time, a missing, empty, underspecified, or oversized block rejects the
   whole spec; Markdown fenced-code examples do not count as task structure or checks. An unbounded
   quality word ("fail-closed", "robust", "comprehensive") must be closed by an enumeration or a named
   mechanism in the same block, and completion review is bound by these checks (deeper concerns are
@@ -371,7 +387,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### coherence-check
 
-> Use at the end of DECIDE (after /plan), for Medium and Large tier specs only, to author the committed traceability mapping — outcomes → FRs → stories → tasks with per-row verdicts — that the land-time coherence gate validates. Not used for S tier.
+> Use only within active engineer/conduct DECIDE after plan for a Medium or Large spec. Authors the committed outcomes-to-requirements-to-stories-to-tasks mapping; do not invoke for Small work or ordinary traceability questions.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -381,9 +397,20 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   and accepted ADRs that constrain the stories.
 - **Outputs** — `.docs/coherence/<plan-stem>.md`. The stem must match the plan filename stem exactly or
   the land validator rejects it as a missing coherence artifact. Applicable `adr` rows trace each
-  accepted decision to the stories that implement or must honor it. The sixth row class, `criterion`,
+  accepted ADR to the stories that implement or must honor it, and independently judge every decision's
+  plan-level Architecture Obligation Coverage disposition. The sixth row class, `criterion`,
   maps each exact extracted happy- or negative-path criterion to cited plan tasks in a six-cell row:
-  criterion text, task ids, verdict, a verbatim task-body quote, and `diff-local` or `outside-diff`.
+  criterion text, task ids, verdict, a verbatim `Done when` quote, and `diff-local` or `outside-diff`.
+- **Criterion achievability** — independently judges whether satisfying the cited task checks would
+  produce the Then-clause within approved architecture (§4g). Checks must establish a mechanism;
+  restating the outcome does not establish delivery. The pass sweeps approved ADRs in the change set
+  for binding constraints. An established inability to deliver is `fail`, explained with
+  `CANNOT-DELIVER:` prose below the table identifying the criterion, task, quoted check, and any
+  binding ADR decision. Criterion rows retain six cells; no Notes cell or new gap-id vocabulary is added.
+  The review also checks preserved/default-mode observables against new side effects across tasks,
+  and verifies that closed state/result/reason sets can truthfully represent required negative paths.
+  Checks over normalized inputs or exported subsets must establish the source boundary as well as
+  the helper behavior; agreement within an incomplete subset does not establish complete coverage.
 - **PRD ↔ stories tie-out** — the `fr` and `story` row classes are checked in both directions (SKILL.md
   §4e). Forward: no PRD `FR-N` without a citing story that a task covers. Reverse: no story citing an
   `FR-N` the PRD never declares, and no story citing no FR at all. Both directions are re-derived
@@ -392,7 +419,8 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   acceptance criteria contradict is `fail`, not `covered`. Story-versus-story contradictions stay with
   `conflict-check`; this skill compares each story against the PRD.
 - **Gate role** — blocking. It authors the artifact the land-time coherence gate validates. Verdicts are
-  exactly `covered`, `gap`, or `fail` — `fail` marks a row whose counterpart exists but contradicts it,
+  exactly `covered`, `gap`, or `fail` — `fail` marks a row whose counterpart exists but contradicts it
+  or whose cited task checks cannot deliver the criterion under approved architecture,
   which coverage alone cannot express. Criterion rows enforce that vocabulary mechanically; unknown
   values are malformed. The five legacy row classes retain affirmative-by-default parsing for backward
   compatibility. In an autonomous run an ambiguous row is marked `gap` and left for the fail-closed land
@@ -400,7 +428,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### intake
 
-> Use when filing an intake issue to GitHub — capturing a bug, idea, or observation for a later DECIDE phase. Structures the issue as WHAT (observed evidence, impact) and desired OUTCOMES (observable acceptance signals), with verbatim logs/commands/repro artifacts a zero-context engineer can debug from. Never prescribes HOW — that belongs to DECIDE.
+> Use only when the requested deliverable is a GitHub intake issue, or when an active harness workflow hands an observation off for later DECIDE. Do not invoke merely because a bug, idea, or observation is being discussed.
 
 - **Frontmatter** — `enforcement: gating`, `phase: decide`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -411,13 +439,14 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 - **Gate role** — neither. Its gate is a pre-file checklist at authoring time; nothing downstream blocks
   on it. See [intake](../guides/intake.md) for the filing procedure.
 
-### engineer
+### composer
 
 > Interactive, phone-drivable idea→spec loop: hands a raw idea to the right repo, runs the full DECIDE phase there, and opens a spec PR. Use when capturing and routing new work, NOT when building inside one repo (that is plain conduct).
 
 - **Frontmatter** — `enforcement: advisory`, `phase: decide`, `standalone: true`, `requires: []`,
   `model: opus`.
-- **Engine step** — none. It is a separate control plane with its own CLI subcommands.
+- **Engine step** — none. It is a separate control plane with its own `ai-conductor compose`
+  subcommands.
 - **Inputs** — a claimed GitHub intake issue, or a launch argument or chat idea; the project registry.
 - **Outputs** - in a per-idea worktree on a `spec/<slug>` branch: the track marker and feature-scoped
   PRD, stories, complexity, conflict, plan, and coherence artifacts named with the exact slug
@@ -431,6 +460,17 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   New runs are machine-gated on readiness before authoring. Successful handoff retains the exact
   worktree for review until lifecycle-owned retirement and cleanup.
   See [engineer-loop](../guides/engineer-loop.md).
+ The deprecated `engineer` skill is a
+  thin compatibility delegate to this canonical composer skill.
+
+### engineer
+
+> Deprecated compatibility delegate to [composer](#composer). It preserves existing explicit
+> `/engineer` invocations while the canonical skill is `/composer`.
+
+- **Frontmatter** — `enforcement: advisory`, `phase: decide`, `standalone: true`, `requires: []`,
+  `model: opus`.
+- **Engine step** — none. Use `composer` for new work.
 
 ## BUILD-phase skills
 
@@ -466,16 +506,16 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 - **Inputs** — the plan's task dependency graph, file sets, and dependency lines;
   `.pipeline/task-status.json`; story acceptance criteria; prior batch reviews; ADRs and the approved
   PRD for the design-conformance check.
-- **Outputs** — `.pipeline/audit-trail/batch-N/review.json` and the batch retro and simplification
+- **Outputs** — `.pipeline/audit-trail/batch-N/review.json` and the batch simplification
   records; `.pipeline/progress.log`; `.pipeline/summary.json`; `.pipeline/halt-user-input-required` and
   `.pipeline/HALT` on a stall; at least one `.memory/` entry per batch; a `pipeline_closeout` record in
-  `.pipeline/pipeline-events.jsonl` per completed evaluator gate, written via `conduct-ts
+  `.pipeline/pipeline-events.jsonl` per completed evaluator gate, written via `ai-conductor
   closeout-event`. `.pipeline/current-task` and `.pipeline/task-status.json` are written by engine
   hooks and must not be hand-edited.
 - **Gate role** — blocking. Evaluator dispatch at each batch boundary is mandatory; a missing or empty
   `review.json` halts and re-dispatches. A missing, malformed, or non-matching `evaluator`
   `pipeline_closeout` record is an independent second hard gate (waived for a batch already in flight
-  before the closeout-event emitter shipped) — see [`conduct-ts closeout-event`](cli.md#conduct-ts-closeout-event).
+  before the closeout-event emitter shipped) — see [`ai-conductor closeout-event`](cli.md#ai-conductor-closeout-event).
   `BLOCK` halts and escalates; `REQUEST_CHANGES` triggers rework against a three-cycle budget. Two
   consecutive zero-completion attempts trip a circuit breaker.
 - **Declared replication copy task** — on a plan with a resolved `**Pattern-source:**` /
@@ -500,13 +540,14 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 - **Frontmatter** — `enforcement: structural`, `phase: build`, `standalone: true`, `requires: []`, no
   model pin.
 - **Engine step** — none. It is the per-task cycle every `pipeline` implementer runs.
-- **Inputs** — one acceptance criterion from the plan; test and source directory paths; the
-  `steps.build.tdd.red.model` and `.green.model` config keys; tech-context lint and typecheck commands;
-  `.memory/decisions/`.
+- **Inputs** — one acceptance criterion from the plan; test and source directory paths; tech-context
+  lint and typecheck commands; `.memory/decisions/`.
 - **Outputs** — git commits carrying `Task: <id>` trailers, including empty evidence commits;
   conditional `.memory/gotchas/` and `.memory/patterns/` entries. No `.docs/` artifact.
 - **Gate role** — neither in flow terms, but COMMIT is a hard in-cycle gate: scoped tests green, linter
-  and type-check clean, clean tree, and an exact bare plan task id in the trailer. The domain reviewer
+  and type-check clean, clean tree, any cross-boundary integration check owned by the task proven
+  through the appropriate project entry point (helper-level proof alone does not close that task), and
+  an exact bare plan task id in the trailer. The domain reviewer
   holds veto authority back to RED or GREEN. `Task:` trailers are telemetry only — build completion is
   derived by `build_review`, not from trailer self-reports.
 - **Declared replication does not shorten the cycle** — a declared replication's copy task only
@@ -519,7 +560,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### code-removal
 
-> Use when removing a file, seam, flag, symbol, or code path. Defines the evidence and test discipline for deletion-shaped work.
+> Use only when deletion is the requested deliverable inside an active change: removing a file, seam, flag, symbol, or code path. Do not invoke for additive work, renames, or refactors that merely edit or deprecate code.
 
 - **Frontmatter** — `enforcement: advisory`, `phase: all`, no model pin. It is implicit-required:
   `/pipeline` activates it inside an already-running build session.
@@ -529,9 +570,10 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 - **Inputs** — the obsolete file, seam, flag, symbol, or code path; the behavior that must survive;
   and the source, test, configuration, and documentation references that mention it.
 - **Outputs** — the deletion diff, any pre-deletion characterization tests needed to cover a
-  non-obvious survivor, and a green full surviving suite.
-- **Gate role** — advisory. It forbids absence tests: deletion evidence is the diff plus the green
-  suite. It requires a survivor inventory for non-obvious survivors, triages touching tests as
+  non-obvious survivor, and passing scoped survivor tests. The `test_suite` step owns
+  full surviving-suite proof.
+- **Gate role** — advisory. It forbids absence tests: deletion task evidence is the diff plus passing scoped
+  survivor tests. It requires a survivor inventory for non-obvious survivors, triages touching tests as
   DIRECT or INCIDENTAL, and finishes with a literal reference sweep.
 
 ### code-review
@@ -553,7 +595,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### simplify
 
-> Review changed code for duplication, complexity, and over-engineering at batch boundaries. Blocking gate — must pass before next batch proceeds.
+> Use only at an active pipeline batch boundary after code has changed. Reviews current-batch duplication, complexity, and over-engineering; do not invoke for ordinary refactors, code review, or requests that merely ask for simpler prose or code.
 
 - **Frontmatter** — `enforcement: gating`, `phase: build`, `standalone: false`, `requires: []`,
   `model: sonnet`.
@@ -571,7 +613,7 @@ records but never blocks. **Neither** means it has no gate role in the flow.
 
 ### debugging
 
-> Use when encountering any bug, test failure, or unexpected behavior. Four-phase systematic investigation: root cause before fix. No fixes without evidence.
+> Use only when the requested task is diagnosis of an observed bug, test failure, or unexpected behavior, or when active BUILD encounters one. Do not invoke for feature implementation, proactive review, or speculative troubleshooting without a concrete failure.
 
 - **Frontmatter** — `enforcement: gating`, `phase: build`, `standalone: true`,
   `requires: [verify-claims]`, `model: opus`.
@@ -586,13 +628,27 @@ records but never blocks. **Neither** means it has no gate role in the flow.
   by an approved decision, the output is a conformance finding, not a patch. Three failed fixes escalate
   to the operator.
 
-`test-suite` and `wiring-check` have no `SKILL.md` — both `test_suite` (index 14) and `wiring_check`
-(index 13) are **engine-native** BUILD steps. `test_suite` obtains a current result from the
-repository-configured aggregate verifier. `wiring_check` is a deprecated no-op retained for compatibility.
+`test-suite` has no `SKILL.md`: `test_suite` is an **engine-native** BUILD verifier that obtains a
+current result from the repository-configured aggregate verifier.
 `build_review` dispatches the engine-managed test-quality rubric
-skills; their raw verdicts are joined before effective dispositions are applied. The two names remain in `build_verification` (see
-[The build verification group](steps.md#the-build-verification-group)); it fans out after `build` and
-joins before `build_review`.
+skills; their raw verdicts are joined before effective dispositions are applied. `test_suite` runs
+after `build` and before `build_review`.
+
+BUILD implementation and repair activities (including implementation agents, `code-removal`,
+`tdd`, and `debugging`) run scoped
+affected tests. If scope is uncertain, they record the trigger and defer aggregate proof
+to `test_suite`, rather than running an intermediate aggregate verifier.
+
+Bootstrap inventories tests without executing them. Acceptance-spec RED runs select only the
+feature's generated or copied specs. Progression checks, batch boundaries, and worktree merges
+consume existing evidence; only concrete changed behavior or interaction risk justifies targeted
+checks. Full-suite or aggregate runs, as configured, belong to `test_suite`.
+Batch evaluators and `code-review` inspect supplied results without routine reruns; targeted
+runs are reserved for reproducing a specific suspected defect. Known scoped
+failures still block BUILD. On an auto-mode suite-failure kickback, the engine supplies
+failure diagnostics and the `.pipeline/test-suite-evidence.json` path to BUILD; repair
+sessions use that evidence, verify affected tests, and commit before the engine reruns
+the aggregate gate. Scoped success alone never satisfies that gate.
 
 ## SHIP-phase skills
 
@@ -606,7 +662,7 @@ joins before `build_review`.
   Checkpoint and loop gate, and the only step that opts into `configDisableAllowed`.
 - **Inputs** — story acceptance criteria; the running application; the absolute worktree `.pipeline`
   path supplied in the step's system prompt.
-- **Outputs** — `.pipeline/manual-test-results.md`, written solely by `conduct-ts manual-test-record`,
+- **Outputs** — `.pipeline/manual-test-results.md`, written solely by `ai-conductor manual-test-record`,
   append-only as numbered attempt sections with per-criterion `PASS`, `WARN`, or `FAIL` results;
   `.pipeline/manual-test-fail-evidence.json`.
 - **Gate role** — blocking. Only the latest attempt is evaluated. The skill must never hand-write or
@@ -620,7 +676,7 @@ joins before `build_review`.
 
 ### prd-audit
 
-> Use at SHIP, after manual-test and before retro/finish. Audits the shipped implementation against the feature stories' acceptance criteria, using PRD functional requirements as intent context when a PRD exists; produces graded, criterion-level findings and never implements or routes work itself.
+> Use at SHIP, after manual-test and before rebase/finish. Audits the shipped implementation against the feature stories' acceptance criteria, using PRD functional requirements as intent context when a PRD exists; produces graded, criterion-level findings and never implements or routes work itself.
 
 - **Frontmatter** — `enforcement: gating`, `phase: ship`, `standalone: true`,
   `requires: [verify-claims]`, `model: opus`.
@@ -630,7 +686,9 @@ joins before `build_review`.
 - **Inputs** — the feature's committed stories (the audit key) via the active plan's `**Stories:**`
   reference; the active plan and any coherence mapping; the matching non-`SUPERSEDED-` PRD when present
   (context, not the key); the implementation, changed tests, and BUILD `Scope:` trailers; operator
-  reseal and `Scope:` trailer rationales as immutable `OVER_SCOPE` intent evidence.
+  reseal and `Scope:` trailer rationales as immutable `OVER_SCOPE` intent evidence;
+  `.pipeline/accepted-widenings.json` when present — a no-owner finding matching a recorded operator
+  decision reuses that entry's summary verbatim so the decision keeps matching across laps.
 - **Outputs** — `.pipeline/prd-audit.md`, overwritten each run; a code-stamp sidecar on the pass path.
 - **Gate role** — blocking. Each finding carries exactly one grade — `PASS`, `FIXABLE`, `PLAN_GAP`, or
   `OVER_SCOPE` — and the report needs exactly one graded verdict row per acceptance criterion. A
@@ -643,7 +701,7 @@ joins before `build_review`.
 
 ### remediate
 
-> Use when a SHIP gate blocks — a prd-audit FIXABLE finding, the as-built architecture review's BLOCKED verdict, or finish verification — or on a build stall. Emits a per-gap disposition and concrete tasks routed to the owning step, and HALTs only for gaps that need a human.
+> Use when a SHIP gate blocks — a prd-audit FIXABLE finding, an all-`REMEDIABLE` as-built architecture-review BLOCKED verdict, or finish verification — or on a build stall. Emits a per-gap disposition and concrete tasks routed to the owning step, and HALTs only for gaps that need a human.
 
 - **Frontmatter** — `enforcement: gating`, `phase: ship`, `standalone: true`,
   `requires: [verify-claims]`, no model pin.
@@ -655,7 +713,13 @@ joins before `build_review`.
   `plan contract:` and `prior attempts:` pointer lines (see
   [gates](../explanation/gates.md#where-a-build_review-fail-goes)).
 - **Outputs** — `.pipeline/remediation.json`, overwritten each run. The engine then appends each task
-  into the feature's plan. No completion glob — the engine reads the JSON directly to route.
+  into the feature's plan. For a `prd_audit` finding without a PRD, its disposition ID is the report
+  criterion `S<story>.<ordinal>` (for example, `S5.1`); the engine admits criterion IDs
+  case-insensitively. An `existing-task` disposition binds the gap to task id(s) already in the
+  active plan instead: the engine re-stages those rows and kicks back to `build` without appending or
+  spending plan-growth allowance (see
+  [gates](../explanation/gates.md#kickback-and-remediation-routing)). No completion glob — the
+  engine reads the JSON directly to route.
 - **Gate role** — advisory; it is the unblocker rather than a blocker. HALT is reserved for exactly
   three categories: architectural clarity, product scope, and unanswerable. Every other gap must route
   to `build`, `acceptance_specs`, `architecture_review`, or `plan`. On absent, stale, or malformed
@@ -664,30 +728,13 @@ joins before `build_review`.
   `build` disposition is not dispatchable work.
 - **Dispatches** — `agents/remediation-planner.md`.
 
-### retro
-
-> Use after finishing a feature or at any natural milestone. Dual retrospective analyzing both the harness workflow (tool) and the application code produced (product). Generates concrete improvement proposals.
-
-- **Frontmatter** — `enforcement: advisory`, `phase: ship`, `standalone: true`, `requires: []`, no model
-  pin.
-- **Engine step** — `retro` (index 19, SHIP, prerequisite `architecture_review_as_built`, skipped at
-  tier S). Loop gate.
-- **Inputs** — `.pipeline/audit-trail/events.jsonl` as the primary gate and rework source, explicitly
-  not `.pipeline/gates/`; `.pipeline/task-status.json`; raw `.pipeline/events.jsonl` for retry history;
-  `.memory/gotchas/`; `.docs/conflicts/`; `.docs/stories/`; the feature diff; the `## Cost` block of the
-  shipped record.
-- **Outputs** — `.docs/retros/<date>-<feature-name>.md`; `.memory/` writes; new debt stories.
-- **Gate role** — advisory. Two internal honesty rules: a missing or empty events log is reported as
-  `INCOMPLETE`, never read as a clean run; a missing Cost block is written as `unmetered/absent`, never
-  fabricated. The completion predicate requires a feature-slug-matched, session-fresh retro file.
-
 ### rebase
 
 > Resolve an in-progress paused rebase conflict, stage fixes, and drive git rebase --continue to completion; invoked by the conductor's finish-time rebase step or by an operator running /rebase.
 
 - **Frontmatter** — `enforcement: advisory`, `phase: ship`, `standalone: true`, `requires: []`, no model
   pin.
-- **Engine step** — `rebase` (index 20, SHIP, prerequisite `retro`). Engine enforcement is
+- **Engine step** — `rebase` (index 19, SHIP, prerequisite `architecture_review_as_built`). Engine enforcement is
   `structural`. The engine rebases natively and dispatches this skill **only on conflict**.
 - **Inputs** — live git state only: status, the rebase-merge or rebase-apply path, the unmerged file
   list, and the conflicted files.
@@ -723,7 +770,7 @@ joins before `build_review`.
   repair (judgment). Neither is trusted on self-report: the coordinator re-reads the PR and a body that
   still classifies as a placeholder is a failed pass. The coordinator separately persists
   `state.pr_url`, commits `.docs/shipped/<slug>.md`, and writes `.pipeline/finish-choice` through
-  `conduct-ts finish-record` after verification.
+  `ai-conductor finish-record` after verification.
 - **Gate role** — blocking. Missing or invalid deterministic evidence stops before this skill is
   dispatched. A placeholder body routes back to authoring; halt boilerplate and a refused judgment
   require a human. No prose defect commits the shipped record, so the halt stays re-dispatchable.
@@ -903,7 +950,7 @@ definition, never the SKILL.md.
 > `skippableForTiers: []` and is `structural`, so it can be neither tier-skipped nor config-disabled;
 > `code-review` is not an engine step at all, and the engine's separate `build_review` step is likewise
 > never tier-skipped. The same file's "Small flow" summary also omits `complexity`, `worktree`,
-> `build_review`, `wiring_check`, `test_suite`, and `rebase`, all of which run at tier S. The
+> `build_review`, `test_suite`, and `rebase`, all of which run at tier S. The
 > authoritative tier-S skip set is the 8 steps listed in [steps](steps.md). Tracked in
 > [#1018](https://github.com/jstoup111/ai-conductor/issues/1018).
 

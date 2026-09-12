@@ -1,8 +1,8 @@
+// Covers: task:4
 // Acceptance specs for adr-approval-gate-before-build (#662).
 //
-// These specs drive every production call site of the approval derivation:
-// - src/engine/engineer/authoring.ts:472 — runAuthoring
-// - src/engine/engineer/land-spec.ts:316 — landSpec
+// These specs drive every live production call site of the approval derivation:
+// - src/engine/engineer/land-spec.ts — landSpec
 // - src/engine/daemon-backlog.ts:703 — discoverBacklog (new pre-dispatch rung)
 //
 // Parser grammar, git-tree enumeration, the unchanged as-built backstop, and
@@ -18,7 +18,6 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BacklogTreeSource } from '../../src/engine/backlog-tree-source.js';
 import { discoverBacklog } from '../../src/engine/daemon-backlog.js';
-import { runAuthoring, type DecideStep } from '../../src/engine/engineer/authoring.js';
 import { landSpec } from '../../src/engine/engineer/land-spec.js';
 import { createEngineerWorktree } from '../../src/engine/engineer/worktree-authoring.js';
 import type { GhRunner } from '../../src/engine/owner-gate/identity.js';
@@ -34,7 +33,10 @@ const STORIES = [
   '## Story 1: enforce approval',
   '',
   '### Acceptance Criteria',
-  '- Given an ADR corpus, when the gate runs, then only approved decisions pass.',
+  '#### Happy Path',
+  '- Given an approved ADR corpus, when the gate runs, then land passes.',
+  '#### Negative Paths',
+  '- Given an unapproved ADR, when the gate runs, then land is refused.',
   '',
 ].join('\n');
 
@@ -48,15 +50,15 @@ const PLAN = [
   '**Dependencies:** none',
   '',
   '**Done when:**',
-  '- Approved ADR declarations are accepted.',
-  '- Unapproved ADR declarations are refused.',
+  '- Given an approved ADR corpus, when the gate runs, then land passes.',
+  '- Given an unapproved ADR, when the gate runs, then land is refused.',
   '',
-].join('\n');
-
-const COHERENCE = [
-  '| Row class | Cited id(s) | Counterpart id(s) | Verdict | Notes |',
-  '|---|---|---|---|---|',
-  '| story | S1 | Task 1 | covered | fixture |',
+  '## Coverage Check',
+  '',
+  '| Criterion | Tasks | Quote | Disposition |',
+  '|---|---|---|---|',
+  '| Story 1 happy: Given an approved ADR corpus, when the gate runs, then land passes. | 1 | Given an approved ADR corpus, when the gate runs, then land passes. | diff-local |',
+  '| Story 1 negative: Given an unapproved ADR, when the gate runs, then land is refused. | 1 | Given an unapproved ADR, when the gate runs, then land is refused. | diff-local |',
   '',
 ].join('\n');
 
@@ -109,62 +111,19 @@ async function seedLandWorktree(adrs: Record<string, string>): Promise<string> {
   return worktreePath;
 }
 
-function authoringDecide(reviewArtifact: string) {
-  return async (step: DecideStep) => {
-    const artifacts: Record<DecideStep, string> = {
-      explore: '# Explore\n\nTechnical track.\n',
-      prd: '# PRD\n\nNot used on the technical track.\n',
-      architecture_diagram: '# Architecture\n\nNo diagram required.\n',
-      architecture_review: reviewArtifact,
-      stories: STORIES,
-      conflict_check: '# Conflict Check\n\nClean.\n',
-      plan: PLAN,
-      coherence_check: COHERENCE,
-    };
-    return { approved: true, artifact: artifacts[step] };
-  };
-}
-
-describe('authoring and land use the same declaration-aware approval signal', () => {
-  it('runAuthoring refuses Proposed before creating a branch or writing artifacts', async () => {
-    await expect(
-      runAuthoring(target(), 'ADR approval demo', {
-        decide: authoringDecide('# ADR\n\nStatus: Proposed\n'),
-        assessComplexity: async () => ({ approved: true, tier: 'M' }),
-        track: 'technical',
-      }),
-    ).rejects.toThrow(/Proposed|not approved/i);
-
-    expect(await git(['branch', '--list', 'spec/*'])).toBe('');
-  });
-
-  it('runAuthoring accepts APPROVED when a later sentence merely illustrates Status: DRAFT', async () => {
-    const review = [
-      '# ADR',
-      '',
-      'Status: APPROVED',
-      '',
-      'The rejected example requires Status: DRAFT, but that prose is not a declaration.',
-      '',
-    ].join('\n');
-
-    await expect(
-      runAuthoring(target(), 'ADR approval demo', {
-        decide: authoringDecide(review),
-        assessComplexity: async () => ({ approved: true, tier: 'M' }),
-        track: 'technical',
-      }),
-    ).resolves.toMatchObject({ branch: 'spec/adr-approval-demo' });
-  });
-
+describe('land uses the declaration-aware approval signal', () => {
   it('landSpec accepts APPROVED when a later sentence merely illustrates Status: DRAFT', async () => {
     const worktree = await seedLandWorktree({
-      'adr-demo.md': [
+      'adr-2026-09-08-demo.md': [
         '# ADR',
         '',
         'Status: APPROVED',
         '',
         'The rejected example requires Status: DRAFT, but that prose is not a declaration.',
+        '',
+        '## Decision',
+        '',
+        '1. **Use the declaration-aware approval signal.**',
         '',
       ].join('\n'),
     });

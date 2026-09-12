@@ -18,14 +18,16 @@ import {
 import { seedTaskStatus } from './task-seed.js';
 import type { GitRunner } from './rebase.js';
 import { makeGitRunner } from './rebase.js';
-import { gateVerdictStillValid } from './gate-code-validity.js';
+import { gateVerdictStillValid, verdictProducedByRun } from './gate-code-validity.js';
+import type { VerdictRunIdentity } from './gate-code-validity.js';
 import {
   classifyOverScopeCriterion,
   overScopeRelations,
   readOverScopeDecisions,
 } from './accepted-widenings.js';
 import { resolveGateCodeValidityConfig } from './config.js';
-import { resolveTaskIds } from './task-progress.js';
+import { resolveBuildReviewConfig } from './resolved-config.js';
+import { resolveTaskIdsWithDiagnostics } from './task-progress.js';
 import { FULL_SUITE_EVIDENCE_PATH } from './full-suite-evidence.js';
 import {
   FullSuiteVerifier,
@@ -38,8 +40,13 @@ import {
   type ShipmentEvidenceResult,
 } from './shipment-evidence.js';
 import { currentCommitSha } from './project-prelude.js';
+import { createEngineStateStore } from './engine-state-store.js';
 import { extractPrdFrIds } from './prd-fr-ids.js';
-import { parsePlanTaskPaths } from './plan-task-parse.js';
+import {
+  parsePlanTaskPaths,
+  parsePlanTaskStoryIds,
+  resolvePlanTaskReference,
+} from './plan-task-parse.js';
 import {
   deriveEffectiveBuildReviewVerdict,
   parseBuildReviewAggregate,
@@ -50,6 +57,16 @@ import {
   type BuildReviewEffectiveResolverDeps,
   type BuildReviewEffectiveResolution,
 } from './build-review-effective.js';
+import { extractStoryCriterionIds, sectionBody, splitStoryBlocks } from './story-criteria.js';
+import { readAsBuiltVerdictLine } from './as-built-verdict-line.js';
+
+export { splitStoryBlocks, type StoryBlock } from './story-criteria.js';
+export { readAsBuiltVerdictLine, type AsBuiltVerdictLine } from './as-built-verdict-line.js';
+import {
+  COVERAGE_BINDING_COMPLETION_STATUSES,
+  coverageBindingEnvelopePath,
+  parseCoverageBindingEnvelope,
+} from './coverage-binding-envelope.js';
 
 export type ArtifactLifecycleScope = 'feature' | 'repository' | 'run';
 
@@ -276,6 +293,7 @@ export const STEP_ARTIFACT_CONTRACTS = {
     },
   ],
   worktree: [],
+  coverage_binding: [{ pattern: '.pipeline/coverage-binding.json', scope: 'run' }],
   acceptance_specs: [
     'spec/acceptance/**/*',
     'spec/requests/**/*',
@@ -295,25 +313,28 @@ export const STEP_ARTIFACT_CONTRACTS = {
   ].map((pattern) => ({ pattern, scope: 'repository' as const })),
   build: [{ pattern: '.pipeline/task-status.json', scope: 'run' }],
   build_review: [{ pattern: '.pipeline/build-review.json', scope: 'run' }],
-  wiring_check: [],
   test_suite: [{ pattern: FULL_SUITE_EVIDENCE_PATH, scope: 'run' }],
   manual_test: [{ pattern: '.pipeline/manual-test-results.md', scope: 'run' }],
   prd_audit: [{ pattern: '.pipeline/prd-audit.md', scope: 'run' }],
   architecture_review_as_built: [
     { pattern: '.pipeline/architecture-review-as-built.md', scope: 'run' },
   ],
-  retro: [
-    {
-      pattern: '.docs/retros/*.md',
-      scope: 'feature',
-      identity: { strategy: 'normalized-stem', stripDatePrefix: true },
-    },
-  ],
   rebase: [],
   finish: [],
   remediate: [],
   attribution_verify: [],
 } satisfies Record<StepName, readonly ArtifactPatternContract[]>;
+
+export function stepArtifactContracts(
+  step: StepName,
+): readonly ArtifactPatternContract[] {
+  return (
+    STEP_ARTIFACT_CONTRACTS as Record<
+      string,
+      readonly ArtifactPatternContract[] | undefined
+    >
+  )[step] ?? [];
+}
 
 export interface FeatureArtifactStemValidationEntry {
   step: StepName;
@@ -362,7 +383,7 @@ function exampleArtifactPath(pattern: string, featureIdentity: string): string {
  * with no second list to update.
  */
 export function featureArtifactPatternsAreRecursive(step: StepName): boolean {
-  return STEP_ARTIFACT_CONTRACTS[step].some(
+  return stepArtifactContracts(step).some(
     (contract) => contract.scope === 'feature' && contract.pattern.includes('**/'),
   );
 }
@@ -381,7 +402,7 @@ export function validateFeatureArtifactStems(
 
   for (const { step, paths } of entries) {
     for (const path of paths) {
-      for (const contract of STEP_ARTIFACT_CONTRACTS[step]) {
+      for (const contract of stepArtifactContracts(step)) {
         if (contract.scope !== 'feature') continue;
         if (!artifactPathMatchesPattern(path, contract.pattern)) continue;
         if (artifactMatchesFeatureIdentity(path, featureIdentity, contract.identity)) continue;
@@ -596,7 +617,7 @@ export async function resolveArtifactFiles(
     };
   };
   let firstFeatureContract: Extract<ArtifactPatternContract, { scope: 'feature' }> | undefined;
-  for (const contract of STEP_ARTIFACT_CONTRACTS[step]) {
+  for (const contract of stepArtifactContracts(step)) {
     const candidates = await matchGlob(dir, contract.pattern);
     if (contract.scope !== 'feature') {
       candidates.forEach((file) => files.add(file));
@@ -659,10 +680,10 @@ export async function resolveArtifactFiles(
  * Resolution order:
  * 1. `.pipeline/engine-state.json` `activePlanPath` — authoritative when the
  *    plan step recorded it (interactive runs, Task 14 of #302).
- * 2. The plan whose stem equals `featureDesc` — the daemon convention
+ * 2. A single plan file on disk — unambiguous regardless of name.
+ * 3. The plan whose stem equals `featureDesc` — the daemon convention
  *    (engineer/land writes `.docs/plans/<slug>.md`, and daemon-cli seeds
  *    `feature_desc` = slug).
- * 3. A single plan file on disk — unambiguous regardless of name.
  * 4. Otherwise `undefined` — multiple plans, none provably ours: never guess.
  *    Callers fail closed (the build gate reports an actionable reason rather
  *    than evaluating someone else's task list).
@@ -682,21 +703,18 @@ export async function recordAppendedRemediationTaskIds(
   const pipelineDir = join(projectRoot, '.pipeline');
   await mkdir(pipelineDir, { recursive: true });
   const engineStatePath = join(pipelineDir, 'engine-state.json');
-
-  let engineState: Record<string, unknown> = {};
-  try {
-    const existing = await readFile(engineStatePath, 'utf-8');
-    engineState = JSON.parse(existing) as Record<string, unknown>;
-  } catch {
-    engineState = {};
+  const result = await createEngineStateStore(engineStatePath).update((state) => {
+    const prior = Array.isArray(state.appendedRemediationTaskIds)
+      ? state.appendedRemediationTaskIds.filter((value): value is string => typeof value === 'string')
+      : [];
+    return {
+      ...state,
+      appendedRemediationTaskIds: Array.from(new Set([...prior, ...ids])),
+    };
+  });
+  if (!result.ok) {
+    throw new Error(`Failed to record appended remediation task ids (${result.kind}): ${result.message}`);
   }
-
-  const prior = Array.isArray(engineState.appendedRemediationTaskIds)
-    ? engineState.appendedRemediationTaskIds.filter((v): v is string => typeof v === 'string')
-    : [];
-  engineState.appendedRemediationTaskIds = Array.from(new Set([...prior, ...ids]));
-
-  await writeFile(engineStatePath, JSON.stringify(engineState, null, 2) + '\n');
 }
 
 /**
@@ -717,16 +735,26 @@ export async function readAppendedRemediationTaskIds(projectRoot: string): Promi
   return [];
 }
 
-export async function resolveFeaturePlanPath(
+export type FeaturePlanSelection =
+  | { kind: 'resolved'; path: string }
+  | { kind: 'unresolvable'; candidates: string[] }
+  | { kind: 'empty' };
+
+/**
+ * Select this feature's plan while preserving why no plan path can be returned.
+ * The resolution rungs intentionally match {@link resolveFeaturePlanPath}'s
+ * legacy behavior: recorded path, singleton corpus, then feature stem.
+ */
+export async function selectFeaturePlan(
   projectRoot: string,
   featureDesc: string | undefined,
-): Promise<string | undefined> {
+): Promise<FeaturePlanSelection> {
   try {
     const raw = await readFile(join(projectRoot, '.pipeline', 'engine-state.json'), 'utf-8');
     const engineState = JSON.parse(raw) as Record<string, unknown>;
     if (typeof engineState.activePlanPath === 'string' && engineState.activePlanPath.trim()) {
       const recorded = engineState.activePlanPath;
-      return recorded.startsWith('/') ? recorded : join(projectRoot, recorded);
+      return { kind: 'resolved', path: recorded.startsWith('/') ? recorded : join(projectRoot, recorded) };
     }
   } catch {
     // No engine state (daemon-preseeded runs never execute the plan step) —
@@ -734,14 +762,56 @@ export async function resolveFeaturePlanPath(
   }
 
   const planFiles = await findArtifactFiles(projectRoot, 'plan');
-  if (planFiles.length === 0) return undefined;
-  if (planFiles.length === 1) return planFiles[0];
+  if (planFiles.length === 0) return { kind: 'empty' };
+  if (planFiles.length === 1) return { kind: 'resolved', path: planFiles[0] };
 
   if (featureDesc) {
     const bySlug = planFiles.find((p) => planStem(p) === featureDesc);
-    if (bySlug) return bySlug;
+    if (bySlug) return { kind: 'resolved', path: bySlug };
   }
-  return undefined;
+  return { kind: 'unresolvable', candidates: [...planFiles].sort() };
+}
+
+export async function resolveFeaturePlanPath(
+  projectRoot: string,
+  featureDesc: string | undefined,
+): Promise<string | undefined> {
+  const selection = await selectFeaturePlan(projectRoot, featureDesc);
+  return selection.kind === 'resolved' ? selection.path : undefined;
+}
+
+/**
+ * The active plan's text — the authority every cited plan-task reference is
+ * resolved against (adr-2026-08-30-shared-plan-task-reference-resolver D1).
+ *
+ * Every prd_audit parse that scores, preserves, or routes on a Verdict Table
+ * `Plan task` cell MUST supply this. `parsePrdAuditReport` has no other way to
+ * learn which ids exist and it refuses to guess: with no plan text a citing
+ * row is rejected, never resolved against the citation under judgement.
+ * Returns undefined when no plan resolves or it cannot be read; the parser
+ * then rejects fail-closed rather than self-validating.
+ */
+export async function readActivePlanText(
+  projectRoot: string,
+  planPath?: string,
+  featureDesc?: string,
+): Promise<string | undefined> {
+  const resolved = planPath ?? (await resolveFeaturePlanPath(projectRoot, featureDesc));
+  if (!resolved) return undefined;
+  return readFile(isAbsolute(resolved) ? resolved : join(projectRoot, resolved), 'utf-8')
+    .catch(() => undefined);
+}
+
+/** {@link readActivePlanText} for a caller that already resolved the feature. */
+async function activePlanTextFor(
+  projectRoot: string,
+  context: ArtifactResolutionContext,
+): Promise<string | undefined> {
+  return readActivePlanText(
+    projectRoot,
+    context.activePlanPath ?? context.planPath,
+    context.featureDesc,
+  );
 }
 
 /**
@@ -865,8 +935,14 @@ async function sweptArtifactStillValid(
   step: StepName,
   config?: HarnessConfig,
   artifactResolution?: ArtifactResolutionContext,
+  expectedRunId?: string,
 ): Promise<boolean> {
   if (!resolveGateCodeValidityConfig(config).enabled) return false;
+  // A prior run identity alone does not condemn the artifact: the code stamp
+  // below decides whether the reviewed tree is still the tree on disk
+  // (adr-2026-08-25 D5 as amended 2026-09-06). Run identity still governs
+  // artifacts with no valid stamp through the predicates' mtime fallback.
+  void expectedRunId;
   const git = makeGitRunner(dir);
   const ctx = { projectRoot: dir, git };
 
@@ -898,9 +974,17 @@ async function sweptArtifactStillValid(
       // about to be swept can diverge from what it was stamped from — never
       // spare a report that does not itself currently read clean.
       const report = await readFile(join(dir, '.pipeline/prd-audit.md'), 'utf-8');
-      const parsed = parsePrdAuditReport(report);
-      if (parsed.ok ? parsed.value.findings.some((finding) => finding.grade !== 'PASS') : findUnalignedFrRows(report).length > 0) return false;
       const resolution = artifactResolution ?? (await buildArtifactResolutionContext(dir, { git }));
+      // Resolve the citation authority BEFORE the parse: a spared report is a
+      // preserved PASS, so its Plan task cells must be checked against the
+      // plan that is active now, never against themselves.
+      const activePlan = await activePlanTextFor(dir, resolution);
+      const parsed = parsePrdAuditReport(report, activePlan);
+      if (
+        parsed.ok
+          ? parsed.value.rejectedRows.length > 0 || parsed.value.findings.some((finding) => finding.grade !== 'PASS')
+          : findUnalignedFrRows(report, activePlan).length > 0
+      ) return false;
       if ((await prdAuditCoverageGap(dir, resolution, report)) !== null) return false;
       return (await prdAuditStoryCoverageGap(dir, resolution, undefined, report)) === null;
     }
@@ -955,12 +1039,13 @@ export async function sweepStaleReviewArtifacts(
   sessionStartedAt: number | undefined,
   config?: HarnessConfig,
   artifactResolution?: ArtifactResolutionContext,
+  expectedRunId?: string,
 ): Promise<string[]> {
   if (!STALE_SWEEP_STEPS.has(step) || sessionStartedAt === undefined) return [];
   const removed: string[] = [];
   for (const f of await findArtifactFiles(dir, step)) {
     if (await fileIsFreshSinceSession(f, sessionStartedAt)) continue; // fresh → keep
-    if (await sweptArtifactStillValid(dir, step, config, artifactResolution)) continue; // still code-valid → spare
+    if (await sweptArtifactStillValid(dir, step, config, artifactResolution, expectedRunId)) continue; // still code-valid → spare
     try {
       await rm(f);
       removed.push(f);
@@ -1000,8 +1085,10 @@ export interface CompletionResult {
     artifact: string;
     mtimeMs?: number;
     floorMs?: number;
-    floorSource: 'attempt' | 'session';
+    floorSource: 'attempt' | 'session' | 'run-identity';
   } & VerdictFreshnessClassification;
+  /** Telemetry-only classification for a retryable stale verdict identity. */
+  retrySignal?: 'stale-run-identity';
   /**
    * Route-signal facet for retry-classification (issue #646). 'named-route'
    * marks a fresh, parseable, non-passing verdict (a real reviewer decision
@@ -1049,7 +1136,7 @@ async function verdictFreshnessFor(
  *
  * Mirrors the bash conductor's behavior for the `build` step, which reads
  * `.pipeline/task-status.json` and requires every task's status to be
- * `completed` (lines 775–811, 1765–1784 of bin/conduct).
+ * `completed` in the legacy implementation.
  */
 export const FINISH_CHOICE_MARKER = '.pipeline/finish-choice';
 export const FINISH_CHOICE_VALUES = ['pr', 'merge-local', 'keep', 'discard'] as const;
@@ -1115,7 +1202,12 @@ export interface CompletionContext {
    * resume/backstop/legacy callers, which fall back to `sessionStartedAt`.
    */
   attemptStartedAt?: number;
-  /** Used by the retro predicate to prefer slug-matched filenames. */
+  /**
+   * Engine-owned identity for the in-flight dispatch. Absent for idle,
+   * resume, and backstop completion checks.
+   */
+  attemptRunId?: string;
+  /** Used by feature-aware completion predicates and artifact resolution. */
   featureDesc?: string;
   /** Prepared once by callers that need feature-aware generic artifact resolution. */
   artifactResolution?: Pick<
@@ -1451,21 +1543,12 @@ export function isSkipAttempt(section: string): boolean {
 }
 
 /**
- * Pull the value off the `Verdict:` line of an as-built review report, e.g.
- * `**Verdict:** APPROVED WITH DRIFT NOTES` → `APPROVED WITH DRIFT NOTES`.
- * Tolerates optional bold markers and an accidental double colon. Returns null
- * when there is no Verdict line (fail-closed: the gate treats that as not-done).
+ * Pull the recognized value off the `Verdict:` line of an as-built review
+ * report. Returns null when the line is absent or uses an unknown verdict.
  */
 export function parseAsBuiltVerdict(content: string): string | null {
-  const m = content.match(
-    /^[^\S\n]*\*{0,2}\s*Verdict\s*\*{0,2}\s*:+\s*\*{0,2}\s*(.+?)\s*\*{0,2}\s*$/im,
-  );
-  if (!m) return null;
-  const value = m[1].replace(/\*+/g, '').trim().toUpperCase();
-  return value === 'APPROVED' || value === 'APPROVED WITH DRIFT NOTES' ||
-    value === 'PLAN_GAP' || value === 'BLOCKED'
-    ? value
-    : null;
+  const verdict = readAsBuiltVerdictLine(content);
+  return verdict.found ? verdict.recognized : null;
 }
 
 /** The terminal interpretation of a fresh as-built review report. */
@@ -1473,8 +1556,12 @@ export type AsBuiltReviewOutcome =
   | { kind: 'approved' }
   | { kind: 'plan-gap-delivered' }
   | { kind: 'plan-gap-undelivered' }
-  | { kind: 'blocked' }
-  | { kind: 'invalid' };
+  | { kind: 'blocked-remediable' }
+  | { kind: 'blocked-design'; designFindings: { id: string; clause: string }[] }
+  | { kind: 'invalid'; cause: 'no-verdict-line' }
+  | { kind: 'invalid'; cause: 'unrecognized-verdict'; value: string }
+  | { kind: 'invalid'; cause: 'plan-gap-missing-outcome' }
+  | { kind: 'invalid'; cause: 'unparseable-blocked-findings'; detail: string };
 
 /**
  * Classify the as-built review's explicit verdict without giving its prose any
@@ -1483,17 +1570,50 @@ export type AsBuiltReviewOutcome =
  * halt, while an omitted/malformed outcome remains fail-closed as invalid.
  */
 export function classifyAsBuiltReviewOutcome(content: string): AsBuiltReviewOutcome {
-  const verdict = parseAsBuiltVerdict(content);
-  if (verdict === null) return { kind: 'invalid' };
-  if (verdict === 'APPROVED' || verdict === 'APPROVED WITH DRIFT NOTES') return { kind: 'approved' };
-  if (verdict === 'BLOCKED') return { kind: 'blocked' };
-  if (verdict !== 'PLAN_GAP') return { kind: 'invalid' };
+  const verdict = readAsBuiltVerdictLine(content);
+  if (!verdict.found) return { kind: 'invalid', cause: 'no-verdict-line' };
+  if (verdict.recognized === null) {
+    return { kind: 'invalid', cause: 'unrecognized-verdict', value: verdict.raw };
+  }
+  const recognizedVerdict = verdict.recognized;
+  if (recognizedVerdict === 'APPROVED' || recognizedVerdict === 'APPROVED WITH DRIFT NOTES') return { kind: 'approved' };
+  if (recognizedVerdict === 'BLOCKED') {
+    const findings = parseAsBuiltBlockedFindings(content);
+    if (!findings.ok) {
+      return { kind: 'invalid', cause: 'unparseable-blocked-findings', detail: findings.error };
+    }
+    const designFindings = findings.value.findings
+      .filter((finding) => finding.class === 'DESIGN')
+      .map(({ id, clause }) => ({ id, clause }));
+    return designFindings.length > 0
+      ? { kind: 'blocked-design', designFindings }
+      : { kind: 'blocked-remediable' };
+  }
+  if (recognizedVerdict !== 'PLAN_GAP') return { kind: 'invalid', cause: 'unrecognized-verdict', value: recognizedVerdict };
 
   const outcome = content.match(/^[^\S\n]*\*{0,2}\s*Outcome delivered\s*\*{0,2}\s*:+\s*(yes|no)\s*$/im)?.[1]
     ?.toLowerCase();
   if (outcome === 'yes') return { kind: 'plan-gap-delivered' };
   if (outcome === 'no') return { kind: 'plan-gap-undelivered' };
-  return { kind: 'invalid' };
+  return { kind: 'invalid', cause: 'plan-gap-missing-outcome' };
+}
+
+/** Render the operator-facing reason for an invalid as-built review outcome. */
+export function renderAsBuiltInvalidReason(
+  outcome: Extract<AsBuiltReviewOutcome, { kind: 'invalid' }>,
+): string {
+  switch (outcome.cause) {
+    case 'no-verdict-line':
+      return 'no parseable `Verdict:` line was found in the as-built review; record one `Verdict: <value>` line and re-run the as-built review';
+    case 'unrecognized-verdict':
+      return `as-built review verdict ${outcome.value} is unrecognized; use one of APPROVED, APPROVED WITH DRIFT NOTES, PLAN_GAP, or BLOCKED and re-run the as-built review`;
+    case 'plan-gap-missing-outcome':
+      return 'as-built review must record `Outcome delivered: yes|no` for PLAN_GAP; re-run the as-built review';
+    case 'unparseable-blocked-findings':
+      return `as-built BLOCKED findings block is unparseable: ${outcome.detail}; re-run the as-built review`;
+  }
+  const exhaustive: never = outcome;
+  return exhaustive;
 }
 
 /**
@@ -2001,6 +2121,44 @@ export async function removeBuildReviewVerdict(dir: string): Promise<void> {
 }
 
 /**
+ * Guard for the daemon's build_review→build kickback route (#1740 follow-up):
+ * a FAIL aggregate whose `lapId` no longer matches `lap-<HEAD>` graded a
+ * PRIOR lap's code, so its findings must never drive a kickback — the
+ * completion predicate above already scores it "no fresh verdict", and this
+ * helper enforces the same rule at the raw-verdict kickback read, which
+ * otherwise re-raises already-fixed findings forever.
+ *
+ * When the stored aggregate is a strict aggregate, non-PASS, and belongs to a
+ * prior lap: the verdict artifact is deleted (final, exactly like the
+ * stale-mirage disposition — the next build_review dispatch must write a
+ * brand-new verdict) and the lap mismatch is returned for telemetry. In every
+ * other case — legacy scalar verdict, current-lap aggregate, or a failed HEAD
+ * probe (advisory: never discard evidence on an indeterminate probe) — the
+ * artifact is left untouched and `null` is returned.
+ */
+export async function discardStaleLapBuildReviewFail(
+  dir: string,
+  verdictRaw: unknown,
+  git?: GitRunner,
+): Promise<{ storedLapId: string; currentLapId: string } | null> {
+  const aggregate = parseBuildReviewAggregate(verdictRaw);
+  if (!aggregate || aggregate.verdict === 'PASS') return null;
+  try {
+    const head = await (git ?? makeGitRunner(dir))(['rev-parse', 'HEAD']);
+    const sha = head.exitCode === 0 ? head.stdout.trim() : '';
+    if (!sha) return null;
+    const currentLapId = `lap-${sha}`;
+    if (aggregate.lapId === currentLapId) return null;
+    await removeBuildReviewVerdict(dir).catch(() => {
+      /* best-effort removal — the returned mismatch still suppresses the kickback */
+    });
+    return { storedLapId: aggregate.lapId, currentLapId };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Which rubric category the grader flagged, when the verdict is FAIL. All
  * fields optional — a grader may flag one, several, or (rarely) none of the
  * categories while still returning FAIL with free-form `reasons`.
@@ -2298,8 +2456,8 @@ export async function stampCode(ctx: CompletionContext): Promise<string | null> 
 }
 
 /**
- * Sidecar code-stamp marker shape for `prd_audit` and
- * `architecture_review_as_built` (gate-code-validity-on-redispatch, #817).
+ * Sidecar code-stamp marker shape for judged gates
+ * (gate-code-validity-on-redispatch, #817).
  * Unlike `build_review` (a JSON verdict) or `manual_test` (which already has
  * a `headSha`-bearing JSON marker), these two gates' verdicts live in
  * markdown reports — so `codeStamp` is recorded in a small adjacent JSON
@@ -2310,6 +2468,7 @@ export async function stampCode(ctx: CompletionContext): Promise<string | null> 
  */
 export interface GateCodeStampMarker {
   codeStamp?: string | null;
+  runId?: string;
 }
 
 /** Sidecar path for prd_audit's code stamp (see `GateCodeStampMarker`). */
@@ -2322,6 +2481,60 @@ export const PRD_AUDIT_CODE_STAMP = '.pipeline/prd-audit-code-stamp.json';
 export const ARCHITECTURE_REVIEW_AS_BUILT_CODE_STAMP =
   '.pipeline/architecture-review-as-built-code-stamp.json';
 
+/** Sidecar path for manual_test's code stamp (see `GateCodeStampMarker`). */
+export const MANUAL_TEST_CODE_STAMP = '.pipeline/manual-test-code-stamp.json';
+
+const VERDICT_RUN_ID_SIDECARS: Partial<Record<StepName, string>> = {
+  manual_test: MANUAL_TEST_CODE_STAMP,
+  prd_audit: PRD_AUDIT_CODE_STAMP,
+  architecture_review_as_built: ARCHITECTURE_REVIEW_AS_BUILT_CODE_STAMP,
+};
+
+/**
+ * The SHIP-tail gates that carry an engine-stamped run identity
+ * (adr-2026-08-25-engine-stamped-ship-tail-verdict-run-identity, Decision
+ * scope). Only these dispatches hand their identity to the provider lifecycle
+ * as its `attempt.id`; every other step keeps the runner's own run-scoped
+ * attempt-id format, which daemon logs and lifecycle telemetry read.
+ */
+export function isVerdictRunIdentityStep(step: StepName): boolean {
+  return Object.prototype.hasOwnProperty.call(VERDICT_RUN_ID_SIDECARS, step);
+}
+
+async function readGateCodeStampMarker(path: string): Promise<GateCodeStampMarker> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, 'utf-8'));
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as GateCodeStampMarker
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Records the engine-owned identity of a verdict dispatch at settle. */
+export async function stampGateRunIdentity(
+  dir: string,
+  step: StepName,
+  runId: string | undefined,
+): Promise<void> {
+  const sidecarPath = VERDICT_RUN_ID_SIDECARS[step];
+  if (!sidecarPath || !runId) return;
+
+  try {
+    const path = join(dir, sidecarPath);
+    const existing = await readGateCodeStampMarker(path);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(
+      path,
+      JSON.stringify({ ...existing, runId } satisfies GateCodeStampMarker, null, 2) + '\n',
+      'utf-8',
+    );
+  } catch {
+    // Best-effort; Task 4 owns observable write-failure policy.
+  }
+}
+
 /**
  * Writes `{ codeStamp }` to a `GateCodeStampMarker` sidecar at true-completion
  * exit. Best-effort — never throws, never blocks returning `done: true`.
@@ -2332,11 +2545,49 @@ async function writeGateCodeStamp(
   ctx: CompletionContext,
 ): Promise<void> {
   const codeStamp = await stampCode(ctx);
+  const path = join(dir, sidecarPath);
+  const existing = await readGateCodeStampMarker(path);
   await writeFile(
-    join(dir, sidecarPath),
-    JSON.stringify({ codeStamp } satisfies GateCodeStampMarker, null, 2),
+    path,
+    JSON.stringify({ ...existing, codeStamp } satisfies GateCodeStampMarker, null, 2),
     'utf-8',
   ).catch(() => {});
+}
+
+/**
+ * Engine-stamped run identity takes precedence over the mtime floor for the
+ * three SHIP-tail verdict predicates. Legacy and kill-switched callers retain
+ * their existing mtime-only behavior.
+ */
+async function completionVerdictRunIdentity(
+  dir: string,
+  step: StepName,
+  ctx: CompletionContext,
+): Promise<VerdictRunIdentity> {
+  if (!resolveGateCodeValidityConfig(ctx.config).enabled) return { state: 'unstamped' };
+  return verdictProducedByRun(dir, step, ctx.attemptRunId, ctx.config);
+}
+
+function staleVerdictRunIdentityResult(
+  artifact: string,
+  identity: Extract<VerdictRunIdentity, { state: 'stale-run-identity' }>,
+): CompletionResult {
+  return {
+    done: false,
+    // A prior dispatch's report is not an adverse verdict from THIS dispatch.
+    // Keep this typed so retry routing never has to infer freshness from text.
+    routeClass: 'absent',
+    retrySignal: 'stale-run-identity',
+    verdictFreshness: {
+      artifact,
+      floorSource: 'run-identity',
+      outcome: 'stale_invalidated',
+      fresh: false,
+    },
+    reason:
+      `${artifact} was produced by run ${identity.foundRunId}, not the current run ` +
+      `${identity.expectedRunId} — scoring 'no fresh verdict'; the prior run's findings are never reused`,
+  };
 }
 
 async function writePrdAuditCodeStamp(dir: string, ctx: CompletionContext): Promise<void> {
@@ -2353,6 +2604,22 @@ async function writeArchitectureReviewAsBuiltCodeStamp(
 export const CUSTOM_COMPLETION_PREDICATES: Partial<
   Record<StepName, (dir: string, ctx: CompletionContext) => Promise<CompletionResult>>
 > = {
+  coverage_binding: async (dir): Promise<CompletionResult> => {
+    const path = coverageBindingEnvelopePath(dir);
+    let envelope;
+    try {
+      envelope = parseCoverageBindingEnvelope(JSON.parse(await readFile(path, 'utf8')));
+    } catch {
+      envelope = null;
+    }
+    if (envelope === null) {
+      return { done: false, reason: '.pipeline/coverage-binding.json is missing or invalid' };
+    }
+    if (!(COVERAGE_BINDING_COMPLETION_STATUSES as readonly string[]).includes(envelope.status)) {
+      return { done: false, reason: `.pipeline/coverage-binding.json has non-completing status: ${envelope.status}` };
+    }
+    return { done: true };
+  },
   // Build is "done" only when (a) no halt marker is present and (b) every
   // task in .pipeline/task-status.json is completed or skipped. The halt-
   // marker check exists because a pipeline session that exits at the user's
@@ -2537,15 +2804,20 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
       // task is trailer-evidenced but rows are still pending/in_progress
       // (rows never explicitly flipped) previously false-halted here at
       // 100% real completion.
-      const resolvedIds = await resolveTaskIds(ctx.projectRoot, planTaskIds);
+      const taskResolution = await resolveTaskIdsWithDiagnostics(ctx.projectRoot, planTaskIds);
+      const resolvedIds = taskResolution.resolved;
       const unresolved = planTaskIds.filter((id) => !resolvedIds.has(id));
 
       if (unresolved.length > 0) {
         const names = unresolved.slice(0, 3).join(', ');
         const more = unresolved.length > 3 ? ` (+${unresolved.length - 3} more)` : '';
+        const repairReason = unresolved
+          .map((id) => taskResolution.unavailableReasons.get(id))
+          .find((reason): reason is string => Boolean(reason));
         return {
           done: false,
-          reason: `${unresolved.length}/${planTaskIds.length} tasks pending/not completed: ${names}${more}`,
+          reason: `${unresolved.length}/${planTaskIds.length} tasks pending/not completed: ${names}${more}` +
+            (repairReason ? `; ${repairReason}` : ''),
         };
       }
 
@@ -2710,6 +2982,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
   manual_test: async (dir, ctx): Promise<CompletionResult> => {
     const file = join(dir, '.pipeline/manual-test-results.md');
     const markerPath = join(dir, MANUAL_TEST_FAIL_EVIDENCE);
+    const runIdentity = await completionVerdictRunIdentity(dir, 'manual_test', ctx);
 
     // gate-code-validity-on-redispatch (#817, Task 6): before falling into
     // the mtime-freshness check below, see if a stamped FAIL-free marker
@@ -2721,7 +2994,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     // could bypass the guard below. Missing marker, parse failure, no
     // codeStamp, or any FAIL/whitewash residue all fall through unchanged
     // to the existing logic (invariant C2/C3).
-    if (resolveGateCodeValidityConfig(ctx.config).enabled) {
+    if (
+      runIdentity.state !== 'stale-run-identity' &&
+      resolveGateCodeValidityConfig(ctx.config).enabled
+    ) {
       try {
         const raw = await readFile(markerPath, 'utf-8');
         const marker = JSON.parse(raw) as ManualTestFailEvidence;
@@ -2764,6 +3040,28 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     // ordering bug). Compute/check FAIL rows BEFORE honoring the sentinel.
     const failRows = region.split('\n').filter(isManualTestFailRow);
 
+    // A stale stamp normally means this dispatch has no verdict to judge, so
+    // retain the typed no-fresh-verdict result rather than re-scoring the old
+    // latest attempt. The one exception is an unresolved same-HEAD FAIL: its
+    // marker is the #367 proof that a later clean section would be a
+    // whitewash, and must remain authoritative even across run identities.
+    if (runIdentity.state === 'stale-run-identity') {
+      if (
+        failRows.length === 0 &&
+        headSha &&
+        (await hasFreshFailEvidenceAtHead(markerPath, headSha, ctx.sessionStartedAt))
+      ) {
+        return {
+          done: false,
+          reason:
+            `manual-test results flipped FAIL→PASS but HEAD (${headSha.slice(0, 12)}) has not ` +
+            'moved since the recorded FAIL — no new commits means no fix (whitewash guard). ' +
+            'Implement and commit the fix, then re-run manual-test',
+        };
+      }
+      return staleVerdictRunIdentityResult('.pipeline/manual-test-results.md', runIdentity);
+    }
+
     // Auto-mode SKIP sentinel (#748): the latest attempt was deliberately
     // skipped (no endpoint/UI stories to exercise) rather than carrying a
     // PASS/WARN/FAIL table. Treat it as done once it's fresh for this session —
@@ -2778,7 +3076,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     // sha means the gate is still blocked; fall through to the whitewash-guard
     // done:false path below instead of returning done:true here.
     if (failRows.length === 0 && isSkipAttempt(region)) {
-      if (!(await fileIsFreshSinceSession(file, ctx.sessionStartedAt))) {
+      if (
+        runIdentity.state !== 'match' &&
+        !(await fileIsFreshSinceSession(file, ctx.sessionStartedAt))
+      ) {
         return {
           done: false,
           reason: '.pipeline/manual-test-results.md exists but is stale (mtime predates this conductor session); manual-test must re-run for the current feature',
@@ -2813,7 +3114,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
         reason: '.pipeline/manual-test-results.md contains FAIL rows (latest attempt) — fix the bugs (commits required) and re-run manual-test',
       };
     }
-    if (!(await fileIsFreshSinceSession(file, ctx.sessionStartedAt))) {
+    if (
+      runIdentity.state !== 'match' &&
+      !(await fileIsFreshSinceSession(file, ctx.sessionStartedAt))
+    ) {
       return {
         done: false,
         reason: '.pipeline/manual-test-results.md exists but is stale (mtime predates this conductor session); manual-test must re-run for the current feature',
@@ -2878,10 +3182,17 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
   // every functional-requirement (FR-N) row is ALIGNED — or an un-ALIGNED row is
   // explicitly marked ACCEPTED (a human-accepted intended divergence). A
   // MISSING / PARTIAL / DIVERGED row that is not ACCEPTED blocks the gate, so the
-  // selector cannot advance to retro/finish until the gap is closed (BUILD) or
+  // selector cannot advance to finish until the gap is closed (BUILD) or
   // the PRD is amended (DECIDE) and the audit re-run. Mirrors manual_test:
   // presence + freshness + no blocking rows.
   prd_audit: async (dir, ctx): Promise<CompletionResult> => {
+    const runIdentity = await completionVerdictRunIdentity(dir, 'prd_audit', ctx);
+    // A prior run's verdict is not condemned by identity alone: the code-stamp
+    // preservation check below runs first, so a verdict formed against this
+    // exact reviewed tree (surface miss since the stamp, including through the
+    // engine's own rebase rewrite) survives a halt/resume. Only when the stamp
+    // cannot vouch for it does the stale identity score 'no fresh verdict'
+    // (adr-2026-08-25 D5 as amended 2026-09-06).
     // gate-code-validity-on-redispatch (#817, Task 6): before the
     // freshness/report-parsing checks below, see if the last recorded PASS
     // (the sidecar is written ONLY on the PASS path — Task 4 — so its mere
@@ -2915,22 +3226,23 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
                   featureDesc: ctx.featureDesc,
                   git: ctx.git,
                 }));
+              const preActivePlan = await activePlanTextFor(dir, artifactResolution);
               for (const f of preCheckFiles) {
                 const report = await readFile(f, 'utf-8');
-                const parsed = parsePrdAuditReport(report);
+                const parsed = parsePrdAuditReport(report, preActivePlan);
                 const preRelations = overScopeRelations(report);
                 const preDecisions = (await readOverScopeDecisions(dir)).decisions;
                 if (
                   (parsed.ok
-                    ? parsed.value.findings.some(
+                    ? parsed.value.rejectedRows.length > 0 || parsed.value.findings.some(
                         (finding) =>
                           finding.grade !== 'PASS' &&
                           !(
                             finding.grade === 'OVER_SCOPE' &&
-                            ['accepted', 'not-blocking'].includes(classifyOverScopeCriterion(finding.criterion, preRelations, preDecisions))
+                            ['accepted', 'not-blocking'].includes(classifyOverScopeCriterion(finding.criterion, finding.evidence, preRelations, preDecisions))
                           ),
                       )
-                    : findUnalignedFrRows(report).length > 0) ||
+                    : findUnalignedFrRows(report, preActivePlan).length > 0) ||
                   (await prdAuditCoverageGap(dir, artifactResolution, report)) !== null ||
                   (await prdAuditStoryCoverageGap(dir, artifactResolution, ctx.featureDesc, report)) !== null
                 ) {
@@ -2952,6 +3264,9 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
         // No sidecar, unreadable, or unparseable — fall through.
       }
     }
+    if (runIdentity.state === 'stale-run-identity') {
+      return staleVerdictRunIdentityResult('.pipeline/prd-audit.md', runIdentity);
+    }
 
     const files = await findArtifactFiles(dir, 'prd_audit');
     if (files.length === 0) {
@@ -2967,7 +3282,9 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     const cmpFloor = verdictFreshnessComparand(ctx);
     const fresh: string[] = [];
     for (const f of files) {
-      if (await fileIsFreshSinceSession(f, cmpFloor)) fresh.push(f);
+      if (runIdentity.state === 'match' || await fileIsFreshSinceSession(f, cmpFloor)) {
+        fresh.push(f);
+      }
     }
     if (fresh.length === 0) {
       const f = files[0];
@@ -2979,11 +3296,15 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
       };
     }
     let blockingReason: string | undefined;
+    // The gate's own scoring parse carries the same citation authority the
+    // remediation path uses, so a Verdict Table cannot score done here and be
+    // rejected there (adr-2026-08-30 D1).
+    const activePlan = await readActivePlanText(dir, ctx.planPath, ctx.featureDesc);
     for (const f of fresh) {
-      const parsed = parsePrdAuditReport(await readFile(f, 'utf-8'));
+      const parsed = parsePrdAuditReport(await readFile(f, 'utf-8'), activePlan);
       if (!parsed.ok) {
         const hasFeatureIdentity = Boolean(ctx.planPath || ctx.featureDesc);
-        const legacyBlocking = findUnalignedFrRows(await readFile(f, 'utf-8'));
+        const legacyBlocking = findUnalignedFrRows(await readFile(f, 'utf-8'), activePlan);
         if (hasFeatureIdentity || legacyBlocking.length > 0) {
           blockingReason = hasFeatureIdentity
             ? `PRD audit report mechanical fault: ${parsed.error}`
@@ -2991,6 +3312,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
           break;
         }
         continue;
+      }
+      if (parsed.value.rejectedRows.length > 0) {
+        blockingReason = `prd-audit found rejected rows: ${formatPrdAuditRejectedRows(parsed.value.rejectedRows)} — correct the report and re-audit`;
+        break;
       }
       // An accepted or non-visible OVER_SCOPE finding is recorded, not blocking.
       // Without this the operator could accept scope bloat and still never
@@ -3004,7 +3329,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
           finding.grade !== 'PASS' &&
           !(
             finding.grade === 'OVER_SCOPE' &&
-            ['accepted', 'not-blocking'].includes(classifyOverScopeCriterion(finding.criterion, relations, decisions))
+            ['accepted', 'not-blocking'].includes(classifyOverScopeCriterion(finding.criterion, finding.evidence, relations, decisions))
           ),
       );
       if (blocking.length > 0) {
@@ -3055,6 +3380,13 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
   // unless the literal word BLOCKED appeared), which let a no-ADR / garbled
   // verdict slip through marked `done` and the loop end without DONE or HALT.
   architecture_review_as_built: async (dir, ctx): Promise<CompletionResult> => {
+    const runIdentity = await completionVerdictRunIdentity(
+      dir,
+      'architecture_review_as_built',
+      ctx,
+    );
+    // Stale run identity is decided AFTER the code-stamp preservation check,
+    // mirroring prd_audit (adr-2026-08-25 D5 as amended 2026-09-06).
     // gate-code-validity-on-redispatch (#817, Task 6): mirrors prd_audit's
     // preserve-check above — the sidecar is written ONLY on the clean-
     // APPROVED PASS path (Task 4), so its mere presence with a codeStamp IS
@@ -3093,6 +3425,12 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
         // No sidecar, unreadable, or unparseable — fall through.
       }
     }
+    if (runIdentity.state === 'stale-run-identity') {
+      return staleVerdictRunIdentityResult(
+        '.pipeline/architecture-review-as-built.md',
+        runIdentity,
+      );
+    }
 
     const files = await findArtifactFiles(dir, 'architecture_review_as_built');
     if (files.length === 0) {
@@ -3105,7 +3443,9 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     const cmpFloor = verdictFreshnessComparand(ctx);
     const fresh: string[] = [];
     for (const f of files) {
-      if (await fileIsFreshSinceSession(f, cmpFloor)) fresh.push(f);
+      if (runIdentity.state === 'match' || await fileIsFreshSinceSession(f, cmpFloor)) {
+        fresh.push(f);
+      }
     }
     if (fresh.length === 0) {
       const f = files[0];
@@ -3123,7 +3463,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
       if (outcome.kind === 'invalid') {
         return {
           done: false,
-          reason: 'as-built review must record `Verdict:` plus `Outcome delivered: yes|no` for PLAN_GAP; re-run the as-built review',
+          reason: renderAsBuiltInvalidReason(outcome),
           routeClass: 'absent',
         };
       }
@@ -3140,10 +3480,21 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
           routeClass: 'named-route',
         };
       }
-      if (outcome.kind === 'blocked') {
+      if (outcome.kind === 'blocked-design') {
         return {
           done: false,
-          reason: 'as-built review verdict is BLOCKED — shipped code violates an approved architecture decision',
+          reason:
+            'as-built review verdict is BLOCKED and needs a human decision — DESIGN finding(s): ' +
+            outcome.designFindings.map((finding) => `${finding.id} (${finding.clause})`).join(', '),
+          routeClass: 'named-route',
+        };
+      }
+      if (outcome.kind === 'blocked-remediable') {
+        return {
+          done: false,
+          reason:
+            'as-built review verdict is BLOCKED and every blocking finding is REMEDIABLE — ' +
+            'a repair, not a decision',
           routeClass: 'named-route',
         };
       }
@@ -3191,7 +3542,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
             if (aggregate) {
               const effectiveResolution = await (
                 ctx.buildReviewEffectiveResolver ?? resolveEffectiveBuildReviewVerdict
-              )(dir, aggregate);
+              )(dir, aggregate, {
+                minConfidence: Object.fromEntries(Object.entries(resolveBuildReviewConfig(ctx.config ?? {}).rubrics)
+                  .map(([id, policy]) => [id, policy.min_confidence])),
+              });
               if (!effectiveResolution.ok) {
                 return {
                   done: false,
@@ -3296,7 +3650,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
       }
       const effectiveResolution = await (
         ctx.buildReviewEffectiveResolver ?? resolveEffectiveBuildReviewVerdict
-      )(dir, aggregate);
+      )(dir, aggregate, {
+        minConfidence: Object.fromEntries(Object.entries(resolveBuildReviewConfig(ctx.config ?? {}).rubrics)
+          .map(([id, policy]) => [id, policy.min_confidence])),
+      });
       if (!effectiveResolution.ok) {
         return {
           done: false,
@@ -3333,10 +3690,6 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     };
   },
 
-  // Retained solely for topology compatibility. Wiring is evaluated by the
-  // build_review rubric; this step must never inspect plans, diffs, or evidence.
-  wiring_check: async (): Promise<CompletionResult> => ({ done: true }),
-
   test_suite: async (dir, ctx): Promise<CompletionResult> => {
     let inspection: FullSuiteInspectionResult;
     try {
@@ -3349,7 +3702,10 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
         reason: `full-suite completion inspection failed: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
-    if (inspection.status === 'CURRENT') return { done: true };
+    if (
+      inspection.status === 'CURRENT' ||
+      inspection.status === 'PRESERVED_WITHIN_BUDGET'
+    ) return { done: true };
     if (inspection.status === 'STALE') {
       return {
         done: false,
@@ -3359,51 +3715,6 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     return {
       done: false,
       reason: `full-suite completion inspection failed (${inspection.reason}): ${inspection.message}`,
-    };
-  },
-
-  // Retro passes when a fresh retro file exists for THIS feature. Filename
-  // should contain the slug per skills/retro/SKILL.md ("Save to
-  // .docs/retros/YYYY-MM-DD-<feature-name>.md"). Falls back to "any retro
-  // fresh in this session" when no feature_desc is available.
-  retro: async (dir, ctx): Promise<CompletionResult> => {
-    const allFiles = await findArtifactFiles(dir, 'retro');
-    if (allFiles.length === 0) {
-      return {
-        done: false,
-        reason: 'no .docs/retros/*.md present (retro skill must save a report)',
-      };
-    }
-    const slug = ctx.featureDesc ? slugify(ctx.featureDesc) : null;
-    if (slug) {
-      const matched = allFiles.filter(
-        (f) => f.endsWith(`-${slug}.md`) || f.endsWith(`/${slug}.md`),
-      );
-      if (matched.length > 0) {
-        for (const f of matched) {
-          if (await fileIsFreshSinceSession(f, ctx.sessionStartedAt)) return { done: true };
-        }
-        return {
-          done: false,
-          reason: `slug-matched retro exists but is stale (mtime predates this session) — retro must re-run`,
-        };
-      }
-      // No slug match — accept any retro file fresh in this session as a
-      // fallback (covers very long feature_desc, slug truncation, etc.).
-      for (const f of allFiles) {
-        if (await fileIsFreshSinceSession(f, ctx.sessionStartedAt)) return { done: true };
-      }
-      return {
-        done: false,
-        reason: `no retro found for current feature (expected .docs/retros/*-${slug}.md OR a retro file with mtime >= session start)`,
-      };
-    }
-    for (const f of allFiles) {
-      if (await fileIsFreshSinceSession(f, ctx.sessionStartedAt)) return { done: true };
-    }
-    return {
-      done: false,
-      reason: 'retro files exist but none are fresh for this session',
     };
   },
 
@@ -3804,6 +4115,24 @@ export function isStoriesApproved(content: string): boolean {
 }
 
 /**
+ * Whether a filename is a canonical, date-prefixed ADR filename.
+ */
+export function isCanonicalAdrFilename(filename: string): boolean {
+  const match = /^adr-(\d{4})-(\d{2})-(\d{2})-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/.exec(filename);
+  if (!match) return false;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+}
+
+/**
  * Read the declared ADR status. APPROVED and SUPERSEDED ADRs satisfy the
  * approval gate; other declared statuses are retained for diagnostics.
  */
@@ -3826,6 +4155,58 @@ export function adrApprovalStatus(content: string): { approved: boolean; found: 
     approved: /^(?:approved|superseded)\b/i.test(found),
     found,
   };
+}
+
+export type AdrDecisionParseResult =
+  | { kind: 'decisions'; ids: Set<string> }
+  | { kind: 'diagnostic'; reason: 'missing-decision-heading'; detail: string };
+
+const ADR_DECISION_HEADING_RE = /^\s{0,3}##\s+Decision\s*$/i;
+const ADR_SECTION_HEADING_RE = /^\s{0,3}##\s+/;
+
+/**
+ * Extract citable decision ids from an ADR's `## Decision` section.
+ *
+ * The accepted forms preserve the AB-R12 compatibility contract: numbered
+ * list items with the emphasis either after the number (`4. **Termination.**`)
+ * or wrapping it (`**4. Termination.**`), bolded D-headings, and ATX
+ * D-headings with optional emphasis.
+ *
+ * The bold-wrapped number is not a stylistic nicety: seven APPROVED ADRs on the
+ * default branch number their decisions that way, including
+ * `adr-2026-08-11-halt-events-ride-the-persisted-spine`. `^\s*\d+\.` cannot step
+ * over the leading `**`, so each of those decisions was uncitable as a governing
+ * clause, and a REMEDIABLE as-built finding naming one halted `needs-human` on
+ * punctuation rather than on anything a human had to decide.
+ */
+export function parseAdrDecisions(content: string): AdrDecisionParseResult {
+  const withoutFencedCodeBlocks = content.replace(
+    /^ {0,3}(`{3,}|~{3,})[^\r\n]*(?:\r?\n|\r)[\s\S]*?^ {0,3}\1[^\r\n]*(?:\r?\n|\r|$)/gm,
+    '',
+  );
+  const lines = withoutFencedCodeBlocks.split(/\r?\n/);
+  const sectionStart = lines.findIndex((line) => ADR_DECISION_HEADING_RE.test(line));
+  if (sectionStart === -1) {
+    return {
+      kind: 'diagnostic',
+      reason: 'missing-decision-heading',
+      detail: 'ADR is missing a ## Decision heading.',
+    };
+  }
+
+  const ids = new Set<string>();
+  for (const line of lines.slice(sectionStart + 1)) {
+    if (ADR_SECTION_HEADING_RE.test(line)) break;
+    const decisionLine = line.replace(/^\s{0,3}>\s?/, '');
+    // `\*{0,2}` before the digit, never after it: `**1.` must match while
+    // `**12.` must not answer for decision 1, so the `.` stays required.
+    const numberedItem = decisionLine.match(/^\s*\*{0,2}(\d+)\.\s+\S/);
+    const dHeading = decisionLine.match(/^\s*#{0,6}\s*\*{0,2}D(\d+)\b/);
+    const id = numberedItem?.[1] ?? dHeading?.[1];
+    if (id !== undefined) ids.add(id);
+  }
+
+  return { kind: 'decisions', ids };
 }
 
 /**
@@ -3952,6 +4333,7 @@ function parseFrVerdictRow(line: string): ParsedFrRow | null {
 
 /** Heading that opens the authoritative verdict table, at any heading level. */
 const VERDICT_TABLE_HEADING_RE = /^\s{0,3}#{1,6}\s+Verdict\s+Table\s*$/i;
+const NO_OWNER_FINDINGS_HEADING_RE = /^\s{0,3}#{1,6}\s+Findings\s+without\s+an\s+owning\s+criterion\s*$/i;
 const MARKDOWN_HEADING_RE = /^\s{0,3}#{1,6}\s+/;
 
 /**
@@ -3978,21 +4360,52 @@ function verdictTableLines(content: string): string[] {
   return end === -1 ? rest : rest.slice(0, end);
 }
 
+/** Return the lines in the explicit no-owner findings section, when present. */
+function noOwnerFindingsLines(content: string): string[] {
+  const lines = content.split('\n');
+  const start = lines.findIndex((line) => NO_OWNER_FINDINGS_HEADING_RE.test(line));
+  if (start === -1) return [];
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => MARKDOWN_HEADING_RE.test(line));
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
 /** The only grades a criterion-level PRD-audit finding may carry. */
 export type PrdAuditGrade = 'PASS' | 'FIXABLE' | 'PLAN_GAP' | 'OVER_SCOPE';
 
 export interface PrdAuditFinding {
   criterion: string;
   grade: PrdAuditGrade;
-  planTask?: number;
+  /**
+   * The single cited plan task, present only when the row cites exactly one.
+   * A FIXABLE row always has it — the parser rejects a multi-task FIXABLE
+   * citation, because its repair must bind to one parent task. A row citing
+   * several tasks validates every id against the plan and carries none here:
+   * nothing downstream binds to a multi-task citation, so exposing the list
+   * would add an API with no consumer.
+   */
+  planTask?: string;
   /** Intent FR associations from the table's PRD: column. */
   prdIds: readonly string[];
   evidence: string;
 }
 
+export interface PrdAuditRejectedRow {
+  rowText: string;
+  key?: string;
+  reason: string;
+}
+
 export interface PrdAuditReport {
   prd: 'present' | 'none';
   findings: PrdAuditFinding[];
+  rejectedRows: PrdAuditRejectedRow[];
+}
+
+interface ParsedPrdAuditFinding {
+  finding: PrdAuditFinding;
+  rowText: string;
+  section: 'verdict-table' | 'no-owner';
 }
 
 export type PrdAuditReportParseResult =
@@ -4005,7 +4418,21 @@ const PRD_AUDIT_GRADES: ReadonlySet<PrdAuditGrade> = new Set([
   'PLAN_GAP',
   'OVER_SCOPE',
 ]);
-const CRITERION_ID_RE = /^S\d+\.\d+$/i;
+/**
+ * A criterion key is `S<story-id>.<number>`. The story id uses the same
+ * alphabet the stories parser accepts for `## Story <id>:` headings
+ * (`[A-Za-z0-9.-]`, see `story-criteria.ts`), so alphanumeric ids like `S5a.1`
+ * and nested ids like `S2.1.3` validate. The final dot-separated segment is
+ * the criterion number and stays numeric, and the story id must be non-empty —
+ * `S.1`, `S1`, and `S1.a` are still rejected, as is the `NC.<number>` findings
+ * form.
+ */
+const CRITERION_ID_RE = /^S[A-Za-z0-9.-]+\.\d+$/i;
+const NO_OWNER_KEY_RE = /^NC\.\d+$/i;
+
+export function isNoOwnerKey(key: string): boolean {
+  return NO_OWNER_KEY_RE.test(key);
+}
 
 function tableCells(line: string): string[] {
   return line
@@ -4019,12 +4446,155 @@ function isTableSeparator(cells: readonly string[]): boolean {
   return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
 }
 
+/** The closed classification set for a BLOCKED as-built review finding. */
+export type AsBuiltBlockedFindingClass = 'REMEDIABLE' | 'DESIGN';
+
+/** A machine-readable BLOCKED finding emitted by an as-built review. */
+export interface AsBuiltBlockedFinding {
+  id: string;
+  class: AsBuiltBlockedFindingClass;
+  clause: string;
+  summary: string;
+}
+
+export interface AsBuiltBlockedFindings {
+  findings: AsBuiltBlockedFinding[];
+}
+
+/** A parser fault is data, so callers can fail closed without catching. */
+export type AsBuiltBlockedFindingsParseResult =
+  | { ok: true; value: AsBuiltBlockedFindings }
+  | { ok: false; class: 'mechanical-fault'; error: string };
+
+const AS_BUILT_BLOCKING_FINDINGS_HEADING_RE = /^\s{0,3}##\s+Blocking\s+Findings\s*$/i;
+const AS_BUILT_BLOCKED_FINDING_CLASSES: ReadonlySet<AsBuiltBlockedFindingClass> = new Set([
+  'REMEDIABLE',
+  'DESIGN',
+]);
+
+/**
+ * Parse the machine-readable Blocking Findings table from a BLOCKED as-built
+ * review. Only the dedicated section is authoritative; historical or prose
+ * tables elsewhere in the report have no routing authority.
+ */
+export function parseAsBuiltBlockedFindings(content: string): AsBuiltBlockedFindingsParseResult {
+  const lines = content.split('\n');
+  const sectionStarts = lines.flatMap((line, index) =>
+    AS_BUILT_BLOCKING_FINDINGS_HEADING_RE.test(line) ? [index] : []);
+  if (sectionStarts.length === 0) {
+    return asBuiltBlockedFindingsMechanicalFault('As-built BLOCKED report is missing its Blocking Findings table.');
+  }
+  if (sectionStarts.length > 1) {
+    return asBuiltBlockedFindingsMechanicalFault('As-built BLOCKED report has duplicate Blocking Findings sections.');
+  }
+  const [sectionStart] = sectionStarts;
+
+  const remainingSection = lines.slice(sectionStart + 1);
+  const sectionEnd = remainingSection.findIndex((line) => /^\s{0,3}##\s+/.test(line));
+  const section = sectionEnd === -1 ? remainingSection : remainingSection.slice(0, sectionEnd);
+  const headerIndex = section.findIndex((line) => {
+    if (!/^\s*\|/.test(line)) return false;
+    const cells = tableCells(line).map((cell) => cell.toLowerCase());
+    return ['finding', 'class', 'governing clause', 'summary'].every((column) => cells.includes(column));
+  });
+  if (headerIndex === -1) {
+    return asBuiltBlockedFindingsMechanicalFault('As-built Blocking Findings table has a malformed header.');
+  }
+
+  const header = tableCells(section[headerIndex]).map((cell) => cell.toLowerCase());
+  const requiredColumns = ['finding', 'class', 'governing clause', 'summary'] as const;
+  if (requiredColumns.some((column) => header.filter((cell) => cell === column).length !== 1)) {
+    return asBuiltBlockedFindingsMechanicalFault('As-built Blocking Findings table has a malformed header.');
+  }
+  const findingIndex = header.indexOf('finding');
+  const classIndex = header.indexOf('class');
+  const clauseIndex = header.indexOf('governing clause');
+  const summaryIndex = header.indexOf('summary');
+  const findings: AsBuiltBlockedFinding[] = [];
+  const findingIds = new Set<string>();
+  let readingTable = false;
+  let tableEnded = false;
+
+  for (const line of section.slice(headerIndex + 1)) {
+    if (!/^\s*\|/.test(line)) {
+      if (readingTable && line.trim() === '') {
+        readingTable = false;
+        tableEnded = true;
+      }
+      continue;
+    }
+    if (tableEnded) {
+      return asBuiltBlockedFindingsMechanicalFault(
+        'As-built BLOCKED report has duplicate Blocking Findings tables.',
+      );
+    }
+    readingTable = true;
+    const cells = tableCells(line);
+    if (isTableSeparator(cells)) continue;
+
+    const id = cells[findingIndex]?.trim() ?? '';
+    if (id === '') {
+      return asBuiltBlockedFindingsMechanicalFault('As-built Blocking Findings row has an empty Finding.');
+    }
+    if (findingIds.has(id)) {
+      return asBuiltBlockedFindingsMechanicalFault(`As-built Blocking Findings table has duplicate Finding id "${id}".`);
+    }
+    findingIds.add(id);
+    const classValue = cells[classIndex]?.trim() ?? '';
+    const rawClass = classValue;
+    if (!AS_BUILT_BLOCKED_FINDING_CLASSES.has(rawClass as AsBuiltBlockedFindingClass)) {
+      return asBuiltBlockedFindingsMechanicalFault(`As-built finding ${id} has an invalid Class value "${classValue}".`);
+    }
+    const clause = cells[clauseIndex]?.trim() ?? '';
+    if (rawClass === 'REMEDIABLE' && clause === '') {
+      return asBuiltBlockedFindingsMechanicalFault(`As-built REMEDIABLE finding ${id} has no Governing clause.`);
+    }
+    const summary = cells[summaryIndex]?.trim() ?? '';
+    if (summary === '') {
+      return asBuiltBlockedFindingsMechanicalFault(`As-built finding ${id} has an empty Summary.`);
+    }
+    findings.push({
+      id,
+      class: rawClass as AsBuiltBlockedFindingClass,
+      clause,
+      summary,
+    });
+  }
+
+  if (findings.length === 0) {
+    return asBuiltBlockedFindingsMechanicalFault('As-built Blocking Findings table has no finding rows.');
+  }
+  return { ok: true, value: { findings } };
+}
+
+function asBuiltBlockedFindingsMechanicalFault(error: string): AsBuiltBlockedFindingsParseResult {
+  return { ok: false, class: 'mechanical-fault', error };
+}
+
+function rejectedPrdAuditRow(
+  rejectedRows: PrdAuditRejectedRow[],
+  line: string,
+  key: string | undefined,
+  reason: string,
+): void {
+  rejectedRows.push({
+    rowText: line.trim(),
+    ...(key === undefined ? {} : { key }),
+    reason,
+  });
+}
+
+const CRITERION_KEY_REASON =
+  'Criterion has invalid key; accepted key forms are S<story-id>.<number> in the Verdict Table — where <story-id> is the story heading id (letters, digits, dots, hyphens; for example S1.1, S5a.1, S2.1.3) and <number> is the numeric criterion — and NC.<number> in Findings without an owning criterion.';
+const NO_OWNER_KEY_REASON =
+  'Finding has invalid key; accepted key forms are NC.<number> in Findings without an owning criterion.';
+
 /**
  * Parse the criterion-grade verdict table emitted by `prd_audit`.
  *
  * The existing per-FR table is evidence only; the criterion table is the
- * authoritative routing contract. Invalid grade vocabulary fails closed here
- * instead of being interpreted by a later route as an implicit new grade.
+ * authoritative routing contract. Report-level structure faults fail closed;
+ * invalid rows are retained as diagnostics so valid sibling rows still route.
  */
 export function parsePrdAuditReport(
   content: string,
@@ -4056,7 +4626,8 @@ export function parsePrdAuditReport(
   const activePlanTaskIds = activePlan === undefined
     ? undefined
     : new Set(parsePlanTaskPaths(activePlan).keys());
-  const findings: PrdAuditFinding[] = [];
+  const parsedFindings: ParsedPrdAuditFinding[] = [];
+  const rejectedRows: PrdAuditRejectedRow[] = [];
 
   let readingCriterionTable = false;
   for (const line of lines.slice(headerIndex + 1)) {
@@ -4071,55 +4642,186 @@ export function parsePrdAuditReport(
     readingCriterionTable = true;
     const cells = tableCells(line);
     if (isTableSeparator(cells)) continue;
-    const criterion = cells[criterionIndex]?.toUpperCase();
+    const key = cells[criterionIndex]?.trim();
+    const criterion = key?.toUpperCase();
     if (!criterion || !CRITERION_ID_RE.test(criterion)) {
-      return prdAuditMechanicalFault('PRD audit finding has an empty or malformed Criterion.');
+      const reason = criterion && isNoOwnerKey(criterion)
+        ? 'NC.<number> keys are valid only in Findings without an owning criterion, not the Verdict Table.'
+        : CRITERION_KEY_REASON;
+      rejectedPrdAuditRow(rejectedRows, line, key || undefined, reason);
+      continue;
     }
 
     const rawGrade = cells[gradeIndex]?.toUpperCase();
     if (!rawGrade || !PRD_AUDIT_GRADES.has(rawGrade as PrdAuditGrade)) {
-      return prdAuditMechanicalFault(`PRD audit finding ${criterion} has an invalid Grade.`);
+      rejectedPrdAuditRow(rejectedRows, line, criterion, `PRD audit finding ${criterion} has an invalid Grade.`);
+      continue;
     }
 
     const rawPlanTask = planTaskIndex === -1 ? '' : cells[planTaskIndex] ?? '';
-    const planTask = rawPlanTask.trim() === '' || rawPlanTask.trim() === '—'
+    const citedPlanTask = rawPlanTask.trim() === '' || rawPlanTask.trim() === '—'
       ? undefined
-      : Number(rawPlanTask);
-    if (planTask !== undefined && (!Number.isInteger(planTask) || planTask < 1)) {
-      return prdAuditMechanicalFault(`PRD audit finding ${criterion} has an invalid Plan task.`);
+      : rawPlanTask;
+    // adr-2026-08-30-shared-plan-task-reference-resolver D1: a citation is
+    // valid only if it names an id the CITING artifact's active plan declares.
+    // With no plan supplied there is no id set to check membership in, so the
+    // row is refused fail-closed. The predecessor derived the lookup set from
+    // the citation under judgement (`activePlanTaskIds ?? new Set([...])`), so
+    // any grammar-valid id resolved against itself and the gate scored a
+    // report that the remediation path — which does pass the plan — rejects.
+    if (citedPlanTask !== undefined && activePlanTaskIds === undefined) {
+      rejectedPrdAuditRow(rejectedRows, line, criterion,
+        `PRD audit finding ${criterion} cites Plan task ${citedPlanTask.trim()}, but the active plan could not be resolved to verify it.`,
+      );
+      continue;
     }
-    if (rawGrade === 'FIXABLE' && planTask === undefined) {
-      return prdAuditMechanicalFault(
+    const planTaskReference = citedPlanTask === undefined || activePlanTaskIds === undefined
+      ? undefined
+      : resolvePlanTaskReference(citedPlanTask, activePlanTaskIds);
+    if (planTaskReference?.kind === 'malformed') {
+      rejectedPrdAuditRow(rejectedRows, line, criterion,
+        `PRD audit finding ${criterion} has malformed Plan task ${planTaskReference.raw}.`,
+      );
+      continue;
+    }
+    if (planTaskReference?.kind === 'unresolvable') {
+      rejectedPrdAuditRow(rejectedRows, line, criterion,
+        `PRD audit finding ${criterion} names Plan task ${planTaskReference.ids.join(', ')}, which is absent from the active plan.`,
+      );
+      continue;
+    }
+    const planTasks = planTaskReference?.ids;
+    if (rawGrade === 'FIXABLE' && planTasks === undefined) {
+      rejectedPrdAuditRow(rejectedRows, line, criterion,
         `PRD audit finding ${criterion} is FIXABLE but has no Plan task.`,
       );
+      continue;
     }
-    if (
-      rawGrade === 'FIXABLE' &&
-      activePlanTaskIds !== undefined &&
-      !activePlanTaskIds.has(String(planTask))
-    ) {
-      return prdAuditMechanicalFault(
-        `PRD audit finding ${criterion} names Plan task ${planTask}, which is absent from the active plan.`,
+    // A multi-task citation is legitimate for a criterion whose evidence spans
+    // several tasks, but a FIXABLE finding is different in kind: the
+    // remediation append binds its fix task to ONE parent
+    // (conductor.ts, `parentTask`), so the parser cannot choose among several
+    // on the auditor's behalf. Reject here, naming the choice, rather than
+    // silently taking the first.
+    if (rawGrade === 'FIXABLE' && planTasks !== undefined && planTasks.length > 1) {
+      rejectedPrdAuditRow(rejectedRows, line, criterion,
+        `PRD audit finding ${criterion} is FIXABLE and cites Plan task ${planTasks.join(', ')}; `
+        + 'a FIXABLE finding must cite exactly one parent task, because its repair is appended under that task.',
+      );
+      continue;
+    }
+    const planTask = planTasks?.length === 1 ? planTasks[0] : undefined;
+    parsedFindings.push({
+      finding: {
+        criterion,
+        grade: rawGrade as PrdAuditGrade,
+        ...(planTask === undefined ? {} : { planTask }),
+        prdIds: Object.freeze([...(prdIndex === -1 ? '' : cells[prdIndex] ?? '').matchAll(/\bFR-\d+[A-Za-z]?\b/gi)].map((match) => match[0].toUpperCase())),
+        evidence: evidenceIndex === -1 ? '' : cells[evidenceIndex] ?? '',
+      },
+      rowText: line,
+      section: 'verdict-table',
+    });
+  }
+
+  const noOwnerLines = noOwnerFindingsLines(content);
+  const noOwnerHeaderIndex = noOwnerLines.findIndex((line) => {
+    if (!/^\s*\|/.test(line)) return false;
+    const cells = tableCells(line).map((cell) => cell.toLowerCase());
+    return cells.includes('finding') && cells.includes('grade');
+  });
+  if (noOwnerHeaderIndex !== -1) {
+    const noOwnerHeader = tableCells(noOwnerLines[noOwnerHeaderIndex]).map((cell) => cell.toLowerCase());
+    const findingIndex = noOwnerHeader.indexOf('finding');
+    const noOwnerGradeIndex = noOwnerHeader.indexOf('grade');
+    const noOwnerEvidenceIndex = noOwnerHeader.indexOf('evidence');
+    let readingNoOwnerTable = false;
+
+    for (const line of noOwnerLines.slice(noOwnerHeaderIndex + 1)) {
+      if (!/^\s*\|/.test(line)) {
+        if (readingNoOwnerTable && line.trim() === '') break;
+        continue;
+      }
+      readingNoOwnerTable = true;
+      const cells = tableCells(line);
+      if (isTableSeparator(cells)) continue;
+      const key = cells[findingIndex]?.trim();
+      const criterion = key?.toUpperCase();
+      if (!criterion || !isNoOwnerKey(criterion)) {
+        rejectedPrdAuditRow(rejectedRows, line, key || undefined, NO_OWNER_KEY_REASON);
+        continue;
+      }
+
+      const rawGrade = cells[noOwnerGradeIndex]?.toUpperCase();
+      if (!rawGrade || !PRD_AUDIT_GRADES.has(rawGrade as PrdAuditGrade)) {
+        rejectedPrdAuditRow(rejectedRows, line, criterion, `PRD audit finding ${criterion} has an invalid Grade.`);
+        continue;
+      }
+      if (rawGrade !== 'OVER_SCOPE') {
+        rejectedPrdAuditRow(
+          rejectedRows,
+          line,
+          criterion,
+          `PRD audit finding ${criterion} in Findings without an owning criterion admits only OVER_SCOPE.`,
+        );
+        continue;
+      }
+
+      parsedFindings.push({
+        finding: {
+          criterion,
+          grade: rawGrade as PrdAuditGrade,
+          prdIds: Object.freeze([]),
+          evidence: noOwnerEvidenceIndex === -1 ? '' : cells[noOwnerEvidenceIndex] ?? '',
+        },
+        rowText: line,
+        section: 'no-owner',
+      });
+    }
+  }
+
+  const findingsBySectionAndKey = new Map<string, ParsedPrdAuditFinding[]>();
+  for (const parsedFinding of parsedFindings) {
+    const normalizedKey = parsedFinding.finding.criterion.toUpperCase();
+    const groupKey = `${parsedFinding.section}:${normalizedKey}`;
+    const group = findingsBySectionAndKey.get(groupKey) ?? [];
+    group.push(parsedFinding);
+    findingsBySectionAndKey.set(groupKey, group);
+  }
+
+  const findings: PrdAuditFinding[] = [];
+  for (const duplicateGroup of findingsBySectionAndKey.values()) {
+    if (duplicateGroup.length === 1) {
+      findings.push(duplicateGroup[0].finding);
+      continue;
+    }
+    const normalizedKey = duplicateGroup[0].finding.criterion.toUpperCase();
+    for (const duplicate of duplicateGroup) {
+      rejectedPrdAuditRow(
+        rejectedRows,
+        duplicate.rowText,
+        duplicate.finding.criterion,
+        `PRD audit finding ${duplicate.finding.criterion} duplicates normalized key ${normalizedKey}; every carrier of a duplicate key is rejected.`,
       );
     }
-
-    findings.push({
-      criterion,
-      grade: rawGrade as PrdAuditGrade,
-      ...(planTask === undefined ? {} : { planTask }),
-      prdIds: Object.freeze([...(prdIndex === -1 ? '' : cells[prdIndex] ?? '').matchAll(/\bFR-\d+[A-Za-z]?\b/gi)].map((match) => match[0].toUpperCase())),
-      evidence: evidenceIndex === -1 ? '' : cells[evidenceIndex] ?? '',
-    });
   }
 
   return {
     ok: true,
-    value: { prd: prdMarker[1].toLowerCase() as PrdAuditReport['prd'], findings },
+    value: {
+      prd: prdMarker[1].toLowerCase() as PrdAuditReport['prd'],
+      findings,
+      rejectedRows,
+    },
   };
 }
 
 function prdAuditMechanicalFault(error: string): PrdAuditReportParseResult {
   return { ok: false, class: 'mechanical-fault', error };
+}
+
+function formatPrdAuditRejectedRows(rows: readonly PrdAuditRejectedRow[]): string {
+  return rows.map((row) => `${row.key ?? row.rowText} (${row.reason})`).join('; ');
 }
 
 /** Return a diagnostic when a resolved PRD requirement lacks an audit verdict row. */
@@ -4135,7 +4837,7 @@ export async function prdAuditCoverageGap(
   const hasFeatureIdentity = Boolean(context.activePlanPath || context.featureDesc || context.featureIdentities.length > 0);
   if (!hasFeatureIdentity) return null;
 
-  const parsed = parsePrdAuditReport(reportContent);
+  const parsed = parsePrdAuditReport(reportContent, await activePlanTextFor(projectRoot, context));
   if (!parsed.ok) return parsed.error;
   const prdPaths = await resolveFeaturePrdPaths(projectRoot, context);
   if (prdPaths.length === 0) {
@@ -4178,14 +4880,23 @@ async function prdAuditStoryCoverageGap(
     return `PRD audit cannot read story criteria at ${relative(projectRoot, storiesPath)}.`;
   }
 
-  const criterionIds = extractStoryCriterionIds(storiesText);
+  // Reported keys are upper-cased at parse time, so the expected set must be
+  // too: a story id carrying letters (`5a`) otherwise derives `S5a.1` here and
+  // never matches the reported `S5A.1`.
+  const criterionIds = extractStoryCriterionIds(storiesText).map((id) => id.toUpperCase());
   if (criterionIds.length === 0) {
     return `PRD audit cannot parse story criteria in ${relative(projectRoot, storiesPath)}.`;
   }
-  const parsed = parsePrdAuditReport(reportContent);
+  // Rows the parser rejects never reach `findings`, so an unauthorized parse
+  // here would drop every citing row and report its criterion as missing.
+  const parsed = parsePrdAuditReport(reportContent, await activePlanTextFor(projectRoot, context));
   if (!parsed.ok) return parsed.error;
   const expectedCriteria = new Set(criterionIds);
-  const reportedCriteria = new Set(parsed.value.findings.map((finding) => finding.criterion));
+  const reportedCriteria = new Set(
+    parsed.value.findings
+      .map((finding) => finding.criterion)
+      .filter((criterion) => !isNoOwnerKey(criterion)),
+  );
   const unknownCriteria = [...reportedCriteria].filter((criterion) => !expectedCriteria.has(criterion));
   if (unknownCriteria.length > 0) {
     return `PRD audit report names criteria absent from the active stories: ${unknownCriteria.join(', ')}.`;
@@ -4234,37 +4945,13 @@ function extractStoryCoveredFrIds(storiesText: string): Set<string> {
   return ids;
 }
 
-/** Map each authoritative Given/When/Then row to its report-table criterion id. */
-function extractStoryCriterionIds(storiesText: string): string[] {
-  const ids: string[] = [];
-  for (const block of splitStoryBlocks(storiesText)) {
-    const story = block.id?.match(/\d+/)?.[0];
-    if (!story) continue;
-    let ordinal = 0;
-    for (const type of ['happy', 'negative'] as const) {
-      const body = sectionBody(
-        block.text,
-        type === 'happy' ? /happy\s*path/i : /negative\s*paths?/i,
-      );
-      if (body === null) continue;
-      for (const line of body.split('\n')) {
-        const match = line.match(/^\s*(?:[-*+] |\d+[.)] )(.+?)\s*$/);
-        if (!match || !/\bgiven\b/i.test(match[1]) || !/\bthen\b/i.test(match[1])) continue;
-        ordinal += 1;
-        ids.push(`S${story}.${ordinal}`);
-      }
-    }
-  }
-  return ids;
-}
-
 /**
  * Scan a PRD-audit report for functional-requirement verdict rows that are not
  * ALIGNED and not human-ACCEPTED. Returns the FR identifier of every still-
  * blocking row. Verdict is read per-cell (see {@link parseFrVerdictRow}).
  */
-function findUnalignedFrRows(content: string): string[] {
-  const parsed = parsePrdAuditReport(content);
+function findUnalignedFrRows(content: string, activePlan?: string): string[] {
+  const parsed = parsePrdAuditReport(content, activePlan);
   if (parsed.ok) {
     return parsed.value.findings
       .filter((finding) => finding.grade !== 'PASS')
@@ -4286,8 +4973,9 @@ function findUnalignedFrRows(content: string): string[] {
 function findUnalignedFrRowsWithClass(
   content: string,
   settledOverScopeCriteria: ReadonlySet<string> = new Set(),
+  activePlan?: string,
 ): UnalignedFrRow[] {
-  const parsed = parsePrdAuditReport(content);
+  const parsed = parsePrdAuditReport(content, activePlan);
   if (parsed.ok) {
     return parsed.value.findings
       .filter((finding) => finding.grade !== 'PASS')
@@ -4328,25 +5016,45 @@ export interface PrdGapClassification {
 export async function classifyPrdAuditGaps(
   dir: string,
   sessionStartedAt: number | undefined,
+  expectedRunId?: string,
+  config?: Pick<HarnessConfig, 'gate_code_validity'>,
 ): Promise<PrdGapClassification> {
   const files = await findArtifactFiles(dir, 'prd_audit');
   const decisions = (await readOverScopeDecisions(dir)).decisions;
+  const identity = await verdictProducedByRun(dir, 'prd_audit', expectedRunId, config);
+  // Routing decides self-heal vs HALT off these rows, so it reads them under
+  // the same citation authority the gate scored them with (adr-2026-08-30 D1).
+  const activePlan = await readActivePlanText(dir);
   const blocking: UnalignedFrRow[] = [];
   for (const f of files) {
-    if (!(await fileIsFreshSinceSession(f, sessionStartedAt))) continue;
+    if (identity.state === 'stale-run-identity') continue;
+    if (
+      identity.state === 'unstamped' &&
+      !(await fileIsFreshSinceSession(f, sessionStartedAt))
+    ) continue;
     const content = await readFile(f, 'utf-8');
+    const parsed = parsePrdAuditReport(content, activePlan);
+    if (parsed.ok && parsed.value.rejectedRows.length > 0) {
+      return {
+        kind: 'needs-decide',
+        summary: `rejected rows: ${formatPrdAuditRejectedRows(parsed.value.rejectedRows)}`,
+      };
+    }
     // An OVER_SCOPE criterion the operator already accepted, or one whose
     // intent relation never made it blocking, is not a gap this routing should
     // act on. Reading only the fresh rows made an accepted widening re-route
     // the next lap exactly as it did before the operator decided (ADR D8).
     const relations = overScopeRelations(content);
+    const findingSummaries = new Map(
+      parsed.ok ? parsed.value.findings.map((finding) => [finding.criterion, finding.evidence]) : [],
+    );
     const settled = new Set(
       [...relations.keys()].filter((criterion) =>
         ['accepted', 'not-blocking'].includes(
-          classifyOverScopeCriterion(criterion, relations, decisions),
+          classifyOverScopeCriterion(criterion, findingSummaries.get(criterion) ?? '', relations, decisions),
         )),
     );
-    blocking.push(...findUnalignedFrRowsWithClass(content, settled));
+    blocking.push(...findUnalignedFrRowsWithClass(content, settled, activePlan));
   }
   if (blocking.length === 0) return { kind: 'clean', summary: 'no blocking FRs' };
 
@@ -4370,13 +5078,17 @@ const RETRY_CLASSIFY_STEPS: ReadonlySet<StepName> = new Set<StepName>([
 ]);
 
 export type RetryDecision =
-  | { decision: 'rerun' }
-  | { decision: 'route'; signal: 'named-route' | 'identical-repeat' | 'unretryable-inputs' };
+  | { decision: 'rerun'; signal?: 'stale-run-identity' }
+  | {
+      decision: 'route';
+      signal: 'named-route' | 'identical-repeat' | 'unretryable-inputs' | 'terminal-refusal';
+    };
 
 /**
  * Pure, synchronous rerun-vs-route classifier for the SHIP-tail verdict steps
- * (issue #646). Out of scope steps (e.g. `build`) always rerun. In scope,
- * signal (a) "named-route" fires when the step has a real, fresh, non-passing
+ * (issue #646). A terminal refusal is classified before the eligible-step
+ * check, so callers must keep out-of-scope steps such as `build` from this
+ * helper. In scope, signal (a) "named-route" fires when the step has a real, fresh, non-passing
  * decision to route on — `completion.routeClass === 'named-route'` for the
  * review steps, or `prdAuditNonClean` for prd_audit — regardless of attempt
  * number. Signal (b) "identical-repeat" fires only when the retry has already
@@ -4394,14 +5106,36 @@ export function classifyRetryDecision(input: {
   inputsUnchanged: boolean;
   prdAuditNonClean?: boolean;
   unretryableInputs?: { retryAfterStep: StepName };
+  terminalRefusal?: 'seal' | 'needs-human' | 'validation-verdict';
 }): RetryDecision {
-  const { step, completion, attempt, priorReason, inputsUnchanged, prdAuditNonClean, unretryableInputs } = input;
+  const {
+    step,
+    completion,
+    attempt,
+    priorReason,
+    inputsUnchanged,
+    prdAuditNonClean,
+    unretryableInputs,
+    terminalRefusal,
+  } = input;
+  if (terminalRefusal === 'needs-human' || terminalRefusal === 'validation-verdict') {
+    return { decision: 'route', signal: 'terminal-refusal' };
+  }
   if (!RETRY_CLASSIFY_STEPS.has(step)) return { decision: 'rerun' };
 
   if (unretryableInputs) return { decision: 'route', signal: 'unretryable-inputs' };
 
   const namedRoute = step === 'prd_audit' ? prdAuditNonClean === true : completion.routeClass === 'named-route';
   if (namedRoute) return { decision: 'route', signal: 'named-route' };
+
+  // D5: no verdict for this dispatch is a retryable absence, even when its
+  // diagnostic happens to repeat byte-for-byte. This is a typed facet rather
+  // than a reason-string exception, so stale findings cannot become a route.
+  if (completion.routeClass === 'absent') {
+    return completion.retrySignal === 'stale-run-identity'
+      ? { decision: 'rerun', signal: 'stale-run-identity' }
+      : { decision: 'rerun' };
+  }
 
   if (
     attempt >= 2 &&
@@ -4442,16 +5176,30 @@ export type RemediationTarget = (typeof REMEDIATION_TARGET_STEPS)[number];
  */
 export const REMEDIATION_PUBLICATION_DISPOSITION = 'publication';
 
+/**
+ * Disposition for a finding already owned by one or more tasks in the active
+ * plan. It rewinds BUILD without appending replacement tasks to that plan.
+ */
+export const REMEDIATION_EXISTING_TASK_DISPOSITION = 'existing-task';
+
 export type RemediationDisposition =
   | RemediationTarget
   | typeof REMEDIATION_PUBLICATION_DISPOSITION
+  | typeof REMEDIATION_EXISTING_TASK_DISPOSITION
   | 'halt';
 
-/** The step a disposition rewinds to. `publication` is prose-only work owned by `finish`. */
+/** The step a disposition rewinds to. */
 export function remediationDispositionStep(
   disposition: RemediationDisposition,
 ): string {
-  return disposition === REMEDIATION_PUBLICATION_DISPOSITION ? 'finish' : disposition;
+  switch (disposition) {
+    case REMEDIATION_PUBLICATION_DISPOSITION:
+      return 'finish';
+    case REMEDIATION_EXISTING_TASK_DISPOSITION:
+      return 'build';
+    default:
+      return disposition;
+  }
 }
 
 /**
@@ -4461,9 +5209,18 @@ export function remediationDispositionStep(
 export function remediationDispositionAppendsToPlan(
   disposition: RemediationDisposition,
 ): boolean {
-  return (REMEDIATION_TARGET_STEPS as readonly string[]).includes(disposition);
+  return (
+    disposition !== REMEDIATION_EXISTING_TASK_DISPOSITION &&
+    (REMEDIATION_TARGET_STEPS as readonly string[]).includes(disposition)
+  );
 }
-export type RemediationHaltCategory = 'architectural-clarity' | 'product-scope';
+export type RemediationHaltCategory = 'architectural-clarity' | 'product-scope' | 'unanswerable';
+
+const REMEDIATION_HALT_CATEGORIES: readonly RemediationHaltCategory[] = [
+  'architectural-clarity',
+  'product-scope',
+  'unanswerable',
+];
 
 export interface RemediationGap {
   id: string;
@@ -4477,51 +5234,123 @@ export interface RemediationGap {
 
 export interface RemediationPlan {
   gaps: RemediationGap[];
+  /** Planner dispositions outside the engine's accepted vocabulary. */
+  rejected: RemediationDispositionRejection[];
   /** Ordinary BUILD dispositions rejected for lacking concrete work. */
   invalidTasklessBuild: boolean;
 }
 
+export interface RemediationDispositionRejection {
+  gapId: string;
+  disposition: string;
+  accepted: readonly string[];
+  field: 'disposition' | 'category';
+}
+
+/** Why the remediation planner did not produce a readable plan. */
+export type RemediationPlanAbsenceCause =
+  | 'absent'
+  | 'stale'
+  | 'unparseable'
+  | 'non-array-dispositions'
+  | 'no-routable-dispositions';
+
+export type RemediationPlanReadResult =
+  | { plan: RemediationPlan }
+  | { plan: null; cause: RemediationPlanAbsenceCause };
+
+/** Render a no-plan cause for a halt which needs operator-facing diagnosis. */
+export function renderRemediationPlanAbsence(cause: RemediationPlanAbsenceCause): string {
+  switch (cause) {
+    case 'absent':
+      return 'the planner wrote no remediation plan';
+    case 'stale':
+      return "the planner's remediation plan is stale (predates this session)";
+    case 'unparseable':
+      return "the planner's remediation plan is not valid JSON";
+    case 'non-array-dispositions':
+      return "the planner's remediation plan has no dispositions array";
+    case 'no-routable-dispositions':
+      return "the planner's remediation plan contains no routable dispositions";
+  }
+}
+
 /**
- * Read + validate `.pipeline/remediation.json` (the /remediate skill's output).
- * Returns null when the file is absent, stale (predates this session), malformed,
- * or contains no recognizable gap — the caller then falls back to the
- * deterministic `classifyPrdAuditGaps` routing. Tolerant of junk: unknown
- * dispositions and non-object gaps are dropped rather than failing the whole plan.
+ * Read + validate `.pipeline/remediation.json` (the /remediate skill's output),
+ * retaining why no usable plan was available. `plan` is null when the file is
+ * absent, stale (predates this session), malformed, or contains no recognizable
+ * gap or rejected disposition — the caller then falls back to the deterministic
+ * `classifyPrdAuditGaps` routing. Tolerant of junk: unknown dispositions and
+ * non-object gaps are dropped rather than failing the whole plan.
  */
-export async function readRemediationPlan(
+export async function readRemediationPlanResult(
   dir: string,
   sessionStartedAt: number | undefined,
   source?: string,
-): Promise<RemediationPlan | null> {
+): Promise<RemediationPlanReadResult> {
   const path = join(dir, '.pipeline/remediation.json');
-  if (!(await fileIsFreshSinceSession(path, sessionStartedAt))) return null;
+  let planStat;
+  try {
+    planStat = await stat(path);
+  } catch {
+    return { plan: null, cause: 'absent' };
+  }
+  if (sessionStartedAt !== undefined && planStat.mtimeMs < sessionStartedAt) {
+    return { plan: null, cause: 'stale' };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(await readFile(path, 'utf-8'));
   } catch {
-    return null;
+    return { plan: null, cause: 'unparseable' };
   }
   const rawGaps = (parsed as { dispositions?: unknown })?.dispositions;
-  if (!Array.isArray(rawGaps)) return null;
+  if (!Array.isArray(rawGaps)) return { plan: null, cause: 'non-array-dispositions' };
 
   const valid: RemediationDisposition[] = [
     ...REMEDIATION_TARGET_STEPS,
     REMEDIATION_PUBLICATION_DISPOSITION,
+    REMEDIATION_EXISTING_TASK_DISPOSITION,
     'halt',
   ];
   const gaps: RemediationGap[] = [];
+  const rejected: RemediationDispositionRejection[] = [];
   let invalidTasklessBuild = false;
-  for (const g of rawGaps) {
+  for (const [index, g] of rawGaps.entries()) {
     if (!g || typeof g !== 'object') continue;
     const o = g as Record<string, unknown>;
-    const disposition = o.disposition as RemediationDisposition;
-    if (!valid.includes(disposition)) continue;
-    const category =
-      o.category === 'architectural-clarity' || o.category === 'product-scope'
-        ? (o.category as RemediationHaltCategory)
-        : null;
+    const gapId = typeof o.id === 'string' ? o.id : `#${index + 1}`;
+    const dispositionValue = o.disposition;
+    const renderedDisposition = dispositionValue === undefined
+      ? '<missing>'
+      : typeof dispositionValue === 'string'
+        ? dispositionValue
+        : JSON.stringify(dispositionValue);
+    if (typeof dispositionValue !== 'string' || !valid.includes(dispositionValue as RemediationDisposition)) {
+      rejected.push({ gapId, disposition: renderedDisposition, accepted: valid, field: 'disposition' });
+      continue;
+    }
+    const disposition = dispositionValue as RemediationDisposition;
+    // Accepted halt categories: architectural-clarity, product-scope, unanswerable.
+    const category = REMEDIATION_HALT_CATEGORIES.includes(o.category as RemediationHaltCategory)
+      ? (o.category as RemediationHaltCategory)
+      : null;
     // A 'halt' must name a category; an autonomous disposition must not be halt.
-    if (disposition === 'halt' && category === null) continue;
+    if (disposition === 'halt' && category === null) {
+      const categoryValue = o.category;
+      const renderedCategory = categoryValue === undefined
+        ? '<missing>'
+        : typeof categoryValue === 'string'
+          ? categoryValue
+          : JSON.stringify(categoryValue);
+      rejected.push({
+        gapId,
+        disposition: renderedCategory,
+        accepted: REMEDIATION_HALT_CATEGORIES,
+        field: 'category',
+      });
+      continue;
+    }
     const tasks = Array.isArray(o.tasks)
       ? o.tasks
           .filter(
@@ -4546,44 +5375,29 @@ export async function readRemediationPlan(
       invalidTasklessBuild = true;
       continue;
     }
+    if (
+      disposition === REMEDIATION_EXISTING_TASK_DISPOSITION &&
+      (tasks.length === 0 || tasks.some((task) => task.id.trim() === ''))
+    ) {
+      continue;
+    }
     gaps.push({
-      id: typeof o.id === 'string' ? o.id : '?',
+      id: gapId,
       disposition,
       category,
       rationale: typeof o.rationale === 'string' ? o.rationale : '',
       tasks,
     });
   }
-  return gaps.length > 0 || invalidTasklessBuild ? { gaps, invalidTasklessBuild } : null;
+  return gaps.length > 0 || invalidTasklessBuild || rejected.length > 0
+    ? { plan: { gaps, rejected, invalidTasklessBuild } }
+    : { plan: null, cause: 'no-routable-dispositions' };
 }
 
 // --- Story / plan structure parsing (shared by stories + plan predicates) ---
-
-export interface StoryBlock {
-  id?: string;
-  text: string;
-}
-
-/**
- * Split a stories file into per-story blocks on `## Story <id>:` headings.
- * Single-story files (no such heading) return one block spanning the file.
- */
-export function splitStoryBlocks(content: string): StoryBlock[] {
-  const heading = /^##\s+Story\s+([A-Za-z0-9.\-]+)/i;
-  const blocks: StoryBlock[] = [];
-  let current: { id: string; lines: string[] } | null = null;
-  for (const line of content.split('\n')) {
-    const m = line.match(heading);
-    if (m) {
-      if (current) blocks.push({ id: current.id, text: current.lines.join('\n') });
-      current = { id: m[1], lines: [line] };
-    } else if (current) {
-      current.lines.push(line);
-    }
-  }
-  if (current) blocks.push({ id: current.id, text: current.lines.join('\n') });
-  return blocks.length > 0 ? blocks : [{ text: content }];
-}
+// Block splitting, section extraction, and positional criterion-id derivation
+// live in `story-criteria.ts` so consumers outside this module (for example
+// build_review's Covers-marker resolver) can share the identical authority.
 
 /** True if the block has a Happy/Negative path section containing a G/W/T bullet. */
 function hasPathSection(blockText: string, type: 'happy' | 'negative'): boolean {
@@ -4593,29 +5407,6 @@ function hasPathSection(blockText: string, type: 'happy' | 'negative'): boolean 
   );
   if (body === null) return false;
   return /\bgiven\b/i.test(body) && /\bthen\b/i.test(body);
-}
-
-/**
- * Return the text under the first heading matching `headingRegex`, up to the
- * next heading of the same or higher level, or null if no such heading exists.
- */
-function sectionBody(text: string, headingRegex: RegExp): string | null {
-  let capturing = false;
-  let level = 0;
-  const body: string[] = [];
-  for (const line of text.split('\n')) {
-    const hm = line.match(/^(#{1,6})\s+(.*)$/);
-    if (hm) {
-      if (capturing && hm[1].length <= level) break;
-      if (!capturing && headingRegex.test(hm[2])) {
-        capturing = true;
-        level = hm[1].length;
-        continue;
-      }
-    }
-    if (capturing) body.push(line);
-  }
-  return capturing ? body.join('\n') : null;
 }
 
 /** Extract a `ST-0NN` / `EP-0NN` id from a single-story filename, if present. */
@@ -4641,16 +5432,9 @@ export function collectPlanCoverage(planText: string): Set<string> {
   const set = new Set<string>();
 
   for (const block of splitOnHeadings(planText, /^###\s+/)) {
-    // Story id(s) this task references. Strip an optional `Story `/`Epic `
-    // prefix word so `**Story:** Story 1` and `**Story:** 1` both yield `1`.
-    const ids = new Set<string>();
-    const storyRef = /\*\*Story:\*\*\s*(?:story|epic)?\s*([A-Za-z0-9.\-]+)/gi;
-    let m: RegExpExecArray | null;
-    while ((m = storyRef.exec(block)) !== null) {
-      const id = m[1];
-      if (/^(n\/?a|prerequisite|none|all)$/i.test(id)) continue;
-      ids.add(id);
-    }
+    // Story id(s) this task references. The shared parser accepts optional
+    // Story/Epic prefixes and filters sentinel values.
+    const ids = new Set(parsePlanTaskStoryIds(block));
     if (ids.size === 0) continue;
 
     // Path type(s) this task covers: prefer an explicit `**Type:**` line, then

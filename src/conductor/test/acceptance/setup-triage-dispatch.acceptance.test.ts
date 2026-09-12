@@ -193,14 +193,21 @@ it('daemon feature, narrative, setup-fix, and CI-fix paths share feature-owned p
     if (ts.isCallExpression(node)) {
       const callee = node.expression.getText(runnerFile);
       if (
-        ['deps.runSetupTriage', 'deps.runConductor', 'emitDaemonSignal'].includes(
+        ['deps.runSetupTriage', 'deps.runConductor', 'captureEngineerSignal'].includes(
           callee,
         )
       ) {
+        // Per-callee argument slot for the context this spec tracks:
+        // `runConductor` takes the provider execution context at index 2, and
+        // `runSetupTriage` takes the feature log at index 4 (its trailing
+        // argument is the feature event emitter, asserted separately in
+        // daemon-runner.test.ts).
         const contextArgument =
           callee === 'deps.runConductor'
             ? node.arguments[2]
-            : node.arguments.at(-1);
+            : callee === 'deps.runSetupTriage'
+              ? node.arguments[4]
+              : node.arguments.at(-1);
         contextFlow.push(
           `${callee}:${contextArgument?.getText(runnerFile)}`,
         );
@@ -247,7 +254,9 @@ it('daemon feature, narrative, setup-fix, and CI-fix paths share feature-owned p
     contextFlow: [
       'deps.runSetupTriage:featureLog',
       'deps.runConductor:providerExecution',
-      'emitDaemonSignal:featureLog',
+      // The engineer signal is captured in the executor (no provider context)
+      // and emitted on the dispatcher side of the seam with the feature log.
+      'captureEngineerSignal:outcome',
     ],
   });
 });
@@ -600,7 +609,7 @@ fi
     expect(halt).toMatch(/contract|setup-still-failing/i);
   });
 
-  it('TS-3 negative (b): fix-session leaves the tree dirty (setup passes, half-fix uncommitted) ⇒ contract fails (an unverifiable half-fix is not a pass), dirty paths named in the HALT', async () => {
+  it('TS-3 repair: fix-session leaves a setup-stable half-fix uncommitted ⇒ engine commits the verified repair and dispatch continues', async () => {
     await initRepo();
     await writeSetupPassesOnlyIfFileExists('fixed.txt');
     await commitAll('add setup requiring fixed.txt');
@@ -614,9 +623,9 @@ fi
     const out = await run({ slug: 'feat-fix-dirty' } as BacklogItem);
 
     expect(fixSession).toHaveBeenCalledTimes(1);
-    expect(out.status).toBe('error');
-    const halt = await readFile(join(dir, '.pipeline', 'HALT'), 'utf-8');
-    expect(halt).toContain('fixed.txt');
+    expect(out.status).toBe('done');
+    expect(await git('status', '--porcelain')).toBe('');
+    expect(await git('show', 'HEAD:fixed.txt')).toBe('half fix, never committed');
   });
 
   it('TS-3 negative (c): the fix-session dispatch itself throws ⇒ routed to HALT as a contract failure — never an unhandled throw, never a second dispatch in this rotation', async () => {
@@ -646,7 +655,7 @@ fi
   //    fixSession's dirty-tree-uncleaned park + daemon-runner's cause-agnostic
   //    reason fallback) ──
 
-  it('#582: fix-session repairs bin/setup but leaves the tree dirty ⇒ dirty-tree-uncleaned park quarantines the residual paths, the working tree ends clean, and the surfaced reason never says "setup failed"', async () => {
+  it('#582: fix-session leaves a commit plus residue ⇒ rejects the mixed state, quarantines it, and never claims setup failed', async () => {
     await initRepo();
     await writeSetupAlwaysFails('SETUP_BROKEN_MARKER');
     await commitAll('add broken bin/setup (clean HEAD, committed breakage)');
@@ -690,7 +699,7 @@ fi
     const halt = await readFile(join(dir, '.pipeline', 'HALT'), 'utf-8');
     expect(halt).not.toMatch(/setup failed/i);
     expect(halt).toContain('wip/setup-quarantine-feat-dirty-after-fix');
-    expect(halt).toMatch(/dirty-tree-uncleaned/);
+    expect(halt).toMatch(/mixed-commit-and-residue/);
   });
 
   // ── TS-4: triage failure HALTs with full evidence, never a silent discard ──

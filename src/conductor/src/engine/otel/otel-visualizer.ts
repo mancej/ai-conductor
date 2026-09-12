@@ -1,6 +1,6 @@
 /**
  * OtelVisualizer — visualizer plugin that exports conductor events as OTel
- * traces and metrics.
+ * traces.
  *
  * Packaging: implements VisualizerPlugin (types/plugin.ts). Constructed and
  * started only when resolveOtelConfig().enabled (FR-1 gate in index.ts).
@@ -11,13 +11,11 @@
  *    BatchSpanProcessor / PeriodicExportingMetricReader. No await, no
  *    network call happens inline (emit() awaits handlers; blocking here
  *    stalls the bus).
- *  - stop() calls forceFlush() on both providers. This IS awaited — it
- *    happens after the run, not on the hot path. shutdown() is intentionally
- *    NOT called so that InMemorySpanExporter retains spans for test assertions.
+ *  - stop() force-flushes the tracer so finished spans remain readable after
+ *    stop(). Metrics are projected only by MetricsListener (ADR-014 D7).
  *
  * Dependency injection:
- *  - ctx.spanExporter / ctx.metricExporter: override the transport exporters
- *    (used in tests to inject InMemorySpanExporter / InMemoryMetricExporter).
+ *  - ctx.spanExporter overrides the transport span exporter (used in tests).
  *  - When not provided, exporters are built from the resolved config via
  *    buildExporters() (OTLP or file transport).
  *
@@ -31,22 +29,17 @@ import {
   type SpanExporter,
   type ReadableSpan,
 } from '@opentelemetry/sdk-trace-base';
-import {
-  MeterProvider,
-  PeriodicExportingMetricReader,
-  type PushMetricExporter,
-  type ResourceMetrics,
-} from '@opentelemetry/sdk-metrics';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
-import type { ConductorEventEmitter } from '../../ui/events.js';
+import { basename } from 'node:path';
+import type { ConductorEventEmitter, EventHandler } from '../../ui/events.js';
 import type { ConductorEvent } from '../../types/events.js';
-import type { VisualizerPlugin } from '../../types/plugin.js';
+import { otelTracedEventTypes } from '../event-sinks.js';
+import type { VisualizerPlugin, VisualizerStartContext } from '../../types/plugin.js';
 import type { ResolvedOtelConfig } from './otel-config.js';
 import { buildResource } from './resource.js';
 import { buildExporters } from './transport.js';
 import { SpanManager } from './span-manager.js';
-import { MetricsRecorder } from './metrics.js';
-import type { TokenUsage } from '../../execution/llm-provider.js';
+import { DispatchMeteringTracker } from '../dispatch-metering.js';
 
 // ── Bounded-warning exporter wrappers (FR-8) ────────────────────────────────
 
@@ -77,66 +70,21 @@ class WarnOnceSpanExporter implements SpanExporter {
   }
 }
 
-/**
- * Wraps a PushMetricExporter to intercept export failures and call warnOnce
- * exactly once. Never throws; forwards the original result to the caller.
- * Optional delegation methods (selectAggregationTemporality, selectAggregation)
- * are forwarded to the inner exporter when present.
- */
-class WarnOnceMetricExporter implements PushMetricExporter {
-  private readonly inner: PushMetricExporter;
-  private readonly warnOnce: (msg: string) => void;
-  selectAggregationTemporality?: PushMetricExporter['selectAggregationTemporality'];
-  selectAggregation?: PushMetricExporter['selectAggregation'];
-
-  constructor(inner: PushMetricExporter, warnOnce: (msg: string) => void) {
-    this.inner = inner;
-    this.warnOnce = warnOnce;
-    // Delegate optional protocol methods from the inner exporter when present.
-    if (inner.selectAggregationTemporality) {
-      this.selectAggregationTemporality = inner.selectAggregationTemporality.bind(inner);
-    }
-    if (inner.selectAggregation) {
-      this.selectAggregation = inner.selectAggregation.bind(inner);
-    }
-  }
-
-  export(metrics: ResourceMetrics, resultCallback: (result: ExportResult) => void): void {
-    this.inner.export(metrics, (result) => {
-      if (result.code !== ExportResultCode.SUCCESS) {
-        this.warnOnce(
-          `[otel] metric export failed: ${result.error?.message ?? 'unknown error'}`,
-        );
-      }
-      resultCallback(result);
-    });
-  }
-
-  async forceFlush(): Promise<void> {
-    const inner = this.inner as { forceFlush?: () => Promise<void> };
-    if (typeof inner.forceFlush === 'function') {
-      return inner.forceFlush();
-    }
-  }
-
-  async shutdown(): Promise<void> {
-    return this.inner.shutdown();
-  }
-}
-
 export interface OtelVisualizerContext {
-  /** Deterministic run ID. When absent, buildResource() resolves from the session file. */
+  /** @deprecated Identity is consumed only from VisualizerPlugin.start(). */
   runId?: string;
-  /** Path to the .pipeline directory (for session-id file when runId absent). */
+  /** @deprecated Identity is consumed only from VisualizerPlugin.start(). */
   pipelineDir?: string;
-  /** Feature name for resource attributes. */
-  feature: string;
-  /** Project name for resource attributes. */
-  project: string;
+  /** @deprecated Identity is consumed only from VisualizerPlugin.start(). */
+  feature?: string;
+  /** @deprecated Identity is consumed only from VisualizerPlugin.start(). */
+  project?: string;
+  /** @deprecated Visualizers are always spans-only; metrics belong to MetricsListener. */
+  metrics?: boolean;
   /** Inject a span exporter (replaces transport; used in tests). */
   spanExporter?: SpanExporter;
-  /** Inject a metric exporter (replaces transport; used in tests). */
-  metricExporter?: PushMetricExporter;
+  /** @deprecated Accepted for compatibility; visualizers never export metrics. */
+  metricExporter?: unknown;
   /** Optional warning callback. Receives O(1) warning strings; never throws. */
   onWarning?: (msg: string) => void;
   /**
@@ -148,8 +96,6 @@ export interface OtelVisualizerContext {
   exportTimeoutMillis?: number;
 }
 
-/** Periodic export interval for metrics (long — actual flush is on stop()). */
-const METRIC_EXPORT_INTERVAL_MS = 60_000;
 /** Default export timeout (ms). An endpoint that does not respond within this
  * bound is considered failed; the export is abandoned and warnOnce fires. */
 const EXPORT_TIMEOUT_MS = 5_000;
@@ -161,10 +107,19 @@ const EXPORT_TIMEOUT_MS = 5_000;
 export class OtelVisualizer implements VisualizerPlugin {
   readonly name = 'otel';
 
-  private readonly tracerProvider: BasicTracerProvider;
-  private readonly meterProvider: MeterProvider;
-  private readonly spanManager: SpanManager;
-  private readonly metricsRecorder: MetricsRecorder;
+  private readonly spanExporter: SpanExporter;
+  private readonly onWarning?: (msg: string) => void;
+  private readonly exportTimeoutMillis: number;
+  /** Compatibility only for legacy direct callers that omit start context. */
+  private readonly legacyStartContext: VisualizerStartContext;
+  /** Configured `otel.project_name` overrides the trace Resource project name. */
+  private readonly projectNameOverride?: string;
+  /** Validated operator-supplied attributes carried by this run's Resource. */
+  private readonly attributes: Record<string, string>;
+  private tracerProvider: BasicTracerProvider | null = null;
+  private spanManager: SpanManager | null = null;
+  /** Selects authoritative invoked attempts before they reach open span state. */
+  private readonly dispatchMetering = new DispatchMeteringTracker();
   /**
    * Bounded warning emitter (FR-8). When ctx.onWarning is provided, this is a
    * once-wrapper shared by both the exporter callback path AND the stop() flush
@@ -172,8 +127,10 @@ export class OtelVisualizer implements VisualizerPlugin {
    * manifests.
    */
   private readonly warnOnce?: (msg: string) => void;
-  /** Registered handlers, kept for potential off() cleanup (currently no off needed). */
+  /** Emitter that owns this visualizer's event subscriptions. */
   private emitter: ConductorEventEmitter | null = null;
+  /** Event subscriptions owned by this run; removed before a sequential run starts. */
+  private readonly eventHandlers: Array<[ConductorEvent['type'], EventHandler]> = [];
 
   // ── T21: idempotent stop + SIGINT/SIGTERM flush handlers ──────────────────
 
@@ -191,27 +148,14 @@ export class OtelVisualizer implements VisualizerPlugin {
 
   constructor(config: ResolvedOtelConfig, ctx: OtelVisualizerContext) {
 
-    // Build the OTel resource from injected context (FR-6).
-    const resource = buildResource({
-      pipelineDir: ctx.pipelineDir ?? '',
-      runId: ctx.runId,
-      feature: ctx.feature,
-      project: ctx.project,
-    });
-
     // Resolve exporters: injected (tests) > transport (production).
     let spanExporter: SpanExporter;
-    let metricExporter: PushMetricExporter;
-
-    if (ctx.spanExporter && ctx.metricExporter) {
-      // Both injected — use them directly (test path).
+    if (ctx.spanExporter) {
       spanExporter = ctx.spanExporter;
-      metricExporter = ctx.metricExporter;
     } else if (config.enabled) {
       // Build from transport config (production path).
       const built = buildExporters(config as Extract<ResolvedOtelConfig, { enabled: true }>);
-      spanExporter = ctx.spanExporter ?? built.spanExporter;
-      metricExporter = ctx.metricExporter ?? built.metricExporter;
+      spanExporter = built.spanExporter;
     } else {
       // Disabled config: should not be constructed. Throw to surface the bug.
       throw new Error(
@@ -233,56 +177,23 @@ export class OtelVisualizer implements VisualizerPlugin {
         }
       };
       spanExporter = new WarnOnceSpanExporter(spanExporter, this.warnOnce);
-      metricExporter = new WarnOnceMetricExporter(metricExporter, this.warnOnce);
     }
 
-    // TracerProvider with BatchSpanProcessor (export is async/background; R1).
-    // exportTimeoutMillis bounds how long a single export call may run before
-    // being abandoned (T19). Default: EXPORT_TIMEOUT_MS (5 s).
-    const exportTimeoutMillis = ctx.exportTimeoutMillis ?? EXPORT_TIMEOUT_MS;
-    this.tracerProvider = new BasicTracerProvider({
-      resource,
-      spanProcessors: [new BatchSpanProcessor(spanExporter, { exportTimeoutMillis })],
-    });
-
-    // MeterProvider with PeriodicExportingMetricReader (export is async; R1).
-    const reader = new PeriodicExportingMetricReader({
-      exporter: metricExporter,
-      exportIntervalMillis: METRIC_EXPORT_INTERVAL_MS,
-    });
-    this.meterProvider = new MeterProvider({ resource, readers: [reader] });
-
-    const tracer = this.tracerProvider.getTracer('conductor', '1.0.0');
-    const meter = this.meterProvider.getMeter('conductor', '1.0.0');
-
-    // MetricsRecorder is wired to SpanManager via a callback.
-    this.metricsRecorder = new MetricsRecorder(meter);
-
-    this.spanManager = new SpanManager(tracer, ctx.onWarning, {
-      onStepClose: (step, durationMs, retryCount) => {
-        // tokenUsage/model are passed below via handleEvent; stashed per-step.
-        // We retrieve them here from the pending maps.
-        const tokenUsage = this.pendingTokenUsage.get(step);
-        this.pendingTokenUsage.delete(step);
-        const model = this.pendingModel.get(step);
-        this.pendingModel.delete(step);
-        this.metricsRecorder.onStepClose(step, durationMs, retryCount, tokenUsage, model);
-      },
-    });
+    this.spanExporter = spanExporter;
+    this.onWarning = ctx.onWarning;
+    this.exportTimeoutMillis = ctx.exportTimeoutMillis ?? EXPORT_TIMEOUT_MS;
+    this.legacyStartContext = {
+      runId: ctx.runId,
+      pipelineDir: ctx.pipelineDir,
+      feature: ctx.feature,
+      project: ctx.project,
+    };
+    this.attributes = config.enabled ? config.attributes ?? {} : {};
+    if (config.enabled && config.projectName) this.projectNameOverride = config.projectName;
+    if (config.enabled && config.attributeWarnings?.length) {
+      ctx.onWarning?.(`[otel] ${config.attributeWarnings.join(' ')}`);
+    }
   }
-
-  /**
-   * Stash tokenUsage from step_completed events so the SpanManager's onStepClose
-   * callback can pass it to MetricsRecorder. Keyed by step name.
-   */
-  private readonly pendingTokenUsage = new Map<string, TokenUsage | undefined>();
-
-  /**
-   * Stash model from step_completed events so the SpanManager's onStepClose
-   * callback can pass it to MetricsRecorder. Keyed by step name. Mirrors
-   * pendingTokenUsage exactly, including orphan-path cleanup.
-   */
-  private readonly pendingModel = new Map<string, string | undefined>();
 
   // ── VisualizerPlugin contract ──────────────────────────────────────────────
 
@@ -293,27 +204,16 @@ export class OtelVisualizer implements VisualizerPlugin {
    * Also registers SIGINT/SIGTERM handlers that call stop() on process termination
    * (T21). Handlers are unregistered in stop() to prevent leaks across instances.
    */
-  start(emitter: ConductorEventEmitter): void {
+  start(emitter: ConductorEventEmitter, context?: VisualizerStartContext): void {
+    this.initializeProviders(context ?? this.legacyStartContext);
     this.emitter = emitter;
-    const eventTypes: ConductorEvent['type'][] = [
-      'step_started',
-      'step_completed',
-      'step_failed',
-      'step_retry',
-      'gate_verdict',
-      'kickback',
-      'feature_complete',
-      'build_progress',
-      'unattributed_progress',
-      'build_no_progress',
-      'build_stall',
-      'pipeline_closeout',
-    ];
-    for (const type of eventTypes) {
-      emitter.on(type, (event) => {
+    for (const type of otelTracedEventTypes()) {
+      const handler: EventHandler = (event) => {
         // Synchronous, O(1): span/metric APIs enqueue to batch processors.
         this.handleEvent(event);
-      });
+      };
+      this.eventHandlers.push([type, handler]);
+      emitter.on(type, handler);
     }
 
     // T21: register SIGINT/SIGTERM handlers so an abrupt process termination
@@ -328,17 +228,14 @@ export class OtelVisualizer implements VisualizerPlugin {
   }
 
   /**
-   * Force-close open spans (FR-9), flush the batch processors, and optionally
-   * shut down providers. Idempotent — safe to call from signal handlers or
+   * Force-close open spans, then shut down both providers after their final
+   * exports. Idempotent — safe to call from signal handlers or
    * directly; subsequent calls return the same promise from the first invocation
    * (not a new wrapper — callers can use reference equality to detect re-entry).
    *
-   * NOTE: We intentionally call forceFlush() ONLY and NOT shutdown() here.
-   * BatchSpanProcessor.shutdown() calls exporter.shutdown() which clears
-   * InMemorySpanExporter._finishedSpans — making spans unreadable after stop().
-   * Callers (tests, acceptance spec) read spans AFTER stop(), so we must not
-   * clear the exporter. In production (OTLP / file), the process exits after
-   * stop() so the providers are GC'd naturally.
+   * Provider shutdown includes the effects of forceFlush under the OTel SDK
+   * contract. Both shutdowns are bounded because exporter implementations may
+   * return arbitrary promises.
    */
   stop(): Promise<void> {
     // Idempotent: if already stopping/stopped, return the existing promise.
@@ -352,6 +249,7 @@ export class OtelVisualizer implements VisualizerPlugin {
       process.off('SIGTERM', this.sigHandler);
       this.sigHandler = null;
     }
+    this.detachEventHandlers();
 
     this.stopPromise = this._doStop();
     return this.stopPromise;
@@ -359,60 +257,76 @@ export class OtelVisualizer implements VisualizerPlugin {
 
   /** Internal flush implementation. Only ever called once (guarded by stopPromise). */
   private async _doStop(): Promise<void> {
+    if (!this.spanManager || !this.tracerProvider) return;
     // Force-close any spans still open (e.g. interrupted run, FR-9).
     this.spanManager.forceCloseAll();
 
-    // Flush providers (off the hot path — intentionally async).
+    // Shut down the trace provider off the hot path.
     //
     // FR-8: export/flush errors are already intercepted at the exporter level
-    // (WarnOnceSpanExporter / WarnOnceMetricExporter). We additionally wrap here
-    // in case forceFlush() itself throws (rare but possible on SDK internals).
+    // (WarnOnceSpanExporter). We additionally wrap here
+    // in case provider shutdown itself throws.
     // T21: a dead transport still resolves within exportTimeoutMillis (T19 bound).
     try {
-      await this.tracerProvider.forceFlush();
+      const shutdownCompleted = await this.awaitTracerShutdown();
+      if (!shutdownCompleted) {
+        this.warnOnce?.(
+          `[otel] tracer shutdown timed out after ${this.exportTimeoutMillis}ms`,
+        );
+      }
     } catch (err) {
       // Exporter-wrapper callback path already calls warnOnce on FAILED results.
-      // This catch handles the rare case where forceFlush() itself throws; the
+      // This catch handles the rare case where shutdown itself throws; the
       // shared warnOnce flag ensures total warning count stays bounded to ONE.
       this.warnOnce?.(
-        `[otel] tracer flush error: ${err instanceof Error ? err.message : String(err)}`,
+        `[otel] tracer shutdown error: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /** Bound terminal trace cleanup without weakening the provider-owned lifecycle. */
+  private async awaitTracerShutdown(): Promise<boolean> {
+    const shutdown = this.tracerProvider!.shutdown().then(() => true);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      await this.meterProvider.forceFlush();
-    } catch (err) {
-      this.warnOnce?.(
-        `[otel] meter flush error: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      return await Promise.race([
+        shutdown,
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), this.exportTimeoutMillis);
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
+  }
+
+  private detachEventHandlers(): void {
+    if (this.emitter !== null) {
+      for (const [type, handler] of this.eventHandlers) this.emitter.off(type, handler);
+    }
+    this.eventHandlers.length = 0;
+    this.emitter = null;
   }
 
   // ── Internal event dispatch (synchronous, O(1)) ────────────────────────────
 
   private handleEvent(event: ConductorEvent): void {
+    if (!this.spanManager) return;
     switch (event.type) {
       case 'step_started':
         this.spanManager.onStepStarted(event);
         break;
       case 'step_completed':
-        // Stash tokenUsage/model before onStepCompleted closes the span and fires onStepClose.
-        this.pendingTokenUsage.set(event.step, event.tokenUsage);
-        this.pendingModel.set(event.step, event.model);
         this.spanManager.onStepCompleted(event);
-        // Cleanup: on the orphan path (no open span), onStepClose never fires and
-        // the entry would leak. onStepClose deletes the entry synchronously when it
-        // runs; if it did, this is a no-op. If it didn't (orphan), we clean up here.
-        this.pendingTokenUsage.delete(event.step);
-        this.pendingModel.delete(event.step);
         break;
       case 'step_failed':
-        // No tokenUsage on failed steps — stash undefined so MetricsRecorder skips.
-        this.pendingTokenUsage.set(event.step, undefined);
-        this.pendingModel.set(event.step, undefined);
         this.spanManager.onStepFailed(event);
-        // Same orphan-path cleanup as step_completed above.
-        this.pendingTokenUsage.delete(event.step);
-        this.pendingModel.delete(event.step);
+        break;
+      case 'provider_attempt':
+        {
+          const observation = this.dispatchMetering.observe(event);
+          if (observation !== undefined) this.spanManager.onProviderAttempt(event.step, observation);
+        }
         break;
       case 'step_retry':
         this.spanManager.onStepRetry(event);
@@ -425,6 +339,9 @@ export class OtelVisualizer implements VisualizerPlugin {
         break;
       case 'feature_complete':
         this.spanManager.onFeatureComplete(event);
+        break;
+      case 'loop_halt':
+        this.spanManager.onLoopHalt(event);
         break;
       case 'build_progress':
         this.spanManager.onBuildProgress(event);
@@ -440,8 +357,34 @@ export class OtelVisualizer implements VisualizerPlugin {
         break;
       case 'pipeline_closeout':
         this.spanManager.onPipelineCloseout(event);
-        this.metricsRecorder.onPipelineCloseout(event);
         break;
     }
+  }
+
+  private initializeProviders(context: VisualizerStartContext): void {
+    if (this.tracerProvider || this.spanManager) return;
+
+    const resourceContext = {
+      attributes: this.attributes,
+      pipelineDir: context.pipelineDir ?? '',
+      runId: context.runId,
+      feature: context.feature,
+      project: context.project,
+      projectName: this.projectNameOverride ?? (context.project ? basename(context.project) : undefined),
+      ...(Object.prototype.hasOwnProperty.call(context, 'branch') ? { branch: context.branch } : {}),
+      ...(Object.prototype.hasOwnProperty.call(context, 'engineVersion')
+        ? { engineVersion: context.engineVersion }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(context, 'harnessVersion')
+        ? { harnessVersion: context.harnessVersion }
+        : {}),
+    };
+    const traceResource = buildResource(resourceContext, 'traces');
+    this.tracerProvider = new BasicTracerProvider({
+      resource: traceResource,
+      spanProcessors: [new BatchSpanProcessor(this.spanExporter, { exportTimeoutMillis: this.exportTimeoutMillis })],
+    });
+    const tracer = this.tracerProvider.getTracer('conductor', '1.0.0');
+    this.spanManager = new SpanManager(tracer, this.onWarning);
   }
 }

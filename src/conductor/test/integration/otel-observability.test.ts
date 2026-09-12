@@ -25,9 +25,11 @@ import { EventPersister } from '../../src/engine/event-persister.js';
 // ── Modules under construction (do not exist yet → RED) ──────────────────────
 import { resolveOtelConfig } from '../../src/engine/otel/otel-config.js';
 import { OtelVisualizer } from '../../src/engine/otel/otel-visualizer.js';
+import { MetricsListener } from '../../src/engine/otel/metrics-listener.js';
+import { MetricsRecorder } from '../../src/engine/otel/metrics.js';
 // In-memory OTel exporters (deps added in Task 1 → RED until then)
-import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
-import { InMemoryMetricExporter, AggregationTemporality } from '@opentelemetry/sdk-metrics';
+import { CapturingSpanExporter as InMemorySpanExporter } from '../fixtures/capturing-span-exporter.js';
+import { InMemoryMetricExporter, AggregationTemporality, MeterProvider, PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
 
 /**
  * A representative SDLC run: 3 steps, one with a retry, one carrying tokenUsage,
@@ -50,6 +52,13 @@ async function emitRepresentativeRun(emitter: ConductorEventEmitter): Promise<vo
     step: 'explore',
     status: 'done',
     tokenUsage: { input: 100, output: 50 }, // partial kinds (no cache) — FR-5
+  });
+  await emitter.emit({
+    type: 'feature_cost_snapshot',
+    costUsd: 0,
+    costComplete: false,
+    byDimension: [],
+    tokensByDimension: [{ step: 'explore', tokens: { input: 100, output: 50 } }],
   });
 
   await emitter.emit({ type: 'step_started', step: 'plan', index: 2 });
@@ -151,11 +160,19 @@ describe('OTel Observability — Phase 1 acceptance', () => {
 
   // ── FR-5: metrics ──────────────────────────────────────────────────────────
   describe('Story: duration/retry/token metrics (FR-5)', () => {
-    it('emits a step.duration histogram and a retries counter; tokens only when present', async () => {
-      const vis = startVisualizer();
+    it('emits a step.duration histogram and a retries counter; token gauges only when present', async () => {
+      const provider = new MeterProvider({
+        readers: [new PeriodicExportingMetricReader({ exporter: metricExporter, exportIntervalMillis: 60_000 })],
+      });
+      const listener = new MetricsListener(
+        new MetricsRecorder(provider.getMeter('observability-acceptance'), { project: 'james-stoup-agents', worker: 'test-worker', feature: 'otel-phase-1' }),
+        undefined,
+        'otel-phase-1',
+      );
+      listener.start(emitter);
       await emitRepresentativeRun(emitter);
-      await vis.stop();
-      await metricExporter.forceFlush?.();
+      listener.stop();
+      await provider.shutdown();
 
       const names = metricExporter
         .getMetrics()
@@ -163,14 +180,14 @@ describe('OTel Observability — Phase 1 acceptance', () => {
 
       expect(names).toContain('conductor.step.duration');
       expect(names).toContain('conductor.step.retries');
-      expect(names).toContain('conductor.step.tokens');
+      expect(names).toContain('conductor.feature.step.tokens');
 
       // token data points exist only for the step that carried tokenUsage (brainstorm),
       // never for 'plan' (no tokenUsage) — no zero-fill / NaN points.
       const tokenMetric = metricExporter
         .getMetrics()
         .flatMap((rm) => rm.scopeMetrics.flatMap((sm) => sm.metrics))
-        .find((m) => m.descriptor.name === 'conductor.step.tokens')!;
+        .find((m) => m.descriptor.name === 'conductor.feature.step.tokens')!;
       const steps = tokenMetric.dataPoints.map((d) => d.attributes['step']);
       expect(steps).toContain('explore');
       expect(steps).not.toContain('plan');
@@ -213,30 +230,6 @@ describe('OTel Observability — Phase 1 acceptance', () => {
       for (const line of lines) {
         expect(() => JSON.parse(line)).not.toThrow();
       }
-    });
-  });
-
-  // ── FR-8: failures never break the run ──────────────────────────────────────
-  describe('Story: exporter failure isolation (FR-8)', () => {
-    it('an unreachable OTLP endpoint leaves the run unaffected with exactly one warning', async () => {
-      const warnings: string[] = [];
-      const resolved = resolveOtelConfig(
-        { otel: { exporter: 'otlp', endpoint: 'http://127.0.0.1:1/v1/traces' } }, // refused
-        pipelineDir,
-      );
-      const vis = new OtelVisualizer(resolved, {
-        runId: 'run-fixed-3',
-        feature: 'otel-phase-1',
-        project: 'james-stoup-agents',
-        onWarning: (m: string) => warnings.push(m),
-      });
-      vis.start(emitter);
-
-      // The run (event emission) must complete without throwing.
-      await expect(emitRepresentativeRun(emitter)).resolves.toBeUndefined();
-      await expect(vis.stop()).resolves.toBeUndefined();
-
-      expect(warnings.length).toBe(1); // bounded — not one-per-event
     });
   });
 

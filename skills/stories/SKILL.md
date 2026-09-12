@@ -1,7 +1,7 @@
 ---
 name: stories
 implicit_invocation: required
-description: "Use after architecture-review, when the design is approved. Generates user stories with mandatory happy and negative paths as Given/When/Then scenarios — from the PRD's FRs (product track) or the technical intent (technical track)."
+description: "Use only within active engineer/conduct DECIDE after architecture approval, when a committed `.docs/stories` acceptance artifact is required. Do not invoke for general user-story examples, requirements discussion, or direct implementation requests."
 enforcement: gating
 phase: decide
 standalone: true
@@ -105,6 +105,11 @@ As a [role], I want [action] so that [outcome].
 - Given [precondition], when [unauthorized access attempted], then [specific rejection]
 - Given [precondition], when [dependency times out], then [specific graceful degradation]
 - Given [precondition], when [concurrent modification occurs], then [specific conflict resolution]
+
+Do not prefix criteria with ids. The engine derives them positionally as
+`S<story-heading-id>.<n>`, numbering happy paths then negative paths in one run — so the
+first negative path of Story 1 is `S1.3`, never `S1.N1`. An authored id the engine does
+not derive is unkeyable and halts `prd_audit`.
 
 ### Done When
 - [ ] [Concrete, verifiable output — e.g., POST /contacts returns 201 with contact JSON including `id`, `name`, `email`]

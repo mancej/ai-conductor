@@ -1,7 +1,7 @@
 ---
 name: simplify
 implicit_invocation: required
-description: "Review changed code for duplication, complexity, and over-engineering at batch boundaries. Blocking gate — must pass before next batch proceeds."
+description: "Use only at an active pipeline batch boundary after code has changed. Reviews current-batch duplication, complexity, and over-engineering; do not invoke for ordinary refactors, code review, or requests that merely ask for simpler prose or code."
 enforcement: gating
 phase: build
 standalone: false
@@ -186,7 +186,7 @@ Write findings to `.pipeline/audit-trail/batch-N-simplification.md`:
 | **CLEAN** | Zero must-fix items | Proceed to next batch |
 | **SIMPLIFY_REQUIRED** | One or more must-fix items | Fix before next batch; counts toward rework budget |
 
-Advisory items are noted but do not block. They feed into the micro-retro.
+Advisory items are noted but do not block.
 
 Rework from simplification counts toward the pipeline rework budget (3 cycles per task).
 If the rework budget is exhausted, escalate to user.

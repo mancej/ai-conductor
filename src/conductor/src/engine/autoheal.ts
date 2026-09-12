@@ -6,7 +6,12 @@ import { originDefaultBranch, makeGitRunner } from './rebase.js';
 // dropped (feature #773, Task 11): the only remaining consumers were the now-
 // deleted derivation engine and its tests; all other callers import directly
 // from plan-task-parse.ts.
-import { TASK_HEADER_PATTERN, TASK_ID_PATTERN, parsePlanTaskPaths } from './plan-task-parse.js';
+import {
+  TASK_HEADER_PATTERN,
+  TASK_ID_PATTERN,
+  TASK_TRAILER_LINE_PATTERN,
+  parsePlanTaskPaths,
+} from './plan-task-parse.js';
 
 // #405: near-miss derive diagnostics (path-corroboration miss, pinned-stamp
 // demotion prevention) repeat on EVERY build-gate evaluation — H7 deliberately
@@ -133,6 +138,11 @@ export interface EvidenceRangeResult {
   anomalies: string[];
   warnings: string[];
 }
+
+/** Strict repair evidence never falls back to older branch history. */
+export type StrictEvidenceRangeResult =
+  | { kind: 'available'; commits: CommitWithTrailers[] }
+  | { kind: 'unavailable'; reason: string };
 
 /**
  * Resolve the `origin/<default>` ref to evaluate evidence against.
@@ -374,6 +384,48 @@ export async function listCommitsWithTrailers(
 }
 
 /**
+ * Reads only commits made after a persisted repair boundary. Unlike the
+ * ordinary evidence-range ladder, an unavailable or non-ancestor boundary is
+ * a typed refusal: historical evidence must not close an open repair.
+ */
+export async function listCommitsWithTrailersAfterRepairBoundary(
+  projectRoot: string,
+  boundary: string,
+): Promise<StrictEvidenceRangeResult> {
+  const commit = await execa('git', ['rev-parse', '--verify', `${boundary}^{commit}`], {
+    cwd: projectRoot,
+    reject: false,
+  });
+  if (commit.exitCode !== 0 || !commit.stdout.trim()) {
+    return { kind: 'unavailable', reason: `repair boundary ${boundary} is unavailable` };
+  }
+  const verifiedBoundary = commit.stdout.trim();
+  const ancestor = await execa('git', ['merge-base', '--is-ancestor', verifiedBoundary, 'HEAD'], {
+    cwd: projectRoot,
+    reject: false,
+  });
+  if (ancestor.exitCode !== 0) {
+    return { kind: 'unavailable', reason: `repair boundary ${verifiedBoundary} is not an ancestor of HEAD` };
+  }
+  const log = await execa('git', ['log', `--format=${COMMIT_RECORD_FORMAT}`, `${verifiedBoundary}..HEAD`], {
+    cwd: projectRoot,
+    reject: false,
+  });
+  if (log.exitCode !== 0 || typeof log.stdout !== 'string') {
+    return { kind: 'unavailable', reason: `repair boundary ${verifiedBoundary} could not be read` };
+  }
+  return {
+    kind: 'available',
+    commits: log.stdout
+      .split('\x1e')
+      .map((record) => record.trim())
+      .filter(Boolean)
+      .map(parseCommitRecord)
+      .filter((item): item is CommitWithTrailers => item !== null),
+  };
+}
+
+/**
  * Log format shared by the trailer-reading paths: sha, TAB, subject, NUL,
  * git-parsed trailers (final paragraph block only), NUL, raw body (%b —
  * message minus subject), record separator. The raw body feeds the mid-body
@@ -391,7 +443,7 @@ const COMMIT_RECORD_FORMAT = '%H%x09%s%x00%(trailers)%x00%b%x1e';
  * quoted lines (`    Task: 9`, `> Task: 9` inside log excerpts) never match.
  */
 export function extractBodyTaskIds(body: string): string[] {
-  const lineRe = new RegExp(`^Task: (${TASK_ID_PATTERN})[ \\t]*$`);
+  const lineRe = new RegExp(TASK_TRAILER_LINE_PATTERN);
   const ids: string[] = [];
   for (const line of body.split('\n')) {
     const match = line.match(lineRe);

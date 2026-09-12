@@ -1,7 +1,7 @@
 ---
 name: intake
 implicit_invocation: required
-description: "Use when filing an intake issue to GitHub — capturing a bug, idea, or observation for a later DECIDE phase. Structures the issue as WHAT (observed evidence, impact) and desired OUTCOMES (observable acceptance signals), with verbatim logs/commands/repro artifacts a zero-context engineer can debug from. Never prescribes HOW — that belongs to DECIDE."
+description: "Use only when the requested deliverable is a GitHub intake issue, or when an active harness workflow hands an observation off for later DECIDE. Do not invoke merely because a bug, idea, or observation is being discussed."
 enforcement: gating
 phase: decide
 standalone: true
@@ -18,7 +18,7 @@ immediately — from the evidence in the issue alone — without anchoring them 
 filer's first idea of a fix.
 
 This skill applies whether the filer is the operator (from chat or phone) or an agent
-filing on the operator's behalf (halt monitor, retro proposals, bugs discovered
+filing on the operator's behalf (halt monitor, follow-up proposals, bugs discovered
 mid-build). GitHub's intake issue form (`.github/ISSUE_TEMPLATE/intake.yml`) scaffolds
 the same shape on web/mobile; anything filed via `gh issue create` must follow it by
 hand — this skill is how.

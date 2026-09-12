@@ -16,11 +16,12 @@ import {
   isResolutionInFlight,
   withResolveWorktree,
   runAcceptanceGuards,
-  runSuiteGate,
   pushRefreshedBranch,
+  type ResolveWorktreeLiveness,
 } from './autoresolve.js';
 import { makeGitRunner } from './rebase.js';
 import { execa } from 'execa';
+import { dispatchTestSuiteCommand } from './test-suite-cli.js';
 
 /**
  * Classify a ci-fix resolver error into a coarse category so logs and
@@ -163,28 +164,36 @@ const NON_TERMINAL_CHECK_STATES = new Set([
 /**
  * Names of the rollup entries that have not reached a terminal state.
  *
- * A check is non-terminal when its `status` is a queued/running state, when its
- * `conclusion` is one (some commit-status rollups report `PENDING` there), or
- * when it carries no conclusion at all — the same "still running" signal
+ * A check is non-terminal when its `status`, `conclusion`, or reported `state`
+ * is queued/running. It is also non-terminal when it carries neither a
+ * conclusion nor a reported state — the same "still running" signal
  * `pr-labels.ts#isCheckFailingOrPending` uses.
  *
  * An absent/empty rollup yields an empty list: no rollup detail is no evidence
  * of a running check, so the caller's gate must not block on it.
  */
 export function nonTerminalCheckNames(
-  rollup?: Array<{ status?: string | null; conclusion?: string | null; name?: string }> | null,
+  rollup?: Array<{
+    status?: string | null;
+    conclusion?: string | null;
+    state?: string | null;
+    name?: string;
+    context?: string;
+  }> | null,
 ): string[] {
   if (!rollup || rollup.length === 0) return [];
   return rollup
     .filter((check) => {
       const status = (check.status ?? '').toUpperCase();
       const conclusion = (check.conclusion ?? '').toUpperCase();
+      const state = (check.state ?? '').toUpperCase();
       if (NON_TERMINAL_CHECK_STATES.has(status)) return true;
       if (NON_TERMINAL_CHECK_STATES.has(conclusion)) return true;
-      // No conclusion recorded yet → the run has not finished.
-      return conclusion.length === 0;
+      if (NON_TERMINAL_CHECK_STATES.has(state)) return true;
+      // No conclusion or reported state recorded yet → the run has not finished.
+      return conclusion.length === 0 && state.length === 0;
     })
-    .map((check) => check.name?.trim() || '(unnamed check)');
+    .map((check) => check.name?.trim() || check.context?.trim() || '(unnamed check)');
 }
 
 /**
@@ -416,8 +425,13 @@ export const productionCiFixRunner: CiFixRunner = {
  *
  * @param deps Dependencies for the fix execution
  * @param deps.fixRunner The injected {@link CiFixRunner} seam
- * @param deps.suiteCommand Optional suite command forwarded to {@link runSuiteGate}.
- *                           Undefined/empty → suite gate is a noop pass.
+ * @param deps.verify Optional test seam for the engine-owned configured verifier.
+ *                    Production reads test_suite from the repair worktree and fails closed.
+ * @param deps.liveness Optional dispatcher-owned liveness seam forwarded to
+ *                      {@link withResolveWorktree}: `worktreeLifecycle`
+ *                      single-flights the transient worktree add/remove through
+ *                      the one lifecycle queue, and `isFeatureInFlight` refuses
+ *                      removal while the slug holds an active work claim.
  * @param logger Optional logging function for abort/error messages
  * @returns CiFixOutcome describing the result
  */
@@ -427,7 +441,8 @@ export async function runCiFix(
   hint: string,
   deps: {
     fixRunner: CiFixRunner;
-    suiteCommand?: string;
+    verify?: (worktreePath: string) => Promise<number>;
+    liveness?: ResolveWorktreeLiveness;
   },
   logger?: (msg: string) => void,
 ): Promise<CiFixOutcome> {
@@ -507,8 +522,10 @@ export async function runCiFix(
         return fixOutcome;
       }
 
-      const suiteResult = await runSuiteGate(deps.suiteCommand, worktreePath, log);
-      if (!suiteResult.ok) {
+      const verify = deps.verify ?? ((projectRoot: string) =>
+        dispatchTestSuiteCommand({ kind: 'run' }, { projectRoot, print: log }));
+      const suiteExitCode = await verify(worktreePath);
+      if (suiteExitCode !== 0) {
         log(`${prUrl}: ci-fix suite gate failed`);
         logOutcome(log, prUrl, 'ci-fix-suite-gate', 'escalated');
         return fixOutcome;
@@ -523,7 +540,7 @@ export async function runCiFix(
 
       logOutcome(log, prUrl, 'ci-fix-lease-push', 'refreshed');
       return fixOutcome;
-    });
+    }, undefined, deps.liveness ?? {});
 
     return outcome;
   } catch (err) {

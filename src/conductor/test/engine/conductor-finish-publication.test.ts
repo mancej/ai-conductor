@@ -54,7 +54,13 @@ const PASS_EVIDENCE: FullSuitePassEvidence = {
 async function writeGreenShipValidatorEvidence(dir: string): Promise<void> {
   await mkdir(join(dir, '.docs', 'specs'), { recursive: true });
   await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
+  await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
   await mkdir(join(dir, '.pipeline'), { recursive: true });
+  // The audit below cites Plan task 1; the plan is its citation authority.
+  await writeFile(
+    join(dir, '.docs', 'plans', 'finish-publication.md'),
+    '### Task 1: Finish publication\n\n**Files:** src/example.ts\n',
+  );
   await writeFile(
     join(dir, '.docs', 'specs', 'finish-publication.md'),
     '# PRD\n\n## Functional Requirements\n\n- FR-1: The feature can finish.\n',
@@ -89,8 +95,8 @@ describe('Conductor FINISH publication routing', () => {
       'bootstrap', 'memory', 'assess', 'explore', 'prd', 'complexity', 'stories',
       'conflict_check', 'plan', 'coherence_check', 'architecture_diagram',
       'architecture_review', 'worktree', 'acceptance_specs', 'build', 'build_review',
-      'wiring_check', 'test_suite', 'manual_test', 'prd_audit',
-      'architecture_review_as_built', 'retro', 'rebase',
+      'test_suite', 'manual_test', 'prd_audit',
+      'architecture_review_as_built', 'rebase',
     ] satisfies StepName[]) {
       state[step] = 'done';
     }
@@ -746,8 +752,8 @@ describe('Conductor FINISH publication routing', () => {
       'bootstrap', 'memory', 'assess', 'explore', 'prd', 'complexity', 'stories',
       'conflict_check', 'plan', 'coherence_check', 'architecture_diagram',
       'worktree', 'acceptance_specs', 'build', 'build_review',
-      'wiring_check', 'test_suite', 'manual_test', 'prd_audit',
-      'architecture_review_as_built', 'retro', 'rebase',
+      'test_suite', 'manual_test', 'prd_audit',
+      'architecture_review_as_built', 'rebase',
     ] satisfies StepName[]) state[step] = 'done';
     // The as-built review now runs even without an upstream DECIDE review.
     state.architecture_review = 'skipped';
@@ -776,6 +782,10 @@ describe('Conductor FINISH publication routing', () => {
         : { stdout: '' },
       gh: async (args) => {
         if (args[0] === 'pr' && args[1] === 'view') return { stdout: JSON.stringify(pullRequest) };
+        if (args[0] === 'pr' && args[1] === 'edit') {
+          pullRequest = { ...pullRequest, body: args[args.indexOf('--body') + 1]! };
+          return { stdout: '' };
+        }
         if (args[0] === 'pr' && args[1] === 'ready') {
           pullRequest.isDraft = false;
           return { stdout: '' };
@@ -834,7 +844,7 @@ describe('Conductor FINISH publication routing', () => {
       'bootstrap', 'memory', 'assess', 'explore', 'prd', 'complexity', 'stories',
       'conflict_check', 'plan', 'coherence_check', 'architecture_diagram',
       'worktree', 'acceptance_specs', 'build', 'build_review',
-      'wiring_check', 'test_suite', 'architecture_review_as_built', 'retro', 'rebase',
+      'test_suite', 'architecture_review_as_built', 'rebase',
     ] satisfies StepName[]) state[step] = 'done';
     // The as-built review runs independently of an upstream DECIDE review.
     state.architecture_review = 'skipped';
@@ -865,6 +875,10 @@ describe('Conductor FINISH publication routing', () => {
         : { stdout: '' },
       gh: async (args) => {
         if (args[0] === 'pr' && args[1] === 'view') return { stdout: JSON.stringify(pullRequest) };
+        if (args[0] === 'pr' && args[1] === 'edit') {
+          pullRequest = { ...pullRequest, body: args[args.indexOf('--body') + 1]! };
+          return { stdout: '' };
+        }
         if (args[0] === 'pr' && args[1] === 'ready') {
           pullRequest.isDraft = false;
           return { stdout: '' };

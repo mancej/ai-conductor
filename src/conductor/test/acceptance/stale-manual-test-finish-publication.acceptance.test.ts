@@ -75,6 +75,7 @@ describe('stale SHIP evidence at FINISH converges through the production coordin
     await commit(root, {
       '.gitignore': '.pipeline/\n',
       'src/feature.ts': 'export const feature = 1;\n',
+      '.docs/plans/stale-manual-test-discovered-at-finish-is-unroutab.md': '# Plan\n',
     }, 'feat: establish manual-test baseline');
 
     const state: Record<string, unknown> = {
@@ -93,7 +94,6 @@ describe('stale SHIP evidence at FINISH converges through the production coordin
       manual_test: manualTestState,
       prd_audit: 'skipped',
       architecture_review_as_built: 'skipped',
-      retro: 'skipped',
       rebase: 'done',
       // The custom documentation-maintenance tail commit lands after rebase.
       // It leaves manual_test's pre-tail code stamp behind the current run.
@@ -214,6 +214,10 @@ describe('stale SHIP evidence at FINISH converges through the production coordin
         pullRequest = { ...pullRequest, isDraft: false };
         return { stdout: '' };
       }
+      if (args[0] === 'pr' && args[1] === 'edit') {
+        pullRequest = { ...pullRequest, body: args[args.indexOf('--body') + 1]! };
+        return { stdout: '' };
+      }
       throw new Error(`unexpected GitHub command: ${args.join(' ')}`);
     });
     const git = vi.fn(async (args: string[]) => {
@@ -296,7 +300,6 @@ describe('stale SHIP evidence at FINISH converges through the production coordin
       manual_test: 'stale',
       prd_audit: 'skipped',
       architecture_review_as_built: 'skipped',
-      retro: 'skipped',
       rebase: 'done',
     });
     await writeState(stateFilePath, state as ConductState);
@@ -367,6 +370,6 @@ describe('stale SHIP evidence at FINISH converges through the production coordin
     await expect(readFile(join(pipeline, 'HALT'), 'utf8')).resolves.toContain(
       'manual-test FAIL unresolved after 2 build kickback(s) (cap 2)',
     );
-    await expect(readFile(join(pipeline, 'HALT.class'), 'utf8')).resolves.toBe('mechanical');
+    await expect(readFile(join(pipeline, 'HALT.class'), 'utf8')).resolves.toBe('needs-human');
   });
 });

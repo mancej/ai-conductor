@@ -66,6 +66,14 @@ has no candidate, no release PR exists to merge and publication is a no-op. The 
 ordinary `main` pushes: it publishes only a merged `automation/release-pr` owned by the configured GitHub
 App and carrying successful, head-bound release-candidate audit evidence.
 
+### Re-run release-PR maintenance
+
+To reconcile the release PR after a failed or interrupted maintenance run, open the
+`release-pr-maintenance` workflow in GitHub Actions and select **Run workflow** on the repository's
+default branch. The workflow serializes this run with merge-triggered maintenance and renders from that
+branch's current commit. A manual run on any other ref fails before checkout and makes no release-branch
+changes.
+
 The release gate does **not** require `[Unreleased]` to be non-empty. Integrity owns the changelog's
 structure; the gate reads release metadata only for migration-block validation.
 
@@ -107,6 +115,9 @@ publisher still re-derives all release authority immediately before mutation:
 5. After both publication artifacts exist, `refs/heads/stable` is created or fast-forwarded to the same
    release commit. The update is non-forced and a failure fails the publish job; retrying the workflow
    verifies the existing artifacts and safely retries only the stable-branch advance.
+   The hosted documentation site (GitHub Pages) publishes from `stable:/docs`, so a release cut is
+   also the moment new documentation goes live; a docs change merged to `main` stays unpublished until
+   the next cut.
 
 The publisher creates the annotated tag and GitHub Release through GitHub APIs. It never rewrites
 `CHANGELOG.md`, bumps `VERSION`, creates a release commit, or pushes `main`. `stable` therefore never points
@@ -204,6 +215,16 @@ A ```` ```bash migration ```` fence inside a `## Migration` (or `### Migration`)
 `bin/migrate`'s own regexes, so "runnable" means exactly what `bin/migrate` will execute when a consumer
 updates past this version.
 
+The fence is the migration; the rest of the section is prose. A sentence telling the operator what the
+block does may sit above it, below it, or between two fences, and `bin/migrate`, the release gate, and
+`ReleaseDisposition.migration` all read only the fences. A section carrying no fence must say exactly
+`none`.
+
+The `## Migration` section and the `Release-*` block may appear in either order, with or without a
+`---` between them, and either may be the last thing in the body — the `Closes owner/repo#N` trailer
+that `injectIssueRef` appends below them is not part of the section. The renderer normalises the order
+when it snapshots the body; nothing in the authored body depends on it.
+
 #### Block authoring contract
 
 Every runnable block must sit under a versioned `## [x.y.z]` release entry. `bin/migrate` runs it from
@@ -293,4 +314,5 @@ PR never shows two contradictory ones. It is also strictly downstream of validat
 invalid disposition fails the check and leaves labels untouched, and a label-apply failure
 (auth, rate limit, network) is logged but never fails the required check.
 
-All work happens on a feature branch; never commit directly to `main`.
+All work happens in an isolated git worktree on a feature branch. Create both before making
+changes; a feature branch in the primary checkout is not sufficient. Never commit directly to `main`.

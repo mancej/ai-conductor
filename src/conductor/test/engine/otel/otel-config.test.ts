@@ -1,3 +1,4 @@
+// Covers: task:1, task:2, task:11
 import { describe, it, expect } from 'vitest';
 import { resolveOtelConfig } from '../../../src/engine/otel/otel-config.js';
 
@@ -84,6 +85,414 @@ describe('resolveOtelConfig', () => {
       );
       expect(result.enabled).toBe(true);
       expect((result as { protocol?: string }).protocol).toBe('grpc');
+    });
+  });
+
+  describe('environment-referenced headers', () => {
+    const headerConfig = {
+      otel: {
+        exporter: 'otlp' as const,
+        endpoint: 'http://localhost:4318',
+        headers: { Authorization: { env: 'OTEL_TEST_AUTHORIZATION' } },
+      },
+    };
+
+    it('resolves a configured header and reads its environment value on every resolution', () => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      try {
+        process.env.OTEL_TEST_AUTHORIZATION = 'first-token';
+        expect(resolveOtelConfig(headerConfig, PIPELINE_DIR)).toMatchObject({
+          enabled: true,
+          headers: { Authorization: 'first-token' },
+        });
+
+        process.env.OTEL_TEST_AUTHORIZATION = 'second-token';
+        expect(resolveOtelConfig(headerConfig, PIPELINE_DIR)).toMatchObject({
+          enabled: true,
+          headers: { Authorization: 'second-token' },
+        });
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+
+    it('leaves the resolved result unchanged when headers are absent', () => {
+      expect(
+        resolveOtelConfig({ otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } }, PIPELINE_DIR),
+      ).toEqual({ enabled: true, exporter: 'otlp', endpoint: 'http://localhost:4318' });
+    });
+
+    it.each([undefined, ''])('disables otlp when a referenced environment variable is %p', (value) => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      try {
+        if (value === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = value;
+
+        const result = resolveOtelConfig(headerConfig, PIPELINE_DIR);
+        expect(result).toMatchObject({ enabled: false });
+        expect((result as { error?: string }).error).toContain('Authorization');
+        expect((result as { error?: string }).error).toContain('OTEL_TEST_AUTHORIZATION');
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+
+    it('retains only header and environment-variable names in the parsed configuration', () => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      try {
+        process.env.OTEL_TEST_AUTHORIZATION = 'credential-value';
+        const result = resolveOtelConfig(headerConfig, PIPELINE_DIR);
+        expect(result).toMatchObject({
+          enabled: true,
+          headers: { Authorization: 'credential-value' },
+        });
+        expect(headerConfig).toEqual({
+          otel: {
+            exporter: 'otlp',
+            endpoint: 'http://localhost:4318',
+            headers: { Authorization: { env: 'OTEL_TEST_AUTHORIZATION' } },
+          },
+        });
+        expect(JSON.stringify(headerConfig)).not.toContain('credential-value');
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+
+    it('accepts a well-formed mapping with no error or warning', () => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      try {
+        process.env.OTEL_TEST_AUTHORIZATION = 'valid-token';
+        const result = resolveOtelConfig(headerConfig, PIPELINE_DIR);
+        expect(result).toEqual({
+          enabled: true,
+          exporter: 'otlp',
+          endpoint: 'http://localhost:4318',
+          headers: { Authorization: 'valid-token' },
+        });
+        expect((result as { error?: string }).error).toBeUndefined();
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+
+    it('retains __proto__ as an own resolved header without changing the header record prototype', () => {
+      const previous = process.env.OTEL_TEST_PROTO_HEADER;
+      try {
+        process.env.OTEL_TEST_PROTO_HEADER = 'proto-token';
+        const headers = JSON.parse('{"__proto__":{"env":"OTEL_TEST_PROTO_HEADER"}}');
+        const result = resolveOtelConfig(
+          {
+            otel: {
+              exporter: 'otlp',
+              endpoint: 'http://localhost:4318',
+              headers,
+            },
+          } as never,
+          PIPELINE_DIR,
+        );
+
+        expect(result).toMatchObject({ enabled: true });
+        const resolvedHeaders = (result as { headers: Record<string, string> }).headers;
+        expect(Object.getPrototypeOf(resolvedHeaders)).toBeNull();
+        expect(Object.hasOwn(resolvedHeaders, '__proto__')).toBe(true);
+        expect(Object.getOwnPropertyDescriptor(resolvedHeaders, '__proto__')).toMatchObject({
+          value: 'proto-token',
+        });
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_PROTO_HEADER;
+        else process.env.OTEL_TEST_PROTO_HEADER = previous;
+      }
+    });
+
+    it.each([
+      ['a literal credential', { Authorization: 'literal-credential' }, /Authorization.*literal credential/i],
+      ['an unknown reference key', { Authorization: { env: 'OTEL_TEST_AUTHORIZATION', secret: true } }, /Authorization.*\{ env:/i],
+      ['an absent reference key', { Authorization: {} }, /Authorization.*\{ env:/i],
+      ['a non-string environment variable name', { Authorization: { env: 42 } }, /Authorization.*\{ env:/i],
+      ['a non-mapping headers block', 'not-a-mapping', /headers.*mapping/i],
+      ['an empty header name', { '': { env: 'OTEL_TEST_AUTHORIZATION' } }, /header ''/i],
+      ['a header name containing a control character', { 'Bad\nHeader': { env: 'OTEL_TEST_AUTHORIZATION' } }, /Bad.*Header/i],
+    ] as const)('refuses %s by name', (_caseName, headers, errorPattern) => {
+      const result = resolveOtelConfig(
+        {
+          otel: {
+            exporter: 'otlp',
+            endpoint: 'http://localhost:4318',
+            headers,
+          } as never,
+        },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({ enabled: false });
+      expect((result as { error?: string }).error).toMatch(errorPattern);
+    });
+
+    // Story 3's negative criterion binds EVERY header-related resolution error
+    // for a reference-bearing entry, so a malformed header name must still name
+    // the environment variable it references while withholding its value.
+    it.each([
+      ['an empty header name', ''],
+      ['a header name containing a control character', 'Bad\nHeader'],
+    ] as const)('names the referenced variable when refusing %s', (_caseName, header) => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      const sentinel = 'malformed-name-sentinel';
+      try {
+        process.env.OTEL_TEST_AUTHORIZATION = sentinel;
+        const result = resolveOtelConfig(
+          {
+            otel: {
+              exporter: 'otlp',
+              endpoint: 'http://localhost:4318',
+              headers: { [header]: { env: 'OTEL_TEST_AUTHORIZATION' } },
+            } as never,
+          },
+          PIPELINE_DIR,
+        );
+
+        expect(result).toMatchObject({ enabled: false });
+        const error = (result as { error?: string }).error ?? '';
+        expect(error).toContain('OTEL_TEST_AUTHORIZATION');
+        expect(error).not.toContain(sentinel);
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+
+    it.each([
+      ['grpc protocol', { exporter: 'otlp', endpoint: 'http://localhost:4317', protocol: 'grpc', headers: headerConfig.otel.headers }],
+      ['file exporter', { exporter: 'file', headers: headerConfig.otel.headers }],
+    ] as const)('refuses headers with the %s without exposing their resolved value', (_caseName, otel) => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      const sentinel = 'unsupported-transport-sentinel';
+      try {
+        process.env.OTEL_TEST_AUTHORIZATION = sentinel;
+        const result = resolveOtelConfig({ otel }, PIPELINE_DIR);
+        const error = (result as { error?: string }).error ?? '';
+        expect(result).toMatchObject({ enabled: false });
+        expect(error).toMatch(/grpc|file/i);
+        expect(error).toContain('Authorization');
+        expect(error).toContain('OTEL_TEST_AUTHORIZATION');
+        expect(error).not.toContain(sentinel);
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+
+    it('never includes an environment value in a header-related error', () => {
+      const previous = process.env.OTEL_TEST_AUTHORIZATION;
+      const sentinel = 'distinctive-sentinel-secret';
+      try {
+        process.env.OTEL_TEST_AUTHORIZATION = sentinel;
+        const result = resolveOtelConfig(
+          {
+            otel: {
+              exporter: 'otlp',
+              endpoint: 'http://localhost:4318',
+              headers: { Authorization: { env: 'OTEL_TEST_AUTHORIZATION', secret: true } },
+            } as never,
+          },
+          PIPELINE_DIR,
+        );
+
+        const error = (result as { error?: string }).error ?? '';
+        expect(error).toContain('Authorization');
+        expect(error).toContain('OTEL_TEST_AUTHORIZATION');
+        expect(error).not.toContain(sentinel);
+      } finally {
+        if (previous === undefined) delete process.env.OTEL_TEST_AUTHORIZATION;
+        else process.env.OTEL_TEST_AUTHORIZATION = previous;
+      }
+    });
+  });
+
+  describe('project_name', () => {
+    it('carries a trimmed configured project name on both enabled variants and omits blank values', () => {
+      const configs = [
+        resolveOtelConfig(
+          { otel: { exporter: 'file', project_name: '  tenant-a  ' } },
+          PIPELINE_DIR,
+        ),
+        resolveOtelConfig(
+          {
+            otel: {
+              exporter: 'otlp',
+              endpoint: 'http://localhost:4318',
+              project_name: 'tenant-b',
+            },
+          },
+          PIPELINE_DIR,
+        ),
+        resolveOtelConfig({ otel: { exporter: 'file', project_name: '   ' } }, PIPELINE_DIR),
+        resolveOtelConfig({ otel: { exporter: 'file', project_name: '' } }, PIPELINE_DIR),
+      ];
+
+      expect(configs).toEqual([
+        { enabled: true, exporter: 'file', file: `${PIPELINE_DIR}/otel.jsonl`, projectName: 'tenant-a' },
+        {
+          enabled: true,
+          exporter: 'otlp',
+          endpoint: 'http://localhost:4318',
+          projectName: 'tenant-b',
+        },
+        { enabled: true, exporter: 'file', file: `${PIPELINE_DIR}/otel.jsonl` },
+        { enabled: true, exporter: 'file', file: `${PIPELINE_DIR}/otel.jsonl` },
+      ]);
+    });
+  });
+
+  describe('attributes', () => {
+    it('carries trimmed attributes on both enabled exporter variants', () => {
+      const attributes = {
+        ' deployment.environment.name ': ' staging ',
+        'team.name': ' platform ',
+      };
+
+      expect([
+        resolveOtelConfig({ otel: { exporter: 'otlp', endpoint: 'http://localhost:4318', attributes } }, PIPELINE_DIR),
+        resolveOtelConfig({ otel: { exporter: 'file', attributes } }, PIPELINE_DIR),
+      ]).toMatchObject([
+        {
+          enabled: true,
+          attributes: { 'deployment.environment.name': 'staging', 'team.name': 'platform' },
+          attributeWarnings: [],
+        },
+        {
+          enabled: true,
+          attributes: { 'deployment.environment.name': 'staging', 'team.name': 'platform' },
+          attributeWarnings: [],
+        },
+      ]);
+    });
+
+    it('retains sixteen valid attributes in declaration order with no warnings', () => {
+      const attributes = Object.fromEntries(
+        Array.from({ length: 16 }, (_, index) => [`example.attribute${index + 1}`, `value${index + 1}`]),
+      );
+
+      expect(resolveOtelConfig({ otel: { exporter: 'file', attributes } }, PIPELINE_DIR)).toMatchObject({
+        enabled: true,
+        attributes,
+        attributeWarnings: [],
+      });
+    });
+
+    it('resolves an empty attributes map exactly like an absent map without leaking placeholders', () => {
+      // Regression guard: these are the pre-attributes default exporter fixtures.
+      const absent = resolveOtelConfig({ otel: { exporter: 'file' } }, PIPELINE_DIR);
+      const empty = resolveOtelConfig({ otel: { exporter: 'file', attributes: {} } }, PIPELINE_DIR);
+
+      expect(empty).toEqual(absent);
+      expect(Object.hasOwn(absent, 'attributes')).toBe(false);
+      expect(Object.hasOwn(absent, 'attributeWarnings')).toBe(false);
+    });
+
+    it('drops an attribute key without a namespace while retaining valid siblings', () => {
+      const result = resolveOtelConfig(
+        { otel: { exporter: 'file', attributes: { 'team.name': 'platform', team: 'platform' } } },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: { 'team.name': 'platform' },
+        attributeWarnings: [expect.stringMatching(/team.*namespaced.*dot/i)],
+      });
+    });
+
+    it.each(['service.name', 'conductor.project', 'host.name'])('drops the reserved %s prefix while retaining valid siblings', (key) => {
+      const result = resolveOtelConfig(
+        { otel: { exporter: 'file', attributes: { 'team.name': 'platform', [key]: 'operator-value' } } },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: { 'team.name': 'platform' },
+        attributeWarnings: [expect.stringMatching(new RegExp(`${key}.*${key.split('.')[0]}\\.`, 'i'))],
+      });
+    });
+
+    it.each([
+      ['a number', 1],
+      ['a boolean', true],
+      ['a list', ['platform']],
+      ['an environment reference', { env: 'OTEL_ATTRIBUTE_VALUE' }],
+    ])('drops %s attribute values while retaining valid siblings', (_caseName, value) => {
+      const result = resolveOtelConfig(
+        { otel: { exporter: 'file', attributes: { 'team.name': 'platform', 'invalid.value': value } } as never },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: { 'team.name': 'platform' },
+        attributeWarnings: [expect.stringMatching(/invalid\.value.*literal string/i)],
+      });
+    });
+
+    it.each([
+      ['an empty key', '', 'platform', /''/],
+      ['a whitespace-only key', '   ', 'platform', /''/],
+      ['an empty value', 'invalid.value', '', /invalid\.value/],
+      ['a whitespace-only value', 'invalid.value', '   ', /invalid\.value/],
+    ])('drops %s while retaining valid siblings', (_caseName, key, value, warningKey) => {
+      const result = resolveOtelConfig(
+        { otel: { exporter: 'file', attributes: { 'team.name': 'platform', [key]: value } } },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: { 'team.name': 'platform' },
+        attributeWarnings: [expect.stringMatching(warningKey)],
+      });
+    });
+
+    it('retains the first sixteen declaration-ordered attributes and warns for the seventeenth', () => {
+      const attributes = Object.fromEntries(
+        Array.from({ length: 17 }, (_, index) => [`example.attribute${index + 1}`, `value${index + 1}`]),
+      );
+      const result = resolveOtelConfig({ otel: { exporter: 'file', attributes } }, PIPELINE_DIR);
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: Object.fromEntries(Object.entries(attributes).slice(0, 16)),
+        attributeWarnings: [expect.stringMatching(/example\.attribute17.*16/i)],
+      });
+    });
+
+    it.each(['not-a-mapping', ['not-a-mapping']])('retains an enabled empty map for a non-mapping attributes block', (attributes) => {
+      const result = resolveOtelConfig(
+        { otel: { exporter: 'file', attributes } as never },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: {},
+        attributeWarnings: [expect.stringMatching(/otel\.attributes.*mapping/i)],
+      });
+    });
+
+    it('keeps the exporter enabled with an empty map when every attribute is invalid', () => {
+      const result = resolveOtelConfig(
+        { otel: { exporter: 'file', attributes: { team: 'platform', 'service.name': 'operator' } } },
+        PIPELINE_DIR,
+      );
+
+      expect(result).toMatchObject({
+        enabled: true,
+        attributes: {},
+        attributeWarnings: [expect.stringMatching(/team/), expect.stringMatching(/service\.name/)],
+      });
     });
   });
 });

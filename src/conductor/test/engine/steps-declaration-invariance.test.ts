@@ -21,23 +21,22 @@ const expectedPolicies: Record<ComplexityTier, {
       'coherence_check',
       'acceptance_specs',
       'manual_test',
-      'retro',
     ],
-    enabledGateSteps: ['prd', 'stories', 'plan', 'wiring_check', 'test_suite', 'build_review', 'prd_audit', 'architecture_review_as_built', 'finish'],
+    enabledGateSteps: ['prd', 'stories', 'plan', 'coverage_binding', 'test_suite', 'build_review', 'prd_audit', 'architecture_review_as_built', 'finish'],
   },
   M: {
     skippedSteps: [],
     enabledGateSteps: [
-      'prd', 'stories', 'conflict_check', 'plan', 'coherence_check', 'acceptance_specs',
-      'wiring_check', 'test_suite', 'build_review', 'manual_test', 'prd_audit',
+      'prd', 'stories', 'conflict_check', 'plan', 'coherence_check', 'coverage_binding', 'acceptance_specs',
+      'test_suite', 'build_review', 'manual_test', 'prd_audit',
       'architecture_review_as_built', 'finish',
     ],
   },
   L: {
     skippedSteps: [],
     enabledGateSteps: [
-      'prd', 'stories', 'conflict_check', 'plan', 'coherence_check', 'acceptance_specs',
-      'wiring_check', 'test_suite', 'build_review', 'manual_test', 'prd_audit',
+      'prd', 'stories', 'conflict_check', 'plan', 'coherence_check', 'coverage_binding', 'acceptance_specs',
+      'test_suite', 'build_review', 'manual_test', 'prd_audit',
       'architecture_review_as_built', 'finish',
     ],
   },

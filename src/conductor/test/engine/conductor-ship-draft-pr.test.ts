@@ -59,8 +59,7 @@ describe('conductor opens a draft implementation PR at SHIP-phase start', () => 
     acceptance_specs: 'done',
     build: 'done',
     build_review: 'done',
-    wiring_check: 'done',
-    test_suite: 'done',
+     test_suite: 'done',
     worktree_branch: BRANCH,
     feature_desc: 'widget import flow',
   };
@@ -135,8 +134,7 @@ describe('conductor opens a draft implementation PR at SHIP-phase start', () => 
         acceptance_specs: 'done',
         build: 'done',
         build_review: 'done',
-        wiring_check: 'done',
-        test_suite: 'done',
+         test_suite: 'done',
         feature_desc: 'widget import flow',
       }),
       'utf8',
@@ -330,8 +328,7 @@ describe('the retained SHIP PR is presentable before the first SHIP consumer', (
     acceptance_specs: 'done',
     build: 'done',
     build_review: 'done',
-    wiring_check: 'done',
-    test_suite: 'done',
+     test_suite: 'done',
     worktree_branch: BRANCH,
     feature_desc: 'widget import flow',
   };
@@ -435,7 +432,7 @@ describe('the retained SHIP PR is presentable before the first SHIP consumer', (
         steps: {
           'release-disposition': customShipStep(
             '.agents/skills/release-disposition/SKILL.md',
-            'retro',
+            'rebase',
           ),
         },
       } as never,
@@ -481,7 +478,7 @@ describe('the retained SHIP PR is presentable before the first SHIP consumer', (
       projectRoot: dir,
       config: {
         steps: {
-          'compliance-attest': customShipStep('.agents/skills/compliance-attest/SKILL.md', 'retro'),
+          'compliance-attest': customShipStep('.agents/skills/compliance-attest/SKILL.md', 'rebase'),
         },
       } as never,
       fromStep: 'manual_test',
@@ -516,7 +513,7 @@ describe('the retained SHIP PR is presentable before the first SHIP consumer', (
         steps: {
           'release-disposition': customShipStep(
             '.agents/skills/release-disposition/SKILL.md',
-            'retro',
+            'rebase',
           ),
         },
       } as never,

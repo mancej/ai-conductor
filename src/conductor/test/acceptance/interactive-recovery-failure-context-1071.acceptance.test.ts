@@ -89,6 +89,9 @@ async function seedAllArtifactsExceptTaskStatus(dir: string): Promise<void> {
     ['.docs/architecture/arch.md', 'x'],
     ['.docs/decisions/adr-001.md', 'x'],
     ['.docs/coherence/coherence.md', 'x'],
+    ['.pipeline/coverage-binding.json', JSON.stringify({
+      version: 1, slug: 'interactive-recovery-1071', runId: 'test-run', status: 'disabled', entries: [],
+    })],
     ['spec/acceptance/feature_spec.rb', 'x'],
     [
       '.pipeline/acceptance-specs-red.json',
@@ -106,7 +109,6 @@ async function seedAllArtifactsExceptTaskStatus(dir: string): Promise<void> {
         intentRationale: 'The fixture records an executed, failing feature acceptance spec.',
       }),
     ],
-    ['.docs/retros/2026-07-23-retro.md', 'x'],
   ];
   for (const [rel, content] of artifacts) {
     const full = join(dir, rel);

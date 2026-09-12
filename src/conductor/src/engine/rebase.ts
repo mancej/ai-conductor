@@ -289,7 +289,7 @@ export async function resolveFreshBase(
     // behavior) over `localBase` (the current branch) — using the current
     // branch as the merge-base ref makes merge-base(ref, HEAD) === HEAD,
     // handing the grader an empty diff (build-review-grades-plan-vs-diff-
-    // against-a-stale-o retro).
+    // against a stale base).
     const fallbackBranch = (await localDefaultBranch(git)) ?? localBase;
     return {
       ref: fallbackBranch,
@@ -410,6 +410,30 @@ export async function changedPathsBetween(
     .filter((l) => l.length > 0);
 }
 
+/**
+ * The paths contributed by a branch since it diverged from a base ref. A
+ * missing merge base is distinguishable from a successful, empty comparison.
+ */
+export async function changedPathsSinceMergeBase(
+  git: GitRunner,
+  baseRef: string,
+  branchRef: string,
+): Promise<string[] | null> {
+  const mergeBase = await git(['merge-base', baseRef, branchRef]);
+  const fromRef = mergeBase.stdout.trim();
+  if (mergeBase.exitCode !== 0 || !fromRef) return null;
+  // This scan must distinguish a failed diff from a clean, empty result.
+  // Keep the legacy helper and its other callers' behavior unchanged.
+  const checkedGit: GitRunner = async (args) => {
+    const result = await git(args);
+    if (result.exitCode !== 0) {
+      throw new Error(`git diff failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    return result;
+  };
+  return changedPathsBetween(checkedGit, fromRef, branchRef);
+}
+
 // ── Conflict inspection ──────────────────────────────────────────────────────
 
 /** Files git reports as unmerged (conflicted) during a paused rebase. */
@@ -446,27 +470,37 @@ export async function rebaseStateActive(
 
 // ── HALT (FR-8) ──────────────────────────────────────────────────────────────
 
+export type RebaseResumeShape = 'paused-rebase' | 'completed-rebase';
+
 /**
- * Park for a human: write `.pipeline/HALT` listing the conflicted files and the
- * resume procedure. The rebase is LEFT PAUSED (no `--abort`); the caller must
- * not mark the feature processed, continue, or open a PR.
+ * Park for a human: write `.pipeline/HALT` with the appropriate resume
+ * procedure. A paused-rebase halt leaves the rebase paused (no `--abort`); the
+ * caller must not mark the feature processed, continue, or open a PR.
  */
 export async function writeHalt(
   projectRoot: string,
   conflicts: string[],
   extraReason?: string,
   events?: ConductorEventEmitter,
+  resumeShape: RebaseResumeShape = 'paused-rebase',
 ): Promise<HaltMarkerWriteResult> {
-  const fileList = conflicts.length > 0 ? conflicts.join(', ') : '(unknown)';
   const note =
-    `rebase conflict — parked for human resolution\n` +
-    (extraReason ? `${extraReason}\n` : '') +
-    `Conflicted files: ${fileList}\n\n` +
-    `Resume procedure:\n` +
-    `  1. Resolve the conflicts in the listed file(s).\n` +
-    `  2. git rebase --continue\n` +
-    `  3. rm .pipeline/HALT\n` +
-    `  4. Re-queue the feature for the daemon.\n`;
+    resumeShape === 'completed-rebase'
+      ? `rebase completed — parked for human review\n` +
+        (extraReason ? `${extraReason}\n` : '') +
+        `\nResume procedure:\n` +
+        `  1. Review the completed rebase and restore any missing feature content.\n` +
+        `  2. Confirm the working tree is clean.\n` +
+        `  3. rm .pipeline/HALT\n` +
+        `  4. Re-queue the feature for the daemon.\n`
+      : `rebase conflict — parked for human resolution\n` +
+        (extraReason ? `${extraReason}\n` : '') +
+        `Conflicted files: ${conflicts.length > 0 ? conflicts.join(', ') : '(unknown)'}\n\n` +
+        `Resume procedure:\n` +
+        `  1. Resolve the conflicts in the listed file(s).\n` +
+        `  2. git rebase --continue\n` +
+        `  3. rm .pipeline/HALT\n` +
+        `  4. Re-queue the feature for the daemon.\n`;
   return writeHaltMarker(projectRoot, note, 'needs-human', events);
 }
 
@@ -511,7 +545,13 @@ export type RebaseOutcome =
       allChangedPaths?: string[];
       featureSurface?: string[];
     }
-  | { kind: 'conflict_halt'; conflicts: string[]; reason: string };
+  | {
+      kind: 'conflict_halt';
+      conflicts: string[];
+      reason: string;
+      /** A completed rebase failed a post-resolution acceptance guard. */
+      resumeShape?: RebaseResumeShape;
+    };
 
 /** A protected-artifact refusal raised before git starts a rebase. */
 export class ProtectedArtifactSealRejection extends Error {
@@ -870,6 +910,43 @@ interface DroppedFileEdit {
   removed: string[];
 }
 
+export type SupersessionVerdict =
+  | { kind: 'superseded' }
+  | {
+    kind: 'rejected';
+    cause: 'unreadable commit diff' | 'binary commit diff' | 'empty commit diff'
+      | 'deleted file still present' | 'added content absent'
+      | 'unreadable parent file' | 'removed content reappeared';
+    path: string | null;
+  };
+
+export type FeatureCommitPreservationVerdict =
+  | { kind: 'preserved' }
+  | { kind: 'rejected'; missing: FeatureCommitPreservationFailure[] };
+
+export interface FeatureCommitPreservationFailure {
+  subject: string;
+  sha?: string;
+  cause: Extract<SupersessionVerdict, { kind: 'rejected' }>['cause']
+    | 'could not resolve pre-rebase commit';
+  path: string | null;
+}
+
+/** Render missing feature-commit evidence for the two acceptance-guard callers. */
+export function formatFeatureCommitPreservationRejection(
+  verdict: Extract<FeatureCommitPreservationVerdict, { kind: 'rejected' }>,
+): string {
+  const limit = 3;
+  const entries = verdict.missing.slice(0, limit).map(({ subject, sha, cause, path }) => {
+    const identity = sha ? ` (${sha.slice(0, 12)}; ` : ' (';
+    const evidence = path ? `${cause}: ${path}` : cause;
+    return `${subject}${identity}${evidence})`;
+  });
+  const omitted = verdict.missing.length - limit;
+  const more = omitted > 0 ? `; and ${omitted} more missing subject(s) omitted` : '';
+  return `feature commit(s) lost during resolution: ${entries.join('; ')}${more}`;
+}
+
 /** Count each line of `content`, trimmed. Blank lines are not counted. */
 function lineCounts(content: string): Map<string, number> {
   const counts = new Map<string, number>();
@@ -881,51 +958,69 @@ function lineCounts(content: string): Map<string, number> {
 }
 
 /** Split a `git show -U0` body into one record per file it touched. */
-function parseDroppedCommitDiff(diff: string): DroppedFileEdit[] | null {
+function parseDroppedCommitDiff(diff: string): DroppedFileEdit[] | { binaryPath: string | null } {
   const edits: DroppedFileEdit[] = [];
   let current: DroppedFileEdit | null = null;
+  let currentPath: string | null = null;
+  let inHunk = false;
   for (const line of diff.split('\n')) {
     if (line.startsWith('diff --git ')) {
       current = { oldPath: null, newPath: null, added: [], removed: [] };
       edits.push(current);
+      currentPath = /^diff --git a\/.+ b\/(.+)$/.exec(line)?.[1] ?? null;
+      inHunk = false;
       continue;
     }
-    if (line.startsWith('Binary files') || line.startsWith('GIT binary patch')) return null;
-    if (current === null || line.startsWith('@@')) continue;
+    if (line.startsWith('Binary files')) {
+      const target = /^Binary files a\/.+ and b\/(.+) differ$/.exec(line)?.[1];
+      return { binaryPath: target ?? current?.newPath ?? current?.oldPath ?? currentPath };
+    }
+    if (line.startsWith('GIT binary patch')) {
+      return { binaryPath: current?.newPath ?? current?.oldPath ?? currentPath };
+    }
+    if (current === null) continue;
+    if (line.startsWith('@@')) {
+      inHunk = true;
+      continue;
+    }
+    if (inHunk) {
+      if (line.startsWith('+')) {
+        const body = line.slice(1).trim();
+        if (body) current.added.push(body);
+      } else if (line.startsWith('-')) {
+        const body = line.slice(1).trim();
+        if (body) current.removed.push(body);
+      }
+      continue;
+    }
     if (line.startsWith('--- ')) {
       const source = line.slice(4).trim();
       current.oldPath = source === '/dev/null' ? null : source.replace(/^a\//, '');
     } else if (line.startsWith('+++ ')) {
       const target = line.slice(4).trim();
       current.newPath = target === '/dev/null' ? null : target.replace(/^b\//, '');
-    } else if (line.startsWith('+')) {
-      const body = line.slice(1).trim();
-      if (body) current.added.push(body);
-    } else if (line.startsWith('-')) {
-      const body = line.slice(1).trim();
-      if (body) current.removed.push(body);
     }
   }
   return edits;
 }
 
-async function supersededByBase(git: GitRunner, sha: string): Promise<boolean> {
+export async function supersededByBase(git: GitRunner, sha: string): Promise<SupersessionVerdict> {
   // -U0: hunk bodies carry only the commit's own +/- lines, no context.
   const show = await git(['show', '--format=', '--unified=0', '--no-renames', sha]);
-  if (show.exitCode !== 0) return false;
+  if (show.exitCode !== 0) return { kind: 'rejected', cause: 'unreadable commit diff', path: null };
   const edits = parseDroppedCommitDiff(show.stdout);
-  if (edits === null) return false;
+  if (!Array.isArray(edits)) return { kind: 'rejected', cause: 'binary commit diff', path: edits.binaryPath };
   // A commit with no diff offers no evidence that its intent survives. Absence
   // of evidence is not supersession: fail closed and let the HALT stand.
-  if (edits.length === 0) return false;
+  if (edits.length === 0) return { kind: 'rejected', cause: 'empty commit diff', path: null };
 
   for (const edit of edits) {
     if (edit.newPath === null) {
       // The commit deleted the file: its intent survives only if HEAD has no
       // such file either.
-      if (edit.oldPath === null) return false;
+      if (edit.oldPath === null) return { kind: 'rejected', cause: 'unreadable commit diff', path: null };
       const stillThere = await git(['cat-file', '-e', `HEAD:${edit.oldPath}`]);
-      if (stillThere.exitCode === 0) return false;
+      if (stillThere.exitCode === 0) return { kind: 'rejected', cause: 'deleted file still present', path: edit.oldPath };
       continue;
     }
 
@@ -933,14 +1028,14 @@ async function supersededByBase(git: GitRunner, sha: string): Promise<boolean> {
     if (head.exitCode !== 0) {
       // HEAD dropped the file. Anything the commit added is gone with it; a
       // pure deletion's intent is satisfied.
-      if (edit.added.length > 0) return false;
+      if (edit.added.length > 0) return { kind: 'rejected', cause: 'added content absent', path: edit.newPath };
       continue;
     }
     const headCounts = lineCounts(head.stdout);
 
     // Additions must be present at least as often as the commit introduced them.
     for (const [line, count] of lineCounts(edit.added.join('\n'))) {
-      if ((headCounts.get(line) ?? 0) < count) return false;
+      if ((headCounts.get(line) ?? 0) < count) return { kind: 'rejected', cause: 'added content absent', path: edit.newPath };
     }
 
     // Removals are judged against the commit's OWN parent, not by bare presence:
@@ -949,13 +1044,13 @@ async function supersededByBase(git: GitRunner, sha: string): Promise<boolean> {
     if (edit.removed.length === 0) continue;
     const parentPath = edit.oldPath ?? edit.newPath;
     const parent = await git(['show', `${sha}^:${parentPath}`]);
-    if (parent.exitCode !== 0) return false;
+    if (parent.exitCode !== 0) return { kind: 'rejected', cause: 'unreadable parent file', path: parentPath };
     const parentCounts = lineCounts(parent.stdout);
     for (const [line, count] of lineCounts(edit.removed.join('\n'))) {
-      if ((headCounts.get(line) ?? 0) > (parentCounts.get(line) ?? 0) - count) return false;
+      if ((headCounts.get(line) ?? 0) > (parentCounts.get(line) ?? 0) - count) return { kind: 'rejected', cause: 'removed content reappeared', path: edit.newPath };
     }
   }
-  return true;
+  return { kind: 'superseded' };
 }
 
 /**
@@ -970,25 +1065,31 @@ async function supersededByBase(git: GitRunner, sha: string): Promise<boolean> {
  * the tip git recorded before replaying) and put through {@link supersededByBase}
  * before the guard reports loss. A subject that cannot be resolved fails closed.
  *
- * Empty `subjectsBefore` → true (nothing to lose).
+ * Empty `subjectsBefore` → preserved (nothing to lose).
  */
 export async function featureCommitsPreserved(
   git: GitRunner,
   baseRef: string,
   subjectsBefore: string[],
-): Promise<boolean> {
-  if (subjectsBefore.length === 0) return true;
+): Promise<FeatureCommitPreservationVerdict> {
+  if (subjectsBefore.length === 0) return { kind: 'preserved' };
   const r = await git(['log', '--format=%s', `${baseRef}..HEAD`]);
-  if (r.exitCode !== 0) return false;
+  if (r.exitCode !== 0) return {
+    kind: 'rejected',
+    missing: subjectsBefore.map((subject) => ({ subject, cause: 'could not resolve pre-rebase commit', path: null })),
+  };
   const currentSubjects = new Set(
     r.stdout.split('\n').map((l) => l.trim()).filter((l) => l.length > 0),
   );
   const missing = subjectsBefore.filter((s) => !currentSubjects.has(s));
-  if (missing.length === 0) return true;
+  if (missing.length === 0) return { kind: 'preserved' };
 
   // NUL-delimited so a subject containing whitespace still splits correctly.
   const pre = await git(['log', '--format=%H%x00%s', `${baseRef}..ORIG_HEAD`]);
-  if (pre.exitCode !== 0) return false;
+  if (pre.exitCode !== 0) return {
+    kind: 'rejected',
+    missing: missing.map((subject) => ({ subject, cause: 'could not resolve pre-rebase commit', path: null })),
+  };
   const shaBySubject = new Map<string, string>();
   for (const line of pre.stdout.split('\n')) {
     const [sha, subject] = line.split('\0');
@@ -997,12 +1098,19 @@ export async function featureCommitsPreserved(
     if (!shaBySubject.has(subject.trim())) shaBySubject.set(subject.trim(), sha.trim());
   }
 
+  const rejected: FeatureCommitPreservationFailure[] = [];
   for (const subject of missing) {
     const sha = shaBySubject.get(subject);
-    if (!sha) return false;
-    if (!(await supersededByBase(git, sha))) return false;
+    if (!sha) {
+      rejected.push({ subject, cause: 'could not resolve pre-rebase commit', path: null });
+      continue;
+    }
+    const supersession = await supersededByBase(git, sha);
+    if (supersession.kind === 'rejected') {
+      rejected.push({ subject, sha, cause: supersession.cause, path: supersession.path });
+    }
   }
-  return true;
+  return rejected.length === 0 ? { kind: 'preserved' } : { kind: 'rejected', missing: rejected };
 }
 
 /**
@@ -1111,15 +1219,18 @@ export async function resolveRebaseConflicts(
         kind: 'conflict_halt',
         conflicts,
         reason: 'rebase resolution left the branch not current with base',
+        resumeShape: 'completed-rebase',
       };
     }
 
     // FR-9: every pre-rebase feature commit subject must still be present.
-    if (!(await featureCommitsPreserved(git, onto, subjectsBefore))) {
+    const preserved = await featureCommitsPreserved(git, onto, subjectsBefore);
+    if (preserved.kind === 'rejected') {
       return {
         kind: 'conflict_halt',
         conflicts,
-        reason: 'rebase resolution dropped feature commit(s)',
+        reason: formatFeatureCommitPreservationRejection(preserved),
+        resumeShape: 'completed-rebase',
       };
     }
 
@@ -1251,8 +1362,17 @@ export async function applyRebaseVerdicts(
   projectRoot: string,
   outcome: RebaseOutcome,
   ranManualTest: boolean,
-  preVerify?: (step: StepName) => Promise<{ done: boolean; reason?: string }>,
-): Promise<{ satisfied: boolean; kickedBack: StepName[]; reverified: StepName[] }> {
+  preVerify?: (step: StepName) => Promise<{
+    done: boolean;
+    reason?: string;
+    preservationBasis?: 'test_suite_drift_budget';
+  }>,
+): Promise<{
+  satisfied: boolean;
+  kickedBack: StepName[];
+  reverified: StepName[];
+  preserved?: Array<{ gate: StepName; basis: 'test_suite_drift_budget' }>;
+}> {
   if (outcome.kind === 'conflict_halt') {
     await writeVerdict(projectRoot, 'rebase', {
       satisfied: false,
@@ -1290,6 +1410,7 @@ export async function applyRebaseVerdicts(
       : '');
   const kickedBack: StepName[] = [];
   const reverified: StepName[] = [];
+  const preserved: Array<{ gate: StepName; basis: 'test_suite_drift_budget' }> = [];
 
   // Pre-verify every gate whose registry declaration says its completion
   // predicate mechanically attests the current tree/history. A successful
@@ -1304,11 +1425,16 @@ export async function applyRebaseVerdicts(
         if (!verification.done) continue;
         await writeVerdict(projectRoot, gate.name, {
           satisfied: true,
-          reason: 're-verified mechanically after file-changing rebase — evidence remains intact',
+          reason: verification.preservationBasis === 'test_suite_drift_budget'
+            ? 're-verified mechanically after file-changing rebase — test-suite PASS preserved within drift budget'
+            : 're-verified mechanically after file-changing rebase — evidence remains intact',
           checkedAt: Date.now(),
         });
         reverified.push(gate.name);
         reverifiedGates.add(gate.name);
+        if (verification.preservationBasis === 'test_suite_drift_budget') {
+          preserved.push({ gate: gate.name, basis: verification.preservationBasis });
+        }
       } catch {
         // Any pre-verify error fails closed through the kickback below.
       }
@@ -1336,25 +1462,12 @@ export async function applyRebaseVerdicts(
   const partition = outcome.featureSurface !== undefined
     ? classifyGateInvalidation(outcome.changedCodePaths, outcome.featureSurface, ranManualTest)
     : undefined;
-  const targets: StepName[] =
-    partition !== undefined
-      ? (['build', ...partition.invalidated] as StepName[])
-      : ranManualTest
-        ? ([
-            'build',
-            'test_suite',
-            'build_review',
-            'manual_test',
-            'prd_audit',
-            'architecture_review_as_built',
-          ] as StepName[])
-        : ([
-            'build',
-            'test_suite',
-            'build_review',
-            'prd_audit',
-            'architecture_review_as_built',
-          ] as StepName[]);
+  const targets: StepName[] = partition !== undefined
+    ? (['build', ...partition.invalidated] as StepName[])
+    : ([
+        'build',
+        ...Object.keys(GATE_SURFACE).filter((gate) => ranManualTest || gate !== 'manual_test'),
+      ] as StepName[]);
   for (const target of targets) {
     // A successful tree-attesting pre-verify has already written this gate's
     // fresh satisfied verdict, so it is not kicked back.
@@ -1369,7 +1482,12 @@ export async function applyRebaseVerdicts(
     });
     kickedBack.push(target);
   }
-  return { satisfied: true, kickedBack, reverified };
+  return {
+    satisfied: true,
+    kickedBack,
+    reverified,
+    ...(preserved.length === 0 ? {} : { preserved }),
+  };
 }
 
 /**
@@ -1421,16 +1539,38 @@ export async function recordRebaseStepCompletion(
  * `matchedPaths` above (empty for a preserved gate, by construction — that
  * emptiness is precisely why it was preserved).
  *
- * A no-op when the outcome isn't a file-changing rebase, or `featureSurface`
- * is unavailable (classifyGateInvalidation cannot be applied — see the
- * fixed-set fallback in applyRebaseVerdicts).
+ * A no-op when the outcome isn't a file-changing rebase. When `featureSurface`
+ * is unavailable, `classifyGateInvalidation` cannot be applied — see the
+ * fixed-set fallback in applyRebaseVerdicts — so no classification-derived
+ * event is emitted. A `preverifiedPreserved` gate is still emitted on that
+ * path (S7.5): its preservation was established mechanically by the
+ * pre-verify, independently of F, so it is knowable when nothing else is.
+ * Omitting it left a real preservation invisible on the spine — neither
+ * invalidated nor preserved.
  */
 export async function emitGateInvalidationEvents(
   events: ConductorEventEmitter,
   outcome: RebaseOutcome,
   ranManualTest: boolean,
+  preverifiedPreserved: ReadonlyArray<{ gate: StepName; basis: 'test_suite_drift_budget' }> = [],
 ): Promise<void> {
-  if (outcome.kind !== 'changed' || outcome.featureSurface === undefined) return;
+  if (outcome.kind !== 'changed') return;
+
+  if (outcome.featureSurface === undefined) {
+    // F is uncomputable: no declared surface and no delta partition exist, so
+    // the event carries the pre-verified fact alone rather than fabricating a
+    // surface it cannot derive.
+    for (const { gate, basis } of preverifiedPreserved) {
+      await events.emit({
+        type: 'rebase_gate_preserved',
+        gate,
+        surface: ['<feature surface uncomputable>'],
+        deltaConsidered: [],
+        basis,
+      });
+    }
+    return;
+  }
 
   const { invalidated, preserved } = classifyGateInvalidation(
     outcome.changedCodePaths,
@@ -1443,6 +1583,7 @@ export async function emitGateInvalidationEvents(
   );
 
   const featureTest = featureTestPaths(outcome.changedCodePaths, outcome.featureSurface);
+  const preservationBases = new Map(preverifiedPreserved.map(({ gate, basis }) => [gate, basis]));
 
   const matchedPathsFor = (gate: string): string[] => {
     const surface = GATE_SURFACE[gate];
@@ -1470,6 +1611,7 @@ export async function emitGateInvalidationEvents(
   };
 
   for (const gate of invalidated) {
+    if (preservationBases.has(gate as StepName)) continue;
     await events.emit({
       type: 'rebase_gate_invalidated',
       gate: gate as StepName,
@@ -1477,12 +1619,15 @@ export async function emitGateInvalidationEvents(
     });
   }
 
-  for (const gate of preserved) {
+  for (const gate of new Set([...preserved, ...preservationBases.keys()])) {
     await events.emit({
       type: 'rebase_gate_preserved',
       gate: gate as StepName,
       surface: declaredSurfaceFor(gate),
       deltaConsidered: matchedPathsFor(gate),
+      ...(preservationBases.has(gate as StepName)
+        ? { basis: preservationBases.get(gate as StepName)! }
+        : {}),
     });
   }
 }

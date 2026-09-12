@@ -1,3 +1,7 @@
+/**
+ * Covers: task:5
+ */
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test: tmux-leak-guard (#377) — the suite-level net that catches kill-switch
 // escapes: any `cc-daemon-*` session created during the run is killed at
@@ -17,9 +21,36 @@ import {
   snapshotDaemonSessions,
   isTmpdirRooted,
   sessionPaneCwd,
+  makeTmuxRunner,
+  TMUX_COMMAND_TIMEOUT_MS,
   type TmuxRunner,
 } from '../tmux-leak-guard.js';
 import { applyTeardownDecision } from '../global-setup.js';
+
+describe('makeTmuxRunner — bounded invocation (2026-08-30 unresponsive-server wedge)', () => {
+  it('kills a client that never answers and classifies it as spawnError (fail closed)', () => {
+    // Stand-in for a tmux client waiting forever on a wedged server: a child
+    // that sleeps far past the timeout. Without the timeout this spawnSync
+    // blocks the whole globalSetup — the exact 0-CPU test-suite hang.
+    const runner = makeTmuxRunner({ command: 'sleep', timeoutMs: 500 });
+
+    const started = Date.now();
+    const result = runner(['30']);
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(result).toEqual({ code: 1, stdout: '', stderr: '', spawnError: true });
+  });
+
+  it('a timed-out listing degrades the snapshot to failed:true, never a trusted empty', () => {
+    const runner = makeTmuxRunner({ command: 'sleep', timeoutMs: 500 });
+    expect(snapshotDaemonSessions(() => runner(['1']))).toEqual({ sessions: [], failed: true });
+  });
+
+  it('still returns clean results for a fast, well-behaved command', () => {
+    const runner = makeTmuxRunner({ command: 'true', timeoutMs: TMUX_COMMAND_TIMEOUT_MS });
+    expect(runner([])).toEqual({ code: 0, stdout: '', stderr: '' });
+  });
+});
 
 describe('isTmpdirRooted (#437) — TR-2 tmpdir cwd corroboration', () => {
   it('is true for os.tmpdir() itself', () => {
@@ -284,6 +315,41 @@ describe('reapLeakedDaemonSessions (#437) — uncorroborated sessions are report
 });
 
 describe('sweepStaleDaemonSessions — permanent-baseline-blindspot fix', () => {
+  it('reaps a stranded restart-wiring fixture while leaving an operator session alone', () => {
+    const calls: string[][] = [];
+    const fixtureSession = 'cc-daemon-restart-wiring-stranded-fixture';
+    const operatorSession = 'cc-daemon-operator-checkout';
+    const runner: TmuxRunner = (args: string[]) => {
+      calls.push(args);
+      if (args[0] === 'list-sessions') {
+        return { code: 0, stdout: `${fixtureSession}\n${operatorSession}\n`, stderr: '' };
+      }
+      if (args[0] === 'display-message') {
+        const target = args[3];
+        if (target === `=${fixtureSession}:`) {
+          return { code: 0, stdout: `${os.tmpdir()}/daemon-restart-wiring-stranded\n`, stderr: '' };
+        }
+        if (target === `=${operatorSession}:`) {
+          return { code: 0, stdout: '/home/user/code/ai-conductor\n', stderr: '' };
+        }
+      }
+      if (args[0] === 'kill-session') {
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      throw new Error(`unexpected tmux invocation: ${args.join(' ')}`);
+    };
+
+    const result = sweepStaleDaemonSessions(runner);
+
+    expect(result.killed).toEqual([
+      `${fixtureSession} (pane cwd: ${os.tmpdir()}/daemon-restart-wiring-stranded)`,
+    ]);
+    expect(calls.filter((args) => args[0] === 'kill-session')).toEqual([
+      ['kill-session', '-t', `=${fixtureSession}`],
+    ]);
+    expect(result.killed.some((line) => line.includes(operatorSession))).toBe(false);
+  });
+
   it('kills a pre-existing tmpdir-rooted session with NO baseline involved at all', () => {
     const calls: string[][] = [];
     const runner: TmuxRunner = (args: string[]) => {

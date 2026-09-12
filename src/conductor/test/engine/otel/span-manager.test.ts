@@ -1,4 +1,6 @@
 /**
+ * Covers: task:1, task:7, task:8
+ *
  * span-manager.test.ts — unit tests for SpanManager via OtelVisualizer.
  *
  * Tests T10–T14 using OtelVisualizer + InMemorySpanExporter (same pattern as
@@ -14,9 +16,10 @@ import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { ConductorEventEmitter } from '../../../src/ui/events.js';
+import type { StepName } from '../../../src/types/steps.js';
 import { resolveOtelConfig } from '../../../src/engine/otel/otel-config.js';
 import { OtelVisualizer } from '../../../src/engine/otel/otel-visualizer.js';
-import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
+import { CapturingSpanExporter as InMemorySpanExporter } from '../../fixtures/capturing-span-exporter.js';
 import { InMemoryMetricExporter, AggregationTemporality } from '@opentelemetry/sdk-metrics';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -64,6 +67,33 @@ afterEach(async () => {
 // ── T10: Run span lifecycle ───────────────────────────────────────────────────
 
 describe('T10: run span lifecycle — one trace per run', () => {
+  it('exports completed step spans while the root remains open before a terminal event', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    try {
+      await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
+      await emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
+      await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+      await emitter.emit({ type: 'step_completed', step: 'explore', status: 'done' });
+
+      // Flush completed children without ending the still-open root span.
+      const { tracerProvider } = vis as unknown as {
+        tracerProvider: { forceFlush(): Promise<void> };
+      };
+      await tracerProvider.forceFlush();
+
+      const finishedSpans = spanExporter.getFinishedSpans();
+      expect(finishedSpans.filter((span) => span.parentSpanContext)).toHaveLength(2);
+      expect(finishedSpans.filter((span) => span.name === 'conductor.run')).toHaveLength(0);
+      expect(
+        finishedSpans.filter((span) => 'conductor.run.outcome' in span.attributes),
+      ).toHaveLength(0);
+    } finally {
+      await vis.stop();
+    }
+  });
+
   it('first event opens exactly one root span', async () => {
     const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
     vis.start(emitter);
@@ -78,7 +108,7 @@ describe('T10: run span lifecycle — one trace per run', () => {
     expect(roots[0].name).toBe('conductor.run');
   });
 
-  it('feature_complete closes the run span with OK status', async () => {
+  it('feature_complete closes the run span with complete outcome and OK status', async () => {
     const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
     vis.start(emitter);
 
@@ -88,20 +118,156 @@ describe('T10: run span lifecycle — one trace per run', () => {
     await vis.stop();
 
     const roots = spanExporter.getFinishedSpans().filter((s) => !s.parentSpanContext);
+    expect(roots[0].attributes['conductor.run.outcome']).toBe('complete');
     expect(roots[0].status.code).toBe(1 /* OK */);
   });
 
-  it('run ending without feature_complete closes run span on flush (forceCloseAll)', async () => {
+  it('bare feature_complete exports no spans and does not throw', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await expect(emitter.emit({ type: 'feature_complete' })).resolves.toBeUndefined();
+    await vis.stop();
+
+    expect(spanExporter.getFinishedSpans()).toHaveLength(0);
+  });
+
+  it('loop_halt closes the root as halted with halt attributes while its open step remains incomplete until flush', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    const { spanManager } = vis as unknown as {
+      spanManager: {
+        onLoopHalt(event: Extract<import('../../../src/types/events.js').ConductorEvent, { type: 'loop_halt' }>): void;
+      };
+    };
+    spanManager.onLoopHalt({
+      type: 'loop_halt',
+      step: 'build',
+      reason: 'missing task evidence',
+      haltClass: 'plan-gap',
+    });
+
+    const { tracerProvider } = vis as unknown as {
+      tracerProvider: { forceFlush(): Promise<void> };
+    };
+    await tracerProvider.forceFlush();
+
+    const root = spanExporter.getFinishedSpans().find((span) => !span.parentSpanContext)!;
+    expect(root.name).toBe('conductor.run');
+    expect(root.attributes['conductor.run.outcome']).toBe('halted');
+    expect(root.status.code).toBe(1 /* OK */);
+    expect(root.attributes['conductor.run.halt.step']).toBe('build');
+    expect(root.attributes['conductor.run.halt.reason']).toBe('missing task evidence');
+    expect(root.attributes['conductor.run.halt.class']).toBe('plan-gap');
+    expect(spanExporter.getFinishedSpans().find((span) => span.name === 'build')).toBeUndefined();
+
+    await vis.stop();
+
+    const step = spanExporter.getFinishedSpans().find((span) => span.name === 'build')!;
+    expect(step.status.code).toBe(2 /* ERROR */);
+    expect(step.attributes['conductor.incomplete']).toBe(true);
+  });
+
+  it('loop_halt omits absent optional halt attributes', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    const { spanManager } = vis as unknown as {
+      spanManager: {
+        onLoopHalt(event: Extract<import('../../../src/types/events.js').ConductorEvent, { type: 'loop_halt' }>): void;
+      };
+    };
+    spanManager.onLoopHalt({ type: 'loop_halt', reason: 'missing task evidence' });
+    await vis.stop();
+
+    const root = spanExporter.getFinishedSpans().find((span) => !span.parentSpanContext)!;
+    expect(root.attributes['conductor.run.halt.reason']).toBe('missing task evidence');
+    expect(Object.prototype.hasOwnProperty.call(root.attributes, 'conductor.run.halt.step')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(root.attributes, 'conductor.run.halt.class')).toBe(false);
+  });
+
+  it('orphan loop_halt warns once, returns safely, and exports no spans', async () => {
+    const warnings: string[] = [];
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir, (message) =>
+      warnings.push(message),
+    );
+    vis.start(emitter);
+    const { spanManager } = vis as unknown as {
+      spanManager: {
+        onLoopHalt(event: Extract<import('../../../src/types/events.js').ConductorEvent, { type: 'loop_halt' }>): void;
+      };
+    };
+
+    expect(() =>
+      spanManager.onLoopHalt({ type: 'loop_halt', reason: 'missing task evidence' }),
+    ).not.toThrow();
+    await vis.stop();
+
+    expect(warnings).toHaveLength(1);
+    expect(spanExporter.getFinishedSpans()).toHaveLength(0);
+  });
+
+  it('late loop_halt after feature_complete preserves the complete root span', async () => {
+    const warnings: string[] = [];
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir, (message) =>
+      warnings.push(message),
+    );
+    vis.start(emitter);
+    const { spanManager } = vis as unknown as {
+      spanManager: {
+        onLoopHalt(event: Extract<import('../../../src/types/events.js').ConductorEvent, { type: 'loop_halt' }>): void;
+      };
+    };
+
+    await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
+    await emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
+    await emitter.emit({ type: 'feature_complete' });
+    spanManager.onLoopHalt({ type: 'loop_halt', reason: 'late arrival' });
+    await vis.stop();
+
+    const roots = spanExporter.getFinishedSpans().filter((span) => !span.parentSpanContext);
+    expect(roots).toHaveLength(1);
+    expect(roots[0].attributes['conductor.run.outcome']).toBe('complete');
+    expect(warnings).toEqual([]);
+  });
+
+  it('forceCloseAll defaults the root outcome to terminated while an open step remains incomplete', async () => {
     const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
-    await emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
-    // No feature_complete — simulate abrupt termination
+    // No step_completed / feature_complete — simulate abrupt termination.
     await vis.stop();
 
     const roots = spanExporter.getFinishedSpans().filter((s) => !s.parentSpanContext);
-    expect(roots).toHaveLength(1); // closed on flush
+    expect(roots).toHaveLength(1);
+    expect(roots[0].attributes['conductor.run.outcome']).toBe('terminated');
+    expect(roots[0].status.code).toBe(1 /* OK */);
+
+    const step = spanExporter.getFinishedSpans().find((s) => s.name === 'bootstrap')!;
+    expect(step.status.code).toBe(2 /* ERROR */);
+    expect(step.attributes['conductor.incomplete']).toBe(true);
+  });
+
+  it('forceCloseAll preserves a prior halted root outcome', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+    const { spanManager } = vis as unknown as {
+      spanManager: {
+        onLoopHalt(event: Extract<import('../../../src/types/events.js').ConductorEvent, { type: 'loop_halt' }>): void;
+      };
+    };
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    spanManager.onLoopHalt({ type: 'loop_halt', reason: 'missing task evidence' });
+    await vis.stop();
+
+    const roots = spanExporter.getFinishedSpans().filter((s) => !s.parentSpanContext);
+    expect(roots).toHaveLength(1);
+    expect(roots[0].attributes['conductor.run.outcome']).toBe('halted');
   });
 
   it('two early events create only one root span (not duplicated)', async () => {
@@ -274,6 +440,129 @@ describe('T12: step span negatives — orphan and re-run', () => {
 // ── T13: Step span attributes ─────────────────────────────────────────────────
 
 describe('T13: step span attributes', () => {
+  it('records dispatch dimensions and fallback details on the completed step span', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'provider_attempt',
+      step: 'build',
+      provider: 'claude',
+      preferredProvider: 'codex',
+      fallbackReason: 'codex unavailable',
+      invoked: true,
+      outcome: 'success',
+    });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'build',
+      status: 'done',
+      model: 'sonnet',
+      effort: 'medium',
+      tier: 'S',
+      preferredProvider: 'codex',
+      actualProvider: 'claude',
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const span = spanExporter.getFinishedSpans().find((s) => s.name === 'build')!;
+    expect(span.attributes).toMatchObject({
+      'conductor.model': 'sonnet',
+      'conductor.effort': 'medium',
+      'conductor.complexity_tier': 'S',
+      'conductor.provider': 'claude',
+      'conductor.provider.preferred': 'codex',
+      'conductor.fallback': true,
+      'conductor.fallback.reason': 'codex unavailable',
+    });
+  });
+
+  it('omits the fallback reason when the provider attempt did not report one', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'claude', invoked: true, outcome: 'success',
+    });
+    await emitter.emit({ type: 'step_completed', step: 'build', status: 'done' });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const span = spanExporter.getFinishedSpans().find((s) => s.name === 'build')!;
+    expect(span.attributes).not.toHaveProperty('conductor.fallback.reason');
+  });
+
+  it('retains the latest complete attempted dimensions when a step fails', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'claude', preferredProvider: 'codex',
+      model: 'sonnet', effort: 'medium', tier: 'S', fallbackReason: 'codex unavailable',
+      invoked: true, outcome: 'failure',
+    });
+    await emitter.emit({
+      type: 'step_failed', step: 'build', error: 'provider failed', retryCount: 1,
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const span = spanExporter.getFinishedSpans().find((candidate) => candidate.name === 'build')!;
+    expect(span.attributes).toMatchObject({
+      'conductor.model': 'sonnet',
+      'conductor.effort': 'medium',
+      'conductor.complexity_tier': 'S',
+      'conductor.provider': 'claude',
+      'conductor.provider.preferred': 'codex',
+      'conductor.fallback': true,
+      'conductor.fallback.reason': 'codex unavailable',
+    });
+  });
+
+  it('preserves the first applicable fallback reason across candidate attempts', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'codex', preferredProvider: 'codex',
+      fallbackReason: 'codex unavailable', invoked: true, outcome: 'unavailable',
+    });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'claude', preferredProvider: 'codex',
+      invoked: true, outcome: 'success',
+    });
+    await emitter.emit({
+      type: 'step_completed', step: 'build', status: 'done', actualProvider: 'claude' });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const span = spanExporter.getFinishedSpans().find((candidate) => candidate.name === 'build')!;
+    expect(span.attributes['conductor.fallback.reason']).toBe('codex unavailable');
+  });
+
+  it('warns and does not create a span for an attempt without an open step', async () => {
+    const warnings: string[] = [];
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir, (message) =>
+      warnings.push(message),
+    );
+    vis.start(emitter);
+
+    await expect(emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'claude', invoked: true, outcome: 'success',
+    })).resolves.toBeUndefined();
+    await vis.stop();
+
+    expect({ warnings, spans: spanExporter.getFinishedSpans() }).toEqual({
+      warnings: ["provider_attempt for 'build' received but no open span exists — ignoring"],
+      spans: [],
+    });
+  });
+
   it('closed step span carries conductor.step, conductor.step.index, conductor.step.status, conductor.retry.count', async () => {
     const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
     vis.start(emitter);
@@ -330,6 +619,72 @@ describe('T13: step span attributes', () => {
     const span = spanExporter.getFinishedSpans().find((s) => s.name === 'stories')!;
     expect(span.attributes['conductor.step.status']).toBe('failed');
     expect(span.attributes['conductor.retry.count']).toBe(2);
+  });
+});
+
+// ── Task 8: TokenUsage span-only detail ────────────────────────────────────
+
+describe('Task 8: TokenUsage detail on step spans', () => {
+  it('exports only present finite usage detail attributes', async () => {
+    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    const complete = async (
+      step: StepName,
+      index: number,
+      tokenUsage?: Extract<import('../../../src/types/events.js').ConductorEvent, { type: 'step_completed' }>['tokenUsage'],
+    ) => {
+      await emitter.emit({ type: 'step_started', step, index });
+      await emitter.emit({ type: 'step_completed', step, status: 'done', tokenUsage });
+    };
+
+    await complete('bootstrap', 0, {
+      input: 100,
+      output: 50,
+      reasoningOutput: 1200,
+      numTurns: 7,
+      durationMs: 84_000,
+      costSource: 'provider',
+    });
+    await complete('memory', 1, {
+      input: 100,
+      output: 50,
+      costSource: 'rate-card',
+    });
+    await complete('assess', 2, { input: 100, output: 50, reasoningOutput: 4, numTurns: 2 });
+    await complete('explore', 3);
+    await complete('complexity', 4, { input: 100, output: 50, reasoningOutput: Number.NaN });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const usageAttributes = (step: string) => {
+      const attributes = spanExporter.getFinishedSpans().find((span) => span.name === step)!.attributes;
+      return Object.fromEntries(Object.entries(attributes).filter(([key]) => (
+        key.startsWith('conductor.usage.') || key === 'conductor.cost.source'
+      )));
+    };
+
+    expect({
+      full: usageAttributes('bootstrap'),
+      rateCard: usageAttributes('memory'),
+      codex: usageAttributes('assess'),
+      none: usageAttributes('explore'),
+      nonFinite: usageAttributes('complexity'),
+    }).toEqual({
+      full: {
+        'conductor.usage.reasoning_output': 1200,
+        'conductor.usage.turns': 7,
+        'conductor.usage.duration_ms': 84_000,
+        'conductor.cost.source': 'provider',
+      },
+      rateCard: { 'conductor.cost.source': 'rate-card' },
+      codex: {
+        'conductor.usage.reasoning_output': 4,
+        'conductor.usage.turns': 2,
+      },
+      none: {},
+      nonFinite: {},
+    });
   });
 });
 

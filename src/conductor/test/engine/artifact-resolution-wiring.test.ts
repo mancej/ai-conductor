@@ -19,12 +19,11 @@ const EXPECTED_CUSTOM_COMPLETION_PREDICATES = [
   'architecture_review_as_built',
   'build',
   'build_review',
+  'coverage_binding',
   'finish',
   'manual_test',
   'prd_audit',
-  'retro',
   'test_suite',
-  'wiring_check',
 ];
 
 function source(relativePath: string): ts.SourceFile {
@@ -179,11 +178,11 @@ function callsThisMethodWithSymbol(node: ts.Node, method: string, symbol: ts.Sym
   return found;
 }
 
-function isStepCompletionGuard(file: ts.SourceFile, expression: ts.Expression): boolean {
+function isReviewableArtifactsGuard(file: ts.SourceFile, expression: ts.Expression): boolean {
   if (!ts.isBinaryExpression(expression)) return false;
   if (expression.operatorToken.kind !== ts.SyntaxKind.AmpersandAmpersandToken) return false;
 
-  const expected = topLevelSymbol(file, 'stepHasCompletionCheck');
+  const expected = topLevelSymbol(file, 'stepDeclaresReviewableArtifacts');
   const left = expression.left;
   const right = expression.right;
   return (
@@ -207,7 +206,7 @@ function hasInteractiveArtifactReviewFlow(file: ts.SourceFile): boolean {
   if (!run) return false;
   let found = false;
   const visit = (node: ts.Node): void => {
-    if (!ts.isIfStatement(node) || !isStepCompletionGuard(file, node.expression)) {
+    if (!ts.isIfStatement(node) || !isReviewableArtifactsGuard(file, node.expression)) {
       if (!found) ts.forEachChild(node, visit);
       return;
     }
@@ -304,7 +303,6 @@ describe('artifact resolution production wiring', () => {
     const artifacts = source('engine/artifacts.ts');
     const conductor = source('engine/conductor.ts');
     const terminalRenderer = source('ui/terminal-renderer.ts');
-    const createRenderer = source('ui/create-renderer.ts');
     const predicateInventory = objectPropertyNames(artifacts, 'CUSTOM_COMPLETION_PREDICATES');
     const runtimePredicateInventory = Object.keys(CUSTOM_COMPLETION_PREDICATES).sort();
     const violations: string[] = [];
@@ -334,11 +332,6 @@ describe('artifact resolution production wiring', () => {
       )
     ) {
       violations.push('TerminalRenderer.collectArtifacts does not reach getArtifactStatus');
-    }
-    if (
-      !callsSymbol(createRenderer, namedBody(createRenderer, 'collectArtifacts'), 'getArtifactStatus')
-    ) {
-      violations.push('createRenderer collectArtifacts does not reach getArtifactStatus');
     }
     if (!hasExportedFunction(artifacts, 'findArtifactFiles') || typeof findArtifactFiles !== 'function') {
       violations.push('findArtifactFiles is not retained as an exported raw corpus API');

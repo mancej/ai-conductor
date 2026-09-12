@@ -3,7 +3,7 @@ set -euo pipefail
 
 # test_harness_integrity.sh — Validates harness structural integrity.
 # Checks bash syntax, SKILL.md frontmatter, agent/template references,
-# cross-skill references, and HARNESS.md model table completeness.
+# cross-skill references, and ARCHITECTURE.md model table completeness.
 #
 # Usage: ./test/test_harness_integrity.sh
 #
@@ -274,7 +274,7 @@ fi
 echo ""
 echo -e "${BOLD}3. Agent references${NC}"
 
-agent_refs=$(grep -roh 'agents/[a-z_-]*\.md' "${HARNESS_DIR}"/skills/ "${HARNESS_DIR}"/HARNESS.md 2>/dev/null | sort -u || true)
+agent_refs=$(grep -roh 'agents/[a-z_-]*\.md' "${HARNESS_DIR}"/skills/ "${HARNESS_DIR}"/HARNESS.md "${HARNESS_DIR}"/ARCHITECTURE.md 2>/dev/null | sort -u || true)
 if [ -z "$agent_refs" ]; then
   assert "no agent references found" 0
 else
@@ -343,21 +343,21 @@ for ref in $skill_refs; do
   fi
 done
 
-# ── 5. HARNESS.md model table ────────────────────────────────────────────────
+# ── 5. ARCHITECTURE.md model table ────────────────────────────────────────────────
 
 echo ""
-echo -e "${BOLD}5. HARNESS.md model table${NC}"
+echo -e "${BOLD}5. ARCHITECTURE.md model table${NC}"
 
 for skill_name in "${known_skills[@]}"; do
-  if grep -qE "\| ${skill_name}[ (|]" "${HARNESS_DIR}/HARNESS.md" 2>/dev/null; then
+  if grep -qE "\| ${skill_name}[ (|]" "${HARNESS_DIR}/ARCHITECTURE.md" 2>/dev/null; then
     assert "${skill_name} in model table" 0
   else
-    warn_check "${skill_name} — not in HARNESS.md model selection table" 1
+    warn_check "${skill_name} — not in ARCHITECTURE.md model selection table" 1
   fi
 done
 
 # ── 5a. Model-table drift gate ───────────────────────────────────────────────
-# bin/generate-model-table --check validates that HARNESS.md's generated
+# bin/generate-model-table --check validates that ARCHITECTURE.md's generated
 # model-selection table region matches what the TypeScript generator would
 # produce. The tool runs the TS source directly via the local tsx binary
 # (src/conductor/node_modules/.bin/tsx), so it's only runnable when
@@ -385,12 +385,12 @@ else
 
   case "$model_table_exit" in
     0)
-      assert "bin/generate-model-table --check — HARNESS.md model table matches source (no drift)" 0
+      assert "bin/generate-model-table --check — ARCHITECTURE.md model table matches source (no drift)" 0
       ;;
     1)
-      echo -e "  ${RED}FAIL${NC} bin/generate-model-table --check — drift detected in HARNESS.md model table"
+      echo -e "  ${RED}FAIL${NC} bin/generate-model-table --check — drift detected in ARCHITECTURE.md model table"
       echo "$model_table_output" | sed 's/^/    /'
-      assert "bin/generate-model-table --check — drift detected in HARNESS.md model table (remediation: run 'bin/generate-model-table' to regenerate)" 1
+      assert "bin/generate-model-table --check — drift detected in ARCHITECTURE.md model table (remediation: run 'bin/generate-model-table' to regenerate)" 1
       ;;
     2)
       echo -e "  ${RED}FAIL${NC} bin/generate-model-table --check — environment error"
@@ -405,11 +405,11 @@ else
   esac
 
   # Fixture sub-test: prove the provider-labelled contract is not a
-  # presence-only check. Run the real binary against a temporary HARNESS.md
+  # presence-only check. Run the real binary against a temporary ARCHITECTURE.md
   # whose Codex provider label is changed, then require both drift exit 1 and
   # a useful unified diff naming the changed and canonical labels.
   model_table_fixture="$(mktemp)"
-  cp "${HARNESS_DIR}/HARNESS.md" "$model_table_fixture"
+  cp "${HARNESS_DIR}/ARCHITECTURE.md" "$model_table_fixture"
   rewrite_with_sed "$model_table_fixture" \
     '1,/| Codex model |/s/| Codex model |/| Codex model-drift |/'
 
@@ -624,7 +624,7 @@ fi
 echo ""
 echo -e "${BOLD}6. Template references${NC}"
 
-template_refs=$(grep -roh 'templates/[a-z_.-]*\.template' "${HARNESS_DIR}"/skills/ "${HARNESS_DIR}"/HARNESS.md 2>/dev/null | sort -u || true)
+template_refs=$(grep -roh 'templates/[a-z_.-]*\.template' "${HARNESS_DIR}"/skills/ "${HARNESS_DIR}"/HARNESS.md "${HARNESS_DIR}"/ARCHITECTURE.md 2>/dev/null | sort -u || true)
 if [ -z "$template_refs" ]; then
   assert "no template references to check" 0
 else
@@ -780,14 +780,14 @@ if [ -f "$adr_template" ]; then
 fi
 
 # 9g. skills/architecture-review/SKILL.md (Medium/Large tier) must run
-# `conduct-ts overlap-scan` over the `## Wiring Surface` candidate paths
+# `ai-conductor overlap-scan` over the `## Wiring Surface` candidate paths
 # before `/plan`, and must state it is advisory. Without this wiring, the
 # Task 7 overlap-scan subcommand exists but is never invoked at DECIDE
 # time, so authors stay blind to unmerged dependent work (the bug this
 # plan fixes). This check ties the skill instruction to the CLI subcommand.
 arch_review_skill="${HARNESS_DIR}/skills/architecture-review/SKILL.md"
 if [ -f "$arch_review_skill" ]; then
-  if grep -q "conduct-ts overlap-scan" "$arch_review_skill" \
+  if grep -q "ai-conductor overlap-scan" "$arch_review_skill" \
     && grep -q "Wiring Surface" "$arch_review_skill" \
     && grep -qi "advisory" "$arch_review_skill" \
     && grep -q "/plan" "$arch_review_skill"; then
@@ -1127,15 +1127,15 @@ done
 assert ".docs/intake/*.md all carry an Owner: marker" "$missing_owner"
 
 # ── 12. /plan wires the overlap-scan subcommand ──────────────────────────────
-# skills/plan/SKILL.md must contain a step invoking `conduct-ts overlap-scan`
+# skills/plan/SKILL.md must contain a step invoking `ai-conductor overlap-scan`
 # over the plan's authoritative Files set before the plan is committed, and
 # must state the result is advisory (never blocks).
 echo ""
 echo -e "${BOLD}12. /plan overlap-scan step${NC}"
 plan_skill="${HARNESS_DIR}/skills/plan/SKILL.md"
 if [ -f "$plan_skill" ]; then
-  grep -q "conduct-ts overlap-scan" "$plan_skill"
-  assert "skills/plan/SKILL.md — invokes conduct-ts overlap-scan" $?
+  grep -q "ai-conductor overlap-scan" "$plan_skill"
+  assert "skills/plan/SKILL.md — invokes ai-conductor overlap-scan" $?
 
   grep -qi "advisory" "$plan_skill"
   assert "skills/plan/SKILL.md — overlap-scan step states result is advisory" $?
@@ -1198,6 +1198,43 @@ if [ -f "$plan_skill" ]; then
   assert "HARNESS.md — assigns whole-feature validation outside terminal plan tasks" $?
 else
   assert "skills/plan/SKILL.md exists" 1
+fi
+
+# ── 12b. Legacy CLI reference guard ─────────────────────────────────────────
+echo ""
+echo -e "${BOLD}12b. Legacy CLI references${NC}"
+legacy_cli_test="${HARNESS_DIR}/test/test_no_legacy_cli_references.sh"
+if [ -f "$legacy_cli_test" ]; then
+  set +e
+  legacy_cli_output=$(bash "$legacy_cli_test" 2>&1)
+  legacy_cli_exit=$?
+  set -e
+
+  if [ "$legacy_cli_exit" -eq 0 ]; then
+    assert "test/test_no_legacy_cli_references.sh — closed legacy-reference allowlist passes" 0
+  else
+    echo "$legacy_cli_output" | sed 's/^/    /'
+    assert "test/test_no_legacy_cli_references.sh — closed legacy-reference allowlist passes" 1
+  fi
+else
+  assert "test/test_no_legacy_cli_references.sh exists" 1
+fi
+
+legacy_cli_backend_test="${HARNESS_DIR}/test/test_legacy_cli_guard_backends.sh"
+if [ -f "$legacy_cli_backend_test" ]; then
+  set +e
+  legacy_cli_backend_output=$(bash "$legacy_cli_backend_test" 2>&1)
+  legacy_cli_backend_exit=$?
+  set -e
+
+  if [ "$legacy_cli_backend_exit" -eq 0 ]; then
+    assert "test/test_legacy_cli_guard_backends.sh — scanner backends fail closed identically" 0
+  else
+    echo "$legacy_cli_backend_output" | sed 's/^/    /'
+    assert "test/test_legacy_cli_guard_backends.sh — scanner backends fail closed identically" 1
+  fi
+else
+  assert "test/test_legacy_cli_guard_backends.sh exists" 1
 fi
 
 # ── 13. ci-detect-docs-only.sh predicate suite ──────────────────────────────
@@ -1404,7 +1441,7 @@ else
 fi
 
 # ── 20. Stories heading grammar agrees with the engine ─────────────────────
-# `splitStoryBlocks` (src/conductor/src/engine/artifacts.ts) splits a stories
+# `splitStoryBlocks` (src/conductor/src/engine/story-criteria.ts) splits a stories
 # file into per-story blocks by matching `## Story` + whitespace + an id. When
 # the /stories template teaches an id-less heading, nothing errors — the file
 # becomes one unnamed block, the per-story happy/negative gate runs once over
@@ -1416,18 +1453,18 @@ echo ""
 echo -e "${BOLD}20. Stories heading grammar agrees with the engine${NC}"
 
 stories_skill="${HARNESS_DIR}/skills/stories/SKILL.md"
-artifacts_ts="${HARNESS_DIR}/src/conductor/src/engine/artifacts.ts"
+story_criteria_ts="${HARNESS_DIR}/src/conductor/src/engine/story-criteria.ts"
 
-if [ ! -f "$stories_skill" ] || [ ! -f "$artifacts_ts" ]; then
-  assert "skills/stories/SKILL.md and src/conductor/src/engine/artifacts.ts exist" 1
+if [ ! -f "$stories_skill" ] || [ ! -f "$story_criteria_ts" ]; then
+  assert "skills/stories/SKILL.md and src/conductor/src/engine/story-criteria.ts exist" 1
 else
   # The engine's grammar, asserted to still be the one this check assumes. If
   # splitStoryBlocks' regex is ever changed, this fails first and names itself,
   # rather than letting the template silently drift to the new form.
-  if grep -qF 'const heading = /^##\s+Story\s+([A-Za-z0-9.\-]+)/i;' "$artifacts_ts"; then
+  if grep -qF 'const heading = /^##\s+Story\s+([A-Za-z0-9.\-]+)/i;' "$story_criteria_ts"; then
     assert "splitStoryBlocks still requires '## Story <id>' (engine grammar unchanged)" 0
   else
-    echo "    artifacts.ts#splitStoryBlocks no longer declares the expected heading regex." | sed 's/^/  /'
+    echo "    story-criteria.ts#splitStoryBlocks no longer declares the expected heading regex." | sed 's/^/  /'
     echo "    Update this check AND skills/stories/SKILL.md together." | sed 's/^/  /'
     assert "splitStoryBlocks still requires '## Story <id>' (engine grammar unchanged)" 1
   fi
@@ -1565,10 +1602,9 @@ else
   fi
 fi
 
-# ── 24. Tagged update identity copy parity ──────────────────────────────────
-# bin/update and bin/conduct intentionally retain parallel tagged-update entry
-# points. Keep their checkout-derived identity behavior byte-for-byte aligned,
-# and require both to delegate tag-to-identity resolution to the shared helper.
+# ── 24. Tagged update identity behavior ─────────────────────────────────────
+# bin/update is the sole surviving tagged-update entry point. Keep its complete
+# checkout-derived decision block and shared identity resolution intact.
 echo ""
 echo -e "${BOLD}24. Tagged update identity copy parity${NC}"
 
@@ -1582,42 +1618,34 @@ tagged_update_decision_block() {
 }
 
 update_tagged_decision_block=$(tagged_update_decision_block "${HARNESS_DIR}/bin/update")
-conduct_tagged_decision_block=$(tagged_update_decision_block "${HARNESS_DIR}/bin/conduct")
 
 if [ -z "$update_tagged_decision_block" ]; then
   echo "    missing tagged update decision block: bin/update"
-  assert "bin/update and bin/conduct share the complete tagged update decision" 1
-elif [ -z "$conduct_tagged_decision_block" ]; then
-  echo "    missing tagged update decision block: bin/conduct"
-  assert "bin/update and bin/conduct share the complete tagged update decision" 1
-elif [ "$update_tagged_decision_block" != "$conduct_tagged_decision_block" ]; then
-  echo "    divergence: bin/update and bin/conduct differ in cache, post-release, up-to-date, offer, or prompt behavior"
-  assert "bin/update and bin/conduct share the complete tagged update decision" 1
+  assert "bin/update retains the complete tagged update decision" 1
 else
-  assert "bin/update and bin/conduct share the complete tagged update decision" 0
+  assert "bin/update retains the complete tagged update decision" 0
 fi
 
 tagged_identity_delegation_violation=0
-for tagged_update_script in "${HARNESS_DIR}/bin/update" "${HARNESS_DIR}/bin/conduct"; do
-  tagged_check=$(awk '
-    /^check_harness_update_tagged\(\)/ { capture=1 }
-    capture { print }
-    capture && /^}$/ { exit }
-  ' "$tagged_update_script")
+tagged_update_script="${HARNESS_DIR}/bin/update"
+tagged_check=$(awk '
+  /^check_harness_update_tagged\(\)/ { capture=1 }
+  capture { print }
+  capture && /^}$/ { exit }
+' "$tagged_update_script")
 
-  resolver_call_count=$(grep -cE 'resolve_harness_identity[[:space:]]+"\$HARNESS_DIR"' <<<"$tagged_check" || true)
-  if [ "$resolver_call_count" -ne 1 ]; then
-    echo "    ${tagged_update_script#"${HARNESS_DIR}/"} must call resolve_harness_identity exactly once (found ${resolver_call_count})"
-    tagged_identity_delegation_violation=1
-  fi
+resolver_call_count=$(grep -cE 'resolve_harness_identity[[:space:]]+"\$HARNESS_DIR"' <<<"$tagged_check" || true)
+if [ "$resolver_call_count" -ne 1 ]; then
+  echo "    ${tagged_update_script#"${HARNESS_DIR}/"} must call resolve_harness_identity exactly once (found ${resolver_call_count})"
+  tagged_identity_delegation_violation=1
+fi
 
-  inline_identity_resolution=$(grep -nE 'git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(describe|tag([[:space:]]+[^[:space:]]+)*[[:space:]]+--merged|rev-list)' <<<"$tagged_check" || true)
-  if [ -n "$inline_identity_resolution" ]; then
-    echo "    inline checkout identity resolution in ${tagged_update_script#"${HARNESS_DIR}/"}: ${inline_identity_resolution}"
-    tagged_identity_delegation_violation=1
-  fi
-done
-assert "bin/update and bin/conduct delegate all checkout identity resolution to resolve_harness_identity" "$tagged_identity_delegation_violation"
+inline_identity_resolution=$(grep -nE 'git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+(describe|tag([[:space:]]+[^[:space:]]+)*[[:space:]]+--merged|rev-list)' <<<"$tagged_check" || true)
+if [ -n "$inline_identity_resolution" ]; then
+  echo "    inline checkout identity resolution in ${tagged_update_script#"${HARNESS_DIR}/"}: ${inline_identity_resolution}"
+  tagged_identity_delegation_violation=1
+fi
+assert "bin/update delegates checkout identity resolution to resolve_harness_identity" "$tagged_identity_delegation_violation"
 
 
 # ── 25. Build-review rubric vocabulary contract ─────────────────────────────
@@ -1642,6 +1670,41 @@ if [ -f "$rubric_vocabulary_check" ]; then
   fi
 else
   assert "test/check_build_review_rubric_skill_vocabularies.sh exists" 1
+fi
+
+counterfactual_sensitivity_engine_source="${HARNESS_DIR}/src/conductor/src/engine/build-review-domain.ts"
+counterfactual_sensitivity_skill_source="${HARNESS_DIR}/skills/build-review-test-quality/SKILL.md"
+if [ ! -r "$counterfactual_sensitivity_engine_source" ] || [ ! -r "$counterfactual_sensitivity_skill_source" ]; then
+  echo "    counterfactualSensitivity vocabulary source missing or unreadable"
+  assert "counterfactualSensitivity vocabulary in SKILL.md equals the engine source" 1
+else
+  counterfactual_sensitivity_engine_vocabulary=$(sed -nE '/^export const COUNTERFACTUAL_SENSITIVITY_VOCABULARY =/ s/.*\[([^]]*)\].*/\1/p' "$counterfactual_sensitivity_engine_source" | grep -oE "'[^']+'" | tr -d "'" | sort -u)
+  counterfactual_sensitivity_skill_vocabulary=$(grep -oE '`(supports|indeterminate|not-applicable)`' "$counterfactual_sensitivity_skill_source" | tr -d '`' | sort -u)
+  counterfactual_sensitivity_engine_count=$(wc -l <<<"$counterfactual_sensitivity_engine_vocabulary" | tr -d ' ')
+  counterfactual_sensitivity_skill_count=$(wc -l <<<"$counterfactual_sensitivity_skill_vocabulary" | tr -d ' ')
+
+  counterfactual_sensitivity_vocabulary_drift=0
+  if [ "$counterfactual_sensitivity_engine_count" -ne 3 ] || [ "$counterfactual_sensitivity_skill_count" -ne 3 ]; then
+    echo "    could not extract exactly three counterfactualSensitivity members from both sources"
+    counterfactual_sensitivity_vocabulary_drift=1
+  fi
+
+  counterfactual_sensitivity_engine_only=$(comm -23 <(printf '%s\n' "$counterfactual_sensitivity_engine_vocabulary") <(printf '%s\n' "$counterfactual_sensitivity_skill_vocabulary"))
+  counterfactual_sensitivity_skill_only=$(comm -13 <(printf '%s\n' "$counterfactual_sensitivity_engine_vocabulary") <(printf '%s\n' "$counterfactual_sensitivity_skill_vocabulary"))
+  if [ -n "$counterfactual_sensitivity_engine_only" ]; then
+    while IFS= read -r member; do
+      [ -n "$member" ] && echo "    counterfactualSensitivity member missing from SKILL.md: ${member}"
+    done <<<"$counterfactual_sensitivity_engine_only"
+    counterfactual_sensitivity_vocabulary_drift=1
+  fi
+  if [ -n "$counterfactual_sensitivity_skill_only" ]; then
+    while IFS= read -r member; do
+      [ -n "$member" ] && echo "    stale counterfactualSensitivity member in SKILL.md: ${member}"
+    done <<<"$counterfactual_sensitivity_skill_only"
+    counterfactual_sensitivity_vocabulary_drift=1
+  fi
+
+  assert "counterfactualSensitivity vocabulary in SKILL.md equals the engine source" "$counterfactual_sensitivity_vocabulary_drift"
 fi
 
 # ── 26. Apache-2.0 licensing surface ────────────────────────────────────────

@@ -1,3 +1,4 @@
+// Covers: task:1, task:2, task:3
 // outcome-staging.test.ts — Task 1 (Story 1 happy path): staging the intake's
 // Desired-outcome bullets into the worktree's gitignored .pipeline/ BEFORE any
 // DECIDE artifact is authored.
@@ -38,6 +39,100 @@ describe('stageIntakeOutcomes', () => {
     const contents = await readFile(stagedPath!, 'utf8');
     expect(contents).toContain(`Source-Ref: ${sourceRef}`);
     expect(contents).toContain('## Desired outcome\n\n- Bullet one\n- Bullet two');
+  });
+
+  it('keeps an inbound envelope\'s verbatim armor lines around neutralized outcomes', async () => {
+    const opening = '<<< INBOUND sourceRef=owner/repo#42 digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >>>';
+    const closing = '<<< END INBOUND >>>';
+    const intakeBody = [
+      opening,
+      '## Desired outcome',
+      '',
+      '- [neutralized:agent-directive]',
+      closing,
+    ].join('\n');
+
+    const stagedPath = await stageIntakeOutcomes(worktreePath, 'owner/repo#42', intakeBody);
+    const contents = await readFile(stagedPath!, 'utf8');
+    expect(contents).toContain(`${opening}\n## Desired outcome\n\n- [neutralized:agent-directive]\n${closing}`);
+
+    await expect(readStagedIntakeOutcomes(worktreePath)).resolves.toEqual({
+      required: true,
+      bullets: ['- [neutralized:agent-directive]'],
+      sourceRef: 'owner/repo#42',
+    });
+  });
+
+  it('stages plural Desired outcomes bullets verbatim and reads them as required', async () => {
+    const sourceRef = 'owner/repo#43';
+    const intakeBody = '## Desired outcomes\n\n- Preserve this\n- And this\n';
+
+    const stagedPath = await stageIntakeOutcomes(worktreePath, sourceRef, intakeBody);
+    const contents = await readFile(stagedPath!, 'utf8');
+    const result = await readStagedIntakeOutcomes(worktreePath);
+
+    expect({ contents, result }).toEqual({
+      contents: `Source-Ref: ${sourceRef}\n\n## Desired outcome\n\n- Preserve this\n- And this\n`,
+      result: {
+        required: true,
+        bullets: ['- Preserve this', '- And this'],
+        sourceRef,
+      },
+    });
+  });
+
+  it.each([
+    ['an empty plural section', 'owner/repo#44', '## Desired outcomes\n\n## Next\n\nOther content\n'],
+    ['no Desired-outcome heading', 'owner/repo#45', '## What\n\nObserved evidence.\n'],
+    ['a near-miss plural heading', 'owner/repo#46', '## Desired outcomes and constraints\n\n- Not an outcome\n'],
+  ])('stages zero bullets silently for %s', async (_caseName, sourceRef, intakeBody) => {
+    const stagedPath = await stageIntakeOutcomes(worktreePath, sourceRef, intakeBody);
+    const contents = await readFile(stagedPath!, 'utf8');
+    const result = await readStagedIntakeOutcomes(worktreePath);
+
+    expect({ stagedPath, contents, result }).toEqual({
+      stagedPath: join(worktreePath, '.pipeline', 'intake-outcomes.md'),
+      contents: `Source-Ref: ${sourceRef}\n\n## Desired outcome\n\n`,
+      result: { required: false, bullets: [], sourceRef },
+    });
+  });
+
+  it('writes identical canonical heading and bullet blocks for singular and plural origins', async () => {
+    const pluralWorktreePath = await mkdtemp(join(tmpdir(), 'engineer-outcome-staging-'));
+    const sourceRef = 'owner/repo#47';
+    const bullets = '- First outcome\n- Second outcome\n';
+
+    try {
+      const singularPath = await stageIntakeOutcomes(
+        worktreePath,
+        sourceRef,
+        `## Desired outcome\n\n${bullets}`,
+      );
+      const pluralPath = await stageIntakeOutcomes(
+        pluralWorktreePath,
+        sourceRef,
+        `## Desired outcomes\n\n${bullets}`,
+      );
+      const singularContents = await readFile(singularPath!, 'utf8');
+      const pluralContents = await readFile(pluralPath!, 'utf8');
+
+      const stagedShape = (contents: string) => ({
+        heading: contents.match(/^## .+$/m)?.[0],
+        bulletBlock: contents.split('\n').filter((line) => /^- /.test(line)).join('\n'),
+      });
+
+      expect({
+        singular: stagedShape(singularContents),
+        plural: stagedShape(pluralContents),
+        pluralContainsPluralHeading: pluralContents.includes('## Desired outcomes'),
+      }).toEqual({
+        singular: { heading: '## Desired outcome', bulletBlock: '- First outcome\n- Second outcome' },
+        plural: { heading: '## Desired outcome', bulletBlock: '- First outcome\n- Second outcome' },
+        pluralContainsPluralHeading: false,
+      });
+    } finally {
+      await rm(pluralWorktreePath, { recursive: true, force: true });
+    }
   });
 
   it('no-ops (no file, no throw) when there is no sourceRef and no intakeBody (chat/CLI origin)', async () => {

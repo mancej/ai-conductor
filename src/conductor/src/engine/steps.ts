@@ -130,6 +130,20 @@ export const ALL_STEPS: StepDefinition[] = [
     skillName: 'coherence-check',
   },
   {
+    // Engine-native BUILD gate: judges whether each criterion coverage claim
+    // is actually asserted by its cited task's Done when checks (ADR D4).
+    name: 'coverage_binding',
+    label: 'Coverage Binding',
+    phase: 'BUILD',
+    enforcement: 'gating',
+    prerequisites: ['plan'],
+    skippableForTiers: [],
+    isCheckpoint: false,
+    // A changed rebase invalidates this feature/runtime-derived judgement, so
+    // it must participate in the shared verdict and kickback topology.
+    kickbackTarget: true,
+  },
+  {
     name: 'acceptance_specs',
     label: 'Acceptance Specs',
     phase: 'BUILD',
@@ -153,19 +167,6 @@ export const ALL_STEPS: StepDefinition[] = [
     treeAttestingCompletion: true,
   },
   {
-    // Deprecated topology-compatibility no-op. build_review owns wiring
-    // judgement, but existing state and prerequisite contracts retain this
-    // slot until the scheduled retirement removes it deliberately.
-    name: 'wiring_check',
-    label: 'Wiring Check',
-    phase: 'BUILD',
-    enforcement: 'gating',
-    prerequisites: ['build'],
-    skippableForTiers: [],
-    isCheckpoint: false,
-    deprecated: { adr: 'adr-2026-08-11-wiring-judged-in-build-review' },
-  },
-  {
     // Native aggregate verification is the other deterministic BUILD branch.
     // Task 16 wires execution through FullSuiteVerifier.
     name: 'test_suite',
@@ -180,13 +181,13 @@ export const ALL_STEPS: StepDefinition[] = [
     treeAttestingCompletion: true,
   },
   {
-    // Judgement begins only after the deterministic BUILD group joins, so a
+    // Judgement begins only after deterministic suite verification, so a
     // mechanically invalid build never spends model-review tokens.
     name: 'build_review',
     label: 'Build Review',
     phase: 'BUILD',
     enforcement: 'gating',
-    prerequisites: ['wiring_check', 'test_suite'],
+    prerequisites: ['test_suite'],
     skippableForTiers: [],
     isCheckpoint: false,
     loopGate: true,
@@ -250,17 +251,6 @@ export const ALL_STEPS: StepDefinition[] = [
     loopGate: true,
   },
   {
-    name: 'retro',
-    label: 'Retro',
-    phase: 'SHIP',
-    enforcement: 'advisory',
-    prerequisites: ['architecture_review_as_built'],
-    skippableForTiers: ['S'],
-    isCheckpoint: false,
-    skillName: 'retro',
-    loopGate: true,
-  },
-  {
     // Engine-native loop gate (like `complexity`, no skillName): rebase the
     // feature branch onto the discovered base before finish. Its objective
     // verdict is "branch is current with base" — the conductor runs the rebase
@@ -269,7 +259,7 @@ export const ALL_STEPS: StepDefinition[] = [
     label: 'Rebase',
     phase: 'SHIP',
     enforcement: 'structural',
-    prerequisites: ['retro'],
+    prerequisites: ['architecture_review_as_built'],
     skippableForTiers: [],
     isCheckpoint: false,
     loopGate: true,
@@ -343,16 +333,6 @@ export const OUT_OF_BAND_STEPS: Record<string, StepDefinition> = {
 };
 
 /**
- * Deterministic BUILD verification: the retained no-op wiring_check and
- * test_suite run after build and join before the semantic build_review gate.
- * Wiring judgement itself belongs to build_review.
- */
-export const BUILD_VERIFICATION_GROUP: StepGroup = {
-  name: 'build_verification',
-  members: ['wiring_check', 'test_suite'],
-};
-
-/**
  * The SHIP-tail validation group (adr-2026-07-10-validation-group-join.md,
  * Decision-1): manual_test, prd_audit, architecture_review_as_built, in that
  * order, positioned immediately after build_review. This is a WRAPPER over
@@ -372,7 +352,6 @@ export const VALIDATION_GROUP: StepGroup = {
  * the members of a declared group appear in `stepToGroupMap` below.
  */
 export const STEP_GROUPS: Record<string, StepGroup> = {
-  [BUILD_VERIFICATION_GROUP.name]: BUILD_VERIFICATION_GROUP,
   [VALIDATION_GROUP.name]: VALIDATION_GROUP,
 };
 

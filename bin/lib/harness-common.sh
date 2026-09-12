@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# harness-common.sh — Shared helpers used by bin/conduct and bin/update.
+# harness-common.sh — Shared helpers used by the surviving shell entrypoints.
 #
-# Copied here (not moved) from bin/conduct so bin/update can source them
-# without depending on bin/conduct's internals. bin/conduct still defines
-# its own copies until #226 removes its update block — until then, any fix
-# made here should be mirrored there (and vice versa) to avoid drift.
+# This module is the permanent home for shell-side configuration and update
+# helpers used by bin/update and other harness maintenance commands.
 #
 # Requires: python3, and optionally PyYAML for harness_cfg_get/harness_cfg_set.
 
@@ -40,6 +38,42 @@ conductor_cfg_key() {
   esac
 }
 
+# Resolve the launcher used by harness-owned shell helpers.  A sourced library
+# has no caller-provided HARNESS_DIR, so its own BASH_SOURCE location is the
+# authoritative repo-relative anchor.  An explicit override wins; unusual
+# layouts retain the historical PATH fallback.
+# Usage: conductor_cli
+conductor_cli() {
+  if [ -n "${AI_CONDUCTOR_ENGINE_BIN:-}" ]; then
+    printf '%s\n' "$AI_CONDUCTOR_ENGINE_BIN"
+    return 0
+  fi
+
+  local common_dir repo_launcher
+  common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  repo_launcher="$common_dir/../ai-conductor"
+  if [ -x "$repo_launcher" ]; then
+    printf '%s\n' "$repo_launcher"
+  else
+    printf '%s\n' 'ai-conductor'
+  fi
+}
+
+# Run the standard-library-only Python helpers used by the shell update flow.
+# An installed checkout normally respects the caller's PATH (including test
+# fixtures).  asdf's shim is the exception: it resolves Python against the
+# checkout's tool file and can fail before Python starts when that file is
+# absent.  In that case, use the POSIX default search path instead.
+# Usage: conductor_python <python arguments...>
+conductor_python() {
+  local python
+  python="$(command -v python3 || true)"
+  case "$python" in
+    */.asdf/shims/python3|*/asdf/shims/python3) command -p python3 "$@" ;;
+    *) python3 "$@" ;;
+  esac
+}
+
 # Read a scalar field from the schema-owned conductor block.
 #
 # The optional default is retained for callers migrating from the legacy
@@ -52,21 +86,36 @@ conductor_cfg_key() {
 # later repair, and the read below still decides fail-closed on the
 # schema-owned block. Letting a stale ~/.claude JSON file veto the read
 # disabled the update check outright even when config.yml was perfectly
-# readable — most visibly mid-update, when an installed conduct-ts too old for
+# readable — most visibly mid-update, when an installed ai-conductor too old for
 # `config set` failed the seed's write while `config read` still worked.
 # Usage: conductor_cfg_get <field> [default]
 conductor_cfg_get() {
   seed_conductor_config_from_legacy || true
   local field=$1
-  if ! command -v conduct-ts &>/dev/null; then
-    warn "conduct-ts is required to read conductor configuration; install or restore it, then re-run bin/install" >&2
+  local cli
+  cli="$(conductor_cli)"
+  if [ "$cli" = 'ai-conductor' ] && ! command -v ai-conductor &>/dev/null; then
+    warn "ai-conductor is required to read conductor configuration; install or restore it, then re-run bin/install" >&2
     return 1
   fi
   local value
-  if ! value=$(conduct-ts config read "conductor.$(conductor_cfg_key "$field")" 2>&1); then
-    warn "${value:-conduct-ts could not read conductor configuration; install or restore it, then re-run bin/install}" >&2
+  # Keep diagnostics separate from scalar stdout: combining streams turns a
+  # value such as `false` or `main` into a multi-line string and makes callers
+  # take the tagged/default path. Failed reads still report their original
+  # diagnostic, while successful reads remain silent.
+  local diagnostic_file diagnostics
+  if ! diagnostic_file=$(mktemp "${TMPDIR:-/tmp}/conduct-config-read.XXXXXX"); then
+    warn "could not create a temporary file to read conductor configuration" >&2
     return 1
   fi
+  if ! value=$("$cli" config read "conductor.$(conductor_cfg_key "$field")" 2>"$diagnostic_file"); then
+    diagnostics=$(<"$diagnostic_file")
+    rm -f "$diagnostic_file"
+    diagnostics=$(printf '%s\n%s\n' "$value" "$diagnostics" | sed '/^$/d')
+    warn "${diagnostics:-ai-conductor could not read conductor configuration; install or restore it, then re-run bin/install}" >&2
+    return 1
+  fi
+  rm -f "$diagnostic_file"
   printf '%s\n' "$value"
 }
 
@@ -77,11 +126,13 @@ conductor_cfg_set() {
     return 1
   fi
   local field=$1 value=$2
-  if ! command -v conduct-ts &>/dev/null; then
-    warn "conduct-ts is required to save conductor configuration; install or restore it, then re-run bin/install" >&2
+  local cli
+  cli="$(conductor_cli)"
+  if [ "$cli" = 'ai-conductor' ] && ! command -v ai-conductor &>/dev/null; then
+    warn "ai-conductor is required to save conductor configuration; install or restore it, then re-run bin/install" >&2
     return 1
   fi
-  conduct-ts config set "conductor.$(conductor_cfg_key "$field")" "$value"
+  "$cli" config set "conductor.$(conductor_cfg_key "$field")" "$value"
 }
 
 # Copy supported values from the former Claude-only JSON config into the
@@ -98,7 +149,7 @@ seed_conductor_config_from_legacy() {
 
   [ -e "$CONDUCTOR_CONFIG" ] || return 0
 
-  if ! legacy_values=$(CONDUCTOR_CONFIG="$CONDUCTOR_CONFIG" python3 - <<'PY'
+  if ! legacy_values=$(CONDUCTOR_CONFIG="$CONDUCTOR_CONFIG" conductor_python - <<'PY'
 import json
 import os
 import sys
@@ -259,7 +310,7 @@ PY
 
 # Render a markdown file using the configured viewer. Reads
 # markdown_viewer.{command,args,mode} from ~/.ai-conductor/config.yml (or
-# .ai-conductor/config.yml in the project — not read here directly; conduct-ts does
+# .ai-conductor/config.yml in the project — not read here directly; ai-conductor does
 # the full project-level merge). Falls back to cat if the configured viewer
 # isn't on PATH, so conduct never hard-crashes on a missing renderer.
 render_md() {
@@ -296,4 +347,36 @@ render_md() {
       "$cmd" "${resolved_args[@]}"
       ;;
   esac
+}
+
+# ─── Global codex rate card ─────────────────────────────────────────────────
+
+# Link the harness checkout's committed codex rate card
+# (.ai-conductor/rate-card.json) at ~/.ai-conductor/rate-card.json. The engine
+# falls back to that global card when a project has no committed card of its
+# own, so codex dispatches price to real dollars in every project — not just
+# ones that ran `conduct rate-card refresh` themselves. A symlink (same idiom
+# as skill installs) tracks the checkout: a daily rate-card bot PR merged to
+# main updates the global card with no re-run of install/update. A missing
+# target simply fails closed to cost-unmetered. A regular file already at the
+# destination is operator-owned and left alone. Never fatal.
+sync_global_rate_card() {
+  local harness_dir=$1
+  local src="${harness_dir}/.ai-conductor/rate-card.json"
+  local dest_dir="${HOME}/.ai-conductor"
+  local dest="${dest_dir}/rate-card.json"
+  [ -f "$src" ] || return 0
+
+  if [ -L "$dest" ]; then
+    [ "$(readlink "$dest")" = "$src" ] && return 0
+  elif [ -e "$dest" ]; then
+    warn "Global rate card ${dest} is a regular file — leaving it; remove it to link the harness card"
+    return 0
+  fi
+
+  if mkdir -p "$dest_dir" && ln -sfn "$src" "$dest"; then
+    ok "Linked global rate card (${dest} -> ${src})"
+  else
+    warn "Could not link global rate card at ${dest}"
+  fi
 }

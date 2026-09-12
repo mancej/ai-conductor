@@ -43,13 +43,13 @@ const execFile = promisify(execFileCb);
 /**
  * Seed state with every step BEFORE 'rebase' marked done/skipped so the
  * conductor can start at `fromStep: 'rebase'` without failing gate checks.
- * `retro` is skipped because the daemon always skips it.
+ * Every prerequisite before rebase is complete.
  */
 async function seedPreRebaseState(statePath: string): Promise<void> {
   const state: ConductState = {};
   for (const s of ALL_STEPS) {
     if (s.name === 'rebase') break;
-    (state as Record<string, unknown>)[s.name] = s.name === 'retro' ? 'skipped' : 'done';
+    (state as Record<string, unknown>)[s.name] = 'done';
   }
   (state as Record<string, unknown>).finish = 'done';
   await writeState(statePath, state);
@@ -267,6 +267,31 @@ describe('runRebaseStep wiring — gated resolution sub-loop (daemon:true, real 
     // HALT file written
     const haltExists = await access(join(repo, '.pipeline/HALT')).then(() => true, () => false);
     expect(haltExists).toBe(true);
+  });
+
+  it('completed rebase that drops feature content writes completed-rebase recovery at the conductor halt site', async () => {
+    const runner: StepRunner = {
+      run: vi.fn().mockResolvedValue({ success: true } satisfies StepRunResult),
+      resolveRebaseConflict: async (): Promise<ResolutionAttempt> => {
+        await gc(['rebase', '--skip']);
+        return { resolved: true };
+      },
+    };
+    const conductor = new Conductor({
+      stateFilePath: statePath,
+      stepRunner: runner,
+      events,
+      projectRoot: repo,
+      daemon: true,
+      mode: 'auto',
+      fromStep: 'rebase',
+    });
+
+    await conductor.run();
+
+    const halt = await readFile(join(repo, '.pipeline/HALT'), 'utf8');
+    expect(halt).toContain('Review the completed rebase and restore any missing feature content.');
+    expect(halt).not.toContain('git rebase --continue');
   });
 
   // ── Test 4 ───────────────────────────────────────────────────────────────

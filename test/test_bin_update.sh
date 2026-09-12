@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# test_bin_update.sh — Real-binary acceptance tests for `bin/update`, the
-# standalone self-update/channel CLI that replaces the update block ported
-# out of `bin/conduct` (327-470). See .docs/stories/port-self-update-flow.md
+# test_bin_update.sh — Real-binary acceptance tests for the standalone
+# `bin/update` self-update/channel CLI. See .docs/stories/port-self-update-flow.md
 # for the acceptance criteria this file encodes (Stories 1-9).
 #
 # Runs the ACTUAL bin/update (no mocks of the script under test) against a
@@ -54,7 +53,7 @@ PY3="$(python3 -c 'import sys; print(sys.executable)')"
 ln -s "$PY3" "$STUBS_DIR/python3"
 TEST_PATH="$STUBS_DIR:$PATH"
 # A deliberately minimal PATH for missing-command scenarios. Do not inherit
-# the operator PATH: it may contain a real ~/.local/bin/conduct-ts.
+# the operator PATH: it may contain a real ~/.local/bin/ai-conductor.
 MISSING_CONDUCT_PATH="$STUBS_DIR:/usr/bin:/bin"
 
 # ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -92,8 +91,8 @@ make_repo() {
     cp -r "$HARNESS_DIR/bin/lib" "$dir/bin/lib"
   fi
   # Normal update scenarios exercise the real script through this local
-  # conduct-ts seam. It persists the scalar conductor fields in config.yml.
-  cat > "$dir/bin/conduct-ts" <<'EOF'
+  # ai-conductor seam. It persists the scalar conductor fields in config.yml.
+  cat > "$dir/bin/ai-conductor" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -126,7 +125,7 @@ case "$2" in
   *) exit 2 ;;
 esac
 EOF
-  chmod +x "$dir/bin/conduct-ts"
+  chmod +x "$dir/bin/ai-conductor"
   stub_migrate "$dir" 0
 
   cat > "$dir/CHANGELOG.md" << 'EOF'
@@ -250,31 +249,57 @@ set_conductor_cfg() {
 # run_conductor_cfg_accessors <home> <field> <value> <default>
 # Sources the shared accessors directly so this contract stays focused on the
 # update configuration boundary, rather than depending on an update scenario
-# to happen to reach each field. The conduct-ts stub is the CLI boundary:
+# to happen to reach each field. The ai-conductor stub is the CLI boundary:
 # tests inspect its argv log instead of parsing the YAML configuration file.
 CONDUCTOR_CFG_STUBS="$TMP_ROOT/conductor-cfg-stubs"
 mkdir -p "$CONDUCTOR_CFG_STUBS"
-cat > "$CONDUCTOR_CFG_STUBS/conduct-ts" <<'EOF'
+cat > "$CONDUCTOR_CFG_STUBS/ai-conductor" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CONDUCTOR_CFG_CALLS"
 if [ "$1" = "config" ] && [ "$2" = "read" ]; then
   printf '%s\n' "$CONDUCTOR_CFG_READ_VALUE"
 fi
 EOF
-chmod +x "$CONDUCTOR_CFG_STUBS/conduct-ts"
+chmod +x "$CONDUCTOR_CFG_STUBS/ai-conductor"
 
 run_conductor_cfg_accessors() {
   local home=$1 field=$2 value=$3 default=$4
-  CONDUCTOR_CFG_CALLS="$home/conductor-cfg-calls" \
+  ACCESSOR_OUT=$(CONDUCTOR_CFG_CALLS="$home/conductor-cfg-calls" \
     CONDUCTOR_CFG_READ_VALUE="$value" \
+    AI_CONDUCTOR_ENGINE_BIN="$CONDUCTOR_CFG_STUBS/ai-conductor" \
     HOME="$home" PATH="$CONDUCTOR_CFG_STUBS:$TEST_PATH" \
     bash -c 'source "$1"; conductor_cfg_set "$2" "$3"; conductor_cfg_get "$2" "$4"' \
-      _ "$HARNESS_DIR/bin/lib/harness-common.sh" "$field" "$value" "$default"
+      _ "$HARNESS_DIR/bin/lib/harness-common.sh" "$field" "$value" "$default" \
+      2>"$home/conductor-cfg-stderr")
+  ACCESSOR_STDERR=$(<"$home/conductor-cfg-stderr")
 }
+
+# The shared helper must locate the launcher beside itself before consulting
+# PATH: bin/update sources it directly, so no caller-provided HARNESS_DIR is
+# available to reconstruct that location.
+CANONICAL_LAUNCHER_ROOT="$TMP_ROOT/canonical-launcher"
+mkdir -p "$CANONICAL_LAUNCHER_ROOT/bin/lib"
+cp "$HARNESS_DIR/bin/lib/harness-common.sh" "$CANONICAL_LAUNCHER_ROOT/bin/lib/harness-common.sh"
+cat > "$CANONICAL_LAUNCHER_ROOT/bin/ai-conductor" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "config" ] && [ "${2:-}" = "read" ]; then
+  printf 'repo-relative\n'
+fi
+EOF
+chmod +x "$CANONICAL_LAUNCHER_ROOT/bin/ai-conductor"
+HOME_DIR=$(make_isolated_home)
+set +e
+CANONICAL_LAUNCHER_OUT=$(HOME="$HOME_DIR" PATH="$MISSING_CONDUCT_PATH" \
+  bash -c 'source "$1"; conductor_cfg_get updateChannel tagged' \
+  _ "$CANONICAL_LAUNCHER_ROOT/bin/lib/harness-common.sh" 2>&1)
+CANONICAL_LAUNCHER_CODE=$?
+set -e
+assert "repo-relative launcher: config read succeeds without ai-conductor on PATH" \
+  "$([ "$CANONICAL_LAUNCHER_CODE" -eq 0 ] && [ "$CANONICAL_LAUNCHER_OUT" = "repo-relative" ] && echo 0 || echo 1)"
 
 # run_install_configure_conductor <home> <update_mode> [identity_fixture]
 # Loads the installer through its public configuration boundary, with the real
-# shared accessor library available beside the copied script.  The conduct-ts
+# shared accessor library available beside the copied script.  The ai-conductor
 # fake persists the same scalar YAML fields that the production CLI owns.
 # `off-tag` and `exact-tag` create local Git checkouts whose release tag and
 # VERSION deliberately disagree, so installer identity must come from checkout
@@ -295,7 +320,7 @@ run_install_configure_conductor() {
   cp "$HARNESS_DIR/bin/install" "$installer_dir/bin/install"
   cp "$HARNESS_DIR/bin/lib/harness-common.sh" "$installer_dir/bin/lib/harness-common.sh"
   mkdir -p "$stubs"
-  cat > "$stubs/conduct-ts" <<'EOF'
+  cat > "$stubs/ai-conductor" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -329,7 +354,7 @@ case "$2" in
   *) exit 2 ;;
 esac
 EOF
-  chmod +x "$stubs/conduct-ts"
+  chmod +x "$stubs/ai-conductor"
   awk '/^# ─── Main /{exit} {print}' "$installer_dir/bin/install" > "$fragment"
   printf '%s\n' "UPDATE_MODE=$update_mode" 'configure_conductor' >> "$fragment"
   chmod +x "$fragment"
@@ -365,24 +390,12 @@ run_update() {
 }
 
 # run_update_without_conduct <repo> <home> [args...]
-# Deliberately leaves the repo's local conduct-ts seam off PATH.
+# Deliberately leaves the repo's local ai-conductor seam off PATH.
 run_update_without_conduct() {
   local repo=$1 home=$2
   shift 2
   set +e
-  OUT=$(cd "$repo" && HOME="$home" PATH="$MISSING_CONDUCT_PATH" "$repo/bin/update" "$@" < /dev/null 2>&1)
-  CODE=$?
-  set -e
-}
-
-# run_conduct_update <repo> <home> — exercise bin/conduct's retained update
-# path through its public --update entry point.
-run_conduct_update() {
-  local repo=$1 home=$2
-  cp "$HARNESS_DIR/bin/conduct" "$repo/bin/conduct"
-  chmod +x "$repo/bin/conduct"
-  set +e
-  OUT=$(cd "$repo" && HOME="$home" PATH="$repo/bin:$TEST_PATH" "$repo/bin/conduct" --update < /dev/null 2>&1)
+  OUT=$(cd "$repo" && AI_CONDUCTOR_ENGINE_BIN=ai-conductor HOME="$home" PATH="$MISSING_CONDUCT_PATH" "$repo/bin/update" "$@" < /dev/null 2>&1)
   CODE=$?
   set -e
 }
@@ -539,7 +552,7 @@ echo -e "${BOLD}Update config accessors — conductor YAML${NC}"
 
 # The legacy accessor names remain the update flow's two-argument interface,
 # but every field must translate its camelCase name to the schema-owned
-# conductor.<snake_case_key> path at the conduct-ts boundary.
+# conductor.<snake_case_key> path at the ai-conductor boundary.
 for ACCESSOR_CASE in \
   'updateChannel|main|tagged|update_channel' \
   'autoCheck|false|true|auto_check' \
@@ -548,43 +561,45 @@ for ACCESSOR_CASE in \
 do
   IFS='|' read -r FIELD VALUE DEFAULT SCHEMA_KEY <<< "$ACCESSOR_CASE"
   HOME_DIR=$(make_isolated_home)
-  ACCESSOR_OUT=$(run_conductor_cfg_accessors "$HOME_DIR" "$FIELD" "$VALUE" "$DEFAULT")
+  run_conductor_cfg_accessors "$HOME_DIR" "$FIELD" "$VALUE" "$DEFAULT"
   ACCESSOR_CALLS=$(cat "$HOME_DIR/conductor-cfg-calls" 2>/dev/null || true)
 
   assert "${FIELD}: two-argument set resolves conductor.${SCHEMA_KEY}" \
     "$(printf '%s\n' "$ACCESSOR_CALLS" | grep -qx "config set conductor.${SCHEMA_KEY} ${VALUE}" && echo 0 || echo 1)"
   assert "${FIELD}: two-argument get resolves conductor.${SCHEMA_KEY}" \
     "$(printf '%s\n' "$ACCESSOR_CALLS" | grep -qx "config read conductor.${SCHEMA_KEY}" && echo 0 || echo 1)"
-  assert "${FIELD}: get returns conduct-ts config read output" \
+  assert "${FIELD}: get returns ai-conductor config read output" \
     "$( [ "$ACCESSOR_OUT" = "$VALUE" ] && echo 0 || echo 1 )"
+  assert "${FIELD}: successful config read emits no deprecation warning" \
+    "$( [ -z "$ACCESSOR_STDERR" ] && echo 0 || echo 1 )"
 done
 
-# A config read is authoritative: a missing conduct-ts must not turn into the
+# A config read is authoritative: a missing ai-conductor must not turn into the
 # caller's default. The update command names its declined reason, while its
 # automatic entry remains advisory for startup callers.
 HOME_DIR=$(make_isolated_home)
 set +e
-ACCESSOR_OUT=$(HOME="$HOME_DIR" PATH="$MISSING_CONDUCT_PATH" bash -c 'source "$1"; conductor_cfg_get updateChannel tagged' \
+ACCESSOR_OUT=$(AI_CONDUCTOR_ENGINE_BIN=ai-conductor HOME="$HOME_DIR" PATH="$MISSING_CONDUCT_PATH" bash -c 'source "$1"; conductor_cfg_get updateChannel tagged' \
   _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>&1)
 ACCESSOR_CODE=$?
 set -e
-assert "missing conduct-ts: config read returns non-zero" "$([ "$ACCESSOR_CODE" -ne 0 ] && echo 0 || echo 1)"
-assert "missing conduct-ts: config read names the prerequisite" "$(case "$ACCESSOR_OUT" in *"conduct-ts"*) echo 0;; *) echo 1;; esac)"
-assert "missing conduct-ts: config read never echoes caller default" "$(case "$ACCESSOR_OUT" in *"tagged"*) echo 1;; *) echo 0;; esac)"
+assert "missing ai-conductor: config read returns non-zero" "$([ "$ACCESSOR_CODE" -ne 0 ] && echo 0 || echo 1)"
+assert "missing ai-conductor: config read names the prerequisite" "$(case "$ACCESSOR_OUT" in *"ai-conductor"*) echo 0;; *) echo 1;; esac)"
+assert "missing ai-conductor: config read never echoes caller default" "$(case "$ACCESSOR_OUT" in *"tagged"*) echo 1;; *) echo 0;; esac)"
 
-REPO=$(make_repo "missing-conduct-ts")
+REPO=$(make_repo "missing-ai-conductor")
 HOME_DIR=$(make_isolated_home)
 run_update_without_conduct "$REPO" "$HOME_DIR"
-assert "missing conduct-ts: forced update check declines" "$([ "$CODE" -ne 0 ] && echo 0 || echo 1)"
-assert "missing conduct-ts: forced update check states the reason" "$(case "$OUT" in *"conduct-ts"*) echo 0;; *) echo 1;; esac)"
+assert "missing ai-conductor: forced update check declines" "$([ "$CODE" -ne 0 ] && echo 0 || echo 1)"
+assert "missing ai-conductor: forced update check states the reason" "$(case "$OUT" in *"ai-conductor"*) echo 0;; *) echo 1;; esac)"
 
 run_update_without_conduct "$REPO" "$HOME_DIR" --auto
-assert "missing conduct-ts: --auto remains advisory" "$([ "$CODE" -eq 0 ] && echo 0 || echo 1)"
-assert "missing conduct-ts: --auto states the declined reason" "$(case "$OUT" in *"conduct-ts"*) echo 0;; *) echo 1;; esac)"
+assert "missing ai-conductor: --auto remains advisory" "$([ "$CODE" -eq 0 ] && echo 0 || echo 1)"
+assert "missing ai-conductor: --auto states the declined reason" "$(case "$OUT" in *"ai-conductor"*) echo 0;; *) echo 1;; esac)"
 
 # ─── Update config access does not depend on PyYAML ────────────────────────
 # The approved ADR keeps the update-specific accessors and entry points off
-# PyYAML, routing every conductor read and write through conduct-ts. It
+# PyYAML, routing every conductor read and write through ai-conductor. It
 # deliberately leaves the generic harness_cfg_get/harness_cfg_set viewer
 # helpers on PyYAML, so those stay out of scope here.
 #
@@ -618,11 +633,12 @@ assert "no-PyYAML fixture actually breaks 'import yaml'" \
   "$( [ "$NO_YAML_PROBE_CODE" -ne 0 ] && case "$NO_YAML_PROBE" in *"unavailable in this fixture"*) echo 0;; *) echo 1;; esac || echo 1)"
 
 # The accessors are the ADR's subject: they must still resolve the conductor
-# block through conduct-ts with PyYAML unimportable.
+# block through ai-conductor with PyYAML unimportable.
 HOME_DIR=$(make_isolated_home)
 set +e
 NO_YAML_ACCESSOR_OUT=$(CONDUCTOR_CFG_CALLS="$HOME_DIR/conductor-cfg-calls" \
   CONDUCTOR_CFG_READ_VALUE="main" \
+  AI_CONDUCTOR_ENGINE_BIN="$CONDUCTOR_CFG_STUBS/ai-conductor" \
   HOME="$HOME_DIR" PATH="$CONDUCTOR_CFG_STUBS:$NO_YAML_PATH" \
   bash -c 'source "$1"; conductor_cfg_set updateChannel main; conductor_cfg_get updateChannel tagged' \
     _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>&1)
@@ -631,11 +647,11 @@ set -e
 NO_YAML_CALLS=$(cat "$HOME_DIR/conductor-cfg-calls" 2>/dev/null || true)
 assert "without PyYAML: conductor accessors still succeed" \
   "$([ "$NO_YAML_ACCESSOR_CODE" -eq 0 ] && echo 0 || echo 1)"
-assert "without PyYAML: conductor write delegates to conduct-ts" \
+assert "without PyYAML: conductor write delegates to ai-conductor" \
   "$(printf '%s\n' "$NO_YAML_CALLS" | grep -qx 'config set conductor.update_channel main' && echo 0 || echo 1)"
-assert "without PyYAML: conductor read delegates to conduct-ts" \
+assert "without PyYAML: conductor read delegates to ai-conductor" \
   "$(printf '%s\n' "$NO_YAML_CALLS" | grep -qx 'config read conductor.update_channel' && echo 0 || echo 1)"
-assert "without PyYAML: conductor read returns the conduct-ts value" \
+assert "without PyYAML: conductor read returns the ai-conductor value" \
   "$(case "$NO_YAML_ACCESSOR_OUT" in *"main"*) echo 0;; *) echo 1;; esac)"
 
 # The entry point must reach the same conclusion it reaches with PyYAML present.
@@ -738,7 +754,7 @@ run_legacy_seed() {
   set +e
   SEED_OUT=$(HOME="$home" PATH="$path" \
     bash -c 'source "$1"; seed_conductor_config_from_legacy' \
-    _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>&1)
+    _ "$repo/bin/lib/harness-common.sh" 2>&1)
   SEED_CODE=$?
   set -e
 }
@@ -751,7 +767,7 @@ run_conductor_cfg_set_then_get() {
   set +e
   ACCESSOR_OUT=$(HOME="$home" PATH="$repo/bin:$TEST_PATH" \
     bash -c 'source "$1"; conductor_cfg_set currentVersion v0.101.0; conductor_cfg_get currentVersion ""' \
-    _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>&1)
+    _ "$repo/bin/lib/harness-common.sh" 2>&1)
   ACCESSOR_CODE=$?
   set -e
 }
@@ -771,6 +787,7 @@ EOF
   set +e
   ACCESSOR_OUT=$(CONDUCTOR_CFG_CALLS="$home/conductor-cfg-calls" \
     CONDUCTOR_CFG_READ_VALUE='' \
+    AI_CONDUCTOR_ENGINE_BIN="$CONDUCTOR_CFG_STUBS/ai-conductor" \
     HOME="$home" PATH="$CONDUCTOR_CFG_STUBS:$python_stubs:$TEST_PATH" \
     bash -c '
       source "$1"
@@ -845,7 +862,7 @@ set_conductor_cfg "$HOME_DIR" updateChannel main
 set +e
 ACCESSOR_VALUE=$(HOME="$HOME_DIR" PATH="$REPO/bin:$TEST_PATH" \
   bash -c 'source "$1"; conductor_cfg_get updateChannel tagged' \
-  _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
+  _ "$REPO/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
 ACCESSOR_CODE=$?
 set -e
 ACCESSOR_STDERR=$(cat "$HOME_DIR/accessor-stderr")
@@ -856,11 +873,11 @@ assert "unseedable legacy JSON: getter still warns about the failed seed" \
 assert "unseedable legacy JSON: source is kept for a later repair" \
   "$( [ -f "$HOME_DIR/.claude/ai-conductor.config.json" ] && [ ! -e "$HOME_DIR/.claude/ai-conductor.config.json.migrated" ] && echo 0 || echo 1 )"
 
-# The seed writes through conduct-ts, so an installed binary too old to accept
+# The seed writes through ai-conductor, so an installed binary too old to accept
 # `config set` fails the seed while `config read` still works. That is exactly
 # the mid-update stale-build case, and it must not decline the update check.
 REPO=$(make_repo "legacy-seed-set-unsupported")
-cat > "$REPO/bin/conduct-ts" <<'EOF'
+cat > "$REPO/bin/ai-conductor" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 config="${HOME}/.ai-conductor/config.yml"
@@ -871,7 +888,7 @@ fi
 echo "conduct: the inline SDLC pipeline now runs under the \`inline\` subcommand." >&2
 exit 1
 EOF
-chmod +x "$REPO/bin/conduct-ts"
+chmod +x "$REPO/bin/ai-conductor"
 HOME_DIR=$(make_isolated_home)
 mkdir -p "$HOME_DIR/.claude"
 cat > "$HOME_DIR/.claude/ai-conductor.config.json" <<'EOF'
@@ -883,7 +900,7 @@ set_conductor_cfg "$HOME_DIR" updateChannel main
 set +e
 ACCESSOR_VALUE=$(HOME="$HOME_DIR" PATH="$REPO/bin:$TEST_PATH" \
   bash -c 'source "$1"; conductor_cfg_get updateChannel tagged' \
-  _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
+  _ "$REPO/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
 ACCESSOR_CODE=$?
 set -e
 assert "unwritable conductor block during seed: getter still reads the channel" \
@@ -938,7 +955,7 @@ EOF
 set +e
 ACCESSOR_VALUE=$(HOME="$HOME_DIR" PATH="$REPO/bin:$TEST_PATH" \
   bash -c 'source "$1"; value=$(conductor_cfg_get currentVersion ""); status=$?; printf "%s\\n" "$value"; exit "$status"' \
-    _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
+    _ "$REPO/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
 ACCESSOR_CODE=$?
 set -e
 ACCESSOR_STDERR=$(cat "$HOME_DIR/accessor-stderr")
@@ -956,14 +973,14 @@ cat > "$HOME_DIR/.claude/ai-conductor.config.json" <<'EOF'
 }
 EOF
 set +e
-ACCESSOR_VALUE=$(HOME="$HOME_DIR" PATH="$MISSING_CONDUCT_PATH" \
+ACCESSOR_VALUE=$(AI_CONDUCTOR_ENGINE_BIN=ai-conductor HOME="$HOME_DIR" PATH="$MISSING_CONDUCT_PATH" \
   bash -c 'source "$1"; value=$(conductor_cfg_get currentVersion ""); status=$?; printf "%s\\n" "$value"; exit "$status"' \
     _ "$HARNESS_DIR/bin/lib/harness-common.sh" 2>"$HOME_DIR/accessor-stderr")
 ACCESSOR_CODE=$?
 set -e
 ACCESSOR_STDERR=$(cat "$HOME_DIR/accessor-stderr")
-assert "missing conduct-ts during legacy seed: getter fails with stderr-only setter diagnostic" \
-  "$(if [ "$ACCESSOR_CODE" -ne 0 ] && [ -z "$ACCESSOR_VALUE" ] && [[ "$ACCESSOR_STDERR" = *"conduct-ts is required to save conductor configuration"* ]]; then echo 0; else echo 1; fi)"
+assert "missing ai-conductor during legacy seed: getter fails with stderr-only setter diagnostic" \
+  "$(if [ "$ACCESSOR_CODE" -ne 0 ] && [ -z "$ACCESSOR_VALUE" ] && [[ "$ACCESSOR_STDERR" = *"ai-conductor is required to save conductor configuration"* ]]; then echo 0; else echo 1; fi)"
 
 # The rename is the idempotence marker. A rename failure must be visible and
 # leave the original source in place, never masquerading as a successful seed.
@@ -1195,14 +1212,6 @@ assert "post-release newest tag: reports distance and baseline without prompting
   "$([ "$CODE" -eq 0 ] && [ -n "$OUT" ] && case "$OUT" in *"2 commits past v0.4.0"*) true;; *) false;; esac && case "$OUT" in *"Update to"*) false;; *) true;; esac && echo 0 || echo 1)"
 assert "post-release newest tag: stamps lastCheckedAt" "$([ -n "$(cfg_get "$HOME_DIR" lastCheckedAt)" ] && echo 0 || echo 1)"
 
-# bin/conduct retains its own update implementation. Its public --update path
-# must report a checkout that has advanced past the newest release instead of
-# silently treating it as current.
-HOME_DIR=$(make_isolated_home)
-run_conduct_update "$REPO" "$HOME_DIR"
-assert "bin/conduct post-release newest tag: reports distance and baseline" \
-  "$( [ "$CODE" -eq 0 ] && case "$OUT" in *"2 commits past v0.4.0"*) true;; *) false;; esac && echo 0 || echo 1)"
-
 # The checkout-derived baseline is a write-only migration cache. A
 # post-release display identity must never leak its +distance suffix into
 # currentVersion, and cache state must not influence the update decision.
@@ -1375,15 +1384,6 @@ assert "tagless bin/update: offers no update" \
 assert "tagless bin/update: writes no currentVersion" \
   "$([ -z "$(cfg_get "$HOME_DIR" currentVersion)" ] && echo 0 || echo 1)"
 
-HOME_DIR=$(make_isolated_home)
-run_conduct_update "$REPO" "$HOME_DIR"
-assert "tagless bin/conduct: reports an unverifiable identity" \
-  "$(printf '%s\n' "$OUT" | grep -Fqx 'Update identity: unverifiable (source: none)' && echo 0 || echo 1)"
-assert "tagless bin/conduct: offers no update" \
-  "$(case "$OUT" in *"Harness update available"*|*"Update to "*) echo 1;; *) echo 0;; esac)"
-assert "tagless bin/conduct: writes no currentVersion" \
-  "$([ -z "$(cfg_get "$HOME_DIR" currentVersion)" ] && echo 0 || echo 1)"
-
 # ─── Story 5: no-TTY guidance ───────────────────────────────────────────────
 
 echo ""
@@ -1473,7 +1473,7 @@ make_main_repo() {
     cd "$clone"
     git remote add origin "$origin"
     git branch -M main
-    git push -q origin main
+    git push -q -u origin main
     git --git-dir="$origin" symbolic-ref HEAD refs/heads/main
   )
   echo "$clone|$origin"
@@ -1609,7 +1609,7 @@ set_current_version "$HOME_DIR" v0.3.0
 run_update "$REPO" "$HOME_DIR" --set-channel stable
 cat > "$REPO/bin/migrate" <<EOF
 #!/usr/bin/env bash
-conduct-ts config set conductor.current_version v0.4.0
+ai-conductor config set conductor.current_version v0.4.0
 echo invoked >> "$REPO/.migrate-calls"
 exit 1
 EOF
@@ -1678,6 +1678,120 @@ run_update "$REPO" "$HOME_DIR"
 assert "stable diverged: refuses the remote release without mutating checkout or version" \
   "$( [ "$CODE" -eq 0 ] && [ "$(git -C "$REPO" branch --show-current)" = "stable" ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$STABLE_ORIGINAL_SHA" ] && [ ! -f "$REPO/.migrate-calls" ] && [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v0.3.0" ] && echo 0 || echo 1)"
 
+# A stable install updated by a pre-v1 `bin/update` was left in detached HEAD by
+# that updater's `git checkout vX.Y.Z`. The branch guard used to end the check
+# there, silently and permanently, so recovery re-attaches the stable branch.
+PAIR=$(make_main_repo "stable-detached-lineage")
+REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
+git -C "$REPO" checkout -q -b stable
+git -C "$REPO" push -q -u origin stable
+HOME_DIR=$(make_isolated_home)
+set_current_version "$HOME_DIR" v0.3.0
+run_update "$REPO" "$HOME_DIR" --set-channel stable
+
+WORK="$TMP_ROOT/stable-detached-lineage-push"
+git clone -q "$ORIGIN" "$WORK"
+git -C "$WORK" config user.email t@t.com
+git -C "$WORK" config user.name T
+git -C "$WORK" checkout -q stable
+git -C "$WORK" commit -q --allow-empty -m "v0.4.0"
+git -C "$WORK" tag v0.4.0
+git -C "$WORK" push -q origin stable v0.4.0
+STABLE_DETACHED_SHA=$(git -C "$WORK" rev-parse HEAD)
+# Reproduce the old updater's outcome: checked out at the release tag, off the branch.
+git -C "$REPO" fetch -q --tags origin stable
+git -C "$REPO" checkout -q --detach "$STABLE_DETACHED_SHA"
+git -C "$WORK" commit -q --allow-empty -m "v0.5.0"
+git -C "$WORK" tag v0.5.0
+git -C "$WORK" push -q origin stable v0.5.0
+STABLE_RELEASE_SHA=$(git -C "$WORK" rev-parse HEAD)
+
+run_update_tty "$REPO" "$HOME_DIR" y
+assert "stable detached on the stable lineage: re-attaches the branch, advances to the tagged release, migrates, and records its version" \
+  "$( [ "$CODE" -eq 0 ] && [ "$(git -C "$REPO" branch --show-current)" = "stable" ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$STABLE_RELEASE_SHA" ] && [ "$(git -C "$REPO" rev-parse stable)" = "$STABLE_RELEASE_SHA" ] && [ -f "$REPO/.migrate-calls" ] && [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v0.5.0" ] && echo 0 || echo 1)"
+
+# The state the old updater actually leaves behind the moment it finishes:
+# detached exactly at origin/stable. There is nothing to fast-forward, but the
+# detachment is still the defect, so re-attaching is the whole repair.
+PAIR=$(make_main_repo "stable-detached-current")
+REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
+git -C "$REPO" checkout -q -b stable
+git -C "$REPO" push -q -u origin stable
+HOME_DIR=$(make_isolated_home)
+set_current_version "$HOME_DIR" v0.3.0
+run_update "$REPO" "$HOME_DIR" --set-channel stable
+
+WORK="$TMP_ROOT/stable-detached-current-push"
+git clone -q "$ORIGIN" "$WORK"
+git -C "$WORK" config user.email t@t.com
+git -C "$WORK" config user.name T
+git -C "$WORK" checkout -q stable
+git -C "$WORK" commit -q --allow-empty -m "v0.4.0"
+git -C "$WORK" tag v0.4.0
+git -C "$WORK" push -q origin stable v0.4.0
+STABLE_RELEASE_SHA=$(git -C "$WORK" rev-parse HEAD)
+git -C "$REPO" fetch -q --tags origin stable
+git -C "$REPO" checkout -q --detach "$STABLE_RELEASE_SHA"
+
+run_update_tty "$REPO" "$HOME_DIR" y
+assert "stable detached at the current release: re-attaches the branch without moving HEAD" \
+  "$( [ "$CODE" -eq 0 ] && [ "$(git -C "$REPO" branch --show-current)" = "stable" ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$STABLE_RELEASE_SHA" ] && [ "$(git -C "$REPO" rev-parse stable)" = "$STABLE_RELEASE_SHA" ] && [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v0.4.0" ] && echo 0 || echo 1)"
+
+# A detached HEAD that is not part of origin/stable's ancestry is a deliberate
+# checkout, not this defect. It must stay exactly as silent as before.
+PAIR=$(make_main_repo "stable-detached-unrelated")
+REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
+git -C "$REPO" checkout -q -b stable
+git -C "$REPO" push -q -u origin stable
+HOME_DIR=$(make_isolated_home)
+set_current_version "$HOME_DIR" v0.3.0
+run_update "$REPO" "$HOME_DIR" --set-channel stable
+
+WORK="$TMP_ROOT/stable-detached-unrelated-push"
+git clone -q "$ORIGIN" "$WORK"
+git -C "$WORK" config user.email t@t.com
+git -C "$WORK" config user.name T
+git -C "$WORK" checkout -q stable
+git -C "$WORK" commit -q --allow-empty -m "v0.4.0"
+git -C "$WORK" tag v0.4.0
+git -C "$WORK" push -q origin stable v0.4.0
+git -C "$REPO" checkout -q --detach HEAD
+git -C "$REPO" commit -q --allow-empty -m "deliberate detached work"
+STABLE_ORIGINAL_SHA=$(git -C "$REPO" rev-parse HEAD)
+
+run_update_tty "$REPO" "$HOME_DIR" y
+assert "stable detached off the stable lineage: leaves the deliberate checkout untouched and silent" \
+  "$( [ "$CODE" -eq 0 ] && [ -z "$(git -C "$REPO" branch --show-current)" ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$STABLE_ORIGINAL_SHA" ] && [ ! -f "$REPO/.migrate-calls" ] && [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v0.3.0" ] && ! printf '%s\n' "$OUT" | grep -Eqi 'detach|stable update available' && echo 0 || echo 1)"
+
+# Without a TTY the recovery is an instruction, not a mutation — and the
+# instruction has to be the one that re-attaches, not the fast-forward pull.
+PAIR=$(make_main_repo "stable-detached-no-tty")
+REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
+git -C "$REPO" checkout -q -b stable
+git -C "$REPO" push -q -u origin stable
+HOME_DIR=$(make_isolated_home)
+set_current_version "$HOME_DIR" v0.3.0
+run_update "$REPO" "$HOME_DIR" --set-channel stable
+
+WORK="$TMP_ROOT/stable-detached-no-tty-push"
+git clone -q "$ORIGIN" "$WORK"
+git -C "$WORK" config user.email t@t.com
+git -C "$WORK" config user.name T
+git -C "$WORK" checkout -q stable
+git -C "$WORK" commit -q --allow-empty -m "v0.4.0"
+git -C "$WORK" tag v0.4.0
+git -C "$WORK" push -q origin stable v0.4.0
+STABLE_ORIGINAL_SHA=$(git -C "$WORK" rev-parse HEAD)
+git -C "$REPO" fetch -q --tags origin stable
+git -C "$REPO" checkout -q --detach "$STABLE_ORIGINAL_SHA"
+git -C "$WORK" commit -q --allow-empty -m "v0.5.0"
+git -C "$WORK" tag v0.5.0
+git -C "$WORK" push -q origin stable v0.5.0
+
+run_update "$REPO" "$HOME_DIR"
+assert "stable detached without a TTY: prints the re-attach command without mutating the checkout" \
+  "$( [ "$CODE" -eq 0 ] && [ -z "$(git -C "$REPO" branch --show-current)" ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$STABLE_ORIGINAL_SHA" ] && [ ! -f "$REPO/.migrate-calls" ] && [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v0.3.0" ] && printf '%s\n' "$OUT" | grep -q 'git checkout -B stable' && echo 0 || echo 1)"
+
 PAIR=$(make_main_repo "s4-diverged")
 REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
 HOME_DIR=$(make_isolated_home)
@@ -1689,6 +1803,68 @@ run_update "$REPO" "$HOME_DIR" --set-channel main
 run_update "$REPO" "$HOME_DIR"
 assert "diverged: exits 0 without pulling" "$([ "$CODE" -eq 0 ] && echo 0 || echo 1)"
 assert "diverged: HEAD unchanged" "$([ "$(git -C "$REPO" rev-parse HEAD)" = "$BEFORE_SHA" ] && echo 0 || echo 1)"
+
+# ── Major-version approval gate ───────────────────────────────────────────────
+# A MAJOR crossing is the one upgrade this harness's own semver rules call
+# breaking, so it must not be applied by the advisory startup check and must
+# not be accepted with a single keypress.
+
+# Tagged channel, MAJOR available under --auto: reported, never applied.
+PAIR=$(make_main_repo "major-auto-tagged")
+REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
+git -C "$REPO" tag v0.104.0
+git -C "$REPO" push -q origin main v0.104.0
+git -C "$REPO" checkout -q v0.104.0
+HOME_DIR=$(make_isolated_home)
+set_current_version "$HOME_DIR" v0.104.0
+run_update "$REPO" "$HOME_DIR" --set-channel tagged
+git -C "$REPO" checkout -q main
+git -C "$REPO" commit -q --allow-empty -m "v1.0.0"
+git -C "$REPO" tag v1.0.0
+git -C "$REPO" push -q origin main v1.0.0
+git -C "$REPO" checkout -q v0.104.0
+BEFORE_SHA=$(git -C "$REPO" rev-parse HEAD)
+
+run_update_tty "$REPO" "$HOME_DIR" y --auto
+assert "major/--auto: reports the major crossing and applies nothing" \
+  "$( [ "$CODE" -eq 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$BEFORE_SHA" ] && \
+     printf '%s' "$OUT" | grep -q "MAJOR update v0.104.0 . v1.0.0" && echo 0 || echo 1)"
+assert "major/--auto: names the deliberate command instead of prompting" \
+  "$( printf '%s' "$OUT" | grep -q "bin/update" && ! printf '%s' "$OUT" | grep -q "\[y/n\]" && echo 0 || echo 1)"
+
+# Tagged channel, MAJOR, interactive: a bare "y" is not approval.
+run_update_tty "$REPO" "$HOME_DIR" y
+assert "major/interactive: a single y does not apply the update" \
+  "$( [ "$CODE" -eq 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" = "$BEFORE_SHA" ] && echo 0 || echo 1)"
+
+# Tagged channel, MAJOR, interactive: typing the version applies it.
+# Reset first: without this the case would pass vacuously whenever an earlier
+# case in this group had already applied the update.
+git -C "$REPO" checkout -q v0.104.0
+set_current_version "$HOME_DIR" v0.104.0
+run_update_tty "$REPO" "$HOME_DIR" v1.0.0
+assert "major/interactive: typing the target version applies the update" \
+  "$( [ "$CODE" -eq 0 ] && [ "$(git -C "$REPO" rev-parse HEAD)" != "$BEFORE_SHA" ] && \
+     [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v1.0.0" ] && echo 0 || echo 1)"
+
+# A non-major upgrade keeps the ordinary one-key flow.
+PAIR=$(make_main_repo "major-gate-minor")
+REPO="${PAIR%%|*}"; ORIGIN="${PAIR##*|}"
+git -C "$REPO" tag v1.0.0
+git -C "$REPO" push -q origin main v1.0.0
+git -C "$REPO" checkout -q v1.0.0
+HOME_DIR=$(make_isolated_home)
+set_current_version "$HOME_DIR" v1.0.0
+run_update "$REPO" "$HOME_DIR" --set-channel tagged
+git -C "$REPO" checkout -q main
+git -C "$REPO" commit -q --allow-empty -m "v1.1.0"
+git -C "$REPO" tag v1.1.0
+git -C "$REPO" push -q origin main v1.1.0
+git -C "$REPO" checkout -q v1.0.0
+
+run_update_tty "$REPO" "$HOME_DIR" y
+assert "non-major: a single y still applies the update" \
+  "$( [ "$CODE" -eq 0 ] && [ "$(cfg_get "$HOME_DIR" currentVersion)" = "v1.1.0" ] && echo 0 || echo 1)"
 
 assert "CHANGELOG carries a Migration block for the flag rename" \
   "$(awk '/^## \[Unreleased\]/{f=1} f&&/^## Migration/{print;exit}' "$HARNESS_DIR/CHANGELOG.md" | grep -q "Migration" && echo 0 || echo 1)"

@@ -1,3 +1,4 @@
+// Covers: task:14
 // ─────────────────────────────────────────────────────────────────────────────
 // Task 12 (adr-2026-07-03-gated-snapshot-status-read-model): the daemon must
 // write `.daemon/gated.json` on EVERY discovery pass — populated, explicitly
@@ -13,19 +14,33 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { access, chmod, mkdtemp, rm, readFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, chmod, mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { ConductorEventEmitter } from '../../src/ui/events.js';
+
+const execFileAsync = promisify(execFile);
 import ts from 'typescript';
 import type { BacklogItem } from '../../src/engine/daemon.js';
 import { localWorkSource, type LocalWorkSourceDeps } from '../../src/engine/daemon-work-source.js';
 import { writeGatedSnapshot } from '../../src/engine/gated-snapshot.js';
 import { acquireScratchHome } from '../../src/engine/self-host/provider-scratch.js';
+import { RESTART_MARKER, readRestartPending, writeRestartPending } from '../../src/engine/restart-marker.js';
+import { computeStatusRow } from '../../src/engine/daemon-observe-cli.js';
+import { getPidfilePath } from '../../src/engine/daemon-lock.js';
 import type { ConductState } from '../../src/types/index.js';
 import { writeState } from '../../src/engine/state.js';
 import { deriveDaemonBaseState, persistDaemonBaseState } from '../../src/engine/daemon-state.js';
-import { renderDaemonEvent, runDaemonMode } from '../../src/daemon-cli.js';
+import {
+  createForcedSetupPrepare,
+  renderDaemonEvent,
+  runDaemonMode,
+} from '../../src/daemon-cli.js';
+import { terminateFeature } from '../../src/engine/daemon-runner.js';
+import type { prepareWorktree } from '../../src/engine/worktree-prepare.js';
 import type {
   ConductStateStore,
   NamedAtomicStateMutationBatch,
@@ -128,6 +143,10 @@ function wiresTeardownShouldStop(property: ts.ObjectLiteralElementLike | undefin
     && initializer.body.expression.expression.text === 'teardown'
     && initializer.body.expression.name.text === 'shouldStop';
 }
+const supportedGhVersion = async () => ({
+  kind: 'ok' as const,
+  version: { major: 2, minor: 73, patch: 0 },
+});
 
 class RecordingConductStateStore implements ConductStateStore<ConductState> {
   readonly calls: Array<{ kind: 'batch'; batch: NamedAtomicStateMutationBatch<ConductState> }> = [];
@@ -147,6 +166,362 @@ class RecordingConductStateStore implements ConductStateStore<ConductState> {
     return this.result;
   }
 }
+
+describe('daemon termination guidance', () => {
+  it('amends the executor HALT through the dispatcher collection seam when auto-park writing fails', async () => {
+    const slug = 'auto-park-write-failed';
+    const worktreeBase = join(root, '.worktrees');
+    const worktreePath = join(worktreeBase, slug);
+    const writeFailure = Object.assign(new Error('EACCES: permission denied writing auto-park marker'), {
+      code: 'EACCES',
+    });
+    await mkdir(worktreePath, { recursive: true });
+    await terminateFeature({
+      worktreePath,
+      reason: 'setup still broken',
+      park: true,
+      deferAutoPark: true,
+      slug,
+    });
+
+    const daemonModule = await import('../../src/engine/daemon.js');
+    const parkMarkerModule = await import('../../src/engine/park-marker.js');
+    const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const runDaemonSpy = vi.spyOn(daemonModule, 'runDaemon').mockImplementation(async (deps) => {
+      await deps.onFeatureTerminalEffects?.({
+        slug,
+        status: 'error',
+        terminalEffects: { autoPark: { reason: 'setup still broken' } },
+      });
+      return { processed: [], stoppedReason: 'backlog_drained' };
+    });
+    const writeAutoParkSpy = vi.spyOn(parkMarkerModule, 'writeAutoPark').mockRejectedValue(writeFailure);
+
+    try {
+      await runDaemonMode({
+        projectRoot: root,
+        concurrency: 1,
+        baseBranch: 'main',
+        ensureFresh: async () => {},
+        probeGhVersion: supportedGhVersion,
+        runHaltClassMigration: async () => worktreeBase,
+        workSource: { discover: async () => [] },
+        watch: false,
+      });
+
+      const halt = await readFile(join(worktreePath, '.pipeline', 'HALT'), 'utf8');
+      expect(halt).toMatch(/^feature errored — automatic park failed/);
+      expect(halt).toContain('EACCES: permission denied writing auto-park marker');
+      expect(halt).toContain(`ai-conductor daemon park ${slug}`);
+      expect(halt).not.toContain(`ai-conductor daemon unpark ${slug}`);
+      expect(consoleLogSpy.mock.calls.flat().join('\n')).toContain(
+        `[daemon-runner] auto-park write failed for ${slug}: EACCES: permission denied writing auto-park marker`,
+      );
+    } finally {
+      runDaemonSpy.mockRestore();
+      writeAutoParkSpy.mockRestore();
+      consoleLogSpy.mockRestore();
+    }
+  });
+
+  it('collects a settled auto-park at the main root and preserves its EEXIST re-park', async () => {
+    const slug = 'dispatcher-collected-auto-park';
+    const worktreeBase = join(root, '.worktrees');
+    const worktreePath = join(worktreeBase, slug);
+    await mkdir(worktreePath, { recursive: true });
+    await terminateFeature({
+      worktreePath,
+      reason: 'runtime dispatch failure',
+      park: true,
+      deferAutoPark: true,
+      slug,
+    });
+
+    const daemonModule = await import('../../src/engine/daemon.js');
+    const runDaemonSpy = vi.spyOn(daemonModule, 'runDaemon').mockImplementation(async (deps) => {
+      const effect = {
+        slug,
+        status: 'error' as const,
+        terminalEffects: { autoPark: { reason: 'runtime dispatch failure' } },
+      };
+      await deps.onFeatureTerminalEffects?.(effect);
+      await deps.onFeatureTerminalEffects?.({
+        ...effect,
+        terminalEffects: { autoPark: { reason: 'new reason must not replace an existing park' } },
+      });
+      return { processed: [], stoppedReason: 'backlog_drained' };
+    });
+
+    try {
+      await runDaemonMode({
+        projectRoot: root,
+        concurrency: 1,
+        baseBranch: 'main',
+        ensureFresh: async () => {},
+        probeGhVersion: supportedGhVersion,
+        runHaltClassMigration: async () => worktreeBase,
+        workSource: { discover: async () => [] },
+        watch: false,
+      });
+
+      const marker = await readFile(join(root, '.daemon', 'parked', slug), 'utf8');
+      const halt = await readFile(join(worktreePath, '.pipeline', 'HALT'), 'utf8');
+      expect(marker).toMatch(/^auto-parked: runtime dispatch failure\ntimestamp: .+\n$/);
+      expect(halt).toMatch(/^feature parked — will not re-dispatch on the next scan/);
+      await expect(readFile(join(worktreePath, '.daemon', 'parked', slug), 'utf8'))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      runDaemonSpy.mockRestore();
+    }
+  });
+
+  // rem-as-built-rem-ab3-1 (adr-2026-08-27 D1): the engineer-store write is a
+  // dispatcher-side terminal effect performed from executor-captured content.
+  it('emits exactly one engineer signal at collection from executor-captured events content, after the worktree is gone', async () => {
+    const slug = 'dispatcher-collected-engineer-signal';
+    const engineerDir = join(root, 'engineer-store');
+    const savedEnv = process.env.AI_CONDUCTOR_ENGINEER_DIR;
+    process.env.AI_CONDUCTOR_ENGINEER_DIR = engineerDir;
+    const eventsContent = [
+      '{"type":"kickback","from":"build","to":"plan","count":1,"ts":"2026-06-25T00:00:02.000Z"}',
+      '',
+    ].join('\n');
+
+    const daemonModule = await import('../../src/engine/daemon.js');
+    const runDaemonSpy = vi.spyOn(daemonModule, 'runDaemon').mockImplementation(async (deps) => {
+      // No worktree exists for this slug — the dispatcher must emit from the
+      // captured content, not by re-reading `.pipeline/events.jsonl`.
+      await deps.onFeatureTerminalEffects?.({
+        slug,
+        status: 'done',
+        prUrl: 'http://pr/9',
+        terminalEffects: {
+          engineerSignal: {
+            outcome: { slug, status: 'done', prUrl: 'http://pr/9', costTokens: 12 },
+            eventsContent,
+          },
+        },
+      });
+      return { processed: [], stoppedReason: 'backlog_drained' };
+    });
+
+    try {
+      await runDaemonMode({
+        projectRoot: root,
+        concurrency: 1,
+        baseBranch: 'main',
+        ensureFresh: async () => {},
+        probeGhVersion: supportedGhVersion,
+        runHaltClassMigration: async () => join(root, '.worktrees'),
+        workSource: { discover: async () => [] },
+        watch: false,
+      });
+
+      const lines = (await readFile(join(engineerDir, 'signals.jsonl'), 'utf8'))
+        .split('\n').filter(Boolean);
+      expect(lines).toHaveLength(1);
+      const record = JSON.parse(lines[0]);
+      expect(record).toMatchObject({
+        project: basename(root),
+        feature: slug,
+        outcome: 'done',
+        kickbacks: [{ from: 'build', to: 'plan', count: 1 }],
+      });
+    } finally {
+      runDaemonSpy.mockRestore();
+      if (savedEnv === undefined) delete process.env.AI_CONDUCTOR_ENGINEER_DIR;
+      else process.env.AI_CONDUCTOR_ENGINEER_DIR = savedEnv;
+    }
+  });
+
+  it('an unwritable engineer dir never fails collection (best-effort signal)', async () => {
+    const slug = 'engineer-signal-unwritable';
+    const blockerFile = join(root, 'blocker-file');
+    await writeFile(blockerFile, 'not a directory', 'utf8');
+    const savedEnv = process.env.AI_CONDUCTOR_ENGINEER_DIR;
+    process.env.AI_CONDUCTOR_ENGINEER_DIR = join(blockerFile, 'engineer');
+
+    const daemonModule = await import('../../src/engine/daemon.js');
+    const runDaemonSpy = vi.spyOn(daemonModule, 'runDaemon').mockImplementation(async (deps) => {
+      await deps.onFeatureTerminalEffects?.({
+        slug,
+        status: 'halted',
+        terminalEffects: {
+          engineerSignal: {
+            outcome: { slug, status: 'halted', reason: 'needs human' },
+            eventsContent: '',
+          },
+        },
+      });
+      return { processed: [], stoppedReason: 'backlog_drained' };
+    });
+
+    try {
+      // Resolving without throwing IS the assertion: the store write is
+      // best-effort and must never fail collection.
+      await runDaemonMode({
+        projectRoot: root,
+        concurrency: 1,
+        baseBranch: 'main',
+        ensureFresh: async () => {},
+        probeGhVersion: supportedGhVersion,
+        runHaltClassMigration: async () => join(root, '.worktrees'),
+        workSource: { discover: async () => [] },
+        watch: false,
+      });
+    } finally {
+      runDaemonSpy.mockRestore();
+      if (savedEnv === undefined) delete process.env.AI_CONDUCTOR_ENGINEER_DIR;
+      else process.env.AI_CONDUCTOR_ENGINEER_DIR = savedEnv;
+    }
+  });
+
+  // Covers: task:10
+  it('keeps parked-feature recovery guidance in the executor HALT', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'daemon-cli-guidance-'));
+    const slug = 'canonical-cli-guidance';
+    const failedWorktree = join(projectRoot, 'failed-worktree');
+    const parkedWorktree = join(projectRoot, 'parked-worktree');
+    const nonDirectoryProjectRoot = join(projectRoot, 'not-a-directory');
+
+    try {
+      await Promise.all([
+        mkdir(failedWorktree, { recursive: true }),
+        mkdir(parkedWorktree, { recursive: true }),
+        writeFile(nonDirectoryProjectRoot, ''),
+      ]);
+
+      await terminateFeature({
+        worktreePath: failedWorktree,
+        projectRoot: nonDirectoryProjectRoot,
+        reason: 'automatic park could not be recorded',
+        park: true,
+        slug,
+      });
+      await terminateFeature({
+        worktreePath: parkedWorktree,
+        projectRoot,
+        reason: 'feature needs operator recovery',
+        park: true,
+        deferAutoPark: true,
+        slug,
+      });
+
+      const [failedHalt, parkedHalt] = await Promise.all([
+        readFile(join(failedWorktree, '.pipeline', 'HALT'), 'utf-8'),
+        readFile(join(parkedWorktree, '.pipeline', 'HALT'), 'utf-8'),
+      ]);
+
+      expect(failedHalt).toContain('feature errored — will re-dispatch on the next scan');
+      expect(parkedHalt).toContain(`ai-conductor daemon unpark ${slug}`);
+      expect(`${failedHalt}\n${parkedHalt}`).not.toContain('conduct-ts daemon');
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('daemon setup-triage prepare wiring', () => {
+  // Real local Git: the base SHA the forced prepare stamps into the setup
+  // marker is resolved from the project root's refs, so the resolution itself
+  // is the boundary under test. No third party is reachable.
+  let projectRoot: string;
+
+  async function git(...args: string[]): Promise<string> {
+    const { stdout } = await execFileAsync('git', ['-C', projectRoot, ...args]);
+    return stdout.trim();
+  }
+
+  beforeEach(async () => {
+    projectRoot = await mkdtemp(join(tmpdir(), 'forced-setup-prepare-'));
+    await execFileAsync('git', ['init', '-b', 'main', projectRoot]);
+    await git('config', 'user.email', 'test@example.com');
+    await git('config', 'user.name', 'Test');
+    await git('config', 'commit.gpgsign', 'false');
+    await git('commit', '--allow-empty', '-m', 'base');
+  });
+
+  afterEach(async () => {
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+
+  it('binds the resolved base SHA and the feature emitter into the forced prepare', async () => {
+    const prepare = vi.fn(async () => {});
+    const log = vi.fn();
+    const events = new ConductorEventEmitter();
+    const runPrepare = createForcedSetupPrepare(
+      prepare as typeof prepareWorktree,
+      log,
+      true,
+      { projectRoot, baseBranch: 'main', events, dispatchStartTimeoutSeconds: 300 },
+    );
+
+    await runPrepare('/worktrees/after-quarantine');
+    await runPrepare('/worktrees/after-fix');
+
+    const baseSha = await git('rev-parse', 'main');
+    // Both triage stages share this callback, and each run must carry the base
+    // (so a success rewrites the marker) and the emitter (so `forced` rides the
+    // spine) — not just `force`.
+    //
+    // `dispatchStartTimeoutSeconds` is the other half of the `dispatchStart`
+    // hook contract: without it `runDispatchStart` silently falls back to the
+    // hardcoded 120s default and the project's configured value never reaches
+    // the setup-triage path. 300 is deliberately NOT the default, so a
+    // regression that drops the forwarding fails here instead of passing on a
+    // coincidental match.
+    expect(prepare).toHaveBeenNthCalledWith(
+      1,
+      '/worktrees/after-quarantine',
+      log,
+      { verbose: true, force: true, baseSha, events, dispatchStart: true, dispatchStartTimeoutSeconds: 300 },
+    );
+    expect(prepare).toHaveBeenNthCalledWith(
+      2,
+      '/worktrees/after-fix',
+      log,
+      { verbose: true, force: true, baseSha, events, dispatchStart: true, dispatchStartTimeoutSeconds: 300 },
+    );
+  });
+
+  it('re-resolves the base on every verification run', async () => {
+    const prepare = vi.fn(async () => {});
+    const runPrepare = createForcedSetupPrepare(
+      prepare as typeof prepareWorktree,
+      undefined,
+      false,
+      { projectRoot, baseBranch: 'main' },
+    );
+
+    await runPrepare('/worktrees/before-advance');
+    const firstBase = await git('rev-parse', 'main');
+    await git('commit', '--allow-empty', '-m', 'base advances mid-triage');
+    await runPrepare('/worktrees/after-advance');
+    const secondBase = await git('rev-parse', 'main');
+
+    expect(secondBase).not.toBe(firstBase);
+    expect(prepare.mock.calls.map((call) => (call as unknown as [string, unknown, { baseSha?: string }])[2].baseSha))
+      .toEqual([firstBase, secondBase]);
+  });
+
+  it('keeps forced setup pinned to the dispatched order when the root advances', async () => {
+    const prepare = vi.fn(async () => {});
+    const pinnedBase = await git('rev-parse', 'main');
+    const runPrepare = createForcedSetupPrepare(
+      prepare as typeof prepareWorktree,
+      undefined,
+      false,
+      { projectRoot, baseBranch: 'main', baseSha: pinnedBase },
+    );
+
+    await runPrepare('/worktrees/before-advance');
+    await git('commit', '--allow-empty', '-m', 'root advances after dispatch');
+    await runPrepare('/worktrees/after-advance');
+
+    expect(prepare.mock.calls.map((call) => (call as unknown as [string, unknown, { baseSha?: string }])[2].baseSha))
+      .toEqual([pinnedBase, pinnedBase]);
+  });
+});
 
 describe('daemon state-store command boundary (Task 17)', () => {
   it('records daemon base-state updates through the shared mutation port', async () => {
@@ -566,6 +941,7 @@ describe('Task 22: Process-level SIGTERM handler in daemon-cli', () => {
         concurrency: 1,
         baseBranch: 'main',
         ensureFresh: async () => {},
+        probeGhVersion: supportedGhVersion,
         runHaltClassMigration: async () => worktreeBase,
         workSource: { discover: async () => [] },
         watch: false,
@@ -599,13 +975,84 @@ describe('Task 22: Process-level SIGTERM handler in daemon-cli', () => {
       vi.restoreAllMocks();
     }
   });
+
+  it('releases the lock then exits after the daemon consumes a queued restart marker', async () => {
+    const events: string[] = [];
+    const started: string[] = [];
+    await mkdir(join(root, '.ai-conductor'), { recursive: true });
+    await writeFile(
+      join(root, '.ai-conductor', 'config.yml'),
+      'daemon_concurrency: 2\nharness_self_host:\n  build_auth:\n    mode: api-key\n',
+    );
+    let releaseWorkers: (() => void) | undefined;
+    const workersReleased = new Promise<void>((resolve) => {
+      releaseWorkers = resolve;
+    });
+    await runDaemonMode({
+        projectRoot: root,
+        concurrency: 2,
+        baseBranch: 'main',
+        ensureFresh: async () => {},
+        probeGhVersion: supportedGhVersion,
+        runHaltClassMigration: async () => join(root, '.worktrees'),
+        workSource: {
+          discover: async () => [
+            { slug: 'first' },
+            { slug: 'second' },
+            { slug: 'later' },
+          ],
+        },
+        watch: false,
+        runFeature: async (item) => {
+          started.push(item.slug);
+          if (started.length === 2) {
+            await writeRestartPending(root, { blockingSlug: 'first' });
+            await vi.waitFor(async () => {
+              await expect(readRestartPending(root)).resolves.toMatchObject({
+                drainSlugs: ['first', 'second'],
+              });
+            });
+            const status = await computeStatusRow(
+              {
+                schemaVersion: 1,
+                name: 'repo',
+                path: root,
+                status: 'registered',
+                registeredAt: '2026-08-30T00:00:00.000Z',
+              },
+              () => true,
+              async () => false,
+            );
+            events.push(`status:${status.restartPending?.drainSlugs?.join(',')}`);
+            releaseWorkers?.();
+          }
+          await workersReleased;
+          return { slug: item.slug, status: 'done' };
+        },
+        exitProcess: () => {
+          events.push(existsSync(join(root, RESTART_MARKER)) ? 'marker-present' : 'marker-consumed');
+          events.push(existsSync(getPidfilePath(root)) ? 'lock-held' : 'lock-released');
+          events.push('exited');
+        },
+      });
+
+    const durableDrainLines = (await readFile(join(root, '.daemon', 'daemon.log'), 'utf8'))
+      .split('\n')
+      .filter((line) => line.includes('drain started: restart-pending'));
+    expect(durableDrainLines).toEqual([
+      expect.stringMatching(/^\d{4}-\d{2}-\d{2}T[^ ]+ \[daemon\] drain started: restart-pending$/),
+    ]);
+    expect({ started, events }).toEqual({
+      started: ['first', 'second'],
+      events: ['status:first,second', 'marker-consumed', 'lock-released', 'exited'],
+    });
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task 3 (#561, daemon-releases-the-lock-only-after-draining-in-fl): SIGTERM
 // must drain (via runDaemon's shouldStop) before the lock is released, with a
-// bounded force-release if the drain never completes. Static source-assert
-// checks mirroring the Task 22 SIGTERM block above.
+// bounded force-release if the drain never completes.
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('Task 3: SIGTERM drains then releases lock; bounded force-release', () => {
@@ -632,18 +1079,76 @@ describe('Task 3: SIGTERM drains then releases lock; bounded force-release', () 
     expect(wiresTeardownShouldStop(propertyNamed(deps, 'shouldStop'))).toBe(true);
   });
 
-  it('onForceRelease synchronously releases the lock and logs a greppable force-release line', () => {
-    const src = readFileSync(join(__dirname, '../../src/daemon-cli.ts'), 'utf-8');
-
-    const teardownMatch = src.match(
-      /createDaemonTeardown\(\{([\s\S]*?)\n  \}\);/,
+  it('force-releases a wedged two-executor daemon after its scaled bound and drops the lock before exit', async () => {
+    // exitProcess records the exit instead of terminating this worker. Pair it
+    // with a recording sink so post-exit fixture cleanup cannot write to a
+    // stream that the real process-exit backstop has already closed.
+    const logLines: string[] = [];
+    const logModule = await import('../../src/engine/daemon-log.js');
+    const logSpy = vi.spyOn(logModule, 'openDaemonLog').mockResolvedValue({
+      write: (line) => { logLines.push(line); },
+      close: async () => {},
+      closeSync: () => {},
+    });
+    const started: string[] = [];
+    const exits: Array<{ code: number; lockPresent: boolean }> = [];
+    let releaseWorkers: (() => void) | undefined;
+    const workersReleased = new Promise<void>((resolve) => {
+      releaseWorkers = resolve;
+    });
+    let workersStarted!: () => void;
+    const startedWorkers = new Promise<void>((resolve) => {
+      workersStarted = resolve;
+    });
+    await mkdir(join(root, '.ai-conductor'), { recursive: true });
+    await writeFile(
+      join(root, '.ai-conductor', 'config.yml'),
+      'daemon_concurrency: 2\nharness_self_host:\n  build_auth:\n    mode: api-key\n',
     );
-    expect(teardownMatch).not.toBeNull();
-    const teardownArgs = teardownMatch![1];
 
-    expect(teardownArgs).toContain('onForceRelease');
-    expect(teardownArgs).toContain('releaseBackstop()');
-    expect(teardownArgs).toMatch(/force-release/);
+    const daemon = runDaemonMode({
+      projectRoot: root,
+      concurrency: 2,
+      baseBranch: 'main',
+      ensureFresh: async () => {},
+      probeGhVersion: supportedGhVersion,
+      runHaltClassMigration: async () => join(root, '.worktrees'),
+      workSource: {
+        discover: async () => [{ slug: 'first' }, { slug: 'second' }],
+      },
+      watch: false,
+      runFeature: async (item) => {
+        started.push(item.slug);
+        if (started.length === 2) workersStarted();
+        await workersReleased;
+        return { slug: item.slug, status: 'done' };
+      },
+      exitProcess: (code) => {
+        exits.push({ code, lockPresent: existsSync(getPidfilePath(root)) });
+      },
+    });
+
+    try {
+      await startedWorkers;
+      vi.useFakeTimers();
+      process.emit('SIGTERM');
+      // The two running executors each receive the full 30-second allowance.
+      // Stopping just short of 60 seconds makes the scaled boundary observable:
+      // the former single-executor 30-second timeout would have force-released
+      // the lock already.
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(exits).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(exits).toEqual([{ code: 1, lockPresent: false }]);
+      expect(logLines.join('\n')).toContain('teardown force-release');
+    } finally {
+      releaseWorkers?.();
+      await daemon;
+      vi.useRealTimers();
+      logSpy.mockRestore();
+    }
   });
 
   it('normal-completion path cancels the teardown controller before/around releasing the lock', () => {

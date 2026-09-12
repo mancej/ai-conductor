@@ -1,4 +1,4 @@
-import { describe, it, expect, expectTypeOf, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   makeVerdictOutcome,
   makeNoVerdictOutcome,
@@ -6,14 +6,12 @@ import {
   classifyOutcome,
   runWithConcurrency,
   runGroupBranch,
-  runNativeGroupBranch,
   runAuxiliaryGroupBranch,
   runAuxiliaryGroupBranches,
   type BranchOutcome,
   type GroupMember,
   type GroupMemberStepEvent,
   type GroupResult,
-  type NativeBranchExecutorDeps,
 } from "../../src/engine/group-core.js";
 import type { StepRunResult, StepRunOptions } from "../../src/engine/conductor.js";
 import type { StepName, ConductState } from "../../src/types/index.js";
@@ -244,101 +242,6 @@ describe("group-core: runWithConcurrency (capped fan-out semaphore)", () => {
   });
 });
 
-describe("group-core: runNativeGroupBranch", () => {
-  it("accepts only an injected executor and member-event dependency", () => {
-    expectTypeOf<Parameters<typeof runNativeGroupBranch>[1]>().toEqualTypeOf<
-      () => Promise<StepRunResult>
-    >();
-    expectTypeOf<NativeBranchExecutorDeps>().toEqualTypeOf<{
-      onMemberEvent?: (event: GroupMemberStepEvent) => void | Promise<void>;
-    }>();
-  });
-
-  it("maps injected native results into ordered member-attributed outcomes", async () => {
-    const events: Array<Pick<GroupMemberStepEvent, "member" | "phase" | "outcome">> = [];
-    const members: GroupMember[] = [
-      { name: "wiring_check", skill: "", outcome: makeSkippedOutcome() },
-      { name: "test_suite", skill: "", outcome: makeSkippedOutcome() },
-    ];
-
-    const outcomes = await runWithConcurrency(
-      [
-        () => runNativeGroupBranch(members[0]!, async () => ({ success: true }), {
-          onMemberEvent: ({ member, phase, outcome }) => {
-            events.push({ member, phase, outcome });
-          },
-        }),
-        () => runNativeGroupBranch(members[1]!, async () => ({ success: false, output: "suite failed" }), {
-          onMemberEvent: ({ member, phase, outcome }) => {
-            events.push({ member, phase, outcome });
-          },
-        }),
-      ],
-      2,
-    );
-
-    expect({ outcomes, events }).toEqual({
-      outcomes: [
-        { kind: "verdict", verdict: "pass" },
-        { kind: "no-verdict", reason: "suite failed" },
-      ],
-      events: [
-        { member: "wiring_check", phase: "dispatch" },
-        { member: "test_suite", phase: "dispatch" },
-        { member: "wiring_check", phase: "result", outcome: "verdict:pass" },
-        { member: "test_suite", phase: "result", outcome: "no-verdict" },
-      ],
-    });
-  });
-
-  it("maps a throwing native executor to no-verdict after started sibling work settles", async () => {
-    let settleSibling!: (value: string) => void;
-    const sibling = new Promise<string>((resolve) => {
-      settleSibling = resolve;
-    });
-    let siblingSettled = false;
-    const members: GroupMember[] = [
-      { name: "wiring_check", skill: "", outcome: makeSkippedOutcome() },
-      { name: "test_suite", skill: "", outcome: makeSkippedOutcome() },
-    ];
-    const events: Array<Pick<GroupMemberStepEvent, "member" | "phase" | "outcome">> = [];
-
-    const groupPromise = runWithConcurrency(
-      [
-        () => runNativeGroupBranch(members[0]!, async () => {
-          throw new Error("wiring crashed");
-        }, {
-          onMemberEvent: ({ member, phase, outcome }) => {
-            events.push({ member, phase, outcome });
-          },
-        }),
-        async () => {
-          const result = await sibling;
-          siblingSettled = true;
-          return runNativeGroupBranch(members[1]!, async () => ({ success: true, output: result }));
-        },
-      ],
-      2,
-    );
-
-    await Promise.resolve();
-    settleSibling("suite settled");
-    const outcomes = await groupPromise;
-
-    expect({ outcomes, siblingSettled, events }).toEqual({
-      outcomes: [
-        { kind: "no-verdict", reason: "wiring crashed" },
-        { kind: "verdict", verdict: "pass" },
-      ],
-      siblingSettled: true,
-      events: [
-        { member: "wiring_check", phase: "dispatch" },
-        { member: "wiring_check", phase: "result", outcome: "no-verdict" },
-      ],
-    });
-  });
-});
-
 describe("group-core: runAuxiliaryGroupBranch", () => {
   it("dispatches string member IDs through typed policy and outcome callbacks without lifecycle state", async () => {
     const policy: ResolvedBuildReviewRubricPolicy = {
@@ -349,6 +252,7 @@ describe("group-core: runAuxiliaryGroupBranch", () => {
       model_fallback_ladder: ["sonnet"],
       max_retries: 2,
       escalate: false,
+      min_confidence: 0,
     };
     const outcome: BuildReviewRubricResult = {
       kind: "skipped",
@@ -379,7 +283,7 @@ describe("group-core: runAuxiliaryGroupBranch", () => {
     const first = deferred<BuildReviewRubricResult>();
     const started: string[] = [];
     const policies: Record<"testQuality", ResolvedBuildReviewRubricPolicy> = {
-      testQuality: { enabled: true, llm_provider: "claude", model: "sonnet", effort: "medium", model_fallback_ladder: ["sonnet", "opus"], max_retries: 2, escalate: false },
+      testQuality: { enabled: true, llm_provider: "claude", model: "sonnet", effort: "medium", model_fallback_ladder: ["sonnet", "opus"], max_retries: 2, escalate: false, min_confidence: 0 },
     };
 
     const outcomesPromise = runAuxiliaryGroupBranches(
@@ -1426,42 +1330,46 @@ describe("group-core: runGroupBranch per-branch stale-sweep isolation (Task 9)",
 
   it("sweeps ONLY the stale member's own marker, leaving the other member's fresh marker untouched", async () => {
     const dir = await mkdtemp(join(tmpdir(), "group-core-sweep-"));
-    await mkdir(join(dir, ".pipeline"), { recursive: true });
+    try {
+      await mkdir(join(dir, ".pipeline"), { recursive: true });
 
-    const sessionStartedAt = Date.now();
+      const sessionStartedAt = Date.now();
 
-    // Member A's marker (manual_test) predates this session — stale.
-    const staleMarker = join(dir, ".pipeline", "manual-test-results.md");
-    await writeFile(staleMarker, "stale content from a crashed prior run");
-    await utimes(staleMarker, new Date(sessionStartedAt - 60_000), new Date(sessionStartedAt - 60_000));
+      // Member A's marker (manual_test) predates this session — stale.
+      const staleMarker = join(dir, ".pipeline", "manual-test-results.md");
+      await writeFile(staleMarker, "stale content from a crashed prior run");
+      await utimes(staleMarker, new Date(sessionStartedAt - 60_000), new Date(sessionStartedAt - 60_000));
 
-    // Member B's marker (prd_audit) is fresh — written THIS session.
-    const freshMarker = join(dir, ".pipeline", "prd-audit.md");
-    await writeFile(freshMarker, "fresh content from this session");
-    await utimes(freshMarker, new Date(sessionStartedAt + 60_000), new Date(sessionStartedAt + 60_000));
+      // Member B's marker (prd_audit) is fresh — written THIS session.
+      const freshMarker = join(dir, ".pipeline", "prd-audit.md");
+      await writeFile(freshMarker, "fresh content from this session");
+      await utimes(freshMarker, new Date(sessionStartedAt + 60_000), new Date(sessionStartedAt + 60_000));
 
-    const memberA: GroupMember = { name: "manual_test" as unknown as string, skill: "manual-test", outcome: makeSkippedOutcome() };
-    const memberB: GroupMember = { name: "prd_audit" as unknown as string, skill: "prd-audit", outcome: makeSkippedOutcome() };
+      const memberA: GroupMember = { name: "manual_test" as unknown as string, skill: "manual-test", outcome: makeSkippedOutcome() };
+      const memberB: GroupMember = { name: "prd_audit" as unknown as string, skill: "prd-audit", outcome: makeSkippedOutcome() };
 
-    await runGroupBranch(
-      memberA,
-      {} as ConductState,
-      { stepRunner: okRunner(), projectRoot: dir, sessionStartedAt },
-      3,
-    );
-    await runGroupBranch(
-      memberB,
-      {} as ConductState,
-      { stepRunner: okRunner(), projectRoot: dir, sessionStartedAt },
-      3,
-    );
+      await runGroupBranch(
+        memberA,
+        {} as ConductState,
+        { stepRunner: okRunner(), projectRoot: dir, sessionStartedAt },
+        3,
+      );
+      await runGroupBranch(
+        memberB,
+        {} as ConductState,
+        { stepRunner: okRunner(), projectRoot: dir, sessionStartedAt },
+        3,
+      );
 
-    // A's stale marker was swept before dispatch.
-    await expect(stat(staleMarker)).rejects.toThrow();
+      // A's stale marker was swept before dispatch.
+      await expect(stat(staleMarker)).rejects.toThrow();
 
-    // B's fresh marker survived untouched.
-    const freshStat = await stat(freshMarker);
-    expect(freshStat).toBeTruthy();
+      // B's fresh marker survived untouched.
+      const freshStat = await stat(freshMarker);
+      expect(freshStat).toBeTruthy();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("does not spare a stale partial PRD-audit report when the dispatch state supplies its feature description", async () => {

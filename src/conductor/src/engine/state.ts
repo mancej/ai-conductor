@@ -42,15 +42,34 @@ export async function readState(path: string): Promise<StateResult<ConductState>
     };
   }
 
+  let parsed: ConductState;
   try {
-    const parsed = JSON.parse(raw) as ConductState;
-    return { ok: true, value: migrateState(parsed) };
+    parsed = JSON.parse(raw) as ConductState;
   } catch {
     return {
       ok: false,
       error: { type: 'corrupted', message: 'Invalid JSON in state file' },
     };
   }
+
+  // A persisted `retro` status can no longer participate in selection. Route
+  // it through the registry's established fail-loud diagnostic rather than
+  // loading a state that can leave a removed gate permanently pending.
+  if (Object.prototype.hasOwnProperty.call(parsed, 'retro')) {
+    try {
+      getStepDefinition('retro' as StepName);
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          type: 'corrupted',
+          message: error instanceof Error ? error.message : 'Unknown step: retro',
+        },
+      };
+    }
+  }
+
+  return { ok: true, value: migrateState(parsed) };
 }
 
 /**
@@ -282,10 +301,6 @@ export async function markFeatureComplete(
  * Mark all 'done' steps after targetStep as 'stale'.
  * Pending, failed, and skipped steps are unchanged.
  *
- * A deprecated no-op step is never staled: it has no work to redo, so
- * re-opening it only burns a selection lap each round and lets a retired step
- * become the gate named in a selection-cap HALT — masking the gate that
- * actually failed (adr-2026-08-11-deprecated-no-op-step-retirement).
  */
 export function markDownstreamStale(
   state: ConductState,
@@ -300,11 +315,20 @@ export function markDownstreamStale(
   for (let i = targetIndex + 1; i < allStepNames.length; i++) {
     const step = allStepNames[i];
     if (preserveSet.has(step)) continue;
-    if (getStepDefinition(step).deprecated) continue;
     if (updated[step] === 'done') {
       (updated as Record<string, unknown>)[step] = 'stale';
     }
   }
 
   return updated;
+}
+
+/** Preserve only restages whose current state is not skipped. */
+export function filterRestageChanges(
+  state: ConductState,
+  changes: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(changes).filter(([field]) => (state as Record<string, unknown>)[field] !== 'skipped'),
+  );
 }

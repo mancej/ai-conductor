@@ -13,7 +13,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.docsonly.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: docsonly
@@ -33,7 +33,7 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Installed explicitly so integrity checks 1b and 9d enforce here rather
       # than degrading to their "tool absent" paths on a runner image change.
       # A stalled Ubuntu mirror must not consume the workflow's six-hour ceiling.
@@ -42,7 +42,12 @@ jobs:
       - name: Install integrity tooling
         run: |
           install_apt_packages() {
+            # ShellCheck and ripgrep come from Ubuntu. Restrict the update to
+            # that source so an unrelated preinstalled repository (for example
+            # Chrome) with a transient bad index cannot block these checks.
             timeout --foreground --kill-after=10s 60s sudo apt-get \
+              -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" \
+              -o Dir::Etc::sourceparts="-" \
               -o Acquire::Retries=0 \
               -o Acquire::http::Timeout=20 \
               -o Acquire::https::Timeout=20 \
@@ -62,7 +67,7 @@ jobs:
       # integrity job needs src/conductor's dependencies installed — without
       # them every probe invocation fails as "could not execute", which reads
       # as a guard failure rather than a missing tool.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version-file: src/conductor/.tool-versions
           cache: npm
@@ -76,12 +81,16 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Keep this independent gate resilient to the same transient mirror stalls.
       - name: Install ShellCheck
         run: |
           install_apt_packages() {
+            # ShellCheck comes from Ubuntu. Restrict the update to that source
+            # so an unrelated preinstalled repository cannot block this check.
             timeout --foreground --kill-after=10s 60s sudo apt-get \
+              -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" \
+              -o Dir::Etc::sourceparts="-" \
               -o Acquire::Retries=0 \
               -o Acquire::http::Timeout=20 \
               -o Acquire::https::Timeout=20 \
@@ -105,8 +114,8 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version-file: src/conductor/.tool-versions
           cache: npm
@@ -121,8 +130,8 @@ jobs:
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version-file: src/conductor/.tool-versions
           cache: npm
@@ -140,11 +149,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    # The aggregate Vitest suite normally completes in a few minutes, but its
+    # filesystem-heavy local-Git fixtures can exceed the platform's short
+    # default execution budget on a contended hosted runner. Keep a finite,
+    # explicit ceiling rather than losing the test summary to that timeout.
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version-file: src/conductor/.tool-versions
           cache: npm
@@ -171,7 +185,7 @@ jobs:
   links:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: lycheeverse/lychee-action@v2
         with:
           # Settings (offline-only, CHANGELOG.md excluded) live in lychee.toml.

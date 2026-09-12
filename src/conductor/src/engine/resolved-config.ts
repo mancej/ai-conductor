@@ -44,15 +44,14 @@ export const DEFAULT_STEP_RETRIES: Record<StepName, number> = {
   architecture_diagram: 3,
   architecture_review: 5,
   worktree: 1,
+  coverage_binding: 3,
   acceptance_specs: 3,
   build: 3,
   build_review: 3,
-  wiring_check: 1, // deprecated compatibility step; never dispatched
   test_suite: 1,
   manual_test: 3,
   prd_audit: 3,
   architecture_review_as_built: 3,
-  retro: 3,
   rebase: 1,
   // FINISH makes one verified publication transition per attempt, then
   // re-observes authoritatively before declaring completion.
@@ -75,15 +74,14 @@ export const DEFAULT_STEP_REVIEW: Record<StepName, ReviewMode> = {
   architecture_diagram: 'auto',
   architecture_review: 'conditional',
   worktree: 'auto',
+  coverage_binding: 'auto', // engine-native gate; the judge config is resolved separately
   acceptance_specs: 'auto',
   build: 'auto',
   build_review: 'conditional', // marker written only on FAIL verdict (kickback)
-  wiring_check: 'auto', // deprecated compatibility step; never dispatched
   test_suite: 'auto', // deterministic native verifier; no generative review
   manual_test: 'auto',
   prd_audit: 'conditional',          // marker written only when an FR is non-ALIGNED
   architecture_review_as_built: 'conditional', // marker written only on drift/BLOCKED
-  retro: 'manual',
   rebase: 'auto',
   finish: 'auto',
   remediate: 'auto',       // conductor routes deterministically from remediation.json
@@ -97,12 +95,32 @@ export const FALLBACK_EFFORT: EffortLevel = 'medium';
 export const FALLBACK_RETRIES = 3;
 export const FALLBACK_REVIEW: ReviewMode = 'manual';
 
+/** The serial daemon default when no executor-pool width is configured. */
+export const DEFAULT_DAEMON_CONCURRENCY = 1;
+
+/**
+ * Resolve the daemon executor-pool width from validated configuration.
+ *
+ * `validateConfig` rejects values outside the accepted integer range [1, ∞),
+ * so this resolver only needs to apply the absent-key default.
+ */
+export function resolveDaemonConcurrency(config?: HarnessConfig): number {
+  return config?.daemon_concurrency ?? DEFAULT_DAEMON_CONCURRENCY;
+}
+
 /**
  * Default for the per-step `escalate` knob (#188). True means retries climb the
  * escalation ladder (effort, then model tier). Existing configs begin escalating
  * by default — the intended behavior change, documented as a migration note.
  */
 export const DEFAULT_STEP_ESCALATE = true;
+
+/** Resolve the default-off coverage-binding judge configuration. */
+export function resolveCoverageBindingConfig(
+  config: Pick<HarnessConfig, 'coverage_binding'> | undefined,
+): { judgeEnabled: boolean } {
+  return { judgeEnabled: config?.coverage_binding?.judge?.enabled ?? false };
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Resolution
@@ -488,6 +506,34 @@ export const DEFAULT_AUTH_PARK_TIMEOUT_MINUTES = 60;
 /** Default bounded grace period for a project-supplied daemon teardown hook. */
 const DEFAULT_TEARDOWN_TIMEOUT_SECONDS = 120;
 
+/** Default bounded grace period for a project-supplied dispatch-start hook. */
+const DEFAULT_DISPATCH_START_TIMEOUT_SECONDS = 120;
+
+type DispatchStartTimeoutConfig = HarnessConfig & {
+  dispatch_start_timeout_seconds?: unknown;
+};
+
+/**
+ * Resolve the project dispatch-start hook timeout from HarnessConfig.
+ *
+ * A dispatch-start hook must always have a bounded grace period: absent values
+ * use the default, and invalid runtime values warn once before falling back to
+ * it.
+ */
+export function resolveDispatchStartTimeoutSeconds(config?: HarnessConfig): number {
+  const override = (config as DispatchStartTimeoutConfig | undefined)?.dispatch_start_timeout_seconds;
+  if (override === undefined) {
+    return DEFAULT_DISPATCH_START_TIMEOUT_SECONDS;
+  }
+  if (typeof override !== 'number' || !Number.isFinite(override) || override <= 0) {
+    console.warn(
+      `Invalid dispatch_start_timeout_seconds ${JSON.stringify(override)}; using default ${DEFAULT_DISPATCH_START_TIMEOUT_SECONDS}.`,
+    );
+    return DEFAULT_DISPATCH_START_TIMEOUT_SECONDS;
+  }
+  return override;
+}
+
 /**
  * Resolve the project teardown hook timeout from HarnessConfig.
  *
@@ -505,38 +551,6 @@ export function resolveTeardownTimeoutSeconds(config?: HarnessConfig): number {
     );
     return DEFAULT_TEARDOWN_TIMEOUT_SECONDS;
   }
-  return override;
-}
-
-/**
- * Resolve the auth park timeout from HarnessConfig.
- *
- * Reads `config.auth_park_timeout_minutes` (top-level HarnessConfig key).
- *
- * Resolution rules:
- *   - undefined / absent     → DEFAULT_AUTH_PARK_TIMEOUT_MINUTES (60)
- *   - finite number (any)    → use the value (0 and negatives signal opt-out at runtime)
- *   - non-numeric (string)   → throw with clear error message
- *   - NaN or Infinity        → throw with clear error message
- *
- * @throws Error if the value is non-numeric or non-finite (NaN, Infinity)
- */
-export function resolveAuthParkTimeoutMinutes(config?: HarnessConfig): number {
-  const override = config?.auth_park_timeout_minutes;
-  if (override === undefined || override === null) {
-    return DEFAULT_AUTH_PARK_TIMEOUT_MINUTES;
-  }
-  if (typeof override !== 'number') {
-    throw new Error(
-      `Invalid auth_park_timeout_minutes: expected a number, got ${typeof override} (${JSON.stringify(override)})`
-    );
-  }
-  if (!Number.isFinite(override)) {
-    throw new Error(
-      `Invalid auth_park_timeout_minutes: must be a finite number, got ${override}`
-    );
-  }
-  // Preserve 0 and negative values as opt-out signals; positive values are timeout in minutes
   return override;
 }
 
@@ -592,7 +606,6 @@ export function getDefaultBuildAuthTokenPath(): string {
 /** Fully-resolved self-host guardrail settings (no optional fields). */
 export interface ResolvedSelfHostConfig {
   activation: SelfHostActivation;
-  skillRelinkPreflight: boolean;
   sandboxBuildEnv: boolean;
   liveContainment: boolean;
   versionApprovalGate: boolean;
@@ -649,7 +662,6 @@ export function resolveSelfHostConfig(config?: HarnessConfig): ResolvedSelfHostC
 
   return {
     activation: block?.activation ?? DEFAULT_SELF_HOST_ACTIVATION,
-    skillRelinkPreflight: block?.skill_relink_preflight ?? true,
     sandboxBuildEnv: block?.sandbox_build_env ?? true,
     liveContainment: typeof block?.live_containment === 'boolean'
       ? block.live_containment
@@ -668,40 +680,12 @@ export function resolveSelfHostConfig(config?: HarnessConfig): ResolvedSelfHostC
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Mergeable autoresolve configuration (auto-resolve merge conflicts on open PRs)
-// ────────────────────────────────────────────────────────────────────────────
-
-export const DEFAULT_MERGEABLE_AUTORESOLVE_ENABLED = false;
-export const DEFAULT_MERGEABLE_AUTORESOLVE_COOLDOWN_MINUTES = 60;
-
-/** Fully-resolved mergeable autoresolve settings (no optional fields). */
-export interface ResolvedMergeableAutoresolveConfig {
-  enabled: boolean;
-  cooldownMinutes: number;
-  suiteCommand: string | undefined;
-}
-
-/**
- * Resolve the `mergeable_autoresolve` block to concrete settings.
- * Absent block defaults to disabled (safe-by-default).
- * Validation of the raw block happens in `validateConfig`; this resolver
- * assumes a validated (or absent) block and only applies defaults.
- */
-export function resolveMergeableAutoresolve(config?: HarnessConfig): ResolvedMergeableAutoresolveConfig {
-  const block = config?.mergeable_autoresolve;
-  return {
-    enabled: block?.enabled ?? DEFAULT_MERGEABLE_AUTORESOLVE_ENABLED,
-    cooldownMinutes: block?.cooldownMinutes ?? DEFAULT_MERGEABLE_AUTORESOLVE_COOLDOWN_MINUTES,
-    suiteCommand: block?.suiteCommand,
-  };
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // build_review configuration (default-on judgement gate at the build →
 // manual_test seam — replacement completion authority, #773 Task 4)
 // ────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_BUILD_REVIEW_ENABLED = true;
+const DEFAULT_BUILD_REVIEW_ADJUDICATION_ENABLED = true;
 const DEFAULT_SCOPE_CONTAINMENT_ENFORCED = false;
 const DEFAULT_BUILD_REVIEW_MAX_PARALLEL = 1;
 const BUILD_REVIEW_RUBRIC_IDS: readonly BuildReviewRubricId[] = ['testQuality'];
@@ -715,11 +699,18 @@ export interface ResolvedBuildReviewRubricPolicy {
   model_fallback_ladder: readonly string[];
   max_retries: number;
   escalate: boolean;
+  min_confidence: number;
+}
+
+/** Concrete post-join remediation adjudication setting. */
+export interface ResolvedBuildReviewAdjudicationConfig {
+  enabled: boolean;
 }
 
 /** Fully-resolved build_review settings (no optional fields). */
 export interface ResolvedBuildReviewConfig {
   enabled: boolean;
+  adjudication: ResolvedBuildReviewAdjudicationConfig;
   scopeContainmentEnforced: boolean;
   maxParallel: number;
   rubrics: Record<BuildReviewRubricId, ResolvedBuildReviewRubricPolicy>;
@@ -826,12 +817,16 @@ export function resolveBuildReviewConfig(
           : rubricPolicy.modelFallbackLadder),
       max_retries: resolvedNeutral.max_retries,
       escalate: resolvedNeutral.escalate,
+      min_confidence: rubric?.min_confidence ?? 0,
     } satisfies ResolvedBuildReviewRubricPolicy];
   })) as Record<BuildReviewRubricId, ResolvedBuildReviewRubricPolicy>;
   const enabledRubricCount = Object.values(rubrics).filter((rubric) => rubric.enabled).length;
 
   return {
     enabled: block?.enabled ?? DEFAULT_BUILD_REVIEW_ENABLED,
+    adjudication: {
+      enabled: block?.adjudication?.enabled ?? DEFAULT_BUILD_REVIEW_ADJUDICATION_ENABLED,
+    },
     scopeContainmentEnforced:
       typeof block?.scopeContainmentEnforced === 'boolean'
         ? block.scopeContainmentEnforced

@@ -70,11 +70,9 @@ function preBuildDoneState(): ConductState {
     acceptance_specs: 'done',
     test_suite: 'done',
     build_review: 'done',
-    wiring_check: 'done',
     manual_test: 'done',
     prd_audit: 'done',
     architecture_review_as_built: 'done',
-    retro: 'done',
     rebase: 'done',
     complexity_tier: 'S',
     track: 'technical', // no PRD/prd_audit — keeps the SHIP tail minimal
@@ -148,6 +146,9 @@ async function writeValidatorArtifact(projectRoot: string, step: StepName): Prom
   if (step === 'prd_audit') {
     await mkdir(join(projectRoot, '.docs', 'specs'), { recursive: true });
     await mkdir(join(projectRoot, '.docs', 'stories'), { recursive: true });
+    await mkdir(join(projectRoot, '.docs', 'plans'), { recursive: true });
+    // The audit below cites Plan task 1; the plan is its citation authority.
+    await writeFile(join(projectRoot, '.docs', 'plans', 'self-build-feat.md'), '### Task 1: Self-host build\n\n**Files:** src/example.ts\n');
     await writeFile(join(projectRoot, '.docs', 'specs', 'self-build-feat.md'), '# PRD\n\n- FR-1: Self-host build completes.\n');
     await writeFile(join(projectRoot, '.docs', 'stories', 'self-build-feat.md'), '# Stories\n\n## Story 1: Self-host build\n\n**Requirement:** FR-1\n\n### Happy Path\n\n- Given a self-host build, when it finishes, then it is complete.\n');
     await writeFile(join(projectRoot, '.pipeline', 'prd-audit.md'), '**PRD:** present\n\n## Verdict Table\n\n| Criterion | Grade | Plan task | Evidence |\n| --- | --- | --- | --- |\n| S1.1 | PASS | 1 | fixture |\n\n| FR | Verdict | Gap-class | Evidence | Accepted? |\n| --- | --- | --- | --- | --- |\n| FR-1 | ALIGNED | n/a | fixture | — |\n');

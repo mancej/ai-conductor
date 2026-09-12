@@ -115,8 +115,8 @@ describe('S-tier pipeline knobs (#668)', () => {
     const gateSteps = [
       'build',
       'build_review',
-      'wiring_check',
       'test_suite',
+      'coverage_binding',
       'rebase',
       'finish',
     ] as const;

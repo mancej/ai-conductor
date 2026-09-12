@@ -1,7 +1,12 @@
+// Covers: task:1, task:3, task:4, task:5
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, readdir, utimes } from 'fs/promises';
+import { mkdtemp, rm, readdir, unlink, utimes, stat } from 'fs/promises';
+import { execFile as execFileCb } from 'child_process';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
+import { promisify } from 'util';
+
+const execFile = promisify(execFileCb);
 
 vi.mock('execa', () => ({
   execa: vi.fn(() =>
@@ -43,7 +48,6 @@ import { ConductorEventEmitter } from '../../src/ui/events.js';
 import { readState, writeState } from '../../src/engine/state.js';
 import {
   ALL_STEPS,
-  BUILD_VERIFICATION_GROUP,
   STEP_GROUPS,
   VALIDATION_GROUP,
   getGroupForStep,
@@ -60,6 +64,7 @@ import {
   findResumeIndex,
   resolveGroupMembership,
   earliestRemediationTarget,
+  resolveExistingTaskBindingsForAdmission,
 } from '../../src/engine/conductor.js';
 import { Conductor } from '../test-conductor.js';
 import type { StepRunner, StepRunResult, StepRunOptions } from '../../src/engine/conductor.js';
@@ -73,12 +78,20 @@ import { createTaskEvidence } from '../../src/engine/task-evidence.js';
 import { AuditTrailWriter } from '../../src/engine/audit-trail.js';
 import { haltMarkerExists } from '../../src/engine/task-progress.js';
 import { writeVerdict, type GateVerdict } from '../../src/engine/gate-verdicts.js';
-import { checkStepCompletion, type RemediationGap } from '../../src/engine/artifacts.js';
+import {
+  checkStepCompletion,
+  stampGateRunIdentity,
+  ARCHITECTURE_REVIEW_AS_BUILT_CODE_STAMP,
+  MANUAL_TEST_CODE_STAMP,
+  PRD_AUDIT_CODE_STAMP,
+  type RemediationGap,
+} from '../../src/engine/artifacts.js';
+import * as artifactModule from '../../src/engine/artifacts.js';
 import {
   creditKickbackGateLaps,
+  MAX_SUITE_INFRASTRUCTURE_RETRIES,
   readKickbackLedger,
-  writeKickbackLedger,
-} from '../../src/engine/kickback-ledger.js';
+  } from '../../src/engine/kickback-ledger.js';
 import { EventPersister } from '../../src/engine/event-persister.js';
 import { computeTimingRollup } from '../../src/engine/timing-rollup.js';
 import { appendTimingSection, renderShippedRecord } from '../../src/engine/shipped-record.js';
@@ -90,7 +103,7 @@ import {
   CODEX_MODEL_POLICY,
   type ProviderModelPolicy,
 } from '../../src/engine/provider-model-policy.js';
-import { DefaultStepRunner } from '../../src/engine/step-runners.js';
+import { CoverageBindingPayloadError, DefaultStepRunner } from '../../src/engine/step-runners.js';
 import { ProviderRuntimeSet } from '../../src/engine/provider-runtime.js';
 import { ProviderSessionStore } from '../../src/engine/provider-session.js';
 import { ModelAvailability } from '../../src/engine/model-availability.js';
@@ -187,6 +200,831 @@ describe('engine/conductor', () => {
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
+  });
+
+  describe('existing-task remediation admission', () => {
+    it('resolves bound ids from the active plan through the shared resolver', () => {
+      const result = resolveExistingTaskBindingsForAdmission(
+        [{ id: '2' }],
+        new Set(['1', '2']),
+      );
+
+      expect(result).toEqual({ kind: 'resolved', ids: ['2'] });
+    });
+
+    it('rejects a bound id absent from the active plan and names it', () => {
+      const result = resolveExistingTaskBindingsForAdmission(
+        [{ id: 'missing-task' }],
+        new Set(['1', '2']),
+      );
+
+      expect(result).toEqual({ kind: 'unresolvable', id: 'missing-task' });
+    });
+
+    it('drops a non-gate existing-task gap before binding or re-staging it', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'existing-task-bindings.md'), '### Task 1: Existing work\n');
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [{
+                  id: 'missing-binding',
+                  disposition: 'existing-task',
+                  category: null,
+                  rationale: 'The existing task owns this repair.',
+                  tasks: [{ id: 'missing-task', title: 'Existing task binding' }],
+                }],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'test admission',
+        { source: 'finish' },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'halt', haltClass: 'kickback-cap' });
+      expect(outcome.detail).toContain('no admitted remediation gap');
+    });
+
+    it('fails closed on an unexpected existing-task id in an enforced as-built round', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'existing-task-bindings.md'), '### Task 1: Existing work\n');
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '1', status: 'completed' }],
+      }));
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings', '',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-1 | REMEDIABLE | Task 1 | Existing work |',
+      ].join('\n'));
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: { run: async () => {
+          await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+            dispositions: [{
+              id: 'unexpected-existing', disposition: 'existing-task', category: null,
+              rationale: 'Incorrect binding.', tasks: [{ id: '1', title: 'Existing work' }],
+            }],
+          }));
+          return { success: true };
+        } },
+        events,
+        projectRoot: dir,
+        config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'unexpected existing-task',
+        { source: 'architecture-review-as-built', evidence: [{ gate: 'architecture_review_as_built', evidenceFile: '.pipeline/architecture-review-as-built.md' }] },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'halt', haltClass: 'needs-human' });
+      expect(outcome.detail).toContain('unexpected-existing');
+      expect(JSON.parse(await readFile(join(dir, '.pipeline', 'task-status.json'), 'utf8')).tasks)
+        .toEqual([{ id: '1', status: 'completed' }]);
+    });
+
+    it.each([
+      ['missing', undefined, false],
+      ['unreadable', undefined, true],
+    ])('halts needs-human without routing when task-status is %s during re-stage', async (_case, taskStatus, makeUnreadable) => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'existing-task-bindings.md'), '### Task 1: Existing work\n');
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings', '',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| existing-binding | REMEDIABLE | Task 1 | Existing work |',
+      ].join('\n'));
+      if (taskStatus !== undefined) {
+        await writeFile(join(dir, '.pipeline', 'task-status.json'), taskStatus);
+      }
+      if (makeUnreadable) {
+        await mkdir(join(dir, '.pipeline', 'task-status.json'));
+      }
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [{
+                  id: 'existing-binding',
+                  disposition: 'existing-task',
+                  category: null,
+                  rationale: 'The existing task owns this repair.',
+                  tasks: [{ id: '1', title: 'Existing task binding' }],
+                }],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000, build: 'done' },
+        ALL_STEPS,
+        'test re-stage failure',
+        { source: 'architecture-review-as-built', evidence: [{ gate: 'architecture_review_as_built', evidenceFile: '.pipeline/architecture-review-as-built.md' }] },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'halt', haltClass: 'needs-human' });
+      expect(outcome.detail).toMatch(/re-stage.*task-status/i);
+    });
+
+    it('halts needs-human without routing when a bound id is absent from task-status during re-stage', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'existing-task-bindings.md'), '### Task 1: Existing work\n');
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings', '',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| missing-status-binding | REMEDIABLE | Task 1 | Existing work |',
+      ].join('\n'));
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '2', status: 'completed' }],
+      }));
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [{
+                  id: 'missing-status-binding',
+                  disposition: 'existing-task',
+                  category: null,
+                  rationale: 'The existing task owns this repair.',
+                  tasks: [{ id: '1', title: 'Existing task binding' }],
+                }],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000, build: 'done' },
+        ALL_STEPS,
+        'test missing re-stage id',
+        { source: 'architecture-review-as-built', evidence: [{ gate: 'architecture_review_as_built', evidenceFile: '.pipeline/architecture-review-as-built.md' }] },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'halt', haltClass: 'needs-human' });
+      expect(outcome.detail).toMatch(/re-stage.*'1'/i);
+      expect(JSON.parse(await readFile(join(dir, '.pipeline', 'task-status.json'), 'utf8')))
+        .toEqual({ tasks: [{ id: '2', status: 'completed' }] });
+    });
+
+    it('strips a trailing parenthesized binding annotation through the shared resolver', () => {
+      const result = resolveExistingTaskBindingsForAdmission(
+        [{ id: '2 (already scoped)' }],
+        new Set(['1', '2']),
+      );
+
+      expect(result).toEqual({ kind: 'resolved', ids: ['2'] });
+    });
+
+    it('routes validated existing-task findings to build without appending or spending growth (#2119)', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'existing-task-bindings.md');
+      const authoredPlan = Array.from(
+        { length: 8 },
+        (_, index) => `### Task ${index + 1}: Existing work ${index + 1}`,
+      ).join('\n');
+      await writeFile(planPath, authoredPlan);
+      const git = (args: string[]) => execFile('git', args, { cwd: dir });
+      await git(['init', '-b', 'main']);
+      await git(['config', 'user.email', 'test@example.com']);
+      await git(['config', 'user.name', 'Conductor test']);
+      await git(['add', '--', '.docs/plans/existing-task-bindings.md']);
+      await git(['commit', '-m', 'test: seed plan']);
+      const uncommittedPlan = `${authoredPlan}\n\nOperator edit that must not be staged\n`;
+      await writeFile(planPath, uncommittedPlan);
+      await writeFile(
+        join(dir, '.pipeline', 'task-status.json'),
+        JSON.stringify({ tasks: Array.from({ length: 8 }, (_, index) => ({
+          id: String(index + 1),
+          status: index < 3 ? 'completed' : 'pending',
+        })) }),
+      );
+      await writeKickbackLedger(dir, {
+        version: 1,
+        gates: {},
+        growth: { authored: 8, added: 0, byGate: {} },
+      });
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED',
+        '',
+        '## Blocking Findings',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-1 | REMEDIABLE | Task 1 | Repair task one |',
+        '| ARCH-2 | REMEDIABLE | Task 2 | Repair task two |',
+      ].join('\n'));
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [1, 2].map((id) => ({
+                  id: `ARCH-${id}`,
+                  disposition: 'existing-task',
+                  category: null,
+                  rationale: `Task ${id} already owns this repair.`,
+                  tasks: [{ id: String(id), title: `Existing work ${id}` }],
+                })),
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+        config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'test #2119',
+        {
+          source: 'architecture-review-as-built',
+          evidence: [{
+            gate: 'architecture_review_as_built',
+            evidenceFile: '.pipeline/architecture-review-as-built.md',
+          }],
+        },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'route', target: 'build' });
+      expect(await readFile(planPath, 'utf8')).toBe(uncommittedPlan);
+      await expect(git(['diff', '--cached', '--quiet', '--', '.docs/plans/existing-task-bindings.md']))
+        .resolves.toBeDefined();
+      const commits = await git(['log', '--format=%s']);
+      expect(commits.stdout).not.toContain('chore(plan): record appended remediation tasks');
+      // Re-stage every bound task before the caller rewinds to build. Task 3
+      // is deliberately completed but unbound: it must stay completed, proving
+      // this route does not broadly reset task tracking.
+      expect(JSON.parse(await readFile(join(dir, '.pipeline', 'task-status.json'), 'utf8')).tasks)
+        .toEqual([
+          { id: '1', name: 'Existing work 1', status: 'pending' },
+          { id: '2', name: 'Existing work 2', status: 'pending' },
+          { id: '3', status: 'completed' },
+          { id: '4', name: 'Existing work 4', status: 'pending' },
+          { id: '5', name: 'Existing work 5', status: 'pending' },
+          { id: '6', name: 'Existing work 6', status: 'pending' },
+          { id: '7', name: 'Existing work 7', status: 'pending' },
+          { id: '8', name: 'Existing work 8', status: 'pending' },
+        ]);
+      const ledger = await readKickbackLedger(dir);
+      expect(ledger.gates.architecture_review_as_built?.laps).toBe(1);
+      expect(ledger.growth).toEqual({ authored: 8, added: 0, byGate: {} });
+      // A non-appending binding is still a successful as-built remediation
+      // authorization. It must leave the same durable finding record that
+      // the next successful as-built projection consumes.
+      expect(ledger.pendingAsBuiltRemediationFindings).toEqual([{
+        gate: 'architecture_review_as_built',
+        finding: 'ARCH-1',
+        class: 'REMEDIABLE',
+        governingClause: 'Task 1',
+        summary: 'Repair task one',
+        outcome: 'remediated',
+      }, {
+        gate: 'architecture_review_as_built',
+        finding: 'ARCH-2',
+        class: 'REMEDIABLE',
+        governingClause: 'Task 2',
+        summary: 'Repair task two',
+        outcome: 'remediated',
+      }]);
+
+      expect(await (conductor as unknown as {
+        projectPendingAsBuiltRemediationFindings: () => Promise<string | undefined>;
+      }).projectPendingAsBuiltRemediationFindings()).toBeUndefined();
+      expect((await readKickbackLedger(dir)).pendingAsBuiltRemediationFindings).toBeUndefined();
+    });
+
+    it('refuses pending as-built projection when its ledger is unreadable', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline', 'kickback-ledger.json'), JSON.stringify({
+        version: 1,
+        gates: {},
+        pendingAsBuiltRemediationFindings: [{ finding: 'malformed' }],
+      }));
+      const conductor = new Conductor({
+        stateFilePath: join(dir, '.pipeline', 'conduct-state.json'),
+        stepRunner: createMockStepRunner(),
+        events: new ConductorEventEmitter(),
+        projectRoot: dir,
+      });
+
+      await expect((conductor as unknown as {
+        projectPendingAsBuiltRemediationFindings: () => Promise<string | undefined>;
+      }).projectPendingAsBuiltRemediationFindings()).resolves.toContain('kickback ledger is unreadable');
+    });
+
+    it('halts an existing-task lap at the as-built lap cap without naming plan growth', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(
+        join(dir, '.docs', 'plans', 'existing-task-bindings.md'),
+        Array.from({ length: 8 }, (_, i) => `### Task ${i + 1}: Existing work ${i + 1}`).join('\n'),
+      );
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '1', status: 'completed' }],
+      }));
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings', '',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-1 | REMEDIABLE | Task 1 | Repair task one |',
+      ].join('\n'));
+      await writeKickbackLedger(dir, {
+        version: 1,
+        gates: {
+          architecture_review_as_built: {
+            count: 0, cumulative: 0, treeHash: null, lastReason: '', priorVerdict: true,
+            resolvedBefore: 0, laps: 1,
+          },
+        },
+        // Two growth slots remain, but this existing-task binding draws none.
+        growth: { authored: 8, added: 0, byGate: {} },
+      });
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [{
+                  id: 'ARCH-1', disposition: 'existing-task', category: null,
+                  rationale: 'Task 1 already owns this repair.',
+                  tasks: [{ id: '1', title: 'Existing work' }],
+                }],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+        config: {
+          architecture_review_as_built: { remediation: { enabled: true }, max_remediation_laps: 1 },
+        } as never,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'test existing-task lap cap',
+        {
+          source: 'architecture-review-as-built',
+          evidence: [{
+            gate: 'architecture_review_as_built',
+            evidenceFile: '.pipeline/architecture-review-as-built.md',
+          }],
+        },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'halt', haltClass: 'kickback-cap' });
+      expect(outcome.detail).toContain('lap cap reached (1/1)');
+      expect(outcome.detail).not.toMatch(/plan-growth allowance/i);
+      expect(outcome.detail).not.toMatch(/growth cap reached/i);
+    });
+
+    it('routes a validated prd_audit FIXABLE existing-task gap without appending', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'existing-task-bindings.md');
+      const authoredPlan = '### Task 1: Existing work\n';
+      await writeFile(planPath, authoredPlan);
+      await writeFile(join(dir, '.docs', 'stories', 'existing-task-bindings.md'), '## Story 1: Existing work\n\n### Happy Path\n- Given work, when repaired, then it passes.\n');
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({ tasks: [{ id: '1', status: 'pending' }] }));
+      await writeFile(join(dir, '.pipeline', 'prd-audit.md'), [
+        '# PRD Audit', '', '**PRD:** present', '', '## Verdict Table', '',
+        '| Criterion | Grade | Plan task | PRD: | Evidence |',
+        '|---|---|---|---|---|',
+        '| S1.1 | FIXABLE | 1 | FR-1 | x |',
+      ].join('\n'));
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [{
+                  id: 'FR-1', disposition: 'existing-task', category: null,
+                  rationale: 'Task 1 already owns this repair.',
+                  tasks: [{ id: '1', title: 'Existing work' }],
+                }],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'test prd existing-task',
+        { source: 'prd_audit', evidence: [{ gate: 'prd_audit', evidenceFile: '.pipeline/prd-audit.md' }] },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'route', target: 'build' });
+      expect(await readFile(planPath, 'utf8')).toBe(authoredPlan);
+      expect(JSON.parse(await readFile(join(dir, '.pipeline', 'task-status.json'), 'utf8')).tasks)
+        .toEqual([{ id: '1', name: 'Existing work', status: 'pending' }]);
+      expect((await readKickbackLedger(dir)).gates.prd_audit?.laps).toBe(1);
+    });
+
+    it('charges one lap to each owning gate in a mixed existing-task round without spending growth', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'existing-task-bindings.md');
+      await writeFile(planPath, '### Task 1: PRD work\n\n### Task 2: As-built work\n');
+      await writeFile(join(dir, '.docs', 'stories', 'existing-task-bindings.md'), '## Story 1: Existing work\n\n### Happy Path\n- Given work, when repaired, then it passes.\n');
+      await writeFile(join(dir, '.pipeline', 'prd-audit.md'), [
+        '# PRD Audit', '', '**PRD:** present', '', '## Verdict Table', '',
+        '| Criterion | Grade | Plan task | PRD: | Evidence |',
+        '|---|---|---|---|---|',
+        '| S1.1 | FIXABLE | 1 | FR-1 | x |',
+      ].join('\n'));
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings', '',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-1 | REMEDIABLE | Task 2 | Repair task two |',
+      ].join('\n'));
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '1', status: 'completed' }, { id: '2', status: 'completed' }],
+      }));
+      await writeKickbackLedger(dir, {
+        version: 1,
+        gates: {},
+        growth: { authored: 2, added: 0, byGate: {} },
+      });
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [
+                  { id: 'FR-1', disposition: 'existing-task', category: null, rationale: 'Task 1 owns this repair.', tasks: [{ id: '1', title: 'PRD work' }] },
+                  { id: 'ARCH-1', disposition: 'existing-task', category: null, rationale: 'Task 2 owns this repair.', tasks: [{ id: '2', title: 'As-built work' }] },
+                ],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+        config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'test mixed existing-task laps',
+        {
+          source: 'prd_audit',
+          evidence: [
+            { gate: 'prd_audit', evidenceFile: '.pipeline/prd-audit.md' },
+            { gate: 'architecture_review_as_built', evidenceFile: '.pipeline/architecture-review-as-built.md' },
+          ],
+        },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'route', target: 'build' });
+      const ledger = await readKickbackLedger(dir);
+      expect(ledger.gates.prd_audit?.laps).toBe(1);
+      expect(ledger.gates.architecture_review_as_built?.laps).toBe(1);
+      expect(ledger.growth).toEqual({ authored: 2, added: 0, byGate: {} });
+    });
+
+    it('carries an existing-task finding through a consolidated manual-test FAIL round without a lap, pending finding, or re-stage (AB-1)', async () => {
+      // Covers: task:8
+      // adr-2026-08-25 decision 8/9 + Story 4: when the same validation-group
+      // round carries a manual_test FAIL, the consolidated kickback owns the
+      // work order. The as-built finding still rides the merged route, but
+      // the gate-local existing-task mechanics — lap charge, pending finding,
+      // task-status re-stage, no-op baseline — must be unreachable.
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'existing-task-bindings.md');
+      await writeFile(planPath, '### Task 1: Existing work 1\n\n### Task 2: Existing work 2\n');
+      const taskStatus = JSON.stringify({
+        tasks: [{ id: '1', status: 'completed' }, { id: '2', status: 'completed' }],
+      });
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), taskStatus);
+      await writeKickbackLedger(dir, {
+        version: 1,
+        gates: {},
+        growth: { authored: 2, added: 0, byGate: {} },
+      });
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-1 | REMEDIABLE | Task 1 | Repair task one |',
+      ].join('\n'));
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async (step) => {
+            if (step === 'remediate') {
+              await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+                dispositions: [{
+                  id: 'ARCH-1',
+                  disposition: 'existing-task',
+                  category: null,
+                  rationale: 'Task 1 already owns this repair.',
+                  tasks: [{ id: '1', title: 'Existing work 1' }],
+                }],
+              }));
+            }
+            return { success: true };
+          },
+        },
+        events,
+        projectRoot: dir,
+        config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
+      });
+
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 },
+        ALL_STEPS,
+        'test consolidated existing-task round',
+        {
+          source: 'validation-group',
+          evidence: [{
+            gate: 'architecture_review_as_built',
+            evidenceFile: '.pipeline/architecture-review-as-built.md',
+          }],
+          consolidatedManualTestFail: true,
+        },
+      );
+
+      // The finding is still addressed and rides the merged work order.
+      expect(outcome).toMatchObject({ kind: 'route', target: 'build' });
+      expect((outcome as { hint: string }).hint).toContain('ARCH-1');
+      // ...but none of the gate-local existing-task mechanics ran.
+      expect(await readFile(join(dir, '.pipeline', 'task-status.json'), 'utf8')).toBe(taskStatus);
+      const ledger = await readKickbackLedger(dir);
+      expect(ledger.gates.architecture_review_as_built?.laps).toBeUndefined();
+      expect(ledger.pendingAsBuiltRemediationFindings).toBeUndefined();
+      expect(ledger.growth).toEqual({ authored: 2, added: 0, byGate: {} });
+      expect((conductor as any).pendingNoOpBaselines.size).toBe(0);
+    });
+
+    it('keeps an appending PRD-audit remediation on the growth path and halts only when that growth is truly exhausted', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'existing-task-bindings.md');
+      const authoredPlan = Array.from({ length: 4 }, (_, i) => `### Task ${i + 1}: Authored ${i + 1}`).join('\n');
+      await writeFile(planPath, authoredPlan);
+      await writeFile(join(dir, '.docs', 'stories', 'existing-task-bindings.md'), '## Story 1: Repair\n\n### Happy Path\n- Given repair work, when it is completed, then it passes.\n');
+      await writeFile(join(dir, '.pipeline', 'prd-audit.md'), [
+        '# PRD Audit', '', '**PRD:** present', '', '## Verdict Table', '',
+        '| Criterion | Grade | Plan task | PRD: | Evidence |',
+        '|---|---|---|---|---|', '| S1.1 | FIXABLE | 1 | FR-1 | x |',
+      ].join('\n'));
+      await writeKickbackLedger(dir, { version: 1, gates: {}, growth: { authored: 4, added: 0, byGate: {} } });
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        projectRoot: dir,
+        events,
+        config: { prd_audit: { max_remediation_laps: 2 } } as never,
+        stepRunner: { run: async (step) => {
+          if (step === 'remediate') await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({ dispositions: [{
+            id: 'FR-1', disposition: 'build', category: null, rationale: 'Append the repair.',
+            tasks: [{ id: 'rem-fr-1', title: 'Appended repair' }],
+          }] }));
+          return { success: true };
+        } },
+      });
+      const input = { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 };
+      const source = { source: 'prd_audit' as const, evidence: [{ gate: 'prd_audit' as const, evidenceFile: '.pipeline/prd-audit.md' }] };
+
+      await expect((conductor as any).planRemediation(input, ALL_STEPS, 'append once', source))
+        .resolves.toMatchObject({ kind: 'route', target: 'build' });
+      expect(await readFile(planPath, 'utf8')).toContain('### Task rem-prd-audit-rem-fr-1: Appended repair');
+      expect((await readKickbackLedger(dir)).growth).toEqual({ authored: 4, added: 1, byGate: { prd_audit: 1 } });
+
+      const exhausted = await (conductor as any).planRemediation(input, ALL_STEPS, 'append beyond growth', source);
+      expect(exhausted).toMatchObject({ kind: 'halt', haltClass: 'kickback-cap' });
+      expect(exhausted.detail).toContain('growth cap reached (1/1 appended; 1 requested, 0 remaining)');
+      expect(exhausted.detail).toContain('Findings: S1.1.');
+    });
+
+    it('reports only appended PRD-audit tasks as requested when mixed remediation exhausts growth', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(
+        join(dir, '.docs', 'plans', 'existing-task-bindings.md'),
+        Array.from({ length: 4 }, (_, i) => `### Task ${i + 1}: Authored ${i + 1}`).join('\n'),
+      );
+      await writeFile(join(dir, '.docs', 'stories', 'existing-task-bindings.md'), [
+        '## Story 1: Repair', '', '### Happy Path',
+        '- Given the first repair, when it is completed, then it passes.',
+        '- Given the second repair, when it is completed, then it passes.',
+        '- Given the third repair, when it is completed, then it passes.',
+      ].join('\n'));
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '2', status: 'completed' }, { id: '3', status: 'completed' }],
+      }));
+      await writeFile(join(dir, '.pipeline', 'prd-audit.md'), [
+        '# PRD Audit', '', '**PRD:** present', '', '## Verdict Table', '',
+        '| Criterion | Grade | Plan task | PRD: | Evidence |',
+        '|---|---|---|---|---|',
+        '| S1.1 | FIXABLE | 1 | FR-1 | x |',
+        '| S1.2 | FIXABLE | 2 | FR-2 | x |',
+        '| S1.3 | FIXABLE | 3 | FR-3 | x |',
+      ].join('\n'));
+      // Four authored tasks permit one appended remediation task. Start with
+      // the allowance available so the bound existing tasks can be observed
+      // re-staged before the second, exhausted mixed round checks its wording.
+      await writeKickbackLedger(dir, {
+        version: 1,
+        gates: {},
+        growth: { authored: 4, added: 0, byGate: {} },
+      });
+      let mixedRound = false;
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        projectRoot: dir,
+        events,
+        config: { prd_audit: { max_remediation_laps: 2 } } as never,
+        stepRunner: { run: async (step) => {
+          if (step === 'remediate') await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({
+            dispositions: [
+              ...(mixedRound ? [{ id: 'S1.1', disposition: 'build', category: null, rationale: 'Append.', tasks: [{ id: 'rem-s1-1', title: 'Appended repair' }] }] : []),
+              { id: 'S1.2', disposition: 'existing-task', category: null, rationale: 'Already owned.', tasks: [{ id: '2', title: 'Authored 2' }] },
+              { id: 'S1.3', disposition: 'existing-task', category: null, rationale: 'Already owned.', tasks: [{ id: '3', title: 'Authored 3' }] },
+            ],
+          }));
+          return { success: true };
+        } },
+      });
+
+      const input = { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 };
+      const source = { source: 'prd_audit', evidence: [{ gate: 'prd_audit', evidenceFile: '.pipeline/prd-audit.md' }] };
+
+      await expect((conductor as any).planRemediation(input, ALL_STEPS, 'restage existing work', source))
+        .resolves.toMatchObject({ kind: 'route', target: 'build' });
+      expect(JSON.parse(await readFile(join(dir, '.pipeline', 'task-status.json'), 'utf8')).tasks)
+        .toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: '2', status: 'pending' }),
+          expect.objectContaining({ id: '3', status: 'pending' }),
+        ]));
+
+      // The first route proves existing-task admission. Model the earlier
+      // appending lap that spent the sole growth slot before checking that a
+      // later mixed request renders only its appended task count.
+      const restagedLedger = await readKickbackLedger(dir);
+      await writeKickbackLedger(dir, {
+        ...restagedLedger,
+        growth: { authored: 4, added: 1, byGate: { prd_audit: 1 } },
+      });
+      mixedRound = true;
+      const outcome = await (conductor as any).planRemediation(input, ALL_STEPS, 'mixed growth exhaustion', source);
+
+      expect(outcome).toMatchObject({ kind: 'halt', haltClass: 'kickback-cap' });
+      expect(outcome.detail).toContain('growth cap reached (1/1 appended; 1 requested, 0 remaining)');
+    });
+
+    it('charges a mixed appending and existing-task round to growth and laps independently', async () => {
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'existing-task-bindings.md');
+      await writeFile(planPath, Array.from({ length: 8 }, (_, i) => `### Task ${i + 1}: Authored ${i + 1}`).join('\n'));
+      await writeFile(join(dir, '.docs', 'stories', 'existing-task-bindings.md'), '## Story 1: Repair\n\n### Happy Path\n- Given repair work, when it is completed, then it passes.\n');
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({ tasks: [{ id: '2', status: 'completed' }] }));
+      await writeFile(join(dir, '.pipeline', 'prd-audit.md'), '# PRD Audit\n\n**PRD:** present\n\n## Verdict Table\n\n| Criterion | Grade | Plan task | PRD: | Evidence |\n|---|---|---|---|---|\n| S1.1 | FIXABLE | 1 | FR-1 | x |\n');
+      await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+        'Verdict: BLOCKED', '', '## Blocking Findings', '',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-1 | REMEDIABLE | Task 2 | Existing repair |',
+      ].join('\n'));
+      await writeKickbackLedger(dir, { version: 1, gates: {}, growth: { authored: 8, added: 0, byGate: {} } });
+      const conductor = new Conductor({
+        stateFilePath: statePath, projectRoot: dir, events,
+        config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
+        stepRunner: { run: async (step) => {
+          if (step === 'remediate') await writeFile(join(dir, '.pipeline', 'remediation.json'), JSON.stringify({ dispositions: [
+            { id: 'FR-1', disposition: 'build', category: null, rationale: 'Append.', tasks: [{ id: 'rem-fr-1', title: 'Appended repair' }] },
+            { id: 'ARCH-1', disposition: 'existing-task', category: null, rationale: 'Already owned.', tasks: [{ id: '2', title: 'Authored 2' }] },
+          ] }));
+          return { success: true };
+        } },
+      });
+      const outcome = await (conductor as any).planRemediation(
+        { feature_desc: 'existing-task-bindings', session_started_at: Date.now() - 1_000 }, ALL_STEPS, 'mixed attribution',
+        { source: 'prd_audit', evidence: [
+          { gate: 'prd_audit', evidenceFile: '.pipeline/prd-audit.md' },
+          { gate: 'architecture_review_as_built', evidenceFile: '.pipeline/architecture-review-as-built.md' },
+        ] },
+      );
+
+      expect(outcome).toMatchObject({ kind: 'route', target: 'build' });
+      const ledger = await readKickbackLedger(dir);
+      expect(ledger.growth).toEqual({ authored: 8, added: 1, byGate: { prd_audit: 1 } });
+      expect(ledger.gates.prd_audit?.laps).toBe(1);
+      expect(ledger.gates.architecture_review_as_built?.laps).toBe(1);
+    });
+
+  });
+
+  it('re-dispatches a typed coverage-binding payload failure without halting', async () => {
+    const state = Object.fromEntries(ALL_STEPS.map((step) => [step.name, 'done'])) as ConductState;
+    state.coverage_binding = 'pending';
+    await writeState(statePath, state);
+
+    let coverageDispatches = 0;
+    const retryReasons: string[] = [];
+    const loopHalts: ConductorEvent[] = [];
+    events.on('loop_halt', (event) => { loopHalts.push(event); });
+    const runner: StepRunner = {
+      run: vi.fn().mockImplementation(async (step, _state, options?: StepRunOptions) => {
+        if (step !== 'coverage_binding') return { success: true };
+        coverageDispatches++;
+        if (coverageDispatches === 1) {
+          await mkdir(join(dir, '.pipeline'), { recursive: true });
+          await writeFile(
+            join(dir, '.pipeline', 'coverage-binding.json'),
+            JSON.stringify({ version: 1, slug: 'test-feature', runId: 'test-run', status: 'failed', entries: [] }),
+          );
+          const infrastructureFailure = new CoverageBindingPayloadError('out-of-vocabulary verdict');
+          return {
+            success: false,
+            // Deliberately unrelated to prove the retry consumes the typed
+            // classifier rather than routing on arbitrary provider text.
+            output: 'provider output that must not select the retry route',
+            infrastructureFailure,
+          };
+        }
+        retryReasons.push(options?.retryReason ?? '');
+        return { success: true };
+      }),
+    };
+    const conductor = new Conductor({
+      projectRoot: dir,
+      stateFilePath: statePath,
+      stepRunner: runner,
+      events,
+      fromStep: 'coverage_binding',
+      verifyArtifacts: false,
+      config: { steps: { coverage_binding: { max_retries: 2 } } },
+    });
+
+    await conductor.run();
+
+    expect(coverageDispatches).toBe(2);
+    expect(retryReasons).toEqual([
+      expect.stringContaining('coverage-binding judge infrastructure failure: out-of-vocabulary verdict'),
+    ]);
+    await expect(readFile(join(dir, '.pipeline', 'HALT'), 'utf8')).rejects.toThrow();
+    expect(loopHalts).toEqual([]);
+    expect(JSON.parse(await readFile(join(dir, '.pipeline', 'coverage-binding.json'), 'utf8'))).toMatchObject({
+      status: 'failed', entries: [],
+    });
   });
 
   it('credits lap counts once immediately before reopening an invalidated build_review after rebase', async () => {
@@ -372,7 +1210,11 @@ describe('engine/conductor', () => {
     expect(calls).toEqual(['build_review']);
     expect(await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8')).toBe('needs-human');
     expect(haltReasons).toEqual([
-      'build_review cumulative kickback cap exceeded (cumulative 6, cap 5): [testQuality] test-insensitive\n[testQuality] test-insensitive',
+      'build_review cumulative kickback cap exceeded:\n' +
+        'Kickback budget (build_review): 6/5 consumed; 0 remaining\n' +
+        'Latest reason: [testQuality] test-insensitive\n[testQuality] test-insensitive\n' +
+        'Adjustment history: unavailable\n' +
+        'Mechanical faults: 0',
     ]);
   });
 
@@ -432,7 +1274,11 @@ describe('engine/conductor', () => {
     await conductor.run();
 
     expect(haltReasons).toEqual([
-      'build_review cumulative kickback cap exceeded (cumulative 6, cap 5): [testQuality] test-insensitive\n[testQuality] test-insensitive',
+      'build_review cumulative kickback cap exceeded:\n' +
+        'Kickback budget (build_review): 6/5 consumed; 0 remaining\n' +
+        'Latest reason: [testQuality] test-insensitive\n[testQuality] test-insensitive\n' +
+        'Adjustment history: unavailable\n' +
+        'Mechanical faults: 0',
     ]);
     expect(await readFile(join(dir, '.pipeline/HALT'), 'utf-8')).toContain('cumulative kickback cap');
   });
@@ -492,6 +1338,375 @@ describe('engine/conductor', () => {
       'Evidence: .pipeline/test-suite-evidence.json';
     expect(haltReasons).toEqual([expected]);
     expect(await readFile(join(dir, '.pipeline/HALT'), 'utf-8')).toBe(`${expected}\n`);
+    expect(await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8')).toBe('needs-human');
+  });
+
+  describe('test_suite kickback boundary', () => {
+    const preservedEvidence = {
+      version: 4 as const,
+      outcome: 'PASS' as const,
+      reason: 'exit_zero' as const,
+      fingerprint: 'sha256:preserved-within-budget',
+      categoryFingerprints: {
+        additional_inputs: 'sha256:additional-inputs',
+        dependencies: 'sha256:dependencies',
+        environment: 'sha256:environment',
+        migrations: 'sha256:migrations',
+        project_config: 'sha256:project-config',
+        source: 'sha256:source',
+        test_infrastructure: 'sha256:test-infrastructure',
+        tests: 'sha256:tests',
+      },
+      provenanceHeadSha: '0123456789abcdef0123456789abcdef01234567',
+      command: 'npm test',
+      workingDirectory: 'src/conductor',
+      startedAt: '2026-08-29T00:00:00.000Z',
+      endedAt: '2026-08-29T00:00:01.000Z',
+      durationMs: 1_000,
+      exitCode: 0 as const,
+      stdout: 'all tests passed\n',
+      stderr: '',
+    };
+
+    async function writeTestSuiteOnlyState(): Promise<void> {
+      const state = Object.fromEntries(
+        ALL_STEPS.map((step) => [step.name, step.name === 'test_suite' ? 'stale' : 'done']),
+      ) as ConductState;
+      state.complexity_tier = 'M';
+      state.feature_desc = 'test-suite-kickback-boundary';
+      // This evaluation resumes the feature that owns the pre-existing ledger.
+      // A fresh feature session correctly clears every prior feature's budget.
+      state.run_started_at = Date.now();
+      await writeState(statePath, state);
+    }
+
+    const ledgerBytes = JSON.stringify({
+      version: 1,
+      gates: {
+        test_suite: {
+          count: 1,
+          cumulative: 1,
+          mechanicalFaults: 0,
+          treeHash: '0123456789abcdef0123456789abcdef01234567',
+          lastReason: 'previous suite failure',
+          priorVerdict: true,
+          resolvedBefore: 4,
+        },
+      },
+    }, null, 2) + '\n';
+
+    it('preserves the test_suite ledger bytes and emits no kickback for a within-budget reuse', async () => {
+      // Covers: task:12
+      await writeTestSuiteOnlyState();
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const ledgerPath = join(dir, '.pipeline/kickback-ledger.json');
+      await writeFile(ledgerPath, ledgerBytes);
+      const before = await readFile(ledgerPath, 'utf8');
+      const beforeHash = createHash('sha256').update(before).digest('hex');
+      const kickbacks: ConductorEvent[] = [];
+      events.on('kickback', (event) => { kickbacks.push(event); });
+      const verifier = {
+        inspect: vi.fn().mockResolvedValue({
+          status: 'PRESERVED_WITHIN_BUDGET' as const,
+          evidence: preservedEvidence,
+        }),
+        ensure: vi.fn().mockResolvedValue({ status: 'REUSED' as const, evidence: preservedEvidence }),
+        recordPreservation: vi.fn().mockResolvedValue(undefined),
+      };
+      const runner = createMockStepRunner();
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        mode: 'auto',
+        fromStep: 'test_suite',
+        fullSuiteVerifier: verifier,
+      });
+
+      await conductor.run();
+
+      const after = await readFile(ledgerPath, 'utf8');
+      expect(createHash('sha256').update(after).digest('hex')).toBe(beforeHash);
+      expect(after).toBe(before);
+      expect(kickbacks).toEqual([]);
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(verifier.inspect).toHaveBeenCalledTimes(1);
+      expect(verifier.ensure).toHaveBeenCalledTimes(1);
+      expect(verifier.recordPreservation).toHaveBeenCalledTimes(1);
+      const finalState = await readState(statePath);
+      expect(finalState.ok).toBe(true);
+      if (!finalState.ok) throw new Error(finalState.error.message);
+      expect(finalState.value.test_suite).toBe('done');
+    });
+
+    it('consumes exactly one test_suite kickback for a genuine rerun nonzero exit', async () => {
+      // Covers: task:3
+      await writeTestSuiteOnlyState();
+      const kickbacks: ConductorEvent[] = [];
+      events.on('kickback', (event) => { kickbacks.push(event); });
+      const suiteFailure = {
+        status: 'FAILED' as const,
+        reason: 'nonzero_exit' as const,
+        message: 'fixture suite failure',
+      };
+      const runner: StepRunner = {
+        run: vi.fn().mockResolvedValue({ success: false, output: 'stop after the expected kickback' }),
+      };
+      const verifier = {
+        inspect: vi.fn().mockResolvedValue(suiteFailure),
+        ensure: vi.fn().mockResolvedValue(suiteFailure),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        mode: 'auto',
+        fromStep: 'test_suite',
+        maxRetries: 1,
+        fullSuiteVerifier: verifier,
+      });
+
+      await conductor.run();
+
+      expect((await readKickbackLedger(dir)).gates.test_suite).toEqual(expect.objectContaining({
+        count: 1,
+        cumulative: 1,
+      }));
+      expect((await readKickbackLedger(dir)).gates.test_suite).not.toHaveProperty(
+        'suiteInfrastructureRetries',
+      );
+      expect(kickbacks).toEqual([expect.objectContaining({
+        type: 'kickback',
+        from: 'test_suite',
+        to: 'build',
+        count: 1,
+      })]);
+      expect(verifier.inspect).toHaveBeenCalledTimes(1);
+      expect(verifier.ensure).toHaveBeenCalledTimes(1);
+      expect(runner.run).toHaveBeenCalledWith('build', expect.anything(), expect.anything());
+    });
+
+    it('retries a timeout within test_suite without consuming a code-repair kickback', async () => {
+      // Covers: task:3
+      await writeTestSuiteOnlyState();
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline/kickback-ledger.json'), ledgerBytes);
+      const timeoutFailure = {
+        status: 'FAILED' as const,
+        reason: 'timeout' as const,
+        message: 'fixture suite timeout',
+      };
+      const retryEvents: ConductorEvent[] = [];
+      events.on('step_retry', (event) => {
+        if (event.type === 'step_retry' && event.step === 'test_suite') retryEvents.push(event);
+      });
+      const verifier = {
+        inspect: vi.fn()
+          .mockResolvedValueOnce(timeoutFailure)
+          .mockResolvedValueOnce({ status: 'CURRENT' as const, evidence: preservedEvidence }),
+        ensure: vi.fn()
+          .mockResolvedValueOnce(timeoutFailure)
+          .mockResolvedValueOnce({ status: 'REUSED' as const, evidence: preservedEvidence }),
+      };
+      const runner = createMockStepRunner();
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        mode: 'auto',
+        daemon: true,
+        fromStep: 'test_suite',
+        fullSuiteVerifier: verifier,
+      });
+
+      await conductor.run();
+
+      const finalState = await readState(statePath);
+      expect(finalState.ok).toBe(true);
+      if (!finalState.ok) throw new Error(finalState.error.message);
+      expect(finalState.value.test_suite).toBe('done');
+      expect(retryEvents).toEqual([expect.objectContaining({
+        type: 'step_retry',
+        step: 'test_suite',
+        attempt: 1,
+        reason: expect.stringContaining('infrastructure'),
+      })]);
+      expect((await readKickbackLedger(dir)).gates.test_suite).toEqual(expect.objectContaining({
+        count: 1,
+        cumulative: 1,
+      }));
+      expect(verifier.inspect).toHaveBeenCalledTimes(2);
+      expect(verifier.ensure).toHaveBeenCalledTimes(2);
+      expect(runner.run).not.toHaveBeenCalled();
+    });
+
+    it('halts needs-human when test_suite infrastructure retries are exhausted', async () => {
+      // Covers: task:4
+      await writeTestSuiteOnlyState();
+      const suiteFailure = {
+        status: 'FAILED' as const,
+        reason: 'spawn_failed' as const,
+        message: 'fixture suite process could not start',
+      };
+      const verifier = {
+        inspect: vi.fn().mockResolvedValue(suiteFailure),
+        ensure: vi.fn().mockResolvedValue(suiteFailure),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner(),
+        events,
+        mode: 'auto',
+        daemon: true,
+        fromStep: 'test_suite',
+        fullSuiteVerifier: verifier,
+      });
+
+      await conductor.run();
+
+      await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).resolves.toBe('needs-human');
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+        `test_suite infrastructure failure (spawn_failed): ${suiteFailure.message}`,
+      );
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+        `retries spent: ${MAX_SUITE_INFRASTRUCTURE_RETRIES}`,
+      );
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+        'Evidence: .pipeline/test-suite-evidence.json',
+      );
+      expect(verifier.inspect).toHaveBeenCalledTimes(MAX_SUITE_INFRASTRUCTURE_RETRIES + 1);
+      expect(verifier.ensure).toHaveBeenCalledTimes(MAX_SUITE_INFRASTRUCTURE_RETRIES + 1);
+    });
+
+    it('halts needs-human without a test_suite re-run when its durable retry counter is unreadable', async () => {
+      // Covers: task:4
+      await writeTestSuiteOnlyState();
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline/kickback-ledger.json'), JSON.stringify({
+        version: 1,
+        gates: { test_suite: { suiteInfrastructureRetries: 1.5 } },
+      }));
+      const suiteFailure = {
+        status: 'FAILED' as const,
+        reason: 'spawn_failed' as const,
+        message: 'fixture suite process could not start',
+      };
+      const verifier = {
+        inspect: vi.fn().mockResolvedValue(suiteFailure),
+        ensure: vi.fn().mockResolvedValue(suiteFailure),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner(),
+        events,
+        mode: 'auto',
+        daemon: true,
+        fromStep: 'test_suite',
+        maxRetries: 1,
+        fullSuiteVerifier: verifier,
+      });
+
+      await conductor.run();
+
+      await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).resolves.toBe('needs-human');
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+        'test_suite infrastructure retry counter is unreadable',
+      );
+      expect(verifier.inspect).toHaveBeenCalledTimes(1);
+      expect(verifier.ensure).toHaveBeenCalledTimes(1);
+    });
+
+    it('continues a persisted test_suite infrastructure retry counter before halting at its allowance', async () => {
+      // Covers: task:4
+      await writeTestSuiteOnlyState();
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline/kickback-ledger.json'), ledgerBytes.replace(
+        '"resolvedBefore": 4',
+        '"resolvedBefore": 4,\n          "suiteInfrastructureRetries": 1',
+      ));
+      const suiteFailure = {
+        status: 'FAILED' as const,
+        reason: 'spawn_failed' as const,
+        message: 'fixture suite process could not start',
+      };
+      const verifier = {
+        inspect: vi.fn().mockResolvedValue(suiteFailure),
+        ensure: vi.fn().mockResolvedValue(suiteFailure),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner(),
+        events,
+        mode: 'auto',
+        daemon: true,
+        fromStep: 'test_suite',
+        fullSuiteVerifier: verifier,
+      });
+
+      await conductor.run();
+
+      expect((await readKickbackLedger(dir)).gates.test_suite.suiteInfrastructureRetries)
+        .toBe(MAX_SUITE_INFRASTRUCTURE_RETRIES);
+      expect(verifier.inspect).toHaveBeenCalledTimes(2);
+      expect(verifier.ensure).toHaveBeenCalledTimes(2);
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+        `retries spent: ${MAX_SUITE_INFRASTRUCTURE_RETRIES}`,
+      );
+    });
+
+    it.each(['timeout', 'unlaunchable'] as const)(
+      'halts %s test_suite infrastructure failures without consuming a kickback',
+      async (reason) => {
+        // Covers: task:3, task:12
+        await writeTestSuiteOnlyState();
+        await mkdir(join(dir, '.pipeline'), { recursive: true });
+        const ledgerPath = join(dir, '.pipeline/kickback-ledger.json');
+        await writeFile(ledgerPath, ledgerBytes);
+        const kickbacks: ConductorEvent[] = [];
+        events.on('kickback', (event) => { kickbacks.push(event); });
+        const suiteFailure = {
+          status: 'FAILED' as const,
+          reason,
+          message: `fixture ${reason} failure`,
+        };
+        const runner = createMockStepRunner();
+        const verifier = {
+          inspect: vi.fn().mockResolvedValue(suiteFailure),
+          ensure: vi.fn().mockResolvedValue(suiteFailure),
+        };
+        const conductor = new Conductor({
+          projectRoot: dir,
+          stateFilePath: statePath,
+          stepRunner: runner,
+          events,
+          mode: 'auto',
+          fromStep: 'test_suite',
+          maxRetries: 1,
+          fullSuiteVerifier: verifier,
+        });
+
+        await conductor.run();
+
+        expect((await readKickbackLedger(dir)).gates.test_suite).toEqual(expect.objectContaining({
+          count: 1,
+          cumulative: 1,
+        }));
+        expect(kickbacks).toEqual([]);
+        expect(verifier.inspect).toHaveBeenCalledTimes(3);
+        expect(verifier.ensure).toHaveBeenCalledTimes(3);
+        expect(runner.run).not.toHaveBeenCalled();
+        await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).resolves.toBe('needs-human');
+        await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+          `test_suite infrastructure failure (${reason})`,
+        );
+      },
+    );
   });
 
   it('keeps the interactive CLI constructor free of daemon operator-park options', async () => {
@@ -1142,7 +2357,6 @@ describe('engine/conductor', () => {
       ): Promise<void>;
     }).commitStateChanges(state, 'join BUILD verification group', {
       build: 'done',
-      build__wiring_check: 'done',
       build__test_suite: 'done',
     });
 
@@ -1150,7 +2364,6 @@ describe('engine/conductor', () => {
       name: 'join BUILD verification group',
       mutations: expect.arrayContaining([
         expect.objectContaining({ field: 'build', expected: 'in_progress', next: 'done' }),
-        expect.objectContaining({ field: 'build__wiring_check', expected: undefined, next: 'done' }),
         expect.objectContaining({ field: 'build__test_suite', expected: undefined, next: 'done' }),
       ]),
     });
@@ -1704,7 +2917,6 @@ describe('engine/conductor', () => {
         s.name !== 'complexity' &&
         s.name !== 'worktree' &&
         s.name !== 'test_suite' &&
-        s.name !== 'wiring_check' &&
         s.name !== 'rebase',
     ).length;
     expect(runner.run).toHaveBeenCalledTimes(dispatchedSteps);
@@ -1782,7 +2994,6 @@ describe('engine/conductor', () => {
         s.name !== 'complexity' &&
         s.name !== 'worktree' &&
         s.name !== 'test_suite' &&
-        s.name !== 'wiring_check' &&
         s.name !== 'rebase',
     ).map((s) => s.name);
     expect(callOrder).toEqual(expectedOrder);
@@ -2114,7 +3325,7 @@ describe('engine/conductor', () => {
       complexity_tier: 'M', prd: 'done', architecture_diagram: 'done',
       architecture_review: 'done', stories: 'done', conflict_check: 'done',
       writing_system_tests: 'done', acceptance_specs: 'done', plan: 'done', coherence_check: 'done', build: 'done',
-      wiring_check: 'done', test_suite: 'done',
+       test_suite: 'done',
     } as ConductState);
 
     let buildReviewCalls = 0;
@@ -2172,7 +3383,7 @@ describe('engine/conductor', () => {
       complexity_tier: 'M', prd: 'done', architecture_diagram: 'done',
       architecture_review: 'done', stories: 'done', conflict_check: 'done',
       writing_system_tests: 'done', acceptance_specs: 'done', plan: 'done', coherence_check: 'done', build: 'done',
-      wiring_check: 'done', test_suite: 'done',
+       test_suite: 'done',
     } as ConductState);
     const runner: StepRunner = {
       run: vi.fn(async (step: StepName) =>
@@ -2216,7 +3427,7 @@ describe('engine/conductor', () => {
       complexity_tier: 'M', prd: 'done', architecture_diagram: 'done',
       architecture_review: 'done', stories: 'done', conflict_check: 'done',
       writing_system_tests: 'done', acceptance_specs: 'done', plan: 'done', coherence_check: 'done', build: 'done',
-      wiring_check: 'done', test_suite: 'done',
+       test_suite: 'done',
     } as ConductState);
     const runner: StepRunner = {
       run: vi.fn(async (step: StepName) =>
@@ -2261,7 +3472,7 @@ describe('engine/conductor', () => {
       complexity_tier: 'M', prd: 'done', architecture_diagram: 'done',
       architecture_review: 'done', stories: 'done', conflict_check: 'done',
       writing_system_tests: 'done', acceptance_specs: 'done', plan: 'done', coherence_check: 'done', build: 'done',
-      wiring_check: 'done', test_suite: 'done',
+       test_suite: 'done',
     } as ConductState);
     const runner: StepRunner = {
       run: vi.fn(async (step: StepName) =>
@@ -2454,6 +3665,330 @@ describe('engine/conductor', () => {
       expect(idleCtxAfter.attemptStartedAt).toBeUndefined();
     });
 
+    // Covers: task:2
+    it('completionCtx carries one distinct attemptRunId for each verdict dispatch only', async () => {
+      await seedToBuildReview();
+      const attemptRunIds: Array<string | undefined> = [];
+      let conductor: Conductor;
+      const runner: StepRunner = {
+        run: async () => {
+          const stateResult = await readState(statePath);
+          const state = stateResult.ok ? stateResult.value : ({} as ConductState);
+          const ctx = await (conductor as unknown as {
+            completionCtx: (s: ConductState) => Promise<{ attemptRunId?: string }>;
+          }).completionCtx(state);
+          attemptRunIds.push(ctx.attemptRunId);
+          return { success: true };
+        },
+      };
+      conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        fromStep: 'build_review',
+        verifyArtifacts: true,
+        maxRetries: 2,
+        config: { build_review: { rubrics: { testQuality: { enabled: true } } } },
+      });
+
+      const stateResult = await readState(statePath);
+      const state = stateResult.ok ? stateResult.value : ({} as ConductState);
+      const idleCtx = await (conductor as unknown as {
+        completionCtx: (s: ConductState) => Promise<{ attemptRunId?: string }>;
+      }).completionCtx(state);
+      expect(idleCtx.attemptRunId).toBeUndefined();
+
+      await conductor.run();
+
+      expect(attemptRunIds).toHaveLength(2);
+      expect(attemptRunIds[0]).toMatch(/\S/);
+      expect(attemptRunIds[1]).toMatch(/\S/);
+      expect(attemptRunIds[0]).not.toBe(attemptRunIds[1]);
+
+      const idleCtxAfter = await (conductor as unknown as {
+        completionCtx: (s: ConductState) => Promise<{ attemptRunId?: string }>;
+      }).completionCtx(state);
+      expect(idleCtxAfter.attemptRunId).toBeUndefined();
+    });
+
+    // Covers: task:3
+    it('merges an engine-owned run id onto a verdict sidecar without changing its code stamp', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const sidecar = join(dir, PRD_AUDIT_CODE_STAMP);
+      await writeFile(sidecar, '{"codeStamp":"head-before-settle"}\n');
+
+      await stampGateRunIdentity(dir, 'prd_audit', 'attempt-owned-by-engine');
+
+      await expect(readFile(sidecar, 'utf8')).resolves.toBe(
+        '{\n  "codeStamp": "head-before-settle",\n  "runId": "attempt-owned-by-engine"\n}\n',
+      );
+    });
+
+    it('leaves a verdict sidecar byte-for-byte and mtime unchanged when gate validity is disabled', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const sidecar = join(dir, PRD_AUDIT_CODE_STAMP);
+      const before = '{"codeStamp":"head-before-settle"}\n';
+      await writeFile(sidecar, before);
+      const beforeStat = await stat(sidecar);
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+        config: { gate_code_validity: { enabled: false } },
+      });
+
+      await (conductor as unknown as {
+        stampVerdictRunIdentity: (step: StepName, runId: string | undefined) => Promise<void>;
+      }).stampVerdictRunIdentity('prd_audit', 'attempt-owned-by-engine');
+
+      expect(await readFile(sidecar, 'utf8')).toBe(before);
+      expect((await stat(sidecar)).mtimeMs).toBe(beforeStat.mtimeMs);
+    });
+
+    it('treats a corrupt verdict sidecar as empty when stamping the engine run id', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const sidecar = join(dir, PRD_AUDIT_CODE_STAMP);
+      await writeFile(sidecar, '{not-json');
+
+      await stampGateRunIdentity(dir, 'prd_audit', 'attempt-owned-by-engine');
+
+      await expect(readFile(sidecar, 'utf8')).resolves.toBe(
+        '{\n  "runId": "attempt-owned-by-engine"\n}\n',
+      );
+    });
+
+    // Covers: task:4
+    it('uses the engine dispatch identity rather than a provider runId echo', async () => {
+      const seedResult = await readState(statePath);
+      const seed = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+      for (const step of ALL_STEPS) {
+        seed[step.name] = step.name === 'prd_audit' ? 'pending' : 'skipped';
+        if (step.name === 'prd_audit') break;
+        seed[step.name] = 'done';
+      }
+      seed.prd_audit = 'pending';
+      seed.architecture_review_as_built = 'skipped';
+      seed.rebase = 'skipped';
+      seed.finish = 'done';
+      await writeState(statePath, seed as ConductState);
+
+      let engineRunId: string | undefined;
+      let conductor: Conductor;
+      conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: {
+          run: async () => {
+            const stateResult = await readState(statePath);
+            const state = stateResult.ok ? stateResult.value : ({} as ConductState);
+            engineRunId = await (conductor as unknown as {
+              completionCtx: (current: ConductState) => Promise<{ attemptRunId?: string }>;
+            }).completionCtx(state).then((ctx) => ctx.attemptRunId);
+            return { success: true, output: 'provider report { "runId": "bogus" }' };
+          },
+        },
+        events,
+        fromStep: 'prd_audit',
+      });
+
+      await conductor.run();
+
+      const stamped = JSON.parse(await readFile(join(dir, PRD_AUDIT_CODE_STAMP), 'utf8')) as {
+        runId?: string;
+      };
+      expect(engineRunId).toMatch(/\S/);
+      expect(stamped.runId).toBe(engineRunId);
+      expect(stamped.runId).not.toBe('bogus');
+    });
+
+    it('warns for the affected verdict branch when its run-id sidecar cannot be written', async () => {
+      await writeFile(join(dir, '.pipeline'), 'not a directory');
+      const logs: string[] = [];
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+        log: (message) => logs.push(message),
+      });
+
+      await expect(
+        (conductor as unknown as {
+          stampVerdictRunIdentity: (step: StepName, runId: string | undefined) => Promise<void>;
+        }).stampVerdictRunIdentity('prd_audit', 'engine-attempt-id'),
+      ).resolves.toBeUndefined();
+
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain('prd_audit');
+      expect(logs[0]).toContain(PRD_AUDIT_CODE_STAMP);
+      await expect(readFile(join(dir, PRD_AUDIT_CODE_STAMP), 'utf8')).rejects.toThrow();
+    });
+
+    // Covers: task:6
+    it.each([
+      ['manual_test', '.pipeline/manual-test-results.md', MANUAL_TEST_CODE_STAMP],
+      ['prd_audit', '.pipeline/prd-audit.md', PRD_AUDIT_CODE_STAMP],
+      [
+        'architecture_review_as_built',
+        '.pipeline/architecture-review-as-built.md',
+        ARCHITECTURE_REVIEW_AS_BUILT_CODE_STAMP,
+      ],
+    ] as const)(
+      'accepts a freshly written %s verdict report with the settled dispatch identity',
+      async (step, reportPath, _sidecarPath) => {
+        await mkdir(join(dir, '.pipeline'), { recursive: true });
+        const runId = `task-6-${step}`;
+        const dispatchStartedAt = Date.now();
+        await writeFile(join(dir, reportPath), 'fresh verdict report\n');
+        await stampGateRunIdentity(dir, step, runId);
+        const conductor = new Conductor({
+          projectRoot: dir,
+          stateFilePath: statePath,
+          stepRunner: createMockStepRunner({ success: true }),
+          events,
+        });
+
+        await expect(
+          (conductor as unknown as {
+            verdictDispatchHandshake: (
+              name: StepName,
+              expectedRunId: string,
+              startedAt: number,
+            ) => Promise<unknown>;
+          }).verdictDispatchHandshake(step, runId, dispatchStartedAt),
+        ).resolves.toBeUndefined();
+      },
+    );
+
+    it('rejects a prior-lap prd report before its stale findings can be routed', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      await writeFile(report, '| FR-17 | FIXABLE | stale finding must not route |\n');
+      const dispatchStartedAt = Date.now();
+      await utimes(report, new Date(dispatchStartedAt - 60_000), new Date(dispatchStartedAt - 60_000));
+      await stampGateRunIdentity(dir, 'prd_audit', 'current-run');
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+      });
+
+      await expect(
+        (conductor as unknown as {
+          verdictDispatchHandshake: (
+            name: StepName,
+            expectedRunId: string,
+            startedAt: number,
+          ) => Promise<{ done: boolean; routeClass?: string; reason?: string }>;
+        }).verdictDispatchHandshake('prd_audit', 'current-run', dispatchStartedAt),
+      ).resolves.toEqual({
+        done: false,
+        routeClass: 'absent',
+        reason: expect.stringContaining('.pipeline/prd-audit.md'),
+      });
+
+      const result = await (conductor as unknown as {
+        verdictDispatchHandshake: (
+          name: StepName,
+          expectedRunId: string,
+          startedAt: number,
+        ) => Promise<{ reason?: string }>;
+      }).verdictDispatchHandshake('prd_audit', 'current-run', dispatchStartedAt);
+      expect(result.reason).toContain('expected run id current-run');
+      expect(result.reason).toContain('found run id current-run');
+      expect(result.reason).toContain('found mtime');
+      expect(result.reason).not.toContain('FR-17');
+    });
+
+    // Covers: task:7
+    it('rejects a partial prd-audit write by naming the missing run-id marker only', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      await writeFile(report, '| FR-17 | FIXABLE | stale finding must not route |\n');
+      const dispatchStartedAt = Date.now();
+      await utimes(report, new Date(dispatchStartedAt), new Date(dispatchStartedAt));
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+      });
+
+      const result = await (conductor as unknown as {
+        verdictDispatchHandshake: (
+          name: StepName,
+          expectedRunId: string,
+          startedAt: number,
+        ) => Promise<{ done: boolean; routeClass?: string; reason?: string }>;
+      }).verdictDispatchHandshake('prd_audit', 'current-run', dispatchStartedAt);
+
+      expect(result).toMatchObject({ done: false, routeClass: 'absent' });
+      expect(result.reason).toContain(PRD_AUDIT_CODE_STAMP);
+      expect(result.reason).not.toContain('.pipeline/prd-audit.md is missing');
+      expect(result.reason).not.toContain('FR-17');
+    });
+
+    it('fails closed and warns without throwing when a verdict sidecar is corrupt', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      await writeFile(report, '| FR-17 | FIXABLE | stale finding must not route |\n');
+      const dispatchStartedAt = Date.now();
+      await utimes(report, new Date(dispatchStartedAt), new Date(dispatchStartedAt));
+      await writeFile(join(dir, PRD_AUDIT_CODE_STAMP), '{not-json');
+      const logs: string[] = [];
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+        log: (message) => logs.push(message),
+      });
+
+      await expect(
+        (conductor as unknown as {
+          verdictDispatchHandshake: (
+            name: StepName,
+            expectedRunId: string,
+            startedAt: number,
+          ) => Promise<{ done: boolean; routeClass?: string; reason?: string }>;
+        }).verdictDispatchHandshake('prd_audit', 'current-run', dispatchStartedAt),
+      ).resolves.toMatchObject({ done: false, routeClass: 'absent' });
+
+      expect(logs).toContainEqual(expect.stringContaining(PRD_AUDIT_CODE_STAMP));
+      expect(logs.join('\n')).not.toContain('FR-17');
+    });
+
+    it.each(['', '{', '[]', 'null', '{"runId":0}', '{"runId":""}'])(
+      'never throws for malformed verdict sidecar input %j',
+      async (sidecar) => {
+        await mkdir(join(dir, '.pipeline'), { recursive: true });
+        const report = join(dir, '.pipeline/prd-audit.md');
+        await writeFile(report, '| FR-17 | FIXABLE | stale finding must not route |\n');
+        const dispatchStartedAt = Date.now();
+        await utimes(report, new Date(dispatchStartedAt), new Date(dispatchStartedAt));
+        await writeFile(join(dir, PRD_AUDIT_CODE_STAMP), sidecar);
+        const conductor = new Conductor({
+          projectRoot: dir,
+          stateFilePath: statePath,
+          stepRunner: createMockStepRunner({ success: true }),
+          events,
+        });
+
+        await expect(
+          (conductor as unknown as {
+            verdictDispatchHandshake: (
+              name: StepName,
+              expectedRunId: string,
+              startedAt: number,
+            ) => Promise<{ done: boolean; routeClass?: string; reason?: string }>;
+          }).verdictDispatchHandshake('prd_audit', 'current-run', dispatchStartedAt),
+        ).resolves.toMatchObject({ done: false, routeClass: 'absent' });
+      },
+    );
+
     it('a review retry whose session does not rewrite the verdict does not pass the gate', async () => {
       await seedToBuildReview();
       // Stale verdict, written well before this run starts; the stub
@@ -2486,6 +4021,372 @@ describe('engine/conductor', () => {
       for (const e of freshnessEvents) {
         expect(e.fresh).toBe(false);
       }
+    });
+
+    // Covers: rem-prd-audit-rem-fr-s2.2-1
+    it.each([
+      'manual_test',
+      'prd_audit',
+      'architecture_review_as_built',
+    ] as const)(
+      'records the %s handshake on failed dispatch retries and preserves its final diagnostic',
+      async (step) => {
+        const seedResult = await readState(statePath);
+        const state = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+        for (const candidate of ALL_STEPS) {
+          state[candidate.name] = candidate.name === step ? 'pending' : 'skipped';
+          if (candidate.name === step) break;
+          state[candidate.name] = 'done';
+        }
+        state[step] = 'pending';
+        state.rebase = 'skipped';
+        state.finish = 'done';
+        await writeState(statePath, state as ConductState);
+
+        const conductor = new Conductor({
+          projectRoot: dir,
+          stateFilePath: statePath,
+          stepRunner: createMockStepRunner({ success: false, output: 'dispatch failed' }),
+          events,
+          fromStep: step,
+          verifyArtifacts: true,
+          mode: 'default',
+          maxRetries: 2,
+          config: { steps: { [step]: { max_retries: 2 } } },
+          onRecovery: async () => 'skip',
+        });
+        const handshakes: Array<{ runId?: string; startedAt?: number }> = [];
+        (conductor as unknown as {
+          verdictDispatchHandshake: (
+            name: StepName,
+            runId: string | undefined,
+            startedAt: number | undefined,
+          ) => Promise<{ done: false; routeClass: 'absent'; reason: string } | undefined>;
+        }).verdictDispatchHandshake = async (name, runId, startedAt) => {
+          expect(name).toBe(step);
+          handshakes.push({ runId, startedAt });
+          return { done: false, routeClass: 'absent', reason: `stale ${step} verdict` };
+        };
+
+        await conductor.run();
+
+        expect(handshakes).toHaveLength(2);
+        for (const handshake of handshakes) {
+          expect(handshake.runId).toMatch(/\S/);
+          expect(handshake.startedAt).toEqual(expect.any(Number));
+        }
+        expect(handshakes[0].runId).not.toBe(handshakes[1].runId);
+      },
+    );
+
+    // Covers: rem-prd-audit-rem-fr-s2.2-1
+    it.each([
+      'manual_test',
+      'prd_audit',
+      'architecture_review_as_built',
+    ] as const)(
+      'records the %s handshake before honoring a step-written halt verbatim',
+      async (step) => {
+        const seedResult = await readState(statePath);
+        const state = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+        for (const candidate of ALL_STEPS) {
+          state[candidate.name] = candidate.name === step ? 'pending' : 'skipped';
+          if (candidate.name === step) break;
+          state[candidate.name] = 'done';
+        }
+        state[step] = 'pending';
+        state.rebase = 'skipped';
+        state.finish = 'done';
+        await writeState(statePath, state as ConductState);
+
+        const haltReason = `step-authored ${step} halt`;
+        const conductor = new Conductor({
+          projectRoot: dir,
+          stateFilePath: statePath,
+          stepRunner: {
+            run: async () => {
+              await mkdir(join(dir, '.pipeline'), { recursive: true });
+              await writeFile(join(dir, '.pipeline/HALT'), haltReason + '\n');
+              await writeFile(join(dir, '.pipeline/HALT.class'), 'needs-human\n');
+              return { success: false, output: 'dispatch failed' };
+            },
+          },
+          events,
+          fromStep: step,
+          verifyArtifacts: true,
+          mode: 'default',
+          maxRetries: 2,
+        });
+        const handshakes: Array<{ runId?: string; startedAt?: number }> = [];
+        (conductor as unknown as {
+          verdictDispatchHandshake: (
+            name: StepName,
+            runId: string | undefined,
+            startedAt: number | undefined,
+          ) => Promise<{ done: false; routeClass: 'absent'; reason: string } | undefined>;
+        }).verdictDispatchHandshake = async (name, runId, startedAt) => {
+          expect(name).toBe(step);
+          handshakes.push({ runId, startedAt });
+          return { done: false, routeClass: 'absent', reason: `stale ${step} verdict` };
+        };
+
+        await conductor.run();
+
+        expect(handshakes).toHaveLength(1);
+        expect(handshakes[0].runId).toMatch(/\S/);
+        expect(handshakes[0].startedAt).toEqual(expect.any(Number));
+        await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toBe(haltReason + '\n');
+      },
+    );
+
+    // Covers: task:11
+    it('halts with the stale prd-audit handshake identity after its retry budget is exhausted', async () => {
+      const seedResult = await readState(statePath);
+      const state = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+      for (const step of ALL_STEPS) {
+        state[step.name] = step.name === 'prd_audit' ? 'pending' : 'skipped';
+        if (step.name === 'prd_audit') break;
+        state[step.name] = 'done';
+      }
+      state.prd_audit = 'pending';
+      state.architecture_review_as_built = 'skipped';
+      state.rebase = 'skipped';
+      state.finish = 'done';
+      await writeState(statePath, state as ConductState);
+
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      await writeFile(report, '| FR-17 | FIXABLE | stale finding must not be surfaced |\n');
+      const staleAt = Date.now() - 60_000;
+      await utimes(report, new Date(staleAt), new Date(staleAt));
+
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+        fromStep: 'prd_audit',
+        verifyArtifacts: true,
+        mode: 'auto',
+        maxRetries: 2,
+      });
+
+      await conductor.run();
+
+      const halt = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
+      expect(await readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).toBe('needs-human');
+      expect(halt).toContain('prd_audit');
+      expect(halt).toContain('.pipeline/prd-audit.md');
+      expect(halt).toContain('expected run id');
+      expect(halt).toContain('found run id');
+      expect(halt).toContain('found mtime');
+      expect(halt).not.toContain('FR-17');
+      expect(halt).not.toContain('stale finding must not be surfaced');
+    });
+
+    // Covers: task:15
+    it('emits and persists stale run-identity telemetry from the verdict handshake', async () => {
+      const seedResult = await readState(statePath);
+      const state = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+      for (const step of ALL_STEPS) {
+        state[step.name] = step.name === 'prd_audit' ? 'pending' : 'skipped';
+        if (step.name === 'prd_audit') break;
+        state[step.name] = 'done';
+      }
+      state.prd_audit = 'pending';
+      state.architecture_review_as_built = 'skipped';
+      state.rebase = 'skipped';
+      state.finish = 'done';
+      await writeState(statePath, state as ConductState);
+
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      await writeFile(report, '| FR-17 | FIXABLE | prior-lap finding |\n');
+      await writeFile(join(dir, PRD_AUDIT_CODE_STAMP), JSON.stringify({ runId: 'prior-run' }));
+
+      const eventsPath = join(dir, '.pipeline/events.jsonl');
+      const persister = new EventPersister(eventsPath, events);
+      const retryDecisions: ConductorEvent[] = [];
+      events.on('retry_decision', (event) => {
+        retryDecisions.push(event);
+      });
+      persister.start();
+
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner({ success: true }),
+        events,
+        fromStep: 'prd_audit',
+        verifyArtifacts: true,
+        mode: 'auto',
+        daemon: true,
+        maxRetries: 1,
+      });
+      // A failed sidecar stamp leaves the prior run identity in place. The
+      // production method deliberately treats this as non-fatal, so this is
+      // the real handshake boundary that must surface the stale decision.
+      (conductor as unknown as {
+        stampVerdictRunIdentity: (step: StepName, runId?: string) => Promise<void>;
+      }).stampVerdictRunIdentity = async () => {};
+
+      try {
+        await conductor.run();
+      } finally {
+        persister.stop();
+      }
+
+      const persisted = (await readFile(eventsPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(persisted).toContainEqual(expect.objectContaining({
+        type: 'verdict_freshness',
+        step: 'prd_audit',
+        artifact: report,
+        floorSource: 'run-identity',
+        outcome: 'stale_invalidated',
+        fresh: false,
+      }));
+      expect(retryDecisions).toContainEqual(expect.objectContaining({
+        type: 'retry_decision',
+        step: 'prd_audit',
+        decision: 'rerun',
+        signal: 'stale-run-identity',
+      }));
+    });
+
+    // Covers: task:12
+    it('recovers from a cleared stale-verdict halt without deleting its prior-lap artifacts', async () => {
+      const seedResult = await readState(statePath);
+      const state = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+      for (const step of ALL_STEPS) {
+        state[step.name] = step.name === 'prd_audit' ? 'pending' : 'skipped';
+        if (step.name === 'prd_audit') break;
+        state[step.name] = 'done';
+      }
+      state.prd_audit = 'pending';
+      state.architecture_review_as_built = 'skipped';
+      state.rebase = 'skipped';
+      state.finish = 'done';
+      await writeState(statePath, state as ConductState);
+
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      const sidecar = join(dir, PRD_AUDIT_CODE_STAMP);
+      await writeFile(report, '| FR-17 | FIXABLE | prior-lap finding |');
+      await writeFile(sidecar, JSON.stringify({ runId: 'prior-lap' }));
+      await writeFile(join(dir, '.pipeline/HALT'), 'stale verdict halt');
+      await writeFile(join(dir, '.pipeline/HALT.class'), 'needs-human');
+
+      // Operator recovery clears only terminal halt markers. The stale report
+      // and sidecar remain until this dispatch replaces their verdict.
+      await unlink(join(dir, '.pipeline/HALT'));
+      await unlink(join(dir, '.pipeline/HALT.class'));
+
+      const runner: StepRunner = {
+        run: vi.fn(async (step) => {
+          expect(step).toBe('prd_audit');
+          await expect(readFile(report, 'utf8')).resolves.toContain('prior-lap finding');
+          await expect(readFile(sidecar, 'utf8')).resolves.toContain('prior-lap');
+          await writeFile(
+            report,
+            [
+              '# PRD Audit', '', '**PRD:** present', '', '## Verdict Table', '',
+              '| Criterion | Grade | Plan task | PRD: | Evidence |',
+              '|---|---|---|---|---|',
+              '| S1.1 | PASS | — | FR-1 | evidence.ts:1 |',
+            ].join('\n'),
+          );
+          return { success: true };
+        }),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        fromStep: 'prd_audit',
+        verifyArtifacts: true,
+        mode: 'auto',
+        daemon: true,
+      });
+
+      await conductor.run();
+
+      expect(runner.run).toHaveBeenCalledTimes(1);
+      const result = await readState(statePath);
+      expect(result.ok && result.value.prd_audit).toBe('done');
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).rejects.toThrow();
+      await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).rejects.toThrow();
+      expect(JSON.parse(await readFile(sidecar, 'utf8'))).toMatchObject({
+        runId: expect.any(String),
+      });
+      expect(await readFile(report, 'utf8')).not.toContain('prior-lap finding');
+    });
+
+    // Covers: task:12
+    it('honors a fresh blocking verdict after the same clear-and-rerun recovery', async () => {
+      const seedResult = await readState(statePath);
+      const state = (seedResult.ok ? seedResult.value : {}) as Record<string, unknown>;
+      for (const step of ALL_STEPS) {
+        state[step.name] = step.name === 'prd_audit' ? 'pending' : 'skipped';
+        if (step.name === 'prd_audit') break;
+        state[step.name] = 'done';
+      }
+      state.prd_audit = 'pending';
+      state.architecture_review_as_built = 'skipped';
+      state.rebase = 'skipped';
+      state.finish = 'done';
+      await writeState(statePath, state as ConductState);
+
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      const report = join(dir, '.pipeline/prd-audit.md');
+      const sidecar = join(dir, PRD_AUDIT_CODE_STAMP);
+      await writeFile(report, '| FR-17 | FIXABLE | prior-lap finding |');
+      await writeFile(sidecar, JSON.stringify({ runId: 'prior-lap' }));
+      await writeFile(join(dir, '.pipeline/HALT'), 'stale verdict halt');
+      await writeFile(join(dir, '.pipeline/HALT.class'), 'needs-human');
+      await unlink(join(dir, '.pipeline/HALT'));
+      await unlink(join(dir, '.pipeline/HALT.class'));
+
+      const runner: StepRunner = {
+        run: vi.fn(async (step) => {
+          expect(step).toBe('prd_audit');
+          await expect(readFile(report, 'utf8')).resolves.toContain('prior-lap finding');
+          await expect(readFile(sidecar, 'utf8')).resolves.toContain('prior-lap');
+          await writeFile(
+            report,
+            [
+              '# PRD Audit', '', '**PRD:** present', '', '## Verdict Table', '',
+              '| Criterion | Grade | Plan task | PRD: | Evidence |',
+              '|---|---|---|---|---|',
+              '| S1.1 | PLAN_GAP | — | FR-1 | evidence.ts:1 |',
+            ].join('\n'),
+          );
+          return { success: true };
+        }),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        fromStep: 'prd_audit',
+        verifyArtifacts: true,
+        mode: 'auto',
+        daemon: true,
+        config: { prd_audit: { halt_on_any_plan_gap: true } } as HarnessConfig,
+      });
+
+      await conductor.run();
+
+      expect(runner.run).toHaveBeenCalledTimes(1);
+      const halt = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
+      expect(halt).toContain('S1.1');
+      expect(halt).toContain('PLAN_GAP');
+      expect(halt).not.toContain('prior-lap finding');
     });
 
     it('verdict_freshness event identifies stale invalidation and rewritten verdict outcomes', async () => {
@@ -2740,7 +4641,7 @@ describe('engine/conductor', () => {
 
       // Write SATISFIED verdicts for all gates
       for (const gateName of ['build', 'build_review', 'manual_test', 'prd_audit',
-        'architecture_review_as_built', 'retro', 'rebase'] as StepName[]) {
+        'architecture_review_as_built', 'rebase'] as StepName[]) {
         await writeVerdict(dir, gateName, { satisfied: true, checkedAt: 1 });
       }
 
@@ -3036,77 +4937,6 @@ describe('engine/conductor', () => {
         halt: expect.stringMatching(/prd-audit impl-gap unresolved/),
         haltClass: 'needs-human',
       });
-    });
-
-    it.skip('hands the BUILD agent the failing FRs (kickback retryReason) — self-heal is not blind', async () => {
-      await seedToPrdAudit();
-      // Same perpetual impl-gap; we assert the handoff CONTENT, not just that a
-      // kickback happened. Each BUILD dispatch driven by the prd_audit kickback
-      // must carry the gap (the FR id + a pointer to .pipeline/prd-audit.md) in
-      // its retryReason — the bug was that BUILD was dispatched blind, saw a
-      // complete task list, and changed nothing (a no-op self-heal loop).
-      const { runner } = shipRunner('| FR-2 | MISSING | impl-gap | x | no |\n');
-      const conductor = new Conductor({
-        stateFilePath: statePath,
-        stepRunner: runner,
-        events,
-        projectRoot: dir,
-        mode: 'default',
-        daemon: true,
-        verifyArtifacts: true,
-        fromStep: 'prd_audit',
-      });
-
-      await conductor.run();
-
-      const buildReasons = vi
-        .mocked(runner.run)
-        .mock.calls.filter((c) => c[0] === 'build')
-        .map((c) => (c[2] as { retryReason?: string } | undefined)?.retryReason ?? '');
-      expect(buildReasons.length).toBeGreaterThan(0);
-      for (const r of buildReasons) {
-        expect(r).toContain('FR-2 (impl-gap)');
-        expect(r).toContain('.pipeline/prd-audit.md');
-      }
-    });
-
-    it.skip('HALTs immediately on a product/plan gap (intended-drift) without rebuilding', async () => {
-      await seedToPrdAudit();
-      const { runner, calls } = shipRunner(
-        '| FR-3 | DIVERGED | intended-drift | baz.ts:88 | no |\n',
-      );
-      const kickbacks: string[] = [];
-      events.on('kickback', (e) => {
-        if (e.type === 'kickback') kickbacks.push(e.to);
-      });
-      let halted = false;
-      events.on('loop_halt', () => {
-        halted = true;
-      });
-      const conductor = new Conductor({
-        stateFilePath: statePath,
-        stepRunner: runner,
-        events,
-        projectRoot: dir,
-        mode: 'auto',
-        daemon: true,
-        verifyArtifacts: true,
-        fromStep: 'prd_audit',
-      });
-
-      await conductor.run();
-
-      expect(halted).toBe(true);
-      const halt = await readFile(join(dir, '.pipeline/HALT'), 'utf-8');
-      expect(halt).toMatch(/product\/plan gap needs human DECIDE/);
-      expect(halt).toMatch(/FR-3 \(intended-drift\)/);
-      // No self-heal: never kicked back to build, never rebuilt.
-      expect(kickbacks).toHaveLength(0);
-      expect(calls.filter((s) => s === 'build')).toHaveLength(0);
-      // This is an operator-only DECIDE-phase gap — the re-kick sweep must
-      // never auto-resume it, so the HALT is classified needs-human.
-      const haltClass = await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8');
-      expect(haltClass).toBe('needs-human');
     });
 
     it('/remediate: routes an autonomous gap to its target step with the gap in the hint', async () => {
@@ -3504,7 +5334,8 @@ describe('engine/conductor', () => {
     // keeps FAILing, the gate-loop budget (MAX_KICKBACKS_PER_GATE) is what
     // eventually stops the loop — a "gate selected N times without
     // satisfying" halt, not a product/plan gap. It must be classified
-    // mechanical so the re-kick sweep keeps retrying it on base advance.
+    // needs-human so the re-kick sweep leaves its capped remediation to an
+    // operator rather than retrying it on base advance.
     it('manual_test FAIL exhausts its mechanical cap when the D2 kill-switch is disabled', async () => {
       await seedToManualTest();
       let buildAttempt = 0;
@@ -3557,7 +5388,7 @@ describe('engine/conductor', () => {
       expect(halt).toMatch(/manual-test FAIL unresolved/);
 
       const haltClass = await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8');
-      expect(haltClass).toBe('mechanical');
+      expect(haltClass).toBe('needs-human');
     });
 
     it('hands BUILD the FAIL rows + the no-whitewash contract in its retryReason', async () => {
@@ -4555,11 +6386,10 @@ describe('engine/conductor', () => {
       expect(haltContent).toContain('Remediation budget exhausted');
       expect(haltContent).toContain('max 2 kickbacks per gate');
 
-      // A build stall is a transient/mechanical condition (no product/plan
-      // gap) — the re-kick sweep must keep retrying it on base advance, so
-      // it is classified mechanical, never needs-human.
+      // The exhausted remediation budget needs a human decision; the re-kick
+      // sweep must not retry it automatically on base advance.
       const haltClass = await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8');
-      expect(haltClass).toBe('mechanical');
+      expect(haltClass).toBe('needs-human');
     });
   });
 
@@ -4901,7 +6731,6 @@ describe('engine/conductor', () => {
           build_review: 'skipped',
           manual_test: 'skipped',
           prd_audit: 'skipped',
-          retro: 'skipped',
           architecture_review_as_built: 'skipped',
           rebase: 'skipped',
         },
@@ -5061,27 +6890,40 @@ describe('engine/conductor', () => {
       expect(haltClass).toBe('needs-human');
     });
 
-    it('as-built review failure is terminal and does not route through remediation', async () => {
+    it('routes a serial remediable as-built BLOCKED verdict back to build and restages the gate', async () => {
       await seedShipTail({ architecture_review_as_built: 'pending' });
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'feat.md');
+      await writeFile(
+        planPath,
+        [1, 2, 3, 4].map((id) => `### Task ${id}: Existing work ${id}`).join('\n'),
+      );
+      let asBuiltRestagedBeforeBuild = false;
       const runner: StepRunner = {
         run: vi.fn(async (step: StepName) => {
           if (step === 'architecture_review_as_built') {
-            return { success: false, error: 'as-built review BLOCKED: ADR violated' };
+            await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+              'Verdict: BLOCKED',
+              '',
+              '## Blocking Findings',
+              '| Finding | Class | Governing clause | Summary |',
+              '| --- | --- | --- | --- |',
+              '| ARCH-1 | REMEDIABLE | Task 1 | Add the missing guard |',
+            ].join('\n'));
           }
           if (step === 'build') {
-            await writeFile(
-              join(dir, '.pipeline/task-status.json'),
-              JSON.stringify({ tasks: [{ id: 'task-1', status: 'completed' }] }),
-            );
+            const current = await readState(statePath);
+            asBuiltRestagedBeforeBuild = current.ok && current.value.architecture_review_as_built === 'stale';
+            return { success: false, error: 'stop after observing serial reroute' };
           } else if (step === 'remediate') {
             await remediationPlanFile({
               dispositions: [
                 {
-                  id: 'adr-2026-07-03-example',
+                  id: 'ARCH-1',
                   disposition: 'build',
                   category: null,
-                  rationale: 'record written to the wrong branch',
-                  tasks: [{ id: 'rem-1', title: 'move the write into the finish flow' }],
+                  rationale: 'Add the missing approved guard.',
+                  tasks: [{ id: 'missing-guard', title: 'Add the missing guard' }],
                 },
               ],
             });
@@ -5107,15 +6949,100 @@ describe('engine/conductor', () => {
         verifyArtifacts: true,
         fromStep: 'architecture_review_as_built',
         maxRetries: 1,
+        config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
         escalateBuildFailure: async () => ({}),
       });
 
       await conductor.run();
 
-      expect(kickbacks).toHaveLength(0);
-      expect(halted).toBe(true);
-      const halt = await readFile(join(dir, '.pipeline/HALT'), 'utf-8');
-      expect(halt).toMatch(/as-built architecture review halted/);
+      expect(kickbacks).toContainEqual({ from: 'architecture_review_as_built', to: 'build' });
+      expect(vi.mocked(runner.run).mock.calls.map(([step]) => step)).toContain('remediate');
+      expect(asBuiltRestagedBeforeBuild).toBe(true);
+      await expect(readFile(planPath, 'utf8')).resolves.toContain('### Task rem-as-built-missing-guard: Add the missing guard');
+      expect(halted).toBe(true); // the test stops the rerouted build deliberately
+    });
+
+    it('halts a mixed serial as-built report with every finding listed and re-dispatches it freshly after clearing HALT', async () => {
+      await seedShipTail({ architecture_review_as_built: 'pending' });
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'feat.md');
+      const originalPlan = [1, 2, 3, 4].map((id) => `### Task ${id}: Existing work ${id}`).join('\n');
+      await writeFile(planPath, originalPlan);
+      let asBuiltCalls = 0;
+      const runner: StepRunner = {
+        run: vi.fn(async (step: StepName) => {
+          if (step === 'architecture_review_as_built') {
+            asBuiltCalls++;
+            await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), [
+              'Verdict: BLOCKED',
+              '',
+              '## Blocking Findings',
+              '| Finding | Class | Governing clause | Summary |',
+              '| --- | --- | --- | --- |',
+              '| ARCH-REMEDIABLE | REMEDIABLE | Task 1 | Add the missing guard |',
+              '| ARCH-DESIGN | DESIGN | ADR-auth decision 2 | Choose the incompatible boundary |',
+            ].join('\n'));
+          }
+          return { success: true };
+        }),
+      };
+      const conductor = new Conductor({
+        stateFilePath: statePath, stepRunner: runner, events, projectRoot: dir,
+        mode: 'auto', daemon: true, verifyArtifacts: true,
+        fromStep: 'architecture_review_as_built', maxRetries: 1,
+        escalateBuildFailure: async () => ({}),
+      });
+
+      await conductor.run();
+
+      await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).resolves.toBe('needs-human');
+      const firstHalt = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
+      expect(firstHalt).toContain('ARCH-REMEDIABLE (REMEDIABLE; Task 1): Add the missing guard');
+      expect(firstHalt).toContain(
+        'ARCH-DESIGN (DESIGN; ADR-auth decision 2): Choose the incompatible boundary',
+      );
+      expect(vi.mocked(runner.run).mock.calls.map(([step]) => step)).not.toContain('remediate');
+      await expect(readFile(planPath, 'utf8')).resolves.toBe(originalPlan);
+
+      await rm(join(dir, '.pipeline/HALT'), { force: true });
+      await rm(join(dir, '.pipeline/HALT.class'), { force: true });
+      const redispatchedConductor = new Conductor({
+        stateFilePath: statePath, stepRunner: runner, events, projectRoot: dir,
+        mode: 'auto', daemon: true, verifyArtifacts: true,
+        fromStep: 'architecture_review_as_built', maxRetries: 1,
+        escalateBuildFailure: async () => ({}),
+      });
+
+      await redispatchedConductor.run();
+
+      expect(asBuiltCalls).toBe(2);
+      expect(vi.mocked(runner.run).mock.calls.map(([step]) => step)).not.toContain('remediate');
+      await expect(readFile(planPath, 'utf8')).resolves.toBe(originalPlan);
+    });
+
+    it('keeps a malformed serial as-built BLOCKED report needs-human with its parse fault', async () => {
+      await seedShipTail({ architecture_review_as_built: 'pending' });
+      const runner: StepRunner = {
+        run: vi.fn(async (step: StepName) => {
+          if (step === 'architecture_review_as_built') {
+            await writeFile(join(dir, '.pipeline', 'architecture-review-as-built.md'), 'Verdict: BLOCKED\n');
+          }
+          return { success: true };
+        }),
+      };
+      const conductor = new Conductor({
+        stateFilePath: statePath, stepRunner: runner, events, projectRoot: dir,
+        mode: 'auto', daemon: true, verifyArtifacts: true,
+        fromStep: 'architecture_review_as_built', maxRetries: 1,
+        escalateBuildFailure: async () => ({}),
+      });
+
+      await conductor.run();
+
+      await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).resolves.toBe('needs-human');
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toContain(
+        'As-built BLOCKED report is missing its Blocking Findings table.',
+      );
     });
 
     it('non-daemon auto mode does NOT dispatch /remediate on a finish failure', async () => {
@@ -5945,7 +7872,7 @@ describe('engine/conductor', () => {
 
   it('clamp does not attract back to tier-skipped steps without verdicts (Story 4, skipped-tier no-attract)', async () => {
     // Story 4 negative path (b): skipped-tier no-attract
-    // On tier S, retro and architecture_review_as_built are tier-skipped. With no verdict files,
+    // On tier S, manual_test is tier-skipped. With no verdict files,
     // they read as satisfied (skipped → satisfied via isSkipped logic). The clamp should not
     // pull back to them.
 
@@ -5982,7 +7909,7 @@ describe('engine/conductor', () => {
     await conductor.run();
 
     // First step is prd_audit (first unsatisfied gate).
-    // The clamp should not be pulled back by tier-skipped steps (retro, architecture_review_as_built)
+    // The clamp should not be pulled back by tier-skipped steps (manual_test)
     // because they read as satisfied (skipped status via isSkipped logic).
     expect(stepsRun[0]).toBe('prd_audit');
   });
@@ -6088,7 +8015,6 @@ describe('engine/conductor', () => {
         s.name !== 'complexity' &&
         s.name !== 'worktree' &&
         s.name !== 'test_suite' &&
-        s.name !== 'wiring_check' &&
         s.name !== 'rebase',
     ).map((s) => s.name);
     expect(stepsRun).toEqual(expectedOrder);
@@ -6110,7 +8036,6 @@ describe('engine/conductor', () => {
       expect(result.value['architecture_diagram']).toBe('skipped');
       expect(result.value['architecture_review']).toBe('skipped');
       expect(result.value['acceptance_specs']).toBe('skipped');
-      expect(result.value['retro']).toBe('skipped');
       // Non-skippable steps should be 'done'
       expect(result.value['worktree']).toBe('done');
       expect(result.value['build']).toBe('done');
@@ -6131,7 +8056,7 @@ describe('engine/conductor', () => {
 
     await conductor.run();
 
-    expect(tierSkipEvents.length).toBe(7);
+    expect(tierSkipEvents.length).toBe(6);
     expect(tierSkipEvents.map((e) => e.step)).toContain('conflict_check');
     expect(tierSkipEvents.map((e) => e.step)).toContain('coherence_check');
     expect(tierSkipEvents.map((e) => e.step)).toContain('architecture_diagram');
@@ -6139,7 +8064,6 @@ describe('engine/conductor', () => {
     expect(tierSkipEvents.map((e) => e.step)).toContain('acceptance_specs');
     expect(tierSkipEvents.map((e) => e.step)).toContain('manual_test');
     expect(tierSkipEvents.map((e) => e.step)).not.toContain('architecture_review_as_built');
-    expect(tierSkipEvents.map((e) => e.step)).toContain('retro');
     // All events should have tier 'S'
     expect(tierSkipEvents.every((e) => e.tier === 'S')).toBe(true);
   });
@@ -6166,7 +8090,6 @@ describe('engine/conductor', () => {
         n !== 'complexity' &&
         n !== 'worktree' &&
         n !== 'test_suite' &&
-        n !== 'wiring_check' &&
         n !== 'rebase',
     );
     expect(stepsRun).toEqual(expectedOrder);
@@ -6305,6 +8228,7 @@ describe('engine/conductor', () => {
       stories: 'done',
       conflict_check: 'done',
       plan: 'done', coherence_check: 'done',
+      coverage_binding: 'done',
       architecture_diagram: 'done',
       architecture_review: 'done',
       acceptance_specs: 'done',
@@ -6345,11 +8269,11 @@ describe('engine/conductor', () => {
       plan: 'done', coherence_check: 'done',
       architecture_diagram: 'done',
       architecture_review: 'done',
+      coverage_binding: 'done',
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
-      test_suite: 'done',
+       test_suite: 'done',
     } as ConductState);
 
     const runner = createMockStepRunner();
@@ -6462,8 +8386,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
-      test_suite: 'done',
+       test_suite: 'done',
     } as ConductState;
 
     it('mode=auto reaching the validation group entry point takes the group path', async () => {
@@ -6616,8 +8539,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
-      test_suite: 'done',
+       test_suite: 'done',
     } as ConductState;
 
     it('width 1: a single dispatchable member degrades to serial semantics — no parallel_started emitted', async () => {
@@ -6724,9 +8646,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -6845,6 +8765,91 @@ describe('engine/conductor', () => {
       expect(calls.filter((call) => call.step === 'manual_test')).toHaveLength(1);
       expect(calls.filter((call) => call.step === 'prd_audit').map((call) => call.attempt)).toEqual([1, 1]);
       expect(calls.filter((call) => call.step === 'architecture_review_as_built').map((call) => call.attempt)).toEqual([1, 1]);
+    });
+
+    it('retries a transient prd_audit branch failure within the serial attempt budget before joining', async () => {
+      await writeState(statePath, VALIDATION_GROUP_PREREQS);
+      const calls: Array<{ step: StepName; attempt?: number }> = [];
+      const runner: StepRunner = {
+        run: vi.fn(async (step: StepName, _state: ConductState, options?: StepRunOptions) => {
+          calls.push({ step, attempt: options?.attempt });
+          await mkdir(join(dir, '.pipeline'), { recursive: true });
+          const prdAuditCalls = calls.filter((call) => call.step === 'prd_audit').length;
+          if (step === 'prd_audit' && prdAuditCalls === 1) {
+            throw new Error('HTTP 500 transient provider error');
+          }
+          if (step === 'manual_test') {
+            await writeFile(join(dir, '.pipeline/manual-test-results.md'), MT_PASS);
+          } else if (step === 'prd_audit') {
+            await writeFile(join(dir, '.pipeline/prd-audit.md'), PRD_AUDIT_PASS);
+          } else if (step === 'architecture_review_as_built') {
+            await writeFile(
+              join(dir, '.pipeline/architecture-review-as-built.md'),
+              AS_BUILT_APPROVED,
+            );
+          }
+          return { success: true };
+        }),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        fromStep: 'manual_test',
+        mode: 'auto',
+        maxRetries: 2,
+        verifyArtifacts: true,
+      });
+
+      await conductor.run();
+
+      expect({
+        prdAuditAttempts: calls
+          .filter((call) => call.step === 'prd_audit')
+          .map((call) => call.attempt),
+        prdAuditVerdict: await readFile(join(dir, '.pipeline/gates/prd_audit.json'), 'utf-8'),
+        haltExists: await haltMarkerExists(dir),
+      }).toEqual({
+        prdAuditAttempts: [1, 2],
+        prdAuditVerdict: expect.stringContaining('"satisfied": true'),
+        haltExists: false,
+      });
+    });
+
+    it('halts after a prd_audit branch spends the serial attempt budget without a verdict', async () => {
+      await writeState(statePath, VALIDATION_GROUP_PREREQS);
+      const calls: Array<{ step: StepName; attempt?: number }> = [];
+      const runner: StepRunner = {
+        run: vi.fn(async (step: StepName, _state: ConductState, options?: StepRunOptions) => {
+          calls.push({ step, attempt: options?.attempt });
+          if (step === 'prd_audit') throw new Error('HTTP 500 provider error');
+          return { success: true };
+        }),
+      };
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        fromStep: 'manual_test',
+        mode: 'auto',
+        maxRetries: 3,
+      });
+
+      await conductor.run();
+
+      expect({
+        prdAuditAttempts: calls
+          .filter((call) => call.step === 'prd_audit')
+          .map((call) => call.attempt),
+        haltClass: await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8'),
+        haltReason: await readFile(join(dir, '.pipeline/HALT'), 'utf-8'),
+      }).toEqual({
+        prdAuditAttempts: [1, 2, 3],
+        haltClass: 'needs-human',
+        haltReason: expect.stringMatching(/branch "prd_audit"[\s\S]*after 3 attempts[\s\S]*HTTP 500 provider error/),
+      });
     });
 
     it('classifies a grouped authentication timeout as needs-human without changing its reason', async () => {
@@ -7077,9 +9082,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -7145,6 +9148,11 @@ describe('engine/conductor', () => {
       // resolves) actually settle before firing SIGINT.
       await new Promise((r) => setImmediate(r));
       await new Promise((r) => setImmediate(r));
+      // The D3 write handshake now performs its own artifact reads after the
+      // branch settles and before it publishes this completion to the
+      // interrupt side-channel. Give that bounded filesystem work time to
+      // finish before simulating SIGINT.
+      await new Promise((r) => setTimeout(r, 25));
       // The engine's registered handler is `() => signalHandlerBase('SIGINT')`,
       // which returns the handler's own promise — awaiting it (instead of a
       // fixed sleep) makes the state-file write deterministically complete
@@ -7215,9 +9223,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -7355,12 +9361,11 @@ describe('engine/conductor', () => {
       plan: 'done', coherence_check: 'done',
       architecture_diagram: 'done',
       architecture_review: 'done',
+      coverage_binding: 'done',
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'skipped',
-      wiring_check: 'skipped',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -7516,9 +9521,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'skipped',
-      wiring_check: 'skipped',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -7629,6 +9632,85 @@ describe('engine/conductor', () => {
 
       expect(kickbacks.some((k) => k.to === 'build')).toBe(false);
     });
+
+    it('halts a mixed as-built group report with every finding listed and re-runs the refused gate after HALT clears', async () => {
+      await writeState(statePath, VALIDATION_GROUP_PREREQS);
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      const planPath = join(dir, '.docs', 'plans', 'mixed-as-built.md');
+      const originalPlan = [1, 2, 3, 4].map((id) => `### Task ${id}: Existing work ${id}`).join('\n');
+      await writeFile(planPath, originalPlan);
+      await writeFile(
+        join(dir, '.pipeline/task-status.json'),
+        JSON.stringify({ tasks: [{ id: 'task-1', status: 'completed' }] }),
+      );
+
+      const mixedReport = [
+        'Verdict: BLOCKED',
+        '',
+        '## Blocking Findings',
+        '| Finding | Class | Governing clause | Summary |',
+        '| --- | --- | --- | --- |',
+        '| ARCH-REMEDIABLE | REMEDIABLE | Task 1 | Add the missing guard |',
+        '| ARCH-DESIGN | DESIGN | ADR-auth decision 2 | Choose the incompatible boundary |',
+      ].join('\n');
+      let asBuiltCalls = 0;
+      let remediateCalls = 0;
+      const runner: StepRunner = {
+        run: vi.fn(async (step: StepName) => {
+          if (step === 'manual_test') {
+            await writeFile(join(dir, '.pipeline/manual-test-results.md'), MT_PASS);
+          } else if (step === 'prd_audit') {
+            await writeFile(join(dir, '.pipeline/prd-audit.md'), [
+              '**PRD:** none',
+              '',
+              '## Verdict Table',
+              '| Criterion | Grade | Plan task | PRD: | Evidence |',
+              '| --- | --- | --- | --- | --- |',
+              '| S1.1 | PASS | — | FR-1 | evidence.ts:1 |',
+            ].join('\n'));
+          } else if (step === 'architecture_review_as_built') {
+            asBuiltCalls++;
+            await writeFile(join(dir, '.pipeline/architecture-review-as-built.md'), mixedReport);
+          } else if (step === 'remediate') {
+            remediateCalls++;
+          }
+          return { success: true };
+        }),
+      };
+      const options = {
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        fromStep: 'manual_test' as StepName,
+        mode: 'auto' as const,
+        daemon: true,
+        verifyArtifacts: true,
+        maxRetries: 1,
+      };
+
+      await new Conductor(options).run();
+
+      await expect(readFile(join(dir, '.pipeline/HALT.class'), 'utf8')).resolves.toBe('needs-human');
+      const firstHalt = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
+      expect(firstHalt).toContain('ARCH-REMEDIABLE (REMEDIABLE; Task 1): Add the missing guard');
+      expect(firstHalt).toContain(
+        'ARCH-DESIGN (DESIGN; ADR-auth decision 2): Choose the incompatible boundary',
+      );
+      expect(remediateCalls).toBe(0);
+      await expect(readFile(planPath, 'utf8')).resolves.toBe(originalPlan);
+      const refused = await readState(statePath);
+      expect(refused.ok && refused.value.architecture_review_as_built).toBe('refused');
+
+      await rm(join(dir, '.pipeline/HALT'), { force: true });
+      await rm(join(dir, '.pipeline/HALT.class'), { force: true });
+      await new Conductor(options).run();
+
+      expect(asBuiltCalls).toBe(2);
+      expect(remediateCalls).toBe(0);
+      await expect(readFile(planPath, 'utf8')).resolves.toBe(originalPlan);
+    });
   });
 
   describe('Merged work order — earliest target + both evidence streams (Task 22)', () => {
@@ -7646,9 +9728,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'skipped',
-      wiring_check: 'skipped',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -7656,7 +9736,16 @@ describe('engine/conductor', () => {
     const MT_FAIL = '# Results\n\n| Story | Result |\n|--|--|\n| s1 | FAIL |\n';
     const PRD_AUDIT_PASS =
       '| FR | Verdict | Gap-class | Evidence | Accepted? |\n|--|--|--|--|--|\n| FR-1 | ALIGNED | | evidence.ts:1 | yes |\n';
-    const AS_BUILT_BLOCKED = '# As-Built Architecture Review\n\nVerdict: BLOCKED\n\nADR-1 violated.\n';
+    const AS_BUILT_BLOCKED = [
+      '# As-Built Architecture Review',
+      '',
+      'Verdict: BLOCKED',
+      '',
+      '## Blocking Findings',
+      '| Finding | Class | Governing clause | Summary |',
+      '| --- | --- | --- | --- |',
+      '| ADR-1 | DESIGN | ADR-auth decision 1 | ADR-1 violated. |',
+    ].join('\n');
 
     // manual_test FAILs deterministically AND architecture_review_as_built
     // is BLOCKED (its own gate unsatisfied) in the SAME join round — the
@@ -7786,9 +9875,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'skipped',
-      wiring_check: 'skipped',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -7797,7 +9884,16 @@ describe('engine/conductor', () => {
     const PRD_AUDIT_GAPS =
       '| FR | Verdict | Gap-class | Evidence | Accepted? |\n|--|--|--|--|--|\n' +
       '| FR-1 | GAP | missing | evidence.ts:1 | no |\n';
-    const AS_BUILT_BLOCKED = '# As-Built Architecture Review\n\nVerdict: BLOCKED\n\nADR-1 violated.\n';
+    const AS_BUILT_BLOCKED = [
+      '# As-Built Architecture Review',
+      '',
+      'Verdict: BLOCKED',
+      '',
+      '## Blocking Findings',
+      '| Finding | Class | Governing clause | Summary |',
+      '| --- | --- | --- | --- |',
+      '| ADR-1 | DESIGN | ADR-auth decision 1 | ADR-1 violated. |',
+    ].join('\n');
 
     it('a halt disposition halts the group even when other gaps in the SAME plan are routable fixes', async () => {
       await writeState(statePath, VALIDATION_GROUP_PREREQS);
@@ -7997,18 +10093,25 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'skipped',
-      wiring_check: 'skipped',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
 
     const MT_FAIL = '# Results\n\n| Story | Result |\n|--|--|\n| s1 | FAIL |\n';
-    const AS_BUILT_BLOCKED = '# As-Built Architecture Review\n\nVerdict: BLOCKED\n\nADR-1 violated.\n';
+    const AS_BUILT_BLOCKED = [
+      '# As-Built Architecture Review',
+      '',
+      'Verdict: BLOCKED',
+      '',
+      '## Blocking Findings',
+      '| Finding | Class | Governing clause | Summary |',
+      '| --- | --- | --- | --- |',
+      '| ADR-1 | DESIGN | ADR-auth decision 1 | ADR-1 violated. |',
+    ].join('\n');
     const AS_BUILT_APPROVED = '# As-Built Architecture Review\n\nVerdict: APPROVED\n';
 
-    it('readRemediationPlan → null (unreadable /remediate plan) still lets the deterministic manual_test kickback proceed — LLM stream independence', async () => {
+    it('readRemediationPlanResult → null plan (unreadable /remediate plan) still lets the deterministic manual_test kickback proceed — LLM stream independence', async () => {
       await writeState(statePath, VALIDATION_GROUP_PREREQS);
       await mkdir(join(dir, '.pipeline'), { recursive: true });
       await writeFile(
@@ -8039,8 +10142,8 @@ describe('engine/conductor', () => {
           } else if (step === 'remediate') {
             remediateCalls.push({ retryReason: opts?.retryReason });
             // Deliberately write no (or unreadable) remediation.json — the
-            // planner produced no usable plan. readRemediationPlan returns
-            // null → planRemediation resolves 'none'.
+            // planner produced no usable plan. readRemediationPlanResult returns
+            // a null plan → planRemediation resolves 'none'.
           }
           return { success: true };
         }),
@@ -8175,9 +10278,7 @@ describe('engine/conductor', () => {
       acceptance_specs: 'done',
       build: 'done',
       build_review: 'done',
-      wiring_check: 'done',
       test_suite: 'done',
-      retro: 'done',
       rebase: 'done',
       finish: 'done',
     } as ConductState;
@@ -8298,11 +10399,10 @@ describe('engine/conductor', () => {
         acceptance_specs: 'pending',
         build: 'pending',
         build_review: 'pending',
-        wiring_check: 'pending',
+        test_suite: 'pending',
         manual_test: 'pending',
         prd_audit: 'pending',
         architecture_review_as_built: 'pending',
-        retro: 'pending',
         rebase: 'pending',
         finish: 'pending',
         remediate: 'pending',
@@ -8595,6 +10695,7 @@ describe('engine/conductor', () => {
         plan: 'done', coherence_check: 'done',
         architecture_diagram: 'done',
         architecture_review: 'done',
+        coverage_binding: 'done',
         acceptance_specs: 'done',
         build: 'done',
         build_review: 'done',
@@ -8659,7 +10760,6 @@ describe('engine/conductor', () => {
     // After 'continue' at build checkpoint, conductor should proceed to manual_test and beyond
     expect(stepsRun).toContain('build');
     expect(stepsRun).toContain('manual_test');
-    expect(stepsRun).toContain('retro');
     expect(stepsRun).toContain('finish');
   });
 
@@ -9451,8 +11551,7 @@ describe('engine/conductor', () => {
         plan: 'done', coherence_check: 'done',
         build: 'done',
         build_review: 'done',
-        wiring_check: 'done',
-        test_suite: 'done',
+         test_suite: 'done',
         manual_test: 'done',
         prd_audit: 'done',
         architecture_review_as_built: 'done',
@@ -9470,7 +11569,7 @@ describe('engine/conductor', () => {
       // ...except a deprecated no-op, which has no work to redo and would
       // otherwise burn a selection lap every round
       // (adr-2026-08-11-deprecated-no-op-step-retirement).
-      expect(result.state['wiring_check']).toBe('done');
+      expect(result.state['test_suite']).toBe('stale');
       expect(result.state['manual_test']).toBe('stale');
       expect(result.state['prd_audit']).toBe('stale');
       expect(result.state['architecture_review_as_built']).toBe('stale');
@@ -9503,6 +11602,7 @@ describe('engine/conductor', () => {
         plan: 'done', coherence_check: 'done',
         architecture_diagram: 'done',
         architecture_review: 'done',
+        coverage_binding: 'done',
         acceptance_specs: 'done',
       } as ConductState);
 
@@ -9649,7 +11749,7 @@ describe('engine/conductor', () => {
       expect(onNavigate).toHaveBeenCalled();
       // No navigation_back events
       expect(navEvents).toHaveLength(0);
-      // Conductor should have continued forward (build, manual_test, retro, finish)
+      // Conductor should have continued forward (build, manual_test, rebase, finish)
       expect(stepsRun).toContain('build');
       expect(stepsRun).toContain('manual_test');
       expect(stepsRun).toContain('finish');
@@ -9730,15 +11830,14 @@ describe('engine/conductor', () => {
         plan: 'done', coherence_check: 'done',
         architecture_diagram: 'done',
         architecture_review: 'done',
+        coverage_binding: 'done',
         acceptance_specs: 'done',
         build: 'done',
         build_review: 'done',
-        wiring_check: 'done',
-        test_suite: 'done',
+         test_suite: 'done',
         manual_test: 'done',
         prd_audit: 'done',
         architecture_review_as_built: 'done',
-        retro: 'done',
         rebase: 'done',
         finish: 'done',
       };
@@ -11125,6 +13224,16 @@ describe('engine/conductor', () => {
   );
 
   describe('rate-limit handling', () => {
+    beforeEach(() => {
+      // Freeze the deadline clock while leaving async I/O and timers real.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-09-01T00:00:00Z'));
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     it('waits and retries without burning retry budget on rate limit', async () => {
       let attempt = 0;
       const runner: StepRunner = {
@@ -12313,6 +14422,11 @@ describe('engine/conductor', () => {
             enforcement: 'gating',
             completion_artifact: '.pipeline/maintain-documentation-pass',
           },
+          'post-documentation': {
+            after: 'maintain-documentation',
+            skill: '.agents/skills/maintain-documentation/SKILL.md',
+            enforcement: 'advisory',
+          },
         },
       };
       const conductor = new Conductor({
@@ -12332,13 +14446,17 @@ describe('engine/conductor', () => {
       const freshRoot = join(dir, 'fresh-marker-run');
       const freshStatePath = join(freshRoot, 'conduct-state.json');
       await mkdir(freshRoot, { recursive: true });
-      await writeState(freshStatePath, {
-        rebase: 'done',
+      const freshState: Record<string, unknown> = {
         complexity_tier: 'M',
         track: 'technical',
-      } as ConductState);
+      };
+      for (const step of ALL_STEPS) freshState[step.name] = 'done';
+      await writeState(freshStatePath, freshState as ConductState);
       const freshEvents = new ConductorEventEmitter();
       const freshness: Array<{ step: StepName; floorSource: string; fresh: boolean }> = [];
+      const freshStepsRun: StepName[] = [];
+      const artifactReviewPrompts = vi.fn().mockResolvedValue('approved' as const);
+      const resolveArtifacts = vi.spyOn(artifactModule, 'resolveArtifactFiles');
       freshEvents.on('verdict_freshness', (event) => {
         if (event.type === 'verdict_freshness') {
           freshness.push({
@@ -12350,6 +14468,7 @@ describe('engine/conductor', () => {
       });
       const freshRunner: StepRunner = {
         run: vi.fn(async (step) => {
+          freshStepsRun.push(step);
           if (step === customStep) {
             await mkdir(join(freshRoot, '.pipeline'), { recursive: true });
             await writeFile(join(freshRoot, '.pipeline/maintain-documentation-pass'), 'PASS\n');
@@ -12365,21 +14484,17 @@ describe('engine/conductor', () => {
         fromStep: customStep,
         config,
         verifyArtifacts: true,
+        mode: 'default',
+        onReviewArtifacts: artifactReviewPrompts,
       }).run();
 
-      const conductorSource = await readFile(
-        join(process.cwd(), 'src/engine/conductor.ts'),
-        'utf-8',
-      );
-      const completionCheckArguments = [
-        ...conductorSource.matchAll(/stepHasCompletionCheck\(([^)]*)\)/g),
-      ].map((match) => match[1].replace(/\s+/g, ' ').trim());
+      const freshRunState = await readState(freshStatePath);
+      const freshHalt = await readFile(join(freshRoot, '.pipeline', 'HALT'), 'utf8').catch(() => undefined);
 
       expect({
         stepsRun,
         customFailure: failed.find((event) => event.step === customStep),
         freshness,
-        completionCheckArguments,
       }).toEqual({
         stepsRun: [customStep],
         customFailure: {
@@ -12388,14 +14503,21 @@ describe('engine/conductor', () => {
             'Step \'maintain-documentation\' completed but completion check failed: configured completion artifact ".pipeline/maintain-documentation-pass" is missing — maintain-documentation must write it after a passing review',
         },
         freshness: [{ step: customStep, floorSource: 'attempt', fresh: true }],
-        completionCheckArguments: [
-          'step: StepName, config: HarnessConfig',
-          'step.name, this.config',
-          'step.name, this.config',
-          'step.name, this.config',
-          'step.name, this.config',
-        ],
       });
+      expect({
+        artifactReviewPrompts: artifactReviewPrompts.mock.calls.length,
+        artifactResolutionCalls: resolveArtifacts.mock.calls.length,
+        customStep: freshRunState.ok ? freshRunState.value[customStep] : undefined,
+        advancedToNextStep: freshStepsRun.includes('post-documentation' as StepName),
+        freshHalt,
+      }).toEqual({
+        artifactReviewPrompts: 0,
+        artifactResolutionCalls: 0,
+        customStep: 'done',
+        advancedToNextStep: true,
+        freshHalt: undefined,
+      });
+      resolveArtifacts.mockRestore();
     });
 
     it("build step requires .pipeline/task-status.json with all tasks completed", async () => {
@@ -12411,9 +14533,12 @@ describe('engine/conductor', () => {
         await writeFile(join(dir, '.docs/decisions/technical-assessment-2026-04-16.md'), 'a');
       });
       await mkdir(join(dir, '.docs/specs'), { recursive: true });
-      await writeFile(join(dir, '.docs/specs/p.md'), 'x');
+      await writeFile(join(dir, '.docs/specs/p.md'), '# Requirements\n\n### FR-1: Fixture requirement\n');
       await mkdir(join(dir, '.docs/stories'), { recursive: true });
-      await writeFile(join(dir, '.docs/stories/p.md'), 'x');
+      await writeFile(
+        join(dir, '.docs/stories/p.md'),
+        '## Story 1: fixture\n\n**Requirements:** FR-1\n\n### Happy Path\n- Given a fixture, when it runs, then it passes.\n',
+      );
       await mkdir(join(dir, '.docs/conflicts'), { recursive: true });
       await writeFile(join(dir, '.docs/conflicts/p.md'), 'x');
       await mkdir(join(dir, '.docs/plans'), { recursive: true });
@@ -12425,8 +14550,6 @@ describe('engine/conductor', () => {
       await writeFile(join(dir, '.docs/decisions/adr-001.md'), 'x');
       await mkdir(join(dir, 'spec/acceptance'), { recursive: true });
       await writeFile(join(dir, 'spec/acceptance/s.rb'), 'x');
-      await mkdir(join(dir, '.docs/retros'), { recursive: true });
-      await writeFile(join(dir, '.docs/retros/r.md'), 'x');
 
       // Write a task-status.json with an INCOMPLETE task
       await mkdir(join(dir, '.pipeline'), { recursive: true });
@@ -12435,6 +14558,7 @@ describe('engine/conductor', () => {
         join(dir, '.pipeline/task-status.json'),
         JSON.stringify({ tasks: [{ id: 't1', status: 'pending' }] }),
       );
+      await writeState(statePath, { coverage_binding: 'done' } as ConductState);
 
       const onRecovery = vi.fn().mockResolvedValue('quit' as const);
       const conductor = new Conductor({
@@ -12493,17 +14617,19 @@ describe('engine/conductor', () => {
     it('passes a step whose declared artifacts exist on disk', async () => {
       // Pre-create artifacts whose creation isn't part of the runner's
       // simulated work (UNDERSTAND/DECIDE/BUILD steps that the conductor
-      // expects to find pre-existing). For SHIP-phase steps (manual_test,
-      // retro, finish), have the runner mock create the artifact when the
+      // expects to find pre-existing). For SHIP-phase steps (manual_test and
+      // finish), have the runner mock create the artifact when the
       // step runs — this mirrors real behavior (skill writes its proof
       // mid-step) and ensures the file's mtime is naturally fresh relative
       // to session_started_at.
       const { mkdir: _mkdir, writeFile: _wf } = await import('fs/promises');
-      const RETRO_SLUG = 'add-foo';
       const preFixtures: Array<[string, string]> = [
         ['.docs/decisions/technical-assessment-2026-04-16.md', 'test'],
         ['.docs/specs/2026-04-16-plan.md', 'test'],
-        ['.docs/stories/2026-04-16-plan.md', 'test'],
+        [
+          '.docs/stories/2026-04-16-plan.md',
+          '## Story 1: fixture\n\n**Requirements:** FR-1\n\n### Happy Path\n- Given a fixture, when it runs, then it passes.\n',
+        ],
         ['.docs/conflicts/2026-04-16-plan.md', 'test'],
         // Empty-is-done is removed (ADR): the build gate parses the plan and
         // requires every plan task resolved, so the fixture plan declares one
@@ -12534,7 +14660,6 @@ describe('engine/conductor', () => {
         await _wf(full, content);
       }
 
-      // Seed feature_desc so the retro predicate slug-matches on filename.
       const seedRes = await readState(statePath);
       const seed = seedRes.ok ? seedRes.value : {};
       seed.feature_desc = 'add foo';
@@ -12558,6 +14683,9 @@ describe('engine/conductor', () => {
               join(dir, '.pipeline/build-review.json'),
               JSON.stringify(passingBuildReviewAggregate()),
             );
+          } else if (step === 'coverage_binding') {
+            await _mkdir(join(dir, '.pipeline'), { recursive: true });
+            await _wf(join(dir, '.pipeline/coverage-binding.json'), JSON.stringify({ version: 1, slug: 'test-feature', runId: 'test-run', status: 'disabled', entries: [] }));
           } else if (step === 'manual_test') {
             await _wf(
               join(dir, '.pipeline/manual-test-results.md'),
@@ -12567,19 +14695,13 @@ describe('engine/conductor', () => {
             await _mkdir(join(dir, '.pipeline'), { recursive: true });
             await _wf(
               join(dir, '.pipeline/prd-audit.md'),
-              '| FR | Verdict | Gap-class | Evidence | Accepted? |\n|---|---|--|--|--|\n| FR-1 | ALIGNED | | foo.ts:1 | yes |\n',
+              '**PRD:** present\n\n## Verdict Table\n\n| Criterion | Grade | Plan task | PRD: | Evidence |\n|---|---|---|---|---|\n| S1.1 | PASS | — | FR-1 | foo.ts:1 |\n',
             );
           } else if (step === 'architecture_review_as_built') {
             await _mkdir(join(dir, '.docs/decisions'), { recursive: true });
             await _wf(
               join(dir, '.pipeline/architecture-review-as-built.md'),
               '# As-Built Review\n\nVerdict: APPROVED\n',
-            );
-          } else if (step === 'retro') {
-            await _mkdir(join(dir, '.docs/retros'), { recursive: true });
-            await _wf(
-              join(dir, `.docs/retros/2026-05-01-${RETRO_SLUG}.md`),
-              '# Retro\n',
             );
           } else if (step === 'finish') {
             await _mkdir(join(dir, '.pipeline'), { recursive: true });
@@ -12597,9 +14719,9 @@ describe('engine/conductor', () => {
         config: { build_review: { rubrics: { testQuality: { enabled: true } } } },
       });
 
-      const failedEvents: Array<{ step: string }> = [];
+      const failedEvents: Array<{ step: string; error: string }> = [];
       events.on('step_failed', (e) => {
-        if (e.type === 'step_failed') failedEvents.push({ step: e.step });
+        if (e.type === 'step_failed') failedEvents.push({ step: e.step, error: e.error });
       });
 
       await conductor.run();
@@ -12838,7 +14960,7 @@ describe('buildRetryHint', () => {
       'manual_test',
       '.pipeline/manual-test-results.md is missing — the manual-test skill must record per-story PASS/FAIL results before exiting',
     );
-    expect(hint).toContain('conduct-ts manual-test-record');
+    expect(hint).toContain('ai-conductor manual-test-record');
   });
 
   it('does not mention --skip for a manual_test FAIL-reason miss', () => {
@@ -13028,13 +15150,16 @@ describe('build-step stall circuit breaker', () => {
       ['.docs/decisions/adr-001.md', 'x'],
       ['spec/acceptance/feature_spec.rb', 'x'],
       ['.pipeline/acceptance-specs-red.json', RED_EVIDENCE_JSON],
-      ['.docs/retros/2026-04-18-retro.md', 'x'],
     ];
     for (const [rel, content] of artifacts) {
       const full = join(dir, rel);
       await mkdir(full.substring(0, full.lastIndexOf('/')), { recursive: true });
       await writeFile(full, content);
     }
+    // Stall tests own the build transition. Pre-resolve the intervening
+    // coverage-binding gate so its default-off envelope is not a prerequisite
+    // for every fixture here.
+    await writeState(statePath, { coverage_binding: 'done' } as ConductState);
   }
 
   // Writes the plan (Task 1..total headings), the status rows, AND a sidecar
@@ -13544,6 +15669,17 @@ describe('build-step stall circuit breaker', () => {
     vi.mocked(execa).mockImplementation(actualExeca as unknown as typeof execa);
     const git: GitRunner = async (args, { cwd }) => {
       const result = await execa('git', args, { cwd });
+      // The conductor persists its own runtime state while this fixture is
+      // exercising the content-dirty exhaustion branch. Keep the probe scoped
+      // to the authored file the scenario owns.
+      if (args[0] === 'status' && args.includes('--porcelain')) {
+        return {
+          stdout: result.stdout
+            .split('\n')
+            .filter((line) => !line.includes('.pipeline/') && !line.includes('conduct-state.json'))
+            .join('\n'),
+        };
+      }
       return { stdout: result.stdout };
     };
     let headSha = 'base-head';
@@ -13599,7 +15735,7 @@ describe('build-step stall circuit breaker', () => {
       // Reset only the terminal state from the first scenario. The worktree
       // remains dirty, but this second run must use the existing no-progress
       // remediation route rather than the commit-movement escape.
-      await writeState(statePath, {} as ConductState);
+      await writeState(statePath, { coverage_binding: 'done' } as ConductState);
       await writeFile(join(dir, '.pipeline/HALT'), '');
       const noMovementEvents = new ConductorEventEmitter();
       const noMovementHalts: string[] = [];
@@ -13991,6 +16127,7 @@ describe('engine/conductor: pipeline-exit false-completion regression', () => {
       await mkdir(full.substring(0, full.lastIndexOf('/')), { recursive: true });
       await writeFile(full, content);
     }
+    await writeState(statePath, { coverage_binding: 'done' } as ConductState);
 
     // Re-write the halt marker on every run() call so the predicate keeps
     // failing even after the conductor's stall handler clears it.
@@ -14699,36 +16836,6 @@ Initial task content.
   });
 });
 
-describe('rebase_gate_reverified event (Task 7: Conductor injects capability and emits event)', () => {
-  let dir: string;
-  let statePath: string;
-  let events: ConductorEventEmitter;
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'conductor-test-'));
-    statePath = join(dir, 'conduct-state.json');
-    events = new ConductorEventEmitter();
-  });
-
-  afterEach(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  it.skip('daemon mode: emits rebase_gate_reverified for build when pre-verify succeeds (evidence-complete)', async () => {
-    // Task 7 / RETRY: This test needs to be rewritten to use a real git repo with
-    // genuine evidence instead of the plan-ambiguity approach. The test fixture setup
-    // is complex and requires proper git initialization, commits with Task trailers,
-    // and deriveCompletion evidence. The conductor.ts fix (fail-closed when planPath
-    // is undefined) is in place and tested indirectly by the integration tests in
-    // test/integration/rebase-loop.test.ts which verify that file-changing rebases
-    // with genuine evidence work correctly.
-    //
-    // TODO: Implement a full test using the seedEvidenceCompleteBuild idiom from
-    // test/integration/rebase-loop.test.ts:280-292, running the conductor from the
-    // 'rebase' step in daemon mode to verify rebase_gate_reverified events are emitted.
-  });
-});
-
 describe('post-rebase build closure (Task 11)', () => {
   let dir: string;
   let statePath: string;
@@ -15158,7 +17265,7 @@ describe('stall remediation gated to daemon halt_marker only (Task 11)', () => {
     [
       'none',
       async (dirPath: string) => {
-        // Malformed JSON -> readRemediationPlan returns null -> outcome 'none'.
+        // Malformed JSON -> readRemediationPlanResult returns a null plan -> outcome 'none'.
         await writeFile(join(dirPath, '.pipeline/remediation.json'), '{not valid json');
       },
     ],
@@ -15934,34 +18041,6 @@ describe('HALT content robust to hostile question text (Task 12)', () => {
   });
 });
 
-describe('built-in deterministic BUILD verification group', () => {
-  it('registers wiring and suite verification between build and build review', () => {
-    expect(BUILD_VERIFICATION_GROUP.members).toEqual(['wiring_check', 'test_suite']);
-    expect(STEP_GROUPS[BUILD_VERIFICATION_GROUP.name]).toBe(BUILD_VERIFICATION_GROUP);
-    expect(getGroupForStep('wiring_check')).toBe(BUILD_VERIFICATION_GROUP);
-    expect(getGroupForStep('test_suite')).toBe(BUILD_VERIFICATION_GROUP);
-    expect(VALIDATION_GROUP.members).toEqual([
-      'manual_test',
-      'prd_audit',
-      'architecture_review_as_built',
-    ]);
-
-    const buildIndex = ALL_STEPS.findIndex((step) => step.name === 'build');
-    const wiringIndex = ALL_STEPS.findIndex((step) => step.name === 'wiring_check');
-    const suiteIndex = ALL_STEPS.findIndex((step) => step.name === 'test_suite');
-    const reviewIndex = ALL_STEPS.findIndex((step) => step.name === 'build_review');
-    expect([wiringIndex, suiteIndex]).toEqual([buildIndex + 1, buildIndex + 2]);
-    expect(reviewIndex).toBe(suiteIndex + 1);
-
-    expect(ALL_STEPS.find((step) => step.name === 'wiring_check')?.prerequisites).toEqual(['build']);
-    expect(ALL_STEPS.find((step) => step.name === 'test_suite')?.prerequisites).toEqual(['build']);
-    expect(ALL_STEPS.find((step) => step.name === 'build_review')?.prerequisites).toEqual([
-      'wiring_check',
-      'test_suite',
-    ]);
-  });
-});
-
 // adr-2026-07-10-validation-group-join.md, Decision-1: the SHIP sequence
 // gains a built-in validation group entry describing the three validators
 // as a group, without disturbing their existing standalone StepDefinitions
@@ -15977,7 +18056,7 @@ describe('built-in SHIP validation group entry (Decision-1)', () => {
 
   it('positions the group after build review in ALL_STEPS ordering', () => {
     const buildReviewIdx = ALL_STEPS.findIndex((s) => s.name === 'build_review');
-    const wiringCheckIdx = ALL_STEPS.findIndex((s) => s.name === 'wiring_check');
+    const wiringCheckIdx = ALL_STEPS.findIndex((s) => s.name === 'test_suite');
     const testSuiteIdx = ALL_STEPS.findIndex((s) => s.name === 'test_suite');
     const firstMemberIdx = ALL_STEPS.findIndex((s) => s.name === VALIDATION_GROUP.members[0]);
     expect(firstMemberIdx).toBe(buildReviewIdx + 1);
@@ -16005,7 +18084,7 @@ describe('built-in SHIP validation group entry (Decision-1)', () => {
   it('reports undefined group for ordinary serial steps', () => {
     expect(getGroupForStep('build')).toBeUndefined();
     expect(getGroupForStep('build_review')).toBeUndefined();
-    expect(getGroupForStep('retro')).toBeUndefined();
+    expect(getGroupForStep('rebase')).toBeUndefined();
   });
 
   it('leaves each member with its own full StepDefinition (skill/gate config unchanged)', () => {
@@ -16033,7 +18112,7 @@ describe('built-in SHIP validation group entry (Decision-1)', () => {
 
     // Ordinary serial steps are completely unaffected.
     expect(tryGetStepIndex('build')).not.toBeNull();
-    expect(tryGetStepIndex('retro')).not.toBeNull();
+    expect(tryGetStepIndex('rebase')).not.toBeNull();
     expect(tryGetStepIndex('remediate')).toBeNull();
   });
 
@@ -16134,3 +18213,5 @@ describe('built-in SHIP validation group entry (Decision-1)', () => {
     },
   );
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

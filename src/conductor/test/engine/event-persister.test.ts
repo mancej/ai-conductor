@@ -96,6 +96,24 @@ describe('EventPersister', () => {
     expect(line.waitSeconds).toBe(30);
   });
 
+  it('persists a coverage-binding judgement to the shared pipeline ledger', async () => {
+    const persister = new EventPersister(eventsPath, emitter);
+    const event = {
+      type: 'coverage_binding_judged',
+      step: 'coverage_binding',
+      verdict: 'asserts',
+      digest: 'sha256:claim',
+      taskIds: ['17'],
+    } satisfies ConductorEvent;
+    persister.start();
+
+    await emitter.emit(event);
+    persister.stop();
+
+    const { ts: _ts, ...record } = JSON.parse((await readFile(eventsPath, 'utf-8')).trim());
+    expect(record).toEqual(event);
+  });
+
   it('persists a step-scoped loop halt without closing the active step interval', async () => {
     const persister = new EventPersister(eventsPath, emitter, scriptedClock(1_000, 1_025));
     persister.start();
@@ -144,7 +162,7 @@ describe('EventPersister', () => {
     });
     await emitter.emit({
       type: 'build_member_evidence_recomputed',
-      member: 'wiring_check',
+      member: 'test_suite',
       decision: 'recompute',
       basis: 'recorded-head-versus-current-head',
     });
@@ -165,9 +183,138 @@ describe('EventPersister', () => {
       },
       {
         type: 'build_member_evidence_recomputed',
-        member: 'wiring_check',
+        member: 'test_suite',
         decision: 'recompute',
         basis: 'recorded-head-versus-current-head',
+      },
+    ]);
+  });
+
+  it('persists remediation case lifecycle occurrences through the existing event ledger', async () => {
+    const lifecycle = [
+      { type: 'remediation_adjudication_started', domain: 'build_review', lapId: 'lap-1' },
+      {
+        type: 'remediation_adjudication_completed',
+        domain: 'build_review',
+        lapId: 'lap-1',
+        caseIds: ['case-1'],
+        effectIds: ['effect-1'],
+      },
+      { type: 'remediation_adjudication_failed', domain: 'build_review', lapId: 'lap-1', reason: 'invalid-result' },
+      {
+        type: 'remediation_case_reconciled',
+        domain: 'build_review',
+        lapId: 'lap-1',
+        caseId: 'case-1',
+        resolution: 'open',
+      },
+      {
+        type: 'remediation_effect_reserved',
+        domain: 'build_review',
+        lapId: 'lap-1',
+        caseId: 'case-1',
+        effectId: 'effect-1',
+        effectKind: 'action',
+      },
+      {
+        type: 'remediation_effect_applied',
+        domain: 'build_review',
+        lapId: 'lap-1',
+        caseId: 'case-1',
+        effectId: 'effect-1',
+        effectKind: 'action',
+      },
+      {
+        type: 'remediation_effect_failed',
+        domain: 'build_review',
+        lapId: 'lap-1',
+        caseId: 'case-1',
+        effectId: 'effect-1',
+        effectKind: 'action',
+        reason: 'intake-unavailable',
+      },
+      {
+        type: 'remediation_semantic_repeat_halt',
+        domain: 'build_review',
+        lapId: 'lap-1',
+        caseId: 'case-1',
+        effectId: 'effect-1',
+        reason: 'already-attempted',
+      },
+    ] satisfies ConductorEvent[];
+    const persister = new EventPersister(eventsPath, emitter);
+    persister.start();
+
+    for (const event of lifecycle) await emitter.emit(event);
+
+    persister.stop();
+
+    const records = (await readFile(eventsPath, 'utf-8')).trim().split('\n').map((line) => {
+      const { ts: _ts, ...record } = JSON.parse(line);
+      return record;
+    });
+    expect(records).toEqual(lifecycle);
+  });
+
+  it('round-trips the scoped-empty aggregate route on the existing verification event', async () => {
+    const persister = new EventPersister(eventsPath, emitter);
+    persister.start();
+
+    await emitter.emit({
+      type: 'test_suite_verification',
+      freshness: { status: 'STALE', reason: 'source_changed' },
+      mode: 'scoped',
+      executionBasis: 'scoped-empty-selection-aggregate',
+    } satisfies ConductorEvent);
+
+    persister.stop();
+
+    const { ts: _ts, ...record } = JSON.parse((await readFile(eventsPath, 'utf-8')).trim());
+    expect(record).toEqual({
+      type: 'test_suite_verification',
+      freshness: { status: 'STALE', reason: 'source_changed' },
+      mode: 'scoped',
+      executionBasis: 'scoped-empty-selection-aggregate',
+    });
+  });
+
+  it('round-trips the additive verification mode and budget verdict fields', async () => {
+    const persister = new EventPersister(eventsPath, emitter);
+    persister.start();
+
+    await emitter.emit({
+      type: 'test_suite_verification',
+      freshness: { status: 'CURRENT' },
+      mode: 'scoped',
+      budgetVerdict: { outcome: 'preserved_within_budget', categories: { source: 3 } },
+    } satisfies ConductorEvent);
+    await emitter.emit({
+      type: 'build_member_evidence_reused',
+      member: 'test_suite',
+      decision: 'reuse',
+      basis: 'fingerprint-match',
+      mode: 'scoped',
+    } satisfies ConductorEvent);
+
+    persister.stop();
+
+    const records = (await readFile(eventsPath, 'utf-8')).trim().split('\n').map((line) => {
+      const { ts: _ts, ...record } = JSON.parse(line);
+      return record;
+    });
+    expect(records).toEqual([
+      {
+        type: 'test_suite_verification',
+        freshness: { status: 'CURRENT' },
+        mode: 'scoped',
+        budgetVerdict: { outcome: 'preserved_within_budget', categories: { source: 3 } },
+      },
+      {
+        type: 'build_member_evidence_reused',
+        member: 'test_suite',
+        decision: 'reuse',
+        basis: 'fingerprint-match',
+        mode: 'scoped',
       },
     ]);
   });

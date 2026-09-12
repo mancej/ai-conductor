@@ -1,3 +1,4 @@
+// Covers: task:1
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, readFile, rm } from 'fs/promises';
 import { join } from 'path';
@@ -31,14 +32,26 @@ vi.mock('../../src/engine/rebase.js', async () => {
     performRebase: vi.fn().mockResolvedValue({ kind: 'noop' }),
   };
 });
+vi.mock('../../src/engine/steps.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/engine/steps.js')>();
+  return {
+    ...actual,
+    buildStepRegistry: vi.fn(actual.buildStepRegistry),
+  };
+});
 
-import type { ConductState, StepName } from '../../src/types/index.js';
+import type { ConductState, StepDefinition, StepName } from '../../src/types/index.js';
 import { ConductorEventEmitter } from '../../src/ui/events.js';
 import { writeState } from '../../src/engine/state.js';
-import { ALL_STEPS } from '../../src/engine/steps.js';
-import { clampToRunnablePrerequisite, Conductor } from '../../src/engine/conductor.js';
+import { ALL_STEPS, buildStepRegistry } from '../../src/engine/steps.js';
+import {
+  clampToRunnablePrerequisite,
+  Conductor,
+  resolveRunnableResumeEntry,
+} from '../../src/engine/conductor.js';
 import type { StepRunner } from '../../src/engine/conductor.js';
-import { writeVerdict, type GateVerdict } from '../../src/engine/gate-verdicts.js';
+import * as gateVerdicts from '../../src/engine/gate-verdicts.js';
+import { readVerdict, writeVerdict, type GateVerdict } from '../../src/engine/gate-verdicts.js';
 import { checkStepCompletion } from '../../src/engine/artifacts.js';
 import { checkGate } from '../../src/engine/gates.js';
 import { gateSatisfied } from '../../src/engine/selector.js';
@@ -106,6 +119,49 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
+  });
+
+  describe('Task 1: resolve a resume entry against its entry gate', () => {
+    function step(name: StepName, prerequisites: StepName[] = []): StepDefinition {
+      return {
+        name,
+        label: name,
+        phase: 'BUILD',
+        enforcement: 'gating',
+        prerequisites,
+        skippableForTiers: [],
+        isCheckpoint: false,
+      };
+    }
+
+    it('returns a candidate whose gate passes unchanged', () => {
+      const steps = [step('build'), step('build_review', ['build'])];
+      const state = { build: 'done' } as ConductState;
+
+      expect(resolveRunnableResumeEntry(steps, state, 1)).toBe(1);
+    });
+
+    it('returns the earlier dispatchable prerequisite when the candidate gate refuses', () => {
+      const steps = [step('build'), step('build_review', ['build'])];
+      const state = { build: 'pending' } as ConductState;
+
+      expect(resolveRunnableResumeEntry(steps, state, 1)).toBe(0);
+    });
+
+    it.each([
+      ['is absent from the resolved steps', [step('build_review', ['build'])]],
+      ['sits at or after the candidate', [step('build_review', ['build']), step('build')]],
+    ])('returns the candidate unchanged when a prerequisite %s', (_case, steps) => {
+      const state = { build: 'failed' } as ConductState;
+
+      expect(resolveRunnableResumeEntry(steps, state, 0)).toBe(0);
+    });
+
+    it('treats a candidate past the final step as a runnable no-op', () => {
+      const steps = [step('build')];
+
+      expect(resolveRunnableResumeEntry(steps, {} as ConductState, 1)).toBe(1);
+    });
   });
 
   // ── Story 1: resume never dispatches past an unsatisfied gate verdict ─────
@@ -254,7 +310,7 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       seed.finish = 'in_progress';
       await writeState(statePath, seed as ConductState);
       for (const name of ['build', 'build_review', 'manual_test', 'prd_audit',
-        'architecture_review_as_built', 'retro', 'rebase'] as StepName[]) {
+        'architecture_review_as_built', 'rebase'] as StepName[]) {
         await writeVerdict(dir, name, { satisfied: true, checkedAt: 1 });
       }
 
@@ -295,24 +351,18 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       });
 
       // Resume's clamp treats a non-current completion as pending; a complete
-      // current PASS remains done. wiring_check is deliberately not consulted.
+      // current PASS remains done.
       expect(completion.done).toBe(done);
-      expect(ALL_STEPS.find((step) => step.name === 'wiring_check')?.loopGate).not.toBe(true);
     });
 
-    // wiring_check is omitted: it is a deprecated no-op that settles
-    // in-process, so a stale wiring proof never steers a resume entry
-    // (adr-2026-08-11-wiring-judged-in-build-review).
     it('a stale test_suite proof resumes before build_review', async () => {
       const staleGate: StepName = 'test_suite';
       const seed = seedDoneThrough('manual_test');
       seed.build = 'done';
-      seed.wiring_check = 'done';
       seed.test_suite = 'stale';
       seed.build_review = 'stale';
       await writeState(statePath, seed as ConductState);
       await writeVerdict(dir, 'build', { satisfied: true, checkedAt: 1 });
-      await writeVerdict(dir, 'wiring_check', { satisfied: true, checkedAt: 1 });
       await writeVerdict(dir, 'test_suite', { satisfied: false, checkedAt: 1, kickback });
       await writeVerdict(dir, 'build_review', { satisfied: false, checkedAt: 1, kickback });
 
@@ -386,13 +436,11 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
     it('a stale step is selected even though its own verdict still says satisfied', async () => {
       const seed = seedDoneThrough('build');
       seed.build = 'done';
-      seed.wiring_check = 'done';
       seed.test_suite = 'done';
       seed.build_review = 'stale';
       seed.rebase = 'done';
       await writeState(statePath, seed as ConductState);
       await writeVerdict(dir, 'build', { satisfied: true, checkedAt: 1 });
-      await writeVerdict(dir, 'wiring_check', { satisfied: true, checkedAt: 1 });
       await writeVerdict(dir, 'test_suite', { satisfied: true, checkedAt: 1 });
       // Stale but the on-disk verdict lies and says satisfied — state must win.
       await writeVerdict(dir, 'build_review', { satisfied: true, checkedAt: 1 });
@@ -431,7 +479,7 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       const seed = seedDoneThrough('finish');
       await writeState(statePath, seed as ConductState);
       for (const name of ['build', 'build_review', 'manual_test', 'prd_audit',
-        'architecture_review_as_built', 'retro', 'rebase'] as StepName[]) {
+        'architecture_review_as_built', 'rebase'] as StepName[]) {
         await writeVerdict(dir, name, { satisfied: true, checkedAt: 1 });
       }
 
@@ -506,7 +554,6 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       const seed = seedDoneThrough('build');
       seed.build = 'failed';
       seed.build_review = 'stale';
-      seed.wiring_check = 'stale';
       seed.test_suite = 'stale';
       seed.manual_test = 'stale';
       seed.architecture_review_as_built = 'stale';
@@ -517,7 +564,6 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       // The divergence: verdict satisfied, state failed.
       await writeVerdict(dir, 'build', { satisfied: true, checkedAt: 1 });
       await writeVerdict(dir, 'build_review', { satisfied: false, checkedAt: 1, kickback });
-      await writeVerdict(dir, 'wiring_check', { satisfied: false, checkedAt: 1, kickback });
       await writeVerdict(dir, 'rebase', { satisfied: true, checkedAt: 1 });
     }
 
@@ -556,6 +602,140 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       expect(started.length).toBeGreaterThan(0);
       expect(started[0]).toBe('build');
       expect(blocked).not.toContain('build_review');
+    });
+  });
+
+  // ── Task 2: every resume candidate is reconciled with checkGate ─────────
+  describe('Task 2: resume reconciles state-derived entries without a verdict clamp', () => {
+    async function seedReopenedBuildFixture(): Promise<void> {
+      const seed = seedDoneThrough('test_suite');
+      // findResumeIndex honors the in-progress test suite first, even though
+      // build was subsequently re-opened. Its entry gate refuses test_suite;
+      // build is the earlier runnable prerequisite.
+      seed.build = 'failed';
+      seed.test_suite = 'in_progress';
+      await writeState(statePath, seed as ConductState);
+    }
+
+    it('reconciles from state when the verdict directory cannot be read', async () => {
+      await seedReopenedBuildFixture();
+      const verdictRead = vi.spyOn(gateVerdicts, 'readAllVerdicts')
+        .mockRejectedValueOnce(new Error('fixture verdict directory unreadable'));
+      const { runner, log } = trackingRunner(dir);
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: runner, events, resume: true,
+        // This test observes resume selection. `test_suite` is engine-native,
+        // so keep its verifier inside the fixture instead of allowing the
+        // selected build to fall through to the repository configuration.
+        fullSuiteVerifier: {
+          ensure: async () => ({ status: 'REUSED', evidence: {} as never }),
+          inspect: async () => ({ status: 'CURRENT', evidence: {} as never }),
+        },
+      });
+
+      await conductor.run();
+
+      expect(verdictRead).toHaveBeenCalledWith(dir);
+      expect(log.find((entry) => entry.startsWith('run:'))).toBe('run:build');
+      expect(log.filter((entry) => entry.startsWith('run:'))).not.toHaveLength(0);
+      await expect(readFile(join(dir, '.pipeline', 'HALT'), 'utf-8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+
+    it('keeps a state-derived entry whose own gate already passes', async () => {
+      const seed = seedDoneThrough('build_review');
+      seed.build_review = 'in_progress';
+      await writeState(statePath, seed as ConductState);
+      const { runner, log } = trackingRunner(dir);
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: runner, events, resume: true,
+      });
+
+      await conductor.run();
+
+      expect(log.find((entry) => entry.startsWith('run:'))).toBe('run:build_review');
+      expect(log).not.toContain('run:build');
+    });
+
+    it('daemon resume halts through the existing DECIDE-entry disposition after reconciliation', async () => {
+      const seed = seedDoneThrough('coverage_binding');
+      seed.plan = 'failed';
+      seed.coverage_binding = 'in_progress';
+      await writeState(statePath, seed as ConductState);
+      const { runner, log } = trackingRunner(dir);
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: runner, events,
+        resume: true, daemon: true, mode: 'auto',
+      });
+
+      await conductor.run();
+
+      expect(log.filter((entry) => entry.startsWith('run:'))).toHaveLength(0);
+      expect(await readFile(join(dir, '.pipeline', 'HALT'), 'utf-8')).toMatch(
+        /DECIDE entry refused.*resume-clamp.*plan/is,
+      );
+    });
+  });
+
+  // ── Task 3: the existing loop owns malformed-entry refusal ────────────
+  describe('Task 3: malformed resume entries reach the loop refusal', () => {
+    it('writes and emits the existing needs-human halt from the real loop gate', async () => {
+      vi.mocked(buildStepRegistry).mockReturnValueOnce([
+        {
+          name: 'build_review',
+          label: 'Build Review',
+          phase: 'BUILD',
+          enforcement: 'gating',
+          prerequisites: ['build'],
+          skippableForTiers: [],
+          isCheckpoint: false,
+        },
+      ]);
+      await writeState(statePath, {
+        build: 'failed',
+        build_review: 'in_progress',
+      } as ConductState);
+      const { runner, log } = trackingRunner(dir);
+      const haltReasons: string[] = [];
+      const blocked: StepName[] = [];
+      events.on('loop_halt', (event) => {
+        if (event.type === 'loop_halt') haltReasons.push(event.reason);
+      });
+      events.on('gate_blocked', (event) => {
+        if (event.type === 'gate_blocked') blocked.push(event.step);
+      });
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: runner, events, resume: true,
+        daemon: true,
+      });
+
+      await conductor.run();
+
+      const marker = await readFile(join(dir, '.pipeline', 'HALT'), 'utf-8');
+      expect(marker).toContain("Step 'build_review' is blocked by unsatisfied prerequisite");
+      expect(marker).toContain('build (failed)');
+      await expect(readFile(join(dir, '.pipeline', 'HALT.class'), 'utf-8')).resolves.toBe('needs-human');
+      expect(haltReasons).toEqual([marker.trim()]);
+      expect(blocked).toEqual(['build_review']);
+      expect(log.filter((entry) => entry.startsWith('run:'))).toHaveLength(0);
+    });
+
+    it('leaves no halt marker for a converged resume past the final step', async () => {
+      const seed = seedDoneThrough('finish');
+      seed.finish = 'done';
+      await writeState(statePath, seed as ConductState);
+      const { runner, log } = trackingRunner(dir);
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: runner, events, resume: true,
+      });
+
+      await conductor.run();
+
+      expect(log.filter((entry) => entry.startsWith('run:'))).toHaveLength(0);
+      await expect(readFile(join(dir, '.pipeline', 'HALT'), 'utf-8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
     });
   });
 
@@ -622,7 +802,6 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
     it('halts with an explicit named verdict when repeated prerequisite dispatch cannot resolve', async () => {
       const seed = seedDoneThrough('finish');
       seed.build = 'failed';
-      seed.wiring_check = 'pending';
       await writeState(statePath, seed as ConductState);
       for (const name of ALL_STEPS.filter((step) => step.loopGate).map((step) => step.name)) {
         if (name !== 'build') await writeVerdict(dir, name, { satisfied: true, checkedAt: 1 });
@@ -672,6 +851,107 @@ describe('acceptance: verdict-aware resume entry (#532)', () => {
       expect(gateSatisfied('test_suite', state, { test_suite: { satisfied: true, checkedAt: 1 } })).toBe(false);
       expect(checkGate(buildReview, state)).toEqual({ passed: true });
       expect(clampToRunnablePrerequisite(ALL_STEPS, state, buildReviewIndex)).toBe(buildReviewIndex);
+    });
+  });
+
+  describe('Task 1: routed-forward BUILD verdict persistence', () => {
+    function advanceTail(conductor: Conductor) {
+      return (conductor as unknown as {
+        advanceTail: (
+          step: typeof ALL_STEPS[number],
+          state: ConductState,
+          stuckGate: Map<StepName, number>,
+          steps: typeof ALL_STEPS,
+          indexOf: (name: StepName) => number,
+          buildRoutedForward?: boolean,
+        ) => Promise<number | null | 'halt'>;
+      }).advanceTail.bind(conductor);
+    }
+
+    async function routedBuildFixture(): Promise<{
+      conductor: Conductor;
+      state: ConductState;
+      build: typeof ALL_STEPS[number];
+      indexOf: (name: StepName) => number;
+    }> {
+      const state = {
+        ...seedDoneThrough('finish'),
+        build_routed_reason: 'build routed after commit movement: retry budget exhausted',
+        test_suite: 'pending',
+      } as ConductState;
+      await writeState(statePath, state);
+      await writeVerdict(dir, 'build', { satisfied: false, checkedAt: 1, kickback });
+      for (const step of ALL_STEPS) {
+        if (step.loopGate && step.name !== 'build' && step.name !== 'test_suite') {
+          await writeVerdict(dir, step.name, { satisfied: true, checkedAt: 1 });
+        }
+      }
+      const { runner } = trackingRunner(dir);
+      return {
+        conductor: new Conductor({
+          projectRoot: dir, stateFilePath: statePath, stepRunner: runner, events, verifyArtifacts: true,
+        }),
+        state,
+        build: ALL_STEPS.find((step) => step.name === 'build')!,
+        indexOf: (name) => ALL_STEPS.findIndex((step) => step.name === name),
+      };
+    }
+
+    it('replaces a routed build kickback verdict before selecting test_suite', async () => {
+      const { conductor, state, build, indexOf } = await routedBuildFixture();
+
+      const selected = await advanceTail(conductor)(build, state, new Map(), ALL_STEPS, indexOf, true);
+
+      const verdict = await readVerdict(dir, 'build');
+      expect({ selected, verdict }).toEqual({
+        selected: indexOf('test_suite'),
+        verdict: expect.objectContaining({
+          satisfied: true,
+          reason: state.build_routed_reason,
+          checkedAt: expect.any(Number),
+        }),
+      });
+      expect(verdict?.checkedAt).toBeGreaterThan(1);
+      expect(verdict?.kickback).toBeUndefined();
+    });
+
+    it('creates a routed build verdict with the fallback reason when none exists', async () => {
+      const { conductor, state, build, indexOf } = await routedBuildFixture();
+      delete state.build_routed_reason;
+      await rm(join(dir, '.pipeline', 'gates', 'build.json'));
+
+      await advanceTail(conductor)(build, state, new Map(), ALL_STEPS, indexOf, true);
+
+      expect(await readVerdict(dir, 'build')).toEqual(expect.objectContaining({
+        satisfied: true,
+        reason: 'build routed after commit movement',
+        checkedAt: expect.any(Number),
+      }));
+    });
+
+    it('does not treat an old route reason as a satisfied ordinary build', async () => {
+      const { conductor, state, build, indexOf } = await routedBuildFixture();
+
+      await advanceTail(conductor)(build, state, new Map(), ALL_STEPS, indexOf, false);
+
+      expect(await readVerdict(dir, 'build')).toEqual(expect.objectContaining({ satisfied: false }));
+    });
+
+    it('rejects before emitting a successful routed verdict when persistence fails', async () => {
+      const { conductor, state, build, indexOf } = await routedBuildFixture();
+      const emitted: StepName[] = [];
+      events.on('gate_verdict', (event) => {
+        if (event.type === 'gate_verdict' && event.satisfied) emitted.push(event.step);
+      });
+      const rejected = vi.spyOn(gateVerdicts, 'writeVerdict').mockRejectedValueOnce(new Error('disk full'));
+      try {
+        await expect(advanceTail(conductor)(build, state, new Map(), ALL_STEPS, indexOf, true))
+          .rejects.toThrow('disk full');
+
+        expect(emitted).not.toContain('build');
+      } finally {
+        rejected.mockRestore();
+      }
     });
   });
 });

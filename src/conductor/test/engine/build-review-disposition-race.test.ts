@@ -37,8 +37,10 @@ describe('engine/conductor — build_review kickback disposition-race guard', ()
         verdict: overrides.unresolved.length === 0 ? ('PASS' as const) : ('FAIL' as const),
         acceptedFindingIds: overrides.accepted,
         unresolvedFindingIds: overrides.unresolved,
+        suppressedFindingIds: [],
         skippedRubrics: [],
         infrastructureFailureRubrics: [],
+        uncoveredInfrastructureFailureRubrics: [],
       },
     };
   }
@@ -260,7 +262,7 @@ describe('engine/conductor — build_review kickback disposition-race guard', ()
     expect(dispatched).toEqual(['build_review']);
     expect(kickbacks).toEqual([]);
     expect(await readFile(join(projectRoot, '.pipeline/HALT'), 'utf-8')).toContain(
-      'build_review cumulative kickback cap exceeded (cumulative 6, cap 5): same',
+      'build_review cumulative kickback cap exceeded:\nKickback budget (build_review): 6/5 consumed; 0 remaining\nLatest reason: same',
     );
     expect(await readFile(join(projectRoot, '.pipeline/HALT.class'), 'utf-8')).toBe('needs-human');
     expect(JSON.parse(await readFile(join(projectRoot, '.pipeline/kickback-ledger.json'), 'utf-8'))).toMatchObject({

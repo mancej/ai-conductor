@@ -12,14 +12,56 @@ import {
   FALLBACK_REVIEW,
   resolveBuildReviewConfig,
   resolveProviderPreparationTimeoutMinutes,
+  resolveDispatchStartTimeoutSeconds,
   resolveTeardownTimeoutSeconds,
+  resolveCoverageBindingConfig,
 } from '../../src/engine/resolved-config.js';
 import type { HarnessConfig } from '../../src/types/config.js';
 import { CLAUDE_MODEL_POLICY, CODEX_MODEL_POLICY } from '../../src/engine/provider-model-policy.js';
 
 type TeardownTimeoutConfig = HarnessConfig & { teardown_timeout_seconds?: unknown };
+type DispatchStartTimeoutConfig = HarnessConfig & { dispatch_start_timeout_seconds?: unknown };
 
 describe('engine/resolved-config', () => {
+  describe('resolveCoverageBindingConfig', () => {
+    it('defaults the judge to disabled', () => {
+      expect(resolveCoverageBindingConfig(undefined)).toEqual({ judgeEnabled: false });
+    });
+
+    it('resolves an explicitly enabled judge', () => {
+      expect(resolveCoverageBindingConfig({ coverage_binding: { judge: { enabled: true } } }))
+        .toEqual({ judgeEnabled: true });
+    });
+  });
+
+  describe('resolveDispatchStartTimeoutSeconds', () => {
+    it.each([
+      { name: 'is absent', value: undefined, expected: 120, warnings: 0 },
+      { name: 'is positive', value: 30, expected: 30, warnings: 0 },
+      { name: 'is zero', value: 0, expected: 120, warnings: 1 },
+      { name: 'is negative', value: -1, expected: 120, warnings: 1 },
+      { name: 'is non-numeric', value: 'soon', expected: 120, warnings: 1 },
+      { name: 'is null', value: null, expected: 120, warnings: 1 },
+      { name: 'is NaN', value: Number.NaN, expected: 120, warnings: 1 },
+      { name: 'is infinite', value: Number.POSITIVE_INFINITY, expected: 120, warnings: 1 },
+      { name: 'is negatively infinite', value: Number.NEGATIVE_INFINITY, expected: 120, warnings: 1 },
+    ])('returns a bounded timeout when dispatch_start_timeout_seconds $name', ({ value, expected, warnings }) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const config = value === undefined
+          ? undefined
+          : { dispatch_start_timeout_seconds: value } as DispatchStartTimeoutConfig;
+        const result = resolveDispatchStartTimeoutSeconds(config);
+
+        expect(result).toBe(expected);
+        expect(Number.isFinite(result)).toBe(true);
+        expect(warn).toHaveBeenCalledTimes(warnings);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   describe('resolveTeardownTimeoutSeconds', () => {
     it.each([
       { name: 'is absent', value: undefined, expected: 120, warnings: 0 },
@@ -151,6 +193,16 @@ describe('engine/resolved-config', () => {
       expect(resolved.scopeContainmentEnforced).toBe(true);
     });
 
+    it.each([
+      [undefined, true],
+      [{ adjudication: { enabled: false } }, false],
+      [{ adjudication: { enabled: true } }, true],
+    ] as const)('resolves default-on adjudication from %j', (buildReview, enabled) => {
+      const config = buildReview === undefined ? undefined : { build_review: buildReview } as HarnessConfig;
+
+      expect(resolveBuildReviewConfig(config).adjudication.enabled).toBe(enabled);
+    });
+
     it('resolves a closed rubric policy map by inheriting the outer policy, applying independent overrides, and clamping fan-out', () => {
       const config = {
         llm_provider: ['claude', 'codex'],
@@ -184,6 +236,7 @@ describe('engine/resolved-config', () => {
           model_fallback_ladder: string[];
           max_retries: number;
           escalate: boolean;
+          min_confidence: number;
         }>;
       };
 
@@ -201,6 +254,7 @@ describe('engine/resolved-config', () => {
             model_fallback_ladder: ['gpt-5.6-terra'],
             max_retries: 2,
             escalate: false,
+            min_confidence: 0,
           },
         },
       });
@@ -301,6 +355,7 @@ describe('engine/resolved-config', () => {
       expect(DEFAULT_STEP_RETRIES.finish).toBeGreaterThanOrEqual(6);
       expect(DEFAULT_STEP_RETRIES.bootstrap).toBe(1);
       expect(DEFAULT_STEP_RETRIES.test_suite).toBe(1);
+      expect(DEFAULT_STEP_RETRIES.coverage_binding).toBeGreaterThanOrEqual(2);
     });
 
     it('fallbacks are sensible', () => {
@@ -315,7 +370,7 @@ describe('engine/resolved-config', () => {
     it('returns the registered phase', () => {
       expect(phaseForStep('explore')).toBe('DECIDE');
       expect(phaseForStep('build')).toBe('BUILD');
-      expect(phaseForStep('retro')).toBe('SHIP');
+      expect(phaseForStep('finish')).toBe('SHIP');
     });
 
     it('throws on unknown step', () => {
@@ -347,8 +402,8 @@ describe('engine/resolved-config', () => {
         ['stories', 'DECIDE'], ['conflict_check', 'DECIDE'], ['plan', 'DECIDE'],
         ['architecture_diagram', 'DECIDE'], ['architecture_review', 'DECIDE'],
         ['worktree', 'SETUP'], ['acceptance_specs', 'BUILD'], ['build', 'BUILD'],
-        ['build_review', 'BUILD'], ['wiring_check', 'BUILD'], ['test_suite', 'BUILD'], ['manual_test', 'SHIP'],
-        ['prd_audit', 'SHIP'], ['architecture_review_as_built', 'SHIP'], ['retro', 'SHIP'],
+        ['build_review', 'BUILD'], ['test_suite', 'BUILD'], ['manual_test', 'SHIP'],
+        ['prd_audit', 'SHIP'], ['architecture_review_as_built', 'SHIP'],
         ['rebase', 'SHIP'], ['finish', 'SHIP'], ['remediate', 'SHIP'],
         ['attribution_verify', 'SHIP'],
       ] as const;
@@ -378,12 +433,10 @@ describe('engine/resolved-config', () => {
         { step: 'acceptance_specs', model: 'opus', effort: 'medium' },
         { step: 'build', model: 'sonnet', effort: 'medium' },
         { step: 'build_review', model: 'opus', effort: 'high' },
-        { step: 'wiring_check', model: 'sonnet', effort: 'low' },
         { step: 'test_suite', model: 'sonnet', effort: 'low' },
         { step: 'manual_test', model: 'sonnet', effort: 'medium' },
         { step: 'prd_audit', model: 'opus', effort: 'high' },
         { step: 'architecture_review_as_built', model: 'opus', effort: 'high' },
-        { step: 'retro', model: 'sonnet', effort: 'medium' },
         { step: 'rebase', model: 'opus', effort: 'high' },
         { step: 'finish', model: 'sonnet', effort: 'medium' },
         { step: 'remediate', model: 'opus', effort: 'medium' },
@@ -930,84 +983,6 @@ describe('engine/resolved-config', () => {
     });
   });
 
-  describe('resolveAuthParkTimeoutMinutes', () => {
-    it('defaults to 60 when auth_park_timeout_minutes is absent', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const result = resolveAuthParkTimeoutMinutes(undefined);
-      expect(result).toBe(60);
-    });
-
-    it('returns the configured value when explicitly set to a positive number', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const config: HarnessConfig = {
-        auth_park_timeout_minutes: 15,
-      };
-      const result = resolveAuthParkTimeoutMinutes(config);
-      expect(result).toBe(15);
-    });
-
-    it('preserves 0 as an opt-out signal', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const config: HarnessConfig = {
-        auth_park_timeout_minutes: 0,
-      };
-      const result = resolveAuthParkTimeoutMinutes(config);
-      expect(result).toBe(0);
-    });
-
-    it('preserves negative values as an opt-out signal', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const config: HarnessConfig = {
-        auth_park_timeout_minutes: -5,
-      };
-      const result = resolveAuthParkTimeoutMinutes(config);
-      expect(result).toBe(-5);
-    });
-
-    it('throws on non-numeric string values', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const config = {
-        auth_park_timeout_minutes: 'soon',
-      } as unknown as HarnessConfig;
-      expect(() => resolveAuthParkTimeoutMinutes(config)).toThrow(
-        /Invalid auth_park_timeout_minutes.*expected a number/
-      );
-    });
-
-    it('throws on NaN (non-finite number)', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const config: HarnessConfig = {
-        auth_park_timeout_minutes: NaN,
-      };
-      expect(() => resolveAuthParkTimeoutMinutes(config)).toThrow(
-        /Invalid auth_park_timeout_minutes.*finite/
-      );
-    });
-
-    it('throws on Infinity', async () => {
-      const { resolveAuthParkTimeoutMinutes } = await import(
-        '../../src/engine/resolved-config.js'
-      );
-      const config: HarnessConfig = {
-        auth_park_timeout_minutes: Infinity,
-      };
-      expect(() => resolveAuthParkTimeoutMinutes(config)).toThrow(
-        /Invalid auth_park_timeout_minutes.*finite/
-      );
-    });
-  });
 
   describe('resolveSelfHostConfig — build_auth defaults', () => {
     it('absent block → buildAuthMode: daemon-token, buildAuthTokenPath: ~/.ai-conductor/build-auth', async () => {

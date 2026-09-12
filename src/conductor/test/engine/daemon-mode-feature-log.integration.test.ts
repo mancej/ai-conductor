@@ -25,6 +25,14 @@ vi.mock('../../src/engine/ci-fix.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/engine/ci-fix.js')>();
   return { ...actual, defaultCiFixProbe: ciFixProbeSpy.defaultCiFixProbe };
 });
+vi.mock('../../src/engine/daemon-deps.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/engine/daemon-deps.js')>();
+  return { ...actual, resolveDaemonBaseSha: vi.fn(async () => 'a'.repeat(40)) };
+});
+vi.mock('../../src/engine/work-order.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/engine/work-order.js')>();
+  return { ...actual, buildWorkOrder: vi.fn((input) => input) };
+});
 
 // The daemon loop checks its build credential before dispatch. This test owns
 // feature-log wiring, so it supplies a deterministic credential boundary
@@ -102,6 +110,7 @@ describe('daemon-mode feature log integration', () => {
         maxItems: 1,
         baseBranch: 'main',
         ensureFresh: async () => {},
+        probeGhVersion: async () => ({ kind: 'ok', version: { major: 2, minor: 73, patch: 0 } }),
         watch: false,
         workSource: { discover: async () => [{ slug: 'feature-a' }] },
       });
@@ -137,7 +146,9 @@ describe('daemon-mode feature log integration', () => {
       '[feature-a] ▶ start feature-a',
       true,
     );
-    expect(buildAuthSpy.readDaemonBuildToken).toHaveBeenCalledTimes(1);
+    // The completed dispatch leaves the pool busy for one snapshot pass. That
+    // pass re-samples all dispatch blockers so its telemetry is current.
+    expect(buildAuthSpy.readDaemonBuildToken).toHaveBeenCalledTimes(2);
     expect(persisted).not.toMatch(/\[daemon\]\[feature-a\]\[feature-a\]/);
 
     // step_started is one of the 19 TerminalSubscriber-rendered event types.

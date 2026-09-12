@@ -1,7 +1,7 @@
 ---
 name: architecture-review
 implicit_invocation: required
-description: "Use before implementation to review stories through a technical feasibility and architectural alignment lens. Also use at batch boundaries to catch architectural drift."
+description: "Use only within an active harness lifecycle when pre-stories feasibility review, a pipeline batch drift check, or the SHIP as-built review is current. Do not invoke for ordinary implementation, code review, or general architecture questions."
 enforcement: gating
 phase: decide
 standalone: true
@@ -309,7 +309,7 @@ Write the review to `.docs/decisions/architecture-review-YYYY-MM-DD-<feature>.md
 the feature introduces (exported function/module, hook script, config key, emitted event,
 scheduled job, CLI subcommand, etc.), state at design time where/how it will be called from
 in production — e.g. "invoked from the daemon loop's step dispatcher," "wired into
-`conduct-ts`'s command table," "consumed by the existing event bus subscriber in
+`ai-conductor`'s command table," "consumed by the existing event bus subscriber in
 `src/x.ts`." This is a design-time commitment, not a code citation — no `file:line` is
 required yet since the code doesn't exist. It informs the review's feasibility and overlap
 analysis; it is not a per-task plan contract.
@@ -323,7 +323,7 @@ an observed caller there).
 Not required for **Small** tier features (the DECIDE-time review is skipped for Small per the
 Lightweight Mode section above; §12 still runs at SHIP).
 
-**Early overlap scan (Medium/Large tier):** Before `/plan` runs, run `conduct-ts overlap-scan
+**Early overlap scan (Medium/Large tier):** Before `/plan` runs, run `ai-conductor overlap-scan
 --files <Wiring Surface candidate paths>` over the paths named in `## Wiring Surface` above.
 Surface the rendered report to the author alongside the review output. This is **advisory
 only** — it never blocks the verdict or the review — it exists to flag unmerged dependent
@@ -382,8 +382,8 @@ echo "verdict: APPROVED_WITH_CONDITIONS, new ADRs: 2" > .pipeline/review-require
 
 Invoked at **SHIP** as `/architecture-review --as-built`, a member of the concurrent
 validation group — fanned out alongside `/manual-test` and `/prd-audit` in daemon/auto
-runs; in interactive runs it runs serially, after `/prd-audit` and before `/retro` and
-`/finish`. It runs for **every feature**, including Small features and features whose DECIDE-time
+runs; in interactive runs it runs serially, after `/prd-audit` and before `/finish`.
+It runs for **every feature**, including Small features and features whose DECIDE-time
 architecture review was skipped. This is the final architectural drift sweep. It is lightweight —
 it does **no** new design or feasibility/complexity assessment, and reuses the drift logic of §10
 (Recurring Review) and the ADR lifecycle of §7b.
@@ -414,7 +414,7 @@ authoritative for the SHIP compliance verdict. It never relied on BUILD proof as
 - **Production reachability sweep (green-but-unwired guard).** For each primitive this
   feature's diff introduces or materially changes — exported functions/modules, hook scripts,
   config keys, emitted events, ADR-promised log lines — trace ONE invocation path from a real
-  production entry point (`conduct-ts` command dispatch, the daemon loop, hook/settings provisioning,
+  production entry point (`ai-conductor` command dispatch, the daemon loop, hook/settings provisioning,
   a wired step runner) and cite the caller as `file:line`. Test files, fixtures, and the
   primitive's own module do not count as callers, except for the narrow same-file composition
   case below.
@@ -441,21 +441,84 @@ authoritative for the SHIP compliance verdict. It never relied on BUILD proof as
     primary's precondition is never produced. All are green under unit tests and invisible to a
     conformance-only review.
 - **Plan-gap check.** When the shipped code faithfully implements the approved design but that
-  design is itself the limit that prevents a stated outcome, issue `PLAN_GAP`. Record the affected
-  outcome and whether it was delivered; do not send unplanned work back to BUILD.
+  design is itself the limit that prevents an outcome the sealed story criteria require, issue
+  `PLAN_GAP`. Record the affected outcome and whether it was delivered; do not send unplanned work
+  back to BUILD.
+  - **Outcome authority: the sealed story criteria.** The approved, sealed acceptance criteria under
+    `.docs/stories/` are this feature's acceptance contract and the only authority for what outcome
+    was stated. `.docs/intake/` is an idea capture that is **superseded** once stories are approved;
+    never grade the shipped code against it. Where intake and the stories disagree, the stories win:
+    a deliberate narrowing recorded in an amended, resealed story is the decision, not a plan gap.
+- **Context budget.** This review runs late in a long session and providers with a ~250k-token
+  window have compacted mid-review (jstoup111/ai-conductor#2377: peaks of 236k–251k, with the
+  reviewer's own reads accounting for 0.85–1.5M characters of output). Treat the window as a budget:
+  - Do NOT re-read `HARNESS.md`, `CLAUDE.md`, or this skill file. They are already in context via
+    the session-start hook and the skill loader.
+  - Read each artifact once. The plan and stories are large; extract the task table, `Done when`
+    blocks, and the criteria you are grading, not the whole file twice.
+  - Bound every git and search command: `git diff --stat <base>...HEAD` first, then per-file
+    `git diff <base>...HEAD -- <path>` with DEFAULT context (never `--unified=80` or higher);
+    `git log --oneline -n 30`; `rg -l` / `rg --files` piped through a slug or path filter before
+    listing. Never dump an unfiltered file list or an unbounded log.
+  - Read source by symbol or line range (`nl -ba <file> | sed -n 'A,Bp'`), not whole engine files.
+  - If you must choose, spend the budget on the shipped source under review, not on policy prose.
+- **Delegated evidence gathering.** The window that matters is the reviewer's own: it holds the
+  verdict. Keep it for judgement and push the reading into subagents through the host's facility
+  (Claude Code: the Agent tool; Codex: `collaboration.spawn_agent` / `collaboration.wait_agent`),
+  the same way §"Provider-native delegation" already allows:
+  - One subagent per enabled check cluster: the APPROVED-ADR set (one per ADR when several apply),
+    the diagram set, the changed-primitive reachability sweep (split by module when the diff is
+    wide), and the plan-gap check against the sealed stories.
+  - Each subagent returns a **digest**, not a transcript: the governing clause quoted verbatim with
+    its path, the shipped code quoted verbatim with `file:line`, the caller chain for
+    reachability, and a candidate disposition with confidence. Cap a digest at roughly two thousand
+    words; anything larger is the subagent forwarding its reads instead of doing them.
+  - The reviewer grades from the digests, re-reads only the lines it needs to settle a disagreement,
+    and owns every verdict. A subagent never writes the report, the verdict, or an ADR.
+  - **Model tiers.** The reviewer stays on this skill's pinned tier; do not trade it down to pay for
+    fan-out. Reading and extraction subagents run on the host's mid tier
+    (Claude Code `model="sonnet"`; Codex uses its configured default). Step a subagent up to the reviewer's
+    tier only when its task is adjudication — an adversarial re-check of one candidate BLOCKED
+    finding before it is recorded.
+  - Subagents inherit the context budget above. A subagent that cannot finish within it reports
+    what it covered and what it did not; the reviewer records the uncovered surface as unverified
+    rather than silently passing it.
+- **Validator discipline (MUST — copy verbatim into every subagent brief).** Both rules below are
+  operator rules on the reviewer and on every subagent it delegates to. Include them **verbatim** in
+  each subagent brief; a subagent that never received them is not bound by them.
+  1. **Read-only evidence.** The validator and every subagent it delegates to MUST NOT execute
+     tests, typecheck, lint, build, the integrity script, or any command that runs project code —
+     including `vitest`, `npm test`/`npm run`, `npx`, `node -e` probes over project modules, and
+     bash test scripts. Evidence is what the source and committed artifacts say: `file:line`, test
+     names read from test source, `git diff`/`git log` output, and `Scope:` trailers. Reachability
+     is proved by citing the caller chain in the source, never by running it. If a check cannot be
+     judged without running code, grade it from the evidence available and say so in the rationale;
+     never run it. The only files the validator writes are its own outputs —
+     `.pipeline/architecture-review-as-built.md` and its review-required markers. Nothing else is
+     written, staged, or committed.
+  2. **Never yield with delegated work outstanding.** The validator MUST NOT end its turn while any
+     subagent it spawned has not returned. Collect every digest before grading; if a subagent is
+     slow, wait for it — do not summarize partial results and do not report progress in place of a
+     verdict.
+  - **Why.** Both rules exist to prevent a daemon halt class. Running project code from a validator
+    mutates the worktree the SHIP gates fingerprint; and ending the turn with subagents outstanding
+    ends the session in print mode, so the host's background-wait ceiling kills the pending
+    subagents, no verdict artifact is written, and the engine's freshness handshake HALTs the
+    feature (`post-dispatch verdict write handshake failed ... is stale`).
 - Do NOT re-run §2/§3/§5 (feasibility/complexity/domain pre-checks) — those belong to the DECIDE
   pass. This is a code-vs-approved-design pattern match plus the reachability sweep above,
   deliberately cheap.
 
 **Verdict:**
-- **APPROVED** — shipped code matches the approved architecture. Proceed to retro/finish.
+- **APPROVED** — shipped code matches the approved architecture. Proceed to finish.
 - **APPROVED WITH DRIFT NOTES** — minor, non-violating drift (e.g. a diagram is now slightly stale,
   a pattern was extended consistently). Record the drift; proceed. Note it for a follow-up ADR only
   when it makes or changes a structural decision; otherwise no ADR is needed, and it does not block.
 - **PLAN_GAP** — the shipped code faithfully implements the approved design, but the design is the
-  limit preventing a stated outcome. Include `Outcome delivered: yes` when acceptance criteria
-  still pass; record the gap and proceed. Include `Outcome delivered: no` when the stated outcome
-  is not delivered; the loop HALTS for a human. Never turn this finding into unplanned BUILD work.
+  limit preventing an outcome the sealed story criteria require. Include `Outcome delivered: yes`
+  when the sealed story criteria are satisfied; record the outcome-level gap and proceed. Include
+  `Outcome delivered: no` only when a sealed story criterion is genuinely unmet and the approved
+  design is the limit; the loop HALTS for a human. Never turn this finding into unplanned BUILD work.
 - **BLOCKED** — an enabled check found an architectural violation, such as an APPROVED-ADR
   violation or an unreachable production rung. The loop HALTS. A human must resolve it: fix the
   code to comply, or for an ADR violation supersede the ADR with a new, human-APPROVED ADR
@@ -491,9 +554,30 @@ same-file exceptions independently cite root → caller → export at the review
 UNEXERCISED entries carry their observation signature)
 ## Drift Notes (if any)
 ## Recorded Findings (if PLAN_GAP — affected outcome and why the approved design is the limit)
+## Blocking Findings (required exactly when Verdict is BLOCKED)
+| Finding | Class | Governing clause | Summary |
+|---|---|---|---|
+| AB-1 | REMEDIABLE | adr-2026-06-29-rate-limit-strategy decision 4 | <one-line finding summary> |
+| AB-2 | REMEDIABLE | Task 7 | <one-line finding summary> |
 ## Blocking Violations (if BLOCKED — which APPROVED ADR or unreachable rung, file:line)
 ## Resolution (if BLOCKED — code fix OR superseding ADR; human-approved)
 ```
+
+For a `BLOCKED` verdict, `## Blocking Findings` is required exactly once and contains one row per
+finding. The header row is **copy-exact** — write literally
+`| Finding | Class | Governing clause | Summary |` with those four names in that order. Do not
+rename columns (`ID`, `Description`, `Finding` in the last slot, etc.): the SHIP gate parses this
+table mechanically and any other header halts the feature as unparseable, wasting the whole review
+lap. `Class` is a closed set: exactly `REMEDIABLE` or `DESIGN`. A `REMEDIABLE` row's
+`Governing clause` must name either an ADR filename stem plus its decision number (`adr-x decision 3`
+or the heading shorthand `adr-x D3` — both resolve), or a task id from
+this feature's own plan; a REMEDIABLE row without a governing clause is malformed. Write the clause
+as **bare text** — no backticks, no bold — and cite **exactly one** clause per row: the resolver
+matches a single identifier, so `` `adr-x` + Decision 4 `` and `Task 9 and Task 10` are both
+unresolvable and HALT the bounded remediation route. Split a finding that spans two tasks into two
+rows. `DESIGN` is for a
+finding that requires a human architectural decision rather than work already required by an approved
+artifact.
 
 The conductor's objective gate reads the `Verdict:` line and is **fail-closed**: only an explicit
 `APPROVED` or `APPROVED WITH DRIFT NOTES` passes. A `PLAN_GAP` passes only with
@@ -542,9 +626,17 @@ echo "verdict: BLOCKED, violated adr-2026-06-29-rate-limit-strategy" > .pipeline
 - [ ] **As-built mode:** statically-reachable-but-unobserved behavior recorded as `UNEXERCISED`
       with its greppable observation signature
 - [ ] **As-built mode:** verdict written to `.pipeline/architecture-review-as-built.md`
-- [ ] **As-built mode:** PLAN_GAP records the affected outcome and `Outcome delivered: yes|no`;
-      no as-built finding sends unplanned work back to BUILD
+- [ ] **As-built mode:** PLAN_GAP records the affected outcome and `Outcome delivered: yes|no`,
+      judged against the sealed `.docs/stories/` criteria and never against superseded
+      `.docs/intake/` capture; no as-built finding sends unplanned work back to BUILD
 - [ ] **As-built mode:** BLOCKED on any enabled APPROVED-ADR violation; resolved by code fix or
       human-approved superseding ADR (never silent downgrade)
+- [ ] **As-built mode:** every BLOCKED verdict contains exactly one `## Blocking Findings` table
+      whose header row is literally `| Finding | Class | Governing clause | Summary |` (no renamed
+      columns such as `ID`); Class is exactly `REMEDIABLE` or `DESIGN`
+- [ ] **As-built mode:** every REMEDIABLE blocking finding cites its governing ADR filename stem
+      plus decision number, or its task id from this feature's plan; a missing clause is malformed
+- [ ] **As-built mode:** every `Governing clause` cell is bare text (no backticks or bold) naming
+      exactly one clause
 - [ ] **As-built mode:** `.pipeline/review-required-architecture-as-built` marker written when the
       verdict is not a clean APPROVED

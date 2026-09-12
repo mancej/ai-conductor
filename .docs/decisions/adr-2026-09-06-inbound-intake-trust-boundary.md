@@ -1,0 +1,230 @@
+# ADR: Inbound intake trust boundary — tracker text is evidence, never instruction
+
+**Date:** 2026-09-06
+**Status:** APPROVED
+**Deciders:** James Stoup (operator), architecture-review for #1479
+
+<!-- Filename convention: adr-2026-09-06-<kebab-slug>.md (no sequential numbers). -->
+
+## Context
+
+Intake issue text (title + body) is joined verbatim by `buildText()` in
+`intake/github-issues.ts` into `Envelope.text` (adr-011 decision 2), printed by `compose
+claim`, persisted as the claim record, and staged into the worktree's
+`.pipeline/intake-outcomes.md` (adr-2026-07-22-coherence-gate-placement-and-validation-split).
+A host DECIDE session reads all of it as prose, in the same channel as operator instruction,
+and the spec it authors is later built autonomously under elevated permissions
+(adr-005-non-autonomy-and-read-only-governor keeps the engineer from spawning that build, but
+does not touch what the build may do once dispatched).
+
+`intake/sanitize.ts` is outbound-only: it redacts secrets and operator paths at the
+`file-issue.ts` filing choke point. No ADR — approved, draft, or superseded — covers the
+inbound direction, prompt injection, or tracker text as a trust boundary (repo-wide sweep of
+307 ADRs, 2026-09-06). #355 proposes an automated filer, which would add a non-human writer to
+this same path.
+
+Constraints found by the sweep that the design must honor:
+
+- adr-009: the `Envelope` contract is locked and evolves additively; `text` must remain
+  non-empty at the port boundary.
+- adr-012: dedup keys on `sourceRef`, never on `text`.
+- adr-2026-07-21-intake-only-enforcement: `claimUnblocked` / `ClaimOutcome` stay byte-identical.
+- adr-2026-07-26-event-sink-registry-exhaustiveness: a new `ConductorEvent` variant must declare
+  its sinks or the engine does not compile.
+- adr-2026-08-12-fail-closed-intake-ledger-durability (amended): the engineer directory is a
+  user-global, cross-repo path with concurrent writers — not a single-writer location.
+- adr-2026-08-09-hook-owned-containment-event-ledger and
+  adr-2026-08-08-pipeline-owned-closeout-timestamps: an emitter-less process writes the same
+  `ConductorEvent` schema to a worktree-local, single-writer sibling ledger.
+- adr-2026-08-24-evidentiary-defects-are-not-waivable: an intake-outcome / criterion mismatch at
+  land is unwaivable, so the staged outcome text must be defined unambiguously.
+- adr-2026-07-22-canonical-tagged-source-ref: any `sourceRef` string is produced by
+  `formatWorkRef`, never a local format.
+
+## Options Considered
+
+### Option A: Delimit at the consumption surface only (composer / engineer prose + claim JSON)
+- **Pros:** No text rewriting; evidence byte-identical; smallest diff.
+- **Cons:** The boundary is enforced by prompt discipline, which drifts; directive-shaped
+  prose still reaches the session unchanged; no signal that it was present; a new consumer
+  or a new writer (#355) bypasses it silently.
+
+### Option B: Neutralize + delimit at the adapter's `buildText()`, record on the spine (chosen)
+- **Pros:** One choke point every writer and every consumer passes through; mirrors where the
+  outbound scrub sits; alterations are inert inline markers so evidence stays debuggable;
+  a `ConductorEvent` makes the alteration operator-visible after the fact.
+- **Cons:** The rule set is a judgement surface (novel phrasing is missed; an over-broad rule
+  mangles evidence); `Envelope.text` is no longer the literal `title+body`, which amends
+  adr-011 decision 2.
+
+### Option C: B plus narrowing what a `--dangerously-skip-permissions` build may do
+- **Pros:** Reduces consequence independently of input handling.
+- **Cons:** Touches both provider launch surfaces and self-host containment; a different
+  problem with its own ADR sweep. Excluded from this feature by the operator-confirmed scope
+  boundary (`.docs/track/github-issue-text-reaches-an-autonomous-build-with.md`); to be filed as
+  a separate intake.
+
+## Decision
+
+1. **The inbound seam is a pure module at the adapter's text-building choke point.**
+   `intake/sanitize-inbound.ts` exports `sanitizeInboundText(text, sourceRef)` and is called
+   from `buildText()` in `intake/github-issues.ts` for every issue the adapter emits — poll,
+   re-route, and re-eligibility paths alike — so no writer to the tracker (human, automated
+   filer, or a future `TrackerClient` backend per adr-2026-07-22-canonical-tracker-client-seam)
+   can bypass it and no consumer can receive raw tracker text. It is the mirror image of
+   `sanitizeIntakeText` in `file-issue.ts`: same shape (rules → result with categorized
+   counts), opposite direction, separate implementation because the goals differ (secret
+   removal vs. instruction neutralization). It is pure and idempotent.
+
+2. **Neutralize in place with inert categorized markers; never delete, never refuse.**
+   Directive-shaped prose is replaced by `[neutralized:<category>]` where it stood. Categories
+   are a closed set (initially `agent-directive`, `role-tag`, `tool-call`, `system-prompt`,
+   `armor-lookalike` — a body line shaped like the engine's own armor line), each
+   rule high-precision on SHAPE — the same precision rule the outbound scrub states in its
+   header — so a value is neutralized only when its form identifies it, never on a suspicious
+   word. An issue is never refused or dropped: `text` stays non-empty (adr-009) and the
+   claimable set is provably identical before and after (the adr-2026-08-05 visibility-only
+   posture) — only the bytes of `text` change.
+
+3. **Fenced and indented code, and quoted log lines, are exempt.** Segmentation into
+   code/prose runs before any rule, using the same fenced-block exclusion approach the
+   single ADR-approval parser uses (`adrApprovalStatus` in `engine/artifacts.ts` strips
+   fenced blocks before matching). Stack traces, shell transcripts, config excerpts, and
+   quoted (`>`) lines are evidence and pass byte-for-byte. Markdown structure — headings such
+   as `## Desired outcome`, bullets, numbering — is preserved so `outcome-staging.ts` and the
+   coherence extractor keep parsing.
+
+> **Amended 2026-09-09 by #1479:** The operator approved treating title and body as separate Markdown inputs. `buildText` passes the non-empty fields as an ordered array to `sanitizeInboundText`; that seam segments each field independently, aggregates category counts, then joins the sanitized fields with a blank line under one armor pair and one digest. An unclosed title fence cannot exempt body prose. The existing single-string API and armored-text idempotence remain supported; code inside either field remains unchanged.
+
+> **Amended 2026-09-10 by operator:** The seam accepts only the ordered title/body array used by production. The test-only single-string API and armored-text idempotence branch are removed; armor-shaped tracker prose remains subject to the `armor-lookalike` rule. The safety guarantee is the closed high-precision shape set in Decision 2, not exhaustive recognition of arbitrary natural-language instructions. `buildText` uses trimming only for emptiness and passes every non-empty field's original bytes into segmentation.
+
+4. **The tracker-sourced region is delimited by armor lines inside `text` itself.** The
+   sanitized text is wrapped in a leading and trailing armor line carrying the canonical
+   `sourceRef` (via `formatWorkRef`) and a sha256 digest of the sanitized content. Because the
+   boundary rides in the text, every downstream surface — claim JSON, claim record, staged
+   outcomes, host prompt — carries it without each consumer being told to add it. The armor
+   lines are outside every Markdown section and are themselves inert under all rules
+   (repeat-safe). The digest is telemetry and provenance only; it is never a dedup or claim
+   key (adr-012).
+
+5. **`Envelope` gains one additive optional field.** `inbound?: { neutralizations:
+   Array<{ category, count }>, digest: string }`. `parseEnvelope` passes it through when
+   present and well-formed and ignores it otherwise; required-field rejection semantics are
+   unchanged (adr-009). The file queue already serializes the whole envelope, so the field
+   round-trips. `claimUnblocked`, `ClaimOutcome`, `createFileQueue`, and the claim decorator
+   chain are untouched (adr-2026-07-21, adr-2026-07-04, adr-2026-07-10): the CLI reads
+   `inbound` off the `Envelope` it already holds.
+
+6. **The claim surface echoes the record.** `compose claim` prints `inbound` alongside `text`,
+   and `persistClaimRecord` stores it on the claim record next to `body`, so the operator sees
+   what was altered at the moment the idea is claimed and can re-read it later by `sourceRef`.
+
+7. **The occurrence rides the event spine as `intake_inbound_sanitized`, written
+   worktree-locally.** A new `ConductorEvent` variant `{ type: 'intake_inbound_sanitized',
+   sourceRef, neutralizations, digest }` is added to the union and declared in `EVENT_SINKS`
+   as `{ render: true, persist: true, audit: false, otel: false }` (adr-2026-07-26;
+   `audit: false` because intake belongs to no `StepName`, the same reasoning as
+   adr-2026-08-09-reseal-audit; `persist: true` is one record per claimed intake issue —
+   negligible volume under adr-2026-08-11's criterion). The engineer/compose CLI has no
+   emitter and the engineer directory is not single-writer (adr-2026-08-12), so the record is
+   appended by `engineer worktree --source-ref` — the first moment a worktree exists — to the
+   single-writer sibling ledger `<worktree>/.pipeline/intake-events.jsonl`, in the same schema,
+   exactly as adr-2026-08-09-hook-owned-containment-event-ledger and
+   adr-2026-08-08-pipeline-owned-closeout-timestamps do (event-spine exceptions A and B). The
+   append is best-effort and never throws into the caller; readers tolerate the file's absence.
+   Chat-origin ideas carry no `inbound` and write no record.
+
+8. **The staged and committed intake body is the sanitized projection.** Whatever
+   `outcome-staging.ts` stages into `.pipeline/intake-outcomes.md`, and whatever `land` commits
+   into `.docs/intake/<plan-stem>.md`, is the text the `Envelope` carries — sanitized, armored.
+   The engine never retains raw tracker text; the tracker itself remains the raw record.
+   Criterion rows and coverage quotes are authored from stories and plan tasks
+   (adr-2026-08-23-coverage-claims-grounded-by-verbatim-quote), never copied from
+   `Envelope.text`, so the verbatim-quote chain is unaffected. `outcome-N` rows are the
+   exception this decision must close: they quote the intake bullet itself, so authorship
+   alone is not a boundary and decision 10 enforces it mechanically.
+
+9. **Build privilege is out of scope.** `--dangerously-skip-permissions` and the
+   non-autonomy invariant (adr-005) are unchanged by this decision; consequence narrowing is
+   a separate intake.
+
+10. **An `outcome-N` coherence row's quote must be the sanitized staged bullet.** The land
+    gate compares each `outcome-N` row's `Quote` cell against `outcomeBullets[n-1]` — the
+    sanitized projection decision 8 stages — and treats a mismatch as an uncovered outcome
+    naming the quote as the problem. Presentation is not content: a leading list marker,
+    surrounding quotation marks, and collapsed whitespace are normalized away, and nothing
+    else is. Without this, a row carrying valid ids and an affirmative verdict admits raw
+    tracker text into the committed coherence artifact, which is precisely the laundering
+    decision 8 exists to prevent.
+
+> **Amended 2026-09-07 by #1479 (as-built review finding AB-1, operator decision).** Decision 7
+> placed the occurrence in a bespoke worktree-local sidecar and deferred any live emitter. That
+> shipped `render: true` / `persist: true` consumers no production code could ever feed, which the
+> as-built reachability check blocked. The occurrence now rides the live spine. This amendment
+> supersedes decision 7's sibling-ledger destination, the Negative consequence "a ledger-appended
+> event never reaches a live emitter", and the deferred follow-up that would have tailed the
+> sidecar. Decision 7's event shape, sink declaration, best-effort posture, and chat-origin
+> exclusion are unchanged.
+>
+> **D11. `engineer worktree --source-ref` emits `intake_inbound_sanitized` on a real
+> `ConductorEventEmitter`.** The CLI process owns no long-lived bus, so it constructs the spine for
+> the duration of the emit — an emitter with an `EventPersister` attached to the canonical
+> `<worktree>/.pipeline/events.jsonl` — and stops the persister in a `finally`. This is the
+> construction `engine/rewind.ts` already uses to put `operator_rewind` (also `render: true`,
+> also produced by a short-lived CLI) on the spine, so no new mechanism is introduced. The emit is
+> best-effort: a persistence failure prints on stderr and never fails worktree creation. The
+> emit is **persist-only**: the CLI process owns no long-lived bus and no renderer is attached to
+> the emitter it builds, so there is no live terminal or daemon-log line at the moment of emit.
+> Consumers see the occurrence wherever the persisted spine is read — OTel exporters, dashboards,
+> and the daemon's own tailers of `<worktree>/.pipeline/events.jsonl`. See D13 for the sink row.
+>
+> **D13. The `EVENT_SINKS` row for `intake_inbound_sanitized` is `render: false, persist: true`.**
+> A `render: true` declaration asserts that a production path carries the occurrence to a live
+> renderer. For this event none does, and building one — a subscriber bridge, an IPC hop, or a
+> ledger replay from the short-lived CLI into the interactive or daemon emitter — is a structural
+> change this feature deliberately does not make. Declaring `render: false` keeps the sink registry
+> a truthful description of production (adr-2026-07-26-event-sink-registry-exhaustiveness) instead
+> of an aspiration, and supersedes D11's earlier "the `EVENT_SINKS` row is unchanged" clause. The
+> render branches that existed only to satisfy that stale declaration — the
+> `terminal-renderer.ts` case, its `TerminalSubscriber` forwarding entry, and the
+> `renderDaemonEventUnsafe` case — are removed with it, so no render branch survives without a
+> producer. Adding a live render path later requires its own ADR.
+>
+> **D12. The sidecar `<worktree>/.pipeline/intake-events.jsonl` is removed, not kept as a derived
+> view.** A repo-wide search found no reader, no tailer, and nothing deriving from it, so it was a
+> write-only second format — a parallel channel by the schema-and-reader-path test. Event-spine
+> exceptions A and B no longer apply: the writer is not an emitter-less process (it can build the
+> emitter, as D11 does), and single-writer atomicity is satisfied by the per-worktree
+> `events.jsonl` the persister already owns. One union, one reader path, one file.
+
+
+## Consequences
+
+### Positive
+- Tracker text is distinguishable from operator instruction at every consumption point by
+  machinery, not prompt discipline, and an issue containing directive-shaped prose produces
+  the same DECIDE input as one describing the problem neutrally.
+- Every writer — including #355's automated filer and any future tracker backend — gets the
+  same treatment for free.
+- The alteration is visible three ways: claim JSON, claim record, and the persisted spine.
+
+### Negative
+- The rule set will miss novel directive phrasing; this is a floor, not a proof. The
+  `[neutralized:*]` markers make misses and false positives auditable, which is the mitigation.
+- `Envelope.text` is no longer the literal `title+body` (adr-011 decision 2 amended in place).
+- ~~A ledger-appended event never reaches a live emitter, so it is invisible to OTel
+  (adr-014) and to `ui_renderer` plugins until a reader tails the sibling ledger.~~ Superseded by
+  the 2026-09-07 amendment (D11): the event is emitted on the live spine and persisted to the
+  canonical `<worktree>/.pipeline/events.jsonl`. It remains outside OTel because its sink row
+  declares `otel: false`, which is a sink policy, not a missing emitter.
+- The occurrence has no live render at emit time (D13). An operator watching a terminal or
+  `daemon.log` while `engineer worktree --source-ref` runs sees nothing; the record is found by
+  reading the persisted spine. This is the accepted cost of not building a bridge from a
+  short-lived CLI process into a long-lived renderer bus.
+- Issue bodies in `.docs/intake/<plan-stem>.md` now carry armor lines and may carry markers.
+
+### Follow-up Actions
+- [ ] File the privilege-narrowing intake (Option C) as a separate issue referencing #1479.
+- [x] ~~Tail `.pipeline/intake-events.jsonl` onto the live bus when a reader for the sibling
+      ledgers is consolidated.~~ Withdrawn by the 2026-09-07 amendment (D12): there is no sidecar
+      to tail — the event is emitted on the live spine at the point of occurrence.

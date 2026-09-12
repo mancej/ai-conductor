@@ -10,8 +10,11 @@ import {
   daemonLogPath,
   formatDaemonLogLine,
   formatDaemonActivityLine,
+  formatDaemonConsoleTeeLine,
   createDaemonModeLogger,
   createFeatureDaemonLogger,
+  createOwnershipAwareDaemonLogger,
+  withDaemonLogFeatureOwnership,
 } from '../../src/engine/daemon-log.js';
 import { renderDaemonEvent, stripAnsi } from '../../src/daemon-cli.js';
 import type { ConductorEvent } from '../../src/types/index.js';
@@ -196,6 +199,7 @@ describe('engine/daemon-log', () => {
         { type: 'step_failed', step: 'build', error: 'boom', retryCount: 1 },
         { type: 'step_retry', step: 'build', attempt: 1, maxAttempts: 3, reason: 'retry' },
         { type: 'gate_verdict', step: 'build', satisfied: false, reason: 'unsatisfied' },
+        { type: 'gate_verdict', step: 'build', satisfied: true },
         { type: 'kickback', from: 'prd_audit', to: 'build', count: 1 },
         { type: 'loop_halt', reason: 'stuck' },
         { type: 'loop_converged' },
@@ -291,6 +295,58 @@ describe('engine/daemon-log', () => {
         '[daemon][feature-a] stderr continuation',
       ]);
       expect(persisted).toEqual(live);
+    });
+  });
+
+  describe('daemon ownership attribution', () => {
+    it('keeps interleaved console tee and global-subscriber output owned by its executor slug', async () => {
+      const live: string[] = [];
+      const persisted: string[] = [];
+      const baseLog = createDaemonModeLogger({
+        writeLive: (line) => live.push(line),
+        writePersisted: (line) => persisted.push(line),
+      });
+      const globalSubscriberLog = createOwnershipAwareDaemonLogger(baseLog);
+
+      await Promise.all([
+        withDaemonLogFeatureOwnership('feature-a', async () => {
+          await Promise.resolve();
+          persisted.push(formatDaemonConsoleTeeLine('warn', 'warning from feature-a'));
+          renderDaemonEvent(
+            { type: 'step_started', step: 'build', index: 0 },
+            globalSubscriberLog,
+          );
+          baseLog('▶ start feature-a');
+          baseLog('▶ start feature-a');
+        }),
+        withDaemonLogFeatureOwnership('feature-b', async () => {
+          persisted.push(formatDaemonConsoleTeeLine('error', 'error from feature-b'));
+          await Promise.resolve();
+          renderDaemonEvent(
+            { type: 'step_started', step: 'build', index: 0 },
+            globalSubscriberLog,
+          );
+          baseLog('▶ start feature-b');
+          baseLog('▶ start feature-b');
+        }),
+      ]);
+
+      persisted.push(formatDaemonConsoleTeeLine('warn', 'daemon-global warning'));
+      renderDaemonEvent(
+        { type: 'step_started', step: 'build', index: 0 },
+        globalSubscriberLog,
+      );
+
+      expect(persisted).toContain('[daemon][feature-a] [warn] warning from feature-a');
+      expect(persisted).toContain('[daemon][feature-b] [error] error from feature-b');
+      expect(persisted).toContain('[daemon] [warn] daemon-global warning');
+      expect(persisted.at(-1)).not.toContain('[feature-');
+
+      expect(live).toContain('[daemon][feature-a] · ▶ build');
+      expect(live).toContain('[daemon][feature-b] · ▶ build');
+      expect(live).toContain('[daemon] · ▶ build');
+      expect(live.filter((line) => line === '[daemon] ▶ start feature-a')).toHaveLength(1);
+      expect(live.filter((line) => line === '[daemon] ▶ start feature-b')).toHaveLength(1);
     });
   });
 

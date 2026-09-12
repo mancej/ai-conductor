@@ -23,12 +23,14 @@ for a human rather than to guess a route.
 
 The daemon should be autonomous. So the default is to **remediate**: translate each gap into
 concrete, file-scoped work and route it back to the right SDLC step. A **HALT** is reserved for the
-two cases a machine genuinely cannot close:
+three cases a machine genuinely cannot close:
 
 1. **architectural-clarity** — an architectural gap that needs a human *decision* (ambiguous trade-off,
    missing ADR, conflicting constraints), not just a code change.
 2. **product-scope** — functionality the **initial design never accounted for** (a real product gap),
    which needs a human DECIDE amendment.
+3. **unanswerable** — a stall-question that cannot be answered from committed artifacts alone and
+   needs more evidence.
 
 If a gap can be turned into concrete work, it is **not** a HALT. This skill plans only — it assigns
 dispositions and writes tasks. It does **not** edit code, write tests, or amend the PRD; the step it
@@ -36,6 +38,88 @@ kicks back to does that.
 
 **Run when `build_review` fails, or at SHIP when a prior audit BLOCKED — dispatched by the
 conductor on the blocking path.**
+
+## Engine-selected build_review case-v1 mode
+
+Use this branch **only when this engine context is the engine-stamped `build_review` `case-v1`
+context declaring `domain: "build_review"` and `mode: "case-v1"`**. It is one judgement by the
+existing `remediate` skill, not a new skill or a second dispatch. Do not create a skill or dispatch
+another agent. For every other context, including all SHIP and stall remediation, skip this section
+and follow the legacy gap-plan instructions below unchanged.
+
+### Supplied input — complete or stop
+
+Judge only the frozen, byte-bounded projection supplied in the engine context. Its exact input fields
+are:
+
+- `domain`: `build_review`.
+- `currentFindings`: every current operator-unresolved content finding, each with its rubric id,
+  stable finding id, anchor, summary, and evidence locations.
+- `priorCases`: all feature-local prior cases, each with outcome, source links, effect status, and
+  resolution evidence.
+- `planContract`: the active approved-plan contract that determines whether work is admitted.
+- `taskStatus`: the engine-supplied task-status evidence.
+- `effectPointers`: the engine-supplied prior effect and BUILD-attempt pointers.
+- `suppressionHistory`: engine-owned sub-floor finding history. It is context only, never a
+  current source and therefore receives no `sourceOutcomes` row.
+
+All feature-local prior cases must be present or stop: never infer, truncate, or silently ignore
+history. Every supplied current finding must receive exactly one source outcome. Use the supplied
+stable identifiers and evidence to make semantic judgements; do not match summaries as identity.
+
+Do not re-audit the source tree. Do not read sibling rubric prompts, inspect a different review
+artifact, or seek additional repository evidence. The engine already selected the scope, excluded exact
+operator-resolved findings, assembled all history, and bounded the input. If the supplied projection
+cannot support a justified judgement, return the required schema with the most supportable
+case-level disposition; do not substitute a legacy gap plan or invent missing evidence.
+
+### Required additive artifact
+
+Overwrite `.pipeline/remediation.json` with one JSON object using exactly these top-level keys:
+`mode`, `domain`, `sourceOutcomes`, `cases`. Set `mode` to `"case-v1"` and `domain` to
+`"build_review"`; do not add legacy `dispositions` or any other keys.
+
+`sourceOutcomes` contains one exact row with `sourceId`, `outcome`, `caseRef` for every and only the
+supplied `currentFindings` identifier. `outcome` is closed: `acted` | `deferred` | `rejected` | `merged` | `refuted`.
+Each `caseRef` is a provider-local reference to one canonical row in `cases`; it is not a durable id.
+Several source rows may reference one canonical case only when the judgement is that they are the same
+repair case.
+
+Each `cases` row has exactly `caseRef`, optional `existingCaseId`, `disposition`, `priority`,
+`rationale`, `confidence`, `effect`; a `refute` row additionally carries `refutation`:
+
+- `caseRef` is the provider-local reference used by source rows. `existingCaseId`, when supplied by
+  the engine in `priorCases`, may bind that existing case only.
+- `disposition` is closed: `act` | `defer` | `reject` | `refute`.
+- `priority` is closed: `critical` | `high` | `medium` | `low`.
+- `rationale` is bounded, evidence-grounded prose explaining the judgement, and `confidence` is
+  closed: `high` | `medium` | `low`.
+- An `act` effect is exactly `{ "kind": "action", "route": "build", "tasks": [{ "title": "..." }] }`.
+  It contains one or more concrete, ordered, file-scoped task titles.
+- A `defer` effect is exactly `{ "kind": "deferral", "title": "...", "body": "...",
+  "exclusionRationale": "..." }`. Its `exclusionRationale` explains why no current plan task admits
+  the work.
+- A `reject` effect is exactly `{ "kind": "none" }` and its rationale explains why the raw finding
+  is non-actionable under the supplied rubric and plan contract.
+- A `refute` row MUST bind an `existingCaseId` for an already attempted `act` case, use confidence
+  `high`, and use either `{ "kind": "none" }` or a complete deferral effect. Its `refutation` is
+  exactly `{ "claim": "...", "assertions": [...] }`; every assertion has `assertion`, a `refuted` or
+  `upheld` verdict, and evidence entries containing only `path` and `excerpt`. Evidence proves current
+  tree content: use no line numbers, hunks, commits, or SHAs. A case may be refuted once only; a later
+  attempt to refute the same case is rejected for human review.
+
+### Authority boundaries
+
+The provider must not mint durable case ids or effect ids. The engine validates the complete graph.
+The engine stamps durable ids, reconciles history, reserves and applies effects, publishes any work
+order, charges the kickback, and derives the effective route.
+
+Never omit, duplicate, or replace a supplied source outcome. A `merged` source is a trace outcome,
+not a case disposition; it still names its canonical `caseRef`. Never assert or create operator
+acceptance, and never treat an autonomous case outcome as accepted risk. Do not apply an effect,
+file an intake issue, navigate BUILD, charge a budget, or mutate durable state. Do not append to the
+approved plan. In this mode the only write is the schema-constrained `.pipeline/remediation.json`
+artifact.
 
 ## Practices
 
@@ -81,6 +165,13 @@ Dispatch the **`remediation-planner`** agent with the blocking gaps + their evid
 returns, per gap, a **disposition** and (for autonomous dispositions) concrete file-scoped **tasks**.
 Keep context tight: feed the agent the blocking gaps and their evidence, not the whole codebase.
 
+Pass each gap's **finding id exactly as the report writes it** — the `Finding` cell for an
+as-built `## Blocking Findings` row (`AB-1`), the `FR-N` (or criterion) row id for `prd-audit`.
+The engine matches the planner's returned ids against those parsed ids one-to-one and fails
+closed on a mismatch, so a returned entry keyed by the governing ADR slug instead of the finding
+id halts the run needs-human with an id-mismatch message that hides the disposition the planner
+actually chose.
+
 ### 3. Disposition Decision
 
 Each blocking gap or stall-question gets exactly one disposition. **HALT is reserved for
@@ -90,6 +181,7 @@ gap must be turned into concrete work:
 | Disposition | When | Daemon effect |
 |---|---|---|
 | `build` | impl / test bug with clear evidence (the fix is obvious from the gap); **implementation/test/documentation drift that preserves the approved architecture**; OR **stall-question is answerable from committed artifacts** | inject the emitted tasks → kick to **build**; for stall-questions, answer lives in `rationale`, `tasks: []` |
+| `existing-task` | a current `prd_audit` **FIXABLE** or as-built **REMEDIABLE** finding's remedy is admitted by an existing active-plan task's **Done when**; bind that disposition to the real active-plan task ID(s) | re-stage the bound task(s) → kick to **build**; no task is appended and no plan-growth allowance is spent. Never use it for a `build_stall` question or a finish failure. |
 | `acceptance_specs` | the gap exists because acceptance coverage is missing or too weak to pin the behavior | kick to **acceptance_specs** (regenerate failing specs), then build |
 | `architecture_review` | changing or clarifying **approved architecture** is required before the gap can be closed | kick to **architecture_review** |
 | `plan` | functionality that **is in scope** but the plan simply omitted or missed (a planning omission, not an architecture or design decision) | In a daemon run, a `plan` disposition is a terminal needs-human HALT and never re-plans. |
@@ -108,7 +200,7 @@ Judgment rules:
   The audit origin or finding id alone does not determine the route: an as-built architecture-review
   finding whose approved architecture remains applicable and authoritative routes to `build` when
   it is conforming implementation/test/documentation drift.
-- **HALT is the exception, not the default.** Only the two human categories above HALT. "I'm not sure
+- **HALT is the exception, not the default.** Only the three categories above HALT. "I'm not sure
   how to fix it" is not a HALT category — if the gap is an impl bug you can describe as a task, it is
   `build`.
 - A gap that is an `impl-gap` in the audit is almost always `build` (or `acceptance_specs` when the
@@ -210,8 +302,13 @@ The conductor reads this file to route, so the shape is exact:
 ```
 
 Field rules:
-- `id` — the blocking FR id (`FR-N`); for an as-built finding, the violated ADR id (its filename stem, e.g. `adr-2026-06-29-rate-limit-strategy`); for a finish test failure, `test:<failing file stem>` (e.g. `test:loop-intake`); for a `build_review` trigger gap, `build_review:<stem>` (e.g. `build_review:completeness`); for a stall-question, `stall:<slug>` where `<slug>` is a 1-3 word summary of the question topic (e.g. `stall:validation-layer`, `stall:acceptance-test-fidelity`).
-- `disposition` — one of `build` | `acceptance_specs` | `architecture_review` | `plan` | `publication` | `halt`.
+- `id` — the blocking FR id (`FR-N`). For a `prd_audit` report row where `PRD: none`, use that row's report criterion exactly as `S<story>.<ordinal>` (e.g. `S5.1`); real `FR-N` rows remain `FR-N`. For an as-built finding, use the violated ADR id (its filename stem, e.g. `adr-2026-06-29-rate-limit-strategy`); for a finish test failure, `test:<failing file stem>` (e.g. `test:loop-intake`); for a `build_review` trigger gap, `build_review:<stem>` (e.g. `build_review:completeness`); for a stall-question, `stall:<slug>` where `<slug>` is a 1-3 word summary of the question topic (e.g. `stall:validation-layer`, `stall:acceptance-test-fidelity`).
+- `disposition` — one of `build` | `existing-task` | `acceptance_specs` | `architecture_review` | `plan` | `publication` | `halt`.
+  Use `existing-task` only when a current `prd_audit` **FIXABLE** or as-built **REMEDIABLE** finding
+  is admitted by an existing active-plan task's **Done when**. It is never valid for a `build_stall`
+  question or a finish failure.
+  Its `tasks` must be non-empty bindings whose `id` values are real active-plan task IDs; it never
+  creates new remediation tasks.
   Use `publication` when the shipped code is already correct and the ONLY defect is in what the
   pull request *says* — a placeholder or wrong-template body, a stale title, a missing `Closes`
   reference, prose that describes a superseded approach. It routes to `finish`, which owns PR
@@ -220,8 +317,10 @@ Field rules:
   `publication` when any code, test, spec, or configuration must change — that is `build`.
 - `category` — **only** when `disposition == "halt"`: `architectural-clarity` | `product-scope` | `unanswerable` (stall-question only). Otherwise `null`.
 - `rationale` — one sentence citing the gap's `file:line` evidence and justifying the disposition. For a **stall-question with `disposition == "build"`**, the rationale contains the **answer to the question**, grounded in the committed artifacts that support it. A `plan` rationale must name the examined plan task IDs and why none admits the fix.
-- `tasks` — for a `publication` disposition, tasks are OPTIONAL and purely informational: the
-  `rationale` is the remedy, and nothing is ever appended to the plan (see §5). Otherwise:
+- `tasks` — for an `existing-task` disposition, tasks are required non-empty bindings to real
+  active-plan task IDs. For a `publication` disposition, tasks are OPTIONAL and purely
+  informational: the `rationale` is the remedy, and nothing is ever appended to the plan (see §5).
+  Otherwise:
   **required, non-empty** when `disposition == "build"` (and recommended for `acceptance_specs`/`plan`), EXCEPT for **stall-question answers**, which have `tasks: []` (no further work — the answer in `rationale` is the remedy). Each task is concrete and **file-scoped** (`file:line` + exactly what to change), drawn from the audit evidence. **`[]` for all `halt` dispositions.** A `build` disposition with empty `tasks` is invalid EXCEPT when the input is a `build_stall` stall-question.
 
 Emit one disposition per **blocking** gap. Non-blocking (`ALIGNED` / `ACCEPTED`) FRs are not included.
@@ -230,10 +329,11 @@ Emit one disposition per **blocking** gap. Non-blocking (`ALIGNED` / `ACCEPTED`)
 
 For `build`, `acceptance_specs`, `plan`, and `architecture_review` dispositions, the conductor engine appends each task to the `.docs/plans/{slug}.md` file as a task header for later execution. The append happens at the engine level after remediation completes.
 
-**`publication` and `halt` dispositions are excluded from the append.** `.docs/plans/{slug}.md` is a
-protected artifact; amending it from a step that is not authoring the plan raises
-"Protected artifact self-amendments detected". A PR-prose fix is not plan work, so the engine
-appends nothing for it and re-dispatches `finish` instead.
+**`existing-task`, `publication`, and `halt` dispositions are excluded from the append.**
+`.docs/plans/{slug}.md` is a protected artifact; amending it from a step that is not authoring the
+plan raises "Protected artifact self-amendments detected". An existing-task remedy reuses approved
+plan work, so it neither appends a task nor spends plan-growth allowance; a PR-prose fix is not plan
+work, so the engine appends nothing for it and re-dispatches `finish` instead.
 
 **Task ID Format:**
 - Task IDs must be non-empty and match the grammar: `[A-Za-z0-9._-]+` (alphanumeric, dots, underscores, hyphens)
@@ -284,6 +384,7 @@ Headers re-parse via the Task 18 grammar and must include:
 - [ ] A gap requiring another feature's sealed-artifact amendment routes to its owning DECIDE step,
       never to `build` or `acceptance_specs`
 - [ ] A `plan` rationale names the examined plan task IDs and why none admits the fix
-- [ ] `id` format correct: `FR-N`, `build_review:<stem>`, `test:<stem>`, `adr-<stem>`, or
-      `stall:<slug>`
+- [ ] `id` format correct: `prd_audit` rows with `PRD: none` use their report criterion exactly as
+      `S<story>.<ordinal>` (e.g. `S5.1`); real `FR-N` rows remain `FR-N`; other sources use
+      `build_review:<stem>`, `test:<stem>`, `adr-<stem>`, or `stall:<slug>`
 - [ ] Valid JSON written to `.pipeline/remediation.json` matching the contract exactly

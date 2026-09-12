@@ -28,6 +28,9 @@ fails ~often on refactors and relocations because its revert-preflight classific
    `test-quality`, **enabled: false by default**. The engine dispatches only enabled members; an
    enabled gate with zero enabled members yields a PASS verdict with a `build_review_no_rubrics`
    reason on the spine and no grader dispatch. This replaces adr-2026-08-13's configuration-error rule.
+
+> **Amended 2026-09-10 by #1986:** membership also admits explicitly enabled project-declared custom rubrics through the effective catalog, under adr-2026-09-10-portable-build-review-policy D1/D7. The built-in member remains default-off; empty-container PASS, retired-key handling, and the prohibition on rubric-driven plan growth remain unchanged.
+
 2. **Retired rubric keys** (`scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`,
    `wiring`) stay on the accepted-key list and are ignored with a one-time `config_deprecated_key`
    warning naming the key and this ADR — the adr-2026-08-14 wiring precedent, extended. They are
@@ -42,12 +45,17 @@ fails ~often on refactors and relocations because its revert-preflight classific
    non-empty, and its classification is **evidence in the projection, never a finding**; the judge
    must cite a concrete stub-passable assertion to raise `test-insensitive`. Findings never append
    plan tasks; a FAIL kicks back to BUILD under the existing cumulative bound.
+> **Amended 2026-09-06 by #2231:** decision 3's changed-test intersection is refined by adr-2026-09-06-engine-owned-test-quality-scope decisions 2–7. Concrete shared setup/helper effects on opted-in tests can be uncertain candidates even when test bodies are unchanged. Production-only refactors without such evidence remain empty-scope PASS with no reviewer or preflight. A concrete unresolved candidate is not an established empty set: the existing reviewer may resolve its scope, and indeterminacy follows the cause-specific bounded recovery path. Missing tests/markers alone never require new tests or a waiver. Candidate-bearing review may use conservative file selectors for counterfactual evidence, distinct from final review targets.
+
 4. **Contracts preserved:** the engine-stamped `judged` envelope, the three-kind content-anchored
    reference schema (test-quality anchors are `content-region` references), stable finding identity
    and dispositions, the mechanical-fault lane, the fresh-base disposition, the cache key (now
    resolving `skills/build-review-test-quality/SKILL.md`), and the `beyond` record kind — retained
    as data for #1810, never produced by this rubric. Vocabularies are now per-registered-rubric;
    the four-rubric enumerations in the amended ADRs are narrowed to the registry, not re-cut by hand.
+
+> **Amended 2026-09-10 by #1986:** the built-in contract remains specialized. Custom members use a separate versioned finding contract and self-describing policy identity through all evidence, cache, disposition, and recovery consumers (adr-2026-09-10-portable-build-review-policy D6/D7); they do not broaden the test-quality vocabulary.
+
 5. S-tier: build_review runs for S exactly as for L (adr-2026-07-21 D4 holds); with the container
    empty it is a no-dispatch PASS at every tier.
 

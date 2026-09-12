@@ -38,11 +38,10 @@ const READY_STATE: ConductState = {
 const BUILD_ONLY_READY_STATE: ConductState = {
   ...READY_STATE,
   build_review: 'done',
-  wiring_check: 'done',
+  test_suite: 'done',
   manual_test: 'done',
   prd_audit: 'done',
   architecture_review_as_built: 'done',
-  retro: 'done',
   rebase: 'done',
   finish: 'done',
   feature_desc: 'token-injection',

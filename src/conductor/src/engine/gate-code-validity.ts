@@ -10,9 +10,20 @@
 // since. Nothing calls `gateVerdictStillValid` yet — later tasks (5, 6, 7)
 // wire it into the completion predicates.
 
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { StepName } from '../types/index.js';
+import type { HarnessConfig } from '../types/config.js';
+import {
+  ARCHITECTURE_REVIEW_AS_BUILT_CODE_STAMP,
+  MANUAL_TEST_CODE_STAMP,
+  PRD_AUDIT_CODE_STAMP,
+} from './artifacts.js';
 import type { GitRunner } from './rebase.js';
 import { originDefaultBranch, changedPathsBetween } from './rebase.js';
 import { featureTestPaths, GATE_SURFACE, partitionDelta } from './gate-invalidation.js';
+import { resolveGateCodeValidityConfig } from './config.js';
+import { resolveThroughMap } from './rebase-translate.js';
 
 /** Minimal context the decision helper needs: an injected git runner rooted
  * at the project's working directory. Mirrors the `GitRunner` convention
@@ -24,6 +35,64 @@ export interface GateCodeValidityContext {
 }
 
 export type GateVerdictValidity = 'preserve' | 'rerun';
+
+/** The identity comparison result for a SHIP-tail verdict sidecar. */
+export type VerdictRunIdentity =
+  | { state: 'match'; runId: string }
+  | {
+      state: 'stale-run-identity';
+      expectedRunId: string;
+      foundRunId: string;
+    }
+  | { state: 'unstamped' };
+
+function verdictRunIdentitySidecar(gate: StepName): string | undefined {
+  switch (gate) {
+    case 'prd_audit':
+      return PRD_AUDIT_CODE_STAMP;
+    case 'architecture_review_as_built':
+      return ARCHITECTURE_REVIEW_AS_BUILT_CODE_STAMP;
+    case 'manual_test':
+      return MANUAL_TEST_CODE_STAMP;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Answers whether a SHIP-tail gate's verdict was produced by `expectedRunId`.
+ *
+ * A valid engine stamp is authoritative: a matching stamp is current and a
+ * different stamp is a typed stale identity. Missing, malformed, or legacy
+ * sidecars deliberately remain `unstamped`, so callers retain their existing
+ * mtime fallback unchanged.
+ */
+export async function verdictProducedByRun(
+  dir: string,
+  gate: StepName,
+  expectedRunId: string | undefined,
+  config?: Pick<HarnessConfig, 'gate_code_validity'>,
+): Promise<VerdictRunIdentity> {
+  if (!resolveGateCodeValidityConfig(config).enabled) return { state: 'unstamped' };
+  if (!expectedRunId) return { state: 'unstamped' };
+
+  const sidecar = verdictRunIdentitySidecar(gate);
+  if (!sidecar) return { state: 'unstamped' };
+
+  try {
+    const parsed: unknown = JSON.parse(await readFile(join(dir, sidecar), 'utf-8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { state: 'unstamped' };
+    }
+    const runId = (parsed as { runId?: unknown }).runId;
+    if (typeof runId !== 'string' || runId.length === 0) return { state: 'unstamped' };
+    return runId === expectedRunId
+      ? { state: 'match', runId }
+      : { state: 'stale-run-identity', expectedRunId, foundRunId: runId };
+  } catch {
+    return { state: 'unstamped' };
+  }
+}
 
 /**
  * Derive the feature's own claimed runtime surface `F` for `partitionDelta`:
@@ -69,6 +138,29 @@ async function deriveFeatureSurface(ctx: GateCodeValidityContext): Promise<strin
  *
  * An unknown `gate` (not in `GATE_SURFACE`) fails closed to `rerun`.
  */
+/**
+ * Resolve a stamped baseline through `.pipeline/rebase-rewrites.json` (written
+ * by the engine's own rebase step, see `rebase-translate.ts`). Returns the
+ * rewritten sha when the map knows the stamp, otherwise null. Missing or
+ * unreadable map → null (fail closed: nothing explains the orphan).
+ */
+async function translateThroughRebaseRewrites(
+  projectRoot: string,
+  codeStamp: string,
+): Promise<string | null> {
+  try {
+    const raw = await readFile(join(projectRoot, '.pipeline', 'rebase-rewrites.json'), 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const map = parsed as Record<string, unknown>;
+    const hit = map[codeStamp];
+    if (typeof hit !== 'string' || hit.length === 0 || hit === codeStamp) return null;
+    return resolveThroughMap(codeStamp, map as Record<string, string>);
+  } catch {
+    return null;
+  }
+}
+
 export async function gateVerdictStillValid(
   ctx: GateCodeValidityContext,
   gate: string,
@@ -80,9 +172,25 @@ export async function gateVerdictStillValid(
   if (!surface) return 'rerun';
 
   const ancestry = await ctx.git(['merge-base', '--is-ancestor', codeStamp, 'HEAD']);
-  if (ancestry.exitCode !== 0) return 'rerun';
+  let diffRange = `${codeStamp}..HEAD`;
+  if (ancestry.exitCode !== 0) {
+    // The stamped baseline is not in the current history. That is the #766
+    // fail-closed case (an amend/reset orphaned it) UNLESS the engine's own
+    // `rebase` step rewrote it: `.pipeline/rebase-rewrites.json` records every
+    // old→new sha the play-forward produced. A stamp that translates to a
+    // reachable rewritten commit is the same reviewed content replayed onto a
+    // new base, so the verdict is judged on the tree delta between the
+    // stamped tree and HEAD (which surfaces the base's own changes as foreign
+    // paths for the partition below). Anything the map cannot explain stays
+    // fail-closed.
+    const translated = await translateThroughRebaseRewrites(ctx.projectRoot, codeStamp);
+    if (translated === null) return 'rerun';
+    const translatedAncestry = await ctx.git(['merge-base', '--is-ancestor', translated, 'HEAD']);
+    if (translatedAncestry.exitCode !== 0) return 'rerun';
+    diffRange = `${codeStamp} HEAD`;
+  }
 
-  const diffResult = await ctx.git(['diff', '--name-only', `${codeStamp}..HEAD`]);
+  const diffResult = await ctx.git(['diff', '--name-only', ...diffRange.split(' ')]);
   if (diffResult.exitCode !== 0) return 'rerun';
 
   const delta = diffResult.stdout

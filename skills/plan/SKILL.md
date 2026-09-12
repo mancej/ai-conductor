@@ -1,7 +1,7 @@
 ---
 name: plan
 implicit_invocation: required
-description: "Use after stories are written and conflict-check has passed clean. Converts user stories into a step-by-step implementation plan with 2-5 minute task granularity."
+description: "Use only within active engineer/conduct DECIDE after accepted stories and a clean conflict-check, when a committed `.docs/plans` implementation artifact is required. Do not invoke for conversational planning, implementation checklists, or direct coding requests."
 enforcement: gating
 phase: decide
 standalone: false
@@ -116,9 +116,8 @@ mark a removal task `Verify-only:` merely to document that absence.
 5. Commit with message: "[descriptive message]"
 
 **Done when:**
-- [2-5 enumerated, falsifiable checks — see 3d. Each is a definite yes/no a
-  zero-context reviewer can evaluate: a named test that passes, a command and
-  its expected output, a concrete property of the diff.]
+- [Falsifiable check naming the mechanism and observable assertion — see 3c and 3d.]
+- [Second falsifiable check; use 2-5 checks, each on one physical line.]
 
 **Files likely touched:**
 - [file path] — [what changes]
@@ -212,6 +211,29 @@ without appealing to an ideal. Name the test and what it asserts, the command an
 output, or the concrete diff property. "The guard is robust" is not a check; "the guard rejects the
 three drift fixtures listed in Steps and exits non-zero" is.
 
+Each check must be verifiable against a **named mechanism** — the function, file, gate, or state
+transition whose existence or behavior it asserts. State what that mechanism does to produce the
+mapped acceptance criterion's Then-clause; paraphrasing the Then-clause alone does not establish
+delivery. For example: "the artifact admission gate returns a rejection for an unsigned artifact
+before persistence, as asserted by the unsigned-artifact test." A test name alone is insufficient:
+name the behavior it verifies. Existing mechanisms remain valid for `Verify-only:` tasks, and internal
+tasks retain the lower-layer scope allowed by §3d.
+
+For a preserved/default-mode behavior, make the relevant checks bound any new side effects on that
+path to their intended conditions. For a closed result/state/reason set, ensure the checks can
+represent each required scenario's actual outcome, including required absence or no-op cases. An
+existing value may cover several scenarios when its meaning fits; do not invent extra states or
+broaden the accepted criteria to fill a speculative case. Resolve any conflict with an approved
+decision during DECIDE rather than leaving BUILD to widen the set or choose which promise wins.
+
+When a check uses normalized inputs or an enumerated subset, name the owning check that establishes
+how source data reaches that representation and how the enumeration covers the criterion's scope.
+An invalid-input fixture or a self-consistent subset alone does not prove that boundary. Reuse a
+sibling task's proof when it owns the boundary; do not add duplicate integration tasks.
+
+Keep each `Done when:` bullet on one physical line. A wrapped continuation ends the parsed block,
+so later checks can disappear from the land-time count and quoted evidence can lose its grounding.
+
 **Unbounded quality words are banned unless immediately closed.** An outcome stated as
 "fail-closed", "comprehensive", "robust", "hardened", "both directions", or any similar unbounded
 property MUST be followed in the same block by either the closed enumeration of cases it means, or
@@ -231,13 +253,32 @@ Do not restate Steps or duplicate story acceptance criteria; the block states th
 state, not the route there. For a `Verify-only:` task the block names what the verification must
 observe.
 
+### 3d. Cross-Boundary Integration Ownership (REQUIRED WHEN APPLICABLE)
+
+For each new or changed behavior that crosses a production boundary, assign exactly one task to own
+the integration proof. That task's `Done when:` must state the observable behavior through an
+appropriate project entry point: for example, a public API or route, CLI, job or worker, event
+consumer, framework hook, application-service boundary, or the project's equivalent. A direct unit
+test of a new helper proves the helper works; it does not prove the application reaches it.
+
+This rule follows behavior, not file type. Do not force an entry-point test onto every task that
+touches non-test code: an internal helper, type-only edit, or refactor can remain unit-scoped when a
+sibling task owns the boundary integration. At Medium/Large tier, derive the owning tasks from the
+approved architecture's `## Wiring Surface`; at Small tier, identify any changed production boundary
+directly from the scoped behavior. Name stable observable behavior, not a `file:line` or private
+caller that will drift under refactoring.
+
 ### 4. Task Ordering Rules
 
 1. **Infrastructure first** — Database migrations, model definitions, route setup
 2. **Happy paths before negative paths** — Build the working flow, then test failure modes
 3. **Negative paths are explicit tasks** — Each negative path scenario gets its own task, not a "clean up error handling" catch-all
 4. **Integration points identified** — Mark tasks where components connect for the first time
-5. **Dependencies declared** — If Task 5 requires Task 3's model, say so
+5. **Dependencies declared** — If Task 5 requires Task 3's model, say so. Declare only genuine
+   dependencies and keep each task's `**Files likely touched:**` to the files it actually changes:
+   BUILD schedules by ready frontier and fans out independent tasks concurrently, so a dependency
+   that is merely narrative order, or a file set padded beyond the task's real reach, serializes
+   work that could have been delivered in parallel
 
 ### 5. Plan Format
 
@@ -314,12 +355,17 @@ the shape of the work before reading individual tasks.]
 ## Integration Points
 - After Task [N]: [What can be tested end-to-end at this point]
 
+## Architecture Obligation Coverage
+[Required only when the current spec change set contains a non-deleted land-accepted ADR (`APPROVED`
+or `SUPERSEDED`) with citable
+decisions. Use the exact table contract from Section 7.]
+
 ## Verification
 - [ ] All happy path criteria covered by at least one task
 - [ ] All negative path criteria covered by at least one task
 - [ ] No task exceeds 5 minutes of work
 - [ ] Every task has a `Done when:` block of falsifiable checks; no unbounded quality word is left
-      without its closed enumeration or named mechanism (3d)
+      without its closed enumeration or named mechanism (3c)
 - [ ] Dependencies are explicit and acyclic
 ```
 
@@ -356,9 +402,12 @@ After generating tasks, check the total count:
 |---|---|
 | 1-20 | Normal — proceed |
 | 21-40 | Warning — surface to user: "This plan has N tasks (~X hours). Consider splitting into multiple features." |
-| 41+ | Hard stop — this is likely multiple features bundled together. Break into separately plannable features and run `/stories` + `/plan` for each. |
+| 41+ | Hard stop — refused when the spec is landed unless the plan carries an authorized scope exception. Break into separately plannable features and run the stories and plan steps for each. |
 
-If the user explicitly confirms a large plan, proceed — but record the decision in `.memory/decisions/`.
+The only exception for a plan with 41 or more tasks is exactly one
+`**Scope-exception:** <non-empty rationale>` declaration on one physical line in the plan. A
+missing, empty, or duplicate declaration is rejected when the spec is landed; a valid rationale is
+the recorded authorization for the oversized plan.
 
 ### 7. Coverage Check
 
@@ -369,13 +418,47 @@ After generating the plan, cross-reference:
 - If any criterion is uncovered, add a task
 - Present the coverage mapping to the user
 
+Record the mapping in a `## Coverage Check` table. At every tier, use one four-cell
+criterion row per extracted criterion; Tier S is required to carry this table because
+it has no coherence artifact carrier. The Criterion cell is the exact extracted text
+(`Story <id> happy|negative: Given …, when …, then …`), not a paraphrase. The quote
+must be taken from one cited task's `Done when` block, and the disposition is
+`diff-local` unless a waiver is required.
+
+| Criterion | Task id(s) | Done when quote | Disposition |
+| --- | --- | --- | --- |
+| Story 2 happy: Given …, when …, then … | 4 | "the required completion check" | diff-local |
+
+**GATE: Every citable decision in each non-deleted land-accepted ADR (`APPROVED` or `SUPERSEDED`) in
+the current spec change set must have exactly one row in `## Architecture Obligation Coverage`.** Use
+this table:
+
+```markdown
+| Decision | Disposition | Task(s) | Evidence |
+| --- | --- | --- | --- |
+| adr-<stem>#D<n> | task | task-<id>[, task-<id>] | <exact fragment from a cited task's Done-when block> |
+| adr-<stem>#D<n> | existing | none | <specific existing implementation evidence> |
+| adr-<stem>#D<n> | no-change | none | <why this decision imposes no implementation change> |
+```
+
+`task` is for implementation work and must cite real task ids plus an exact Done-when fragment.
+`existing` is for a decision already satisfied by the codebase. `no-change` is for a constraint or
+recorded choice that requires no implementation change in this feature. The latter two cite no task
+and require concrete evidence; they are not escape hatches for undecided work.
+
+The land-time coherence machinery enumerates the ADR decisions and rejects missing, duplicate, or
+invented rows, invalid dispositions, nonexistent task ids, and task evidence absent from the cited
+Done-when block. `/coherence-check` independently judges whether the cited task or existing/no-change
+evidence actually satisfies the decision; deterministic validation establishes bookkeeping, not
+semantic truth.
+
 ### 8. Save and Suggest
 
 Save the plan to `.docs/plans/YYYY-MM-DD-<feature>.md`
 
 ### 8a. Advisory Overlap Scan
 
-Before the plan is committed, run `conduct-ts overlap-scan --files <comma-separated Files set>` over
+Before the plan is committed, run `ai-conductor overlap-scan --files <comma-separated Files set>` over
 the union of every task's `**Files:**` paths (add `--source-ref
 <issue ref>` when the feature's originating issue/intake ref is known). Surface the
 rendered report to the author as-is.
@@ -389,7 +472,7 @@ plan regardless of what the scan reports.
 Before committing the plan, run:
 
 ```bash
-conduct-ts plan-protected-targets .docs/plans/<feature>.md
+ai-conductor plan-protected-targets .docs/plans/<feature>.md
 ```
 
 This check is **blocking**. It must report no task/path violations before the plan is saved or
@@ -413,19 +496,25 @@ any code is written. The full flow from here is:
   → /architecture-diagram (generate/update current-state diagrams)
   → /architecture-review (feasibility, alignment, risks — consumes diagrams, may BLOCK)
   → /writing-system-tests (failing acceptance specs from stories)
-  → /pipeline or /tdd (implement until all tests pass)
+  → /pipeline or /tdd (implement and verify affected tests; `test_suite` owns configured suite verification)
 ```
 
 ## Verification
 
 - [ ] Preconditions validated (stories exist, both paths, conflict-check clean)
 - [ ] Every acceptance criterion maps to at least one task
+- [ ] Every citable decision in each non-deleted land-accepted ADR in the current change set has one
+      mechanically valid Architecture Obligation Coverage row
+- [ ] Every changed cross-boundary behavior has exactly one integration-owning task whose `Done
+      when:` states observable behavior through an appropriate project entry point
 - [ ] Negative paths are explicit tasks (not grouped into catch-alls)
 - [ ] The plan has no terminal catch-all task that re-validates the completed feature
 - [ ] Tasks are 2-5 minute granularity
 - [ ] Each task has specific test and implementation descriptions
+- [ ] Every `Done when:` check names a mechanism and its observable assertion, rather than merely
+      restating the mapped criterion; each bullet occupies one physical line
 - [ ] Dependencies are declared and acyclic
-- [ ] `conduct-ts plan-protected-targets .docs/plans/<feature>.md` passes with no task/path
+- [ ] `ai-conductor plan-protected-targets .docs/plans/<feature>.md` passes with no task/path
       violations; no task targets another feature's sealed artifact
 - [ ] Plan saved to `.docs/plans/`
 - [ ] Coverage mapping presented to user

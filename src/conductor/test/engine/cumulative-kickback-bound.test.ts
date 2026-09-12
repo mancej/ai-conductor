@@ -10,7 +10,7 @@ import { coordinateBuildReviewRubrics, type BuildReviewCoordination } from '../.
 import { parseBuildReviewLapId } from '../../src/engine/build-review-domain.js';
 import type { BuildReviewFrozenInputs } from '../../src/engine/build-review-inputs.js';
 import { HALT_MARKER } from '../../src/engine/halt-marker.js';
-import { readKickbackLedger, writeKickbackLedger } from '../../src/engine/kickback-ledger.js';
+import { readKickbackLedger } from '../../src/engine/kickback-ledger.js';
 import { resolveBuildReviewConfig } from '../../src/engine/resolved-config.js';
 import { DefaultStepRunner } from '../../src/engine/step-runners.js';
 import { writeState } from '../../src/engine/state.js';
@@ -64,7 +64,7 @@ describe('cumulative build-review kickback bound', () => {
         worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
         conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
         architecture_review: 'skipped', acceptance_specs: 'skipped',
-        wiring_check: 'skipped', test_suite: 'done',
+        test_suite: 'done',
       });
 
       const runner: StepRunner = {
@@ -179,8 +179,8 @@ describe('cumulative build-review kickback bound', () => {
         ok: true,
         feature: { version: 'v1', repository: dir, feature: 'cumulative-kickback-bound' },
         effective: {
-          rawVerdict: 'FAIL', verdict: 'FAIL', acceptedFindingIds: [], unresolvedFindingIds: [],
-          skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'],
+          rawVerdict: 'FAIL', verdict: 'FAIL', acceptedFindingIds: [], unresolvedFindingIds: [], suppressedFindingIds: [],
+          skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'], uncoveredInfrastructureFailureRubrics: ['testQuality'],
         },
       }),
       buildReviewArtifactReader: async (_root, rubric, lapId, snapshotDigest, _fs) => ({
@@ -220,7 +220,7 @@ describe('cumulative build-review kickback bound', () => {
       worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
       conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
       architecture_review: 'skipped', acceptance_specs: 'skipped',
-      wiring_check: 'skipped', test_suite: 'done',
+      test_suite: 'done',
     });
     let mixedBuildReviewRuns = 0;
     await new Conductor({
@@ -236,15 +236,20 @@ describe('cumulative build-review kickback bound', () => {
       buildReviewEffectiveResolver: async () => ({
         ok: true,
         effective: {
-          rawVerdict: 'FAIL', verdict: 'FAIL', acceptedFindingIds: [], unresolvedFindingIds: [],
-          skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'],
+          rawVerdict: 'FAIL', verdict: 'FAIL', acceptedFindingIds: [], unresolvedFindingIds: [], suppressedFindingIds: [],
+          skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'], uncoveredInfrastructureFailureRubrics: ['testQuality'],
         },
       }),
       stepRunner: {
         run: async (step: string) => {
           if (step === 'build_review') {
             mixedBuildReviewRuns += 1;
-            return runRubricLap('mixed-lap');
+            // Stamp the REAL HEAD: a FAIL aggregate from a prior lap is
+            // discarded at the kickback read instead of driving a kickback,
+            // so a fabricated lap id would never reach the charge under test.
+            return runRubricLap(
+              execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir }).toString().trim(),
+            );
           }
           if (step === 'build') throw new Error('stop after mixed lap kickback');
           return { success: true };
@@ -285,3 +290,5 @@ describe('cumulative build-review kickback bound', () => {
     });
   });
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

@@ -22,14 +22,13 @@ A gate is a check that can block progression. Every step passes through two of t
    An agent cannot declare its own step complete; see [evidence model](evidence-model.md).
 
 A step that never ran still leaves a verdict. When the engine resolves a verdict-bearing step by *skipping*
-it — complexity tier, work track, bootstrap mode, an upstream skip, `disable: true`, a false `when:`, the
-daemon's in-loop `retro` skip, or an advisory step that failed and was auto-skipped in auto mode — it writes
+it — complexity tier, work track, bootstrap mode, an upstream skip, `disable: true`, a false `when:`, or an
+advisory step that failed and was auto-skipped in auto mode — it writes
 `{"satisfied": true, "reason": "skipped: <cause>"}` to `.pipeline/gates/<step>.json`. Satisfaction is
 unchanged (the selector has always treated a skipped gate as satisfied); what changes is that the skip is
 *recorded*. Before this, a skipped gate left no verdict file at all and the selector fell back to the step's
-own status flag, so `retro` — advisory, tier-S-skippable, and skipped on every daemon run — could reach a
-resolved state with no verdict anywhere in the audit record. Read the `skipped: ` prefix as "this gate was
-deliberately not run", never as "this gate's evidence passed".
+own status flag. Read the `skipped: ` prefix as "this gate was deliberately not run", never as "this gate's
+evidence passed".
 
 Those two are orthogonal. Prerequisites answer *may this run yet*; completion answers *did it actually
 happen*. A step can pass the first and fail the second forever, which is exactly what a halt looks like.
@@ -47,8 +46,8 @@ Enforcement is a property of the step, not of the gate. It decides what happens 
 
 Read the levels as a statement about *who can decline the step*:
 
-- **Advisory** steps are useful, not load-bearing. Memory recall, exploration, architecture diagrams, retro.
-  If one fails unattended the run keeps going, because a missing retro should not strand a finished feature.
+- **Advisory** steps are useful, not load-bearing. Memory recall, exploration, and architecture diagrams.
+  If one fails unattended the run keeps going rather than stranding an otherwise valid feature.
 - **Gating** steps are the correctness contract. A failure means the thing being gated is not true yet, so
   the run stops rather than proceeding on a false premise. The interactive recovery menu drops the `skip`
   option for these — you can retry, fix interactively, go back, or quit, but you cannot wave one through.
@@ -70,7 +69,7 @@ different times against different evidence.
 | --- | --- | --- | --- |
 | prerequisite | before every step | that step | 1 (universal) |
 | per-step completion | after a step runs, and whenever the loop re-scores it | that step, and the loop | 12 |
-| land-time | when a spec PR is landed | the spec, before anything is built | 9 |
+| land-time | when a spec PR is landed | the spec, before anything is built | 10 |
 | self-host | before the finish step, only when the harness is building itself | the PR | 6 |
 | hook | at the moment of a tool call | the individual edit, command, or dispatch | see [settings and hooks](../reference/settings-and-hooks.md) |
 
@@ -97,6 +96,10 @@ the grader judges the branch diff rather than commit messages. The rubric projec
 reference — per-file paths, change kinds, and hunk line ranges anchored to the merge base — and the grader
 session, running inside the feature worktree, reads the referenced file contents and per-path diffs itself
 instead of receiving the raw diff text inline.
+
+The advisory remains in the warning log and step output on every lap. On a failing lap it follows the review's
+own reason, so the failure and retry lines name the actual review failure; on a passing lap it precedes the
+review output.
 
 ### Declared pattern replication check
 
@@ -125,15 +128,13 @@ verdict layer, so they can be strict without disturbing the linear walk.
 | `build` | tasks reported complete without work — task rows are re-seeded and re-derived from the plan each evaluation, so a forged row fails; a task carrying `Done when:` checks additionally must show each check true before it closes, and a check the approved plan cannot make true is reported as a plan gap rather than repaired off-plan |
 | `acceptance_specs` | acceptance specs that never ran — proof is required that this feature's specs executed *and failed*, so a collection error or a skipped spec cannot pass for RED |
 | `build_review` | an incomplete build — a container of individually opt-in rubrics (currently only `testQuality`, off by default) judged from the diff rather than self-reports; an empty rubric set is a PASS with nothing dispatched |
-| `wiring_check` | no active check — a deprecated compatibility step retained so existing state, config, and prerequisites continue to resolve |
 | `test_suite` | a stale green — the fingerprint is re-inspected every time, so the evidence file's existence can never satisfy it |
 | `manual_test` | a whitewashed retest — after a recorded FAIL, HEAD must have moved before an all-PASS attempt is accepted |
-| `prd_audit` | a partial audit report passing as complete — exactly one graded verdict row (`PASS`, `FIXABLE`, `PLAN_GAP`, or `OVER_SCOPE`) is required for every acceptance criterion across the feature's stories; a missing row, an invalid grade, or a `FIXABLE` naming no plan task blocks. Only the `## Verdict Table` section's rows count as verdicts, so a prior-cycle history table cannot block an all-`PASS` audit. An unresolvable or unreadable criterion set also blocks fail-closed |
+| `prd_audit` | a partial or malformed audit report passing as complete — exactly one graded verdict row (`PASS`, `FIXABLE`, `PLAN_GAP`, or `OVER_SCOPE`) is required for every acceptance criterion across the feature's stories; a `FIXABLE` naming no plan task blocks. A cited `Plan task` is resolved against the ids the active plan actually declares — an id the plan does not carry is rejected by name, and a report whose active plan cannot be resolved at all is rejected fail-closed rather than having its citations taken on trust. A finding without an owning criterion is a unique `NC.<n>` `OVER_SCOPE` row in `## Findings without an owning criterion`; its visible-scope operator decision is valid only for the same evidence summary. Invalid or duplicate rows are rejected individually while valid siblings remain routable, but any rejected row blocks with its diagnostic. Only the `## Verdict Table` section's story rows count as verdicts, so a prior-cycle history table cannot block an all-`PASS` audit. An unresolvable or unreadable criterion set also blocks fail-closed |
 | `architecture_review_as_built` | an unrecognized verdict passing by default — only an explicit approval verdict satisfies it |
-| `retro` | a retro from a different feature or a prior session counting for this one |
 | `finish` | a publication outcome that was never coherently recorded — `.pipeline/finish-choice` is the final record, not the source of interactive intent; a `pr` outcome additionally requires the recorded PR identity and verified publication evidence |
 | `finish` (release readiness) | a configured release-disposition result that is missing, stale, malformed, or unreadable — FINISH reports the exact typed condition before dispatching prose authoring or judgment, or making a publication mutation |
-| `finish` (prose authorship) | a retained PR whose body is still the engine-seeded placeholder — the coordinator dispatches its `author_pr_prose` pass (with the branch diff and the feature's spec artifacts) and accepts it only when re-observation shows the placeholder classification gone. The judgment pass is therefore never handed an unauthored body, and no prose defect commits the shipped record, so a prose halt stays re-dispatchable |
+| `finish` (prose authorship) | a retained PR whose body is still the engine-seeded placeholder, or whose exact authored revision received a persisted `revision_required` judgment — the coordinator dispatches its `author_pr_prose` pass with the branch diff and feature artifacts; a judged-deficient revision also carries the concrete objection into that pass. It accepts the pass only when fresh observation selects the next valid publication transition. The judgment pass is therefore never handed unauthored prose, and a prose defect neither commits the shipped record nor deadlocks the author→judge revision lap |
 | `finish` (presentation) | a PR shipping with halt boilerplate or an engine-generated floor body (the body-floor marker plus floor content — a marker an authoring pass left behind on real prose does not count) — either classification keeps a bounded prose pass required and prevents the final outcome record. Every completion-gate refusal in this class is classified `missing: 'presentation'`, which routes the loop back into `finish` for a body rewrite rather than into `/remediate` or `build`; that re-dispatch is bounded to one attempt per `pr_url` (recorded in `.pipeline/pr-body-regen-attempt.json`), after which the engine's deterministic body floor runs as a last resort so the feature still converges. A reused halt PR's *presentation* is repaired earlier still — whenever the retained SHIP PR identity is resolved (SHIP-phase adoption, the pre-finish snapshot, or the finish-time restore), so SHIP steps that run before `finish` do not read a `needs-remediation` placeholder; a lighter clear additionally runs once at the start of every dispatch regardless of phase, so a resumed `BUILD` step is not left holding the placeholder either; the draft→ready flip stays finish-only |
 
 Within `build_review`, `testQuality`'s revert-and-rerun preflight runs only when the rubric is opted in
@@ -142,8 +143,9 @@ counterfactual is classified solely by the scoped command's exit code; the engin
 runner-specific output. Exit code zero stays green and every nonzero exit is counterfactual RED. Only
 launch, timeout, and signal are scoped-run infrastructure outcomes. The preflight is evidence the judge
 may cite, never a finding by itself — a test that stays green under revert is not automatically a
-failure. A scoped-run infrastructure failure carries a bounded output excerpt on the existing
-`.pipeline/events.jsonl` event spine.
+failure. A preflight infrastructure failure carries its bounded diagnostic excerpt on the existing
+`.pipeline/events.jsonl` event spine and in the `build_review` aggregate, so a materialization or
+scoped-run failure remains diagnosable after the mechanical allowance is exhausted.
 
 Each predicate's exact file, format, and failure text is in [artifacts](../reference/artifacts.md).
 
@@ -168,15 +170,13 @@ the ordinary fast path for a current proof.
 
 ### BUILD-verification round authority
 
-`wiring_check` and `test_suite` remain the BUILD-verification group for topology compatibility.
-`wiring_check` is a deprecated no-op; only `test_suite` performs an active verification. After BUILD
-is repaired, the next round re-dispatches every non-skipped member; a satisfied gate verdict on disk
-never skips a member by itself. The group's current join is the sole authority that marks a member
-satisfied for that round.
+`test_suite` is the sole BUILD verifier. After BUILD is repaired, it re-inspects the current suite
+evidence; a satisfied gate verdict on disk never skips that verification by itself. Its current
+result is the sole authority that marks the verifier satisfied for that round.
 
 ### Land-time gates
 
-These run when the engineer loop lands a spec branch, outside the step loop. They protect the base branch
+These run when the composer loop lands a spec branch, outside the step loop. They protect the base branch
 from specs that would waste a build.
 
 | Gate | Refuses |
@@ -188,23 +188,34 @@ from specs that would waste a build.
 | tier agreement | a declared complexity tier that disagrees with the artifacts present |
 | coherence | a traceability record that does not connect outcomes, requirements, accepted ADRs, stories, and tasks, or stories that do not tie out to the PRD |
 | mermaid render | a diagram that does not render — previously prose guidance, now enforced |
+| diagram presence | a non-Small architecture artifact with no fenced Mermaid block |
 | protected-target plan | a task that directs BUILD to amend another feature's sealed DECIDE artifact |
 | plan completion checks | a task with no `Done when:` block, a blank check, fewer than two checks, or more than five checks; fenced-code examples are ignored |
+| plan task count | a plan with 41 or more parsed tasks unless it has exactly one `**Scope-exception:**` declaration with a non-empty rationale; 21–40 tasks are a plan-authoring warning, not a land refusal |
+| architecture obligation coverage | a decision in a changed land-accepted ADR (`APPROVED` or `SUPERSEDED`) with no unique disposition, an invented decision, an invalid disposition, a nonexistent task, or task evidence absent from the cited task's `Done when:` block |
 
-Before land, plan authoring runs `conduct-ts plan-protected-targets <plan-path>`. It is a blocking,
+Before land, plan authoring runs `ai-conductor plan-protected-targets <plan-path>`. It is a blocking,
 read-only check that reports every offending task/path pair. Land repeats the same judgment against
 the plan being landed, so a plan cannot bypass the rule by skipping the authoring command. Both gates
 apply at every tier and judge only the current plan, not historical plans already merged.
 
-The coherence gate is itself layered. It disengages entirely at tier S, and it does not apply retroactively:
-a change set with no coherence artifact path in it is treated as a legacy change, not a violation. Once
-engaged, the story, criterion, orphan-task, and coverage-table layers are always required; the
-functional-requirement layer only on the product track; the outcome layer only when outcomes exist; and
-the ADR layer whenever the current spec change set contains a `.docs/decisions/adr-*` path, including a
-deletion. The ADR row pool itself contains only non-deleted ADRs, so a deletion-only change engages the
-layer but passes with no ADR row. It aggregates every waivable gap rather than stopping at the first, and
-reports them as one error. Already-landed specs whose coherence artifacts predate criterion rows remain
-valid for daemon discovery and BUILD. See [engineer loop](../guides/engineer-loop.md).
+The coherence gate is itself layered. Tier S always engages its criterion layer, carried directly in the
+plan. At other tiers, a change set with no coherence artifact path is treated as a legacy change rather
+than a violation. Once engaged, the story, criterion, orphan-task, and coverage-table layers are always
+required; the functional-requirement layer only on the product track; the outcome layer only when outcomes
+exist; and the ADR layer whenever the current spec change set contains a `.docs/decisions/adr-*` path,
+including a deletion. The ADR row pool itself contains only non-deleted ADRs, so a deletion-only change
+engages the layer but passes with no ADR row. It aggregates every waivable gap rather than stopping at the
+first, and reports them as one error. Already-landed specs whose coherence artifacts predate criterion
+rows remain valid for daemon discovery and BUILD. See [composer loop](../guides/engineer-loop.md).
+
+When that ADR pool contains citable decisions, the plan must also carry an `## Architecture Obligation
+Coverage` table with exactly one row per `<adr-stem>#D<n>`. A row dispositions the decision to real plan
+tasks, existing implementation, or no implementation change. The engine validates complete and unique
+decision coverage, the closed disposition vocabulary, real task ids, and an exact evidence fragment from
+a cited task's `Done when:` block. Missing or malformed bookkeeping is non-waivable. The subsequent
+`coherence-check` judgement decides whether the mapped task or existing/no-change evidence actually
+satisfies the decision; the engine does not derive that semantic answer from matching text.
 
 The criterion layer requires exactly one row for every happy- and negative-path criterion extracted from
 the stories artifact. Each row must mark the criterion `covered`, cite an existing plan task, quote an
@@ -215,6 +226,11 @@ that disposition; it does not infer locality from the criterion's prose. Omitted
 non-covered, ungrounded, and missing-disposition rows are also coverage gaps. A malformed criterion row or
 a stories artifact with no parseable criteria is defective evidence and fails before waiver evaluation.
 See [artifacts](../reference/artifacts.md#coherence-mapping-shape) for the row format.
+
+Each task's leading `**Story:**` line cites its story with `story-N`, `Story N`, bare `N`, or `epic-N`;
+the cited id may include dots or hyphens. A task that cites no declared story is reported as an orphan. The
+failure names the unbindable id and these accepted spellings; a missing or empty reference line is reported
+as absent rather than assigned an invented id.
 
 The functional-requirement layer checks both directions, because coverage alone is only half of a tie-out.
 Forward, a PRD requirement no story cites — or whose only citing stories no task covers — is a gap.
@@ -250,8 +266,9 @@ Three specific forms this takes:
 - **Presence is never proof.** Several gates re-derive their answer even when a passing artifact is sitting
   right there, because the artifact could describe a previous state of the code.
 - **Freshness is part of the check.** A verdict must be newer than a floor — the current judging attempt
-  when there is one, otherwise the run's session start. Without the per-attempt floor, a review session that
-  failed to rewrite its verdict would silently re-score the previous session's answer forever. A small
+  when there is one, otherwise the run's session start. The SHIP-tail verdict gates additionally require an
+  engine-stamped dispatch `runId` when one is available; a mismatch is no verdict and retries rather than
+  routing the earlier report's findings. Unstamped legacy artifacts retain the mtime fallback. A small
   filesystem-clock tolerance applies to the attempt floor only.
 - **Undeterminable is a failure, not a pass.** When a gate cannot compute its input at all — an unresolvable
   plan among several, a change set git cannot produce, a scope it cannot bound — it blocks. It does not
@@ -278,7 +295,7 @@ unknown target or phase, or an unsatisfied or unverified DECIDE completion contr
 
 The policy fast-forwards without dispatch only when the DECIDE step is tier-skipped, has no completion
 contract, or has a verified satisfied contract. Otherwise an operator must create a matching
-[`decide-grant`](../reference/cli.md#conduct-ts-decide-grant); the grant authorizes one named step and
+[`decide-grant`](../reference/cli.md#ai-conductor-decide-grant); the grant authorizes one named step and
 is consumed immediately before that step dispatches. The grant is stored in the daemon-owned
 `.daemon/grants/<slug>.json`, outside every feature worktree, so a build agent cannot author its own
 authorization; a `decide-grant.json` inside `.pipeline/` authorizes nothing. `plan` is excluded
@@ -320,6 +337,26 @@ An ordinary `build` disposition must carry concrete tasks — a taskless `build`
 halts instead of dispatching an empty route to the builder. The one exception is a build-stall question:
 there the answer legitimately lives in the gap's `rationale` with `tasks: []`, so a taskless `build` is
 accepted only when the gap's source is a build-stall.
+
+For a `prd_audit` `FIXABLE` finding, the remediation disposition identifies the finding by its report
+criterion: a feature without a PRD uses `S<story>.<ordinal>` (for example, `S5.1`), while a PRD-backed
+finding may use its `FR-N` identity. The engine matches criterion keys case-insensitively when admitting
+the planner's task, so a case-only spelling difference cannot strand an otherwise authorized repair.
+An ID that matches neither an admitted criterion nor another authorized gate finding halts with the
+rejected IDs and the available admission keys rather than appending unbounded work.
+
+A sixth disposition, `existing-task`, covers a current `prd_audit` `FIXABLE` or as-built `REMEDIABLE`
+finding whose remedy an existing active-plan task's **Done when** already admits. The planner binds the
+gap to the real plan task id(s); the engine re-stages those rows to `pending` in
+`.pipeline/task-status.json` and kicks back to `build` without appending anything to the plan. It charges
+one lap under the owning gate's key (`gates.prd_audit` or `gates.architecture_review_as_built`) and never
+draws from the shared plan-growth allowance, so a lap-cap halt names `lap cap reached (n/n)` rather than
+the growth figures. A bound id absent from the active plan halts `needs-human` naming that id. The no-op
+escalation stays armed for every gate on the lap: each participating gate banks the pre-re-stage resolved
+count, so a BUILD that only re-completes the re-staged rows on a byte-identical tree is classified
+`no-work` and halts instead of admitting another lap. When the same validation-group round also carries a
+`manual_test` FAIL, the consolidated kickback owns the work order: the finding rides that single merged
+rewind, and the existing-task lap, pending-finding, and re-stage mechanics do not run.
 
 Remediation tasks must not order a regression. A task that removes, replaces, rewrites, or relaxes
 existing code, tests, or assertions has to name the completed plan task or story criterion whose
@@ -369,9 +406,18 @@ same-surface PASS survive re-dispatch. The stale condition is recorded on the ev
 `build_review_stale_aggregate` (telemetry only; never consulted for routing) and consumes no
 kickback budget.
 
+The same rule guards the daemon's post-retry kickback route. When `build_review` exhausts its
+retries, the daemon re-reads the raw verdict to build the kickback evidence; a stale-lap FAIL
+aggregate found there is discarded outright (the artifact is deleted, exactly like the stale-mirage
+disposition) and the run re-lands on `build_review` instead of kicking its prior-lap findings back
+to `build`. Without this, a stored `lapId` that never matches a moving HEAD replayed already-fixed
+findings as kickbacks indefinitely. The discard also emits `build_review_stale_aggregate`. A
+second stale-lap FAIL in the same run means the grader itself is stamping a prior lap, so the run
+halts `needs-human` instead of re-landing again.
+
 A below-cap mechanical (infrastructure) fault publishes no aggregate at all, so it cannot be stale
 by this check; the last such fault is instead recorded on the kickback ledger's `build_review` gate
-entry (`lastMechanicalFault`) and surfaces in `conduct-ts build-review findings` and in the
+entry (`lastMechanicalFault`) and surfaces in `ai-conductor build-review findings` and in the
 exhausted-mechanical-allowance HALT when the current lap has no readable diagnostic of its own — see
 [the runbook](../runbooks/stalled-or-stuck-feature.md#build_review-halted-on-an-exhausted-mechanical-fault-allowance).
 
@@ -421,8 +467,29 @@ complexity tier — the reachability sweep and the plan-gap check run at every t
 whenever approved ADRs exist; `diagramDrift` runs where diagrams exist — and each is
 operator-configurable per tier via `architecture_review_as_built.checks.<name>.tiers`. Its verdict is one
 of `APPROVED`, `PLAN_GAP`, or `BLOCKED` (FR-16): `PLAN_GAP` means the code faithfully implements the
-approved design and the design itself is the limit; it is recorded in the verdict and the shipped record
-and ships when acceptance criteria still pass, and halts when a stated outcome is not delivered.
+approved design and the design itself is the limit. The outcome it is judged against is the sealed
+story criteria under `.docs/stories/` — superseded `.docs/intake/` capture is never the authority — so
+the gap is recorded in the verdict and the shipped record and ships when those criteria are satisfied,
+and halts only when a sealed story criterion is unmet.
+
+A `BLOCKED` report must contain exactly one `## Blocking Findings` table with `Finding`, `Class`,
+`Governing clause`, and `Summary` columns. `Class` is either `REMEDIABLE` or `DESIGN`. Every
+`REMEDIABLE` row names an approved ADR decision (`<ADR filename stem> decision <number>`, where the word
+`decision` is optional) or a task in the feature's active plan; a missing or malformed table, class,
+clause, or row is invalid and halts for a human. Inline markdown emphasis around the clause — a
+backticked or bolded stem — is stripped before the clause is resolved, so `` `adr-x` + Decision 4 ``
+resolves exactly as `adr-x decision 4` does. A clause naming more than one reference
+(`Task 9 and Task 10`) remains unresolvable: cite one clause per row and split the finding.
+
+When every valid finding is `REMEDIABLE`, daemon runs with as-built remediation enabled can dispatch the
+bounded remediation route, append the authorized repair work, and re-stage BUILD. The route is bounded by
+`architecture_review_as_built.max_remediation_laps` and the shared plan-growth allowance; exhausting
+either produces a `kickback-cap` halt before another append. A `DESIGN` finding (including a mixed
+report) halts for a human decision and names each DESIGN finding with its governing clause. An all-
+`REMEDIABLE` report that cannot route halts `needs-human`, names whether remediation was disabled,
+the run was not a daemon, or the planner produced no usable plan, and lists every blocking finding.
+An invalid report halts with its parse fault. After a later successful as-built verdict, each remediated
+finding is retained in the verdict artifact and the shipped record.
 
 ### Per-task `Done when:` evidence
 
@@ -434,9 +501,10 @@ with no `Done when:` blocks — closes tasks on the prior evidence rule instead 
 ### Bounded plan growth
 
 The total number of tasks a plan can accumulate after approval is bounded by the authored count plus the
-capped `prd_audit` additions; no other gate appends tasks (FR-18). `conduct daemon status` prints a
-`PLAN GROWTH [<slug>]:` line per in-progress feature — authored count, added count broken down by gate,
-and tasks remaining under the cap (FR-19; see [`daemon status`](../reference/cli.md#daemon-status)).
+capped remediation additions from `prd_audit` and enabled as-built review remediation (FR-18). Each
+gate has its own remediation-lap cap, but both draw from the same plan-growth allowance. `ai-conductor daemon
+status` prints a `PLAN GROWTH [<slug>]:` line per in-progress feature — authored count, added count
+broken down by gate, and tasks remaining under the cap (FR-19; see [`daemon status`](../reference/cli.md#daemon-status)).
 
 The `build` rework hint for a `testQuality` FAIL carries best-effort `plan contract:` and
 `prior attempts:` pointer lines derived from the raw rubric aggregate — a `plan contract:` pointer names the
@@ -449,12 +517,18 @@ derivation is scoped to that rework hint; `/remediate` dispatches are triggered 
 as-built review, `finish` verification, and build stalls instead.
 
 Every exit from a `build_review` FAIL block consults the disposition store using the effective verdict, not
-only the raw aggregate that first reported the FAIL. An operator `conduct build-review accept` can land
+only the raw aggregate that first reported the FAIL. An operator `ai-conductor build-review accept` can land
 while the remediation planner is composing rework from that raw aggregate (a window of minutes); when
 every graded finding is accepted at routing time, the composed rework is dropped and `build_review`
 re-lands instead. Its re-run settles from cache, applies the dispositions, and re-dispatches only
 infrastructure-failed rubrics. Without this guard a kickback has ordered removal of exactly the surface
 the operator had just accepted.
+
+The cache identity also includes the judging engine (adr-2026-08-21): the engine's 12-hex content
+stamp and a `sha256:` digest of the rubric's installed `SKILL.md`. A cached judgement made under a
+different engine build or edited rubric skill text is discarded (miss reasons
+`engine-version-mismatch` / `skill-digest-mismatch`) and re-judged; each discard is a
+`build_review_cache_discarded` event in `events.jsonl`, the daemon log, and the audit trail.
 
 Each rubric has a closed engine-owned finding vocabulary, repeated in its provider-facing skill contract:
 `testQuality` uses `test-insensitive`. The parser normalizes harmless casing and underscore variation
@@ -482,6 +556,12 @@ still carries every appended remediation task, and a `rem-*` task's outcome is b
 and never enlarges any other task's outcome — remediation-lap products are inputs to converge on, never a
 surface that expands what a later lap must litigate.
 
+The graded diff also excludes paths touched only by feature commits Git identifies as patch-equivalent to
+commits already on the resolved review base. This is path-scoped and fail-closed: a path stays graded if a
+novel feature commit also touched it, or if the patch-equivalence probe or path attribution cannot establish
+the exclusion. The `build_review_base` event payload carries the filtered commit set and excluded paths,
+while the daemon log renders its filtered-commit count for the operator.
+
 When a deterministic BUILD verification gate — `test_suite` or any other gate in that group —
 fails, the engine accumulates the sanitized failure in `.pipeline/build-review-rebase-repairs.json`.
 The ledger is outside rewritten Git history, so repeated rebases retain earlier entries without
@@ -500,7 +580,7 @@ independently of `build_review` (`test-suite-remediation.ts` reads it during reb
 
 ### Operator-authorized protected-artifact reseals
 
-An [`conduct-ts reseal`](../reference/cli.md#conduct-ts-reseal) an operator runs mid-feature writes a new
+An [`ai-conductor reseal`](../reference/cli.md#ai-conductor-reseal) an operator runs mid-feature writes a new
 baseline at the current commit and appends a `rebaselines` entry to
 `.pipeline/protected-artifact-seal.json` recording the trigger (`operator-reseal`) and rationale, and a
 `protected_artifact_reseal` audit record with an `operator` origin — so the override is auditable rather
@@ -514,6 +594,31 @@ conformance.
 
 Kickback counting is untouched by the consolidation — a `build_review` FAIL routed to `build` counts
 against the per-gate cap like any other.
+
+### Post-join build-review adjudication
+
+For a current aggregate FAIL, the daemon normally runs one `remediate` judgement after the rubric
+join. The judgement receives the complete unresolved finding set and the feature's prior case history;
+it does not replace the raw verdict in `.pipeline/build-review.json` or the operator's exact-finding
+dispositions. `build_review.adjudication.enabled: false` retains the legacy raw-FAIL route.
+
+The engine validates the judgement as a complete source-to-case mapping, assigns durable case and
+effect identities, and records the feature-local state before applying an effect. An action publishes
+a durable BUILD work order and returns to `build`; a justified deferral files or reuses its marked
+intake issue; a rejection has no external effect. A `refute` row can instead settle an already attempted
+action case once: it must bind that case, carry high-confidence path/excerpt evidence and at least one
+refuted assertion, and changes the case to a resolved refutation without charging another BUILD route.
+It emits `remediation_case_refuted`. A refutation may retain only a complete deferral for a narrow
+remainder; the refuted source settles only after that residual is applied, while a reserved or failed
+residual remains blocking. A second refutation of the same case halts `needs-human`. In a mixed lap,
+an action route takes precedence while an uncovered infrastructure failure remains blocking after the
+BUILD attempt. Invalid, incomplete, stale, repeated, or unfinished case state halts rather than silently
+routing or passing.
+
+The case store and work order survive a daemon restart. BUILD stamps the work order before it starts,
+so an already attempted case cannot receive another free route; a later clean review settles cases
+whose sources are absent. Inspect the durable state and lifecycle events in
+[`artifacts`](../reference/artifacts.md#verdict-and-evidence-artifacts) when diagnosing a halt.
 
 Not every gate reruns on retry. For the three judged SHIP gates, a genuine fresh non-passing decision routes
 immediately, while an identical repeat on provably unchanged inputs only routes on the second attempt —
@@ -583,3 +688,20 @@ Three things in this repo are easy to conflate and are not the same:
 
 Per-step enforcement values and skip rules: [steps](../reference/steps.md). Gate-related config keys:
 [configuration](../reference/configuration.md).
+
+## Directory hints in build review
+
+A plan Files entry ending in `/` describes a directory, not a source file. Build review does not
+read it as a Git blob or seed dependency discovery from it. Changed test files beneath that directory
+still enter review through the pinned Git diff; explicit test-file entries still seed discovery.
+Missing required source blobs and invalid file paths continue to block review.
+
+### Test-quality candidate references
+
+A reviewer may cite a resolved candidate using the source-region reference supplied by the engine.
+When that reference identifies exactly one validated candidate, the engine translates it to the
+existing test-title and occurrence identity before validating the finding. This prevents a source
+hash versus title hash mismatch from discarding an otherwise actionable review. Shared source
+references require a canonical test reference; excluded, indeterminate, or foreign regions remain
+rejected. Finding identities, prior dispositions, and the substantive test-quality verdict do not
+change.

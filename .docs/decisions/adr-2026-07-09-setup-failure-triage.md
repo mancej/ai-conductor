@@ -52,6 +52,15 @@ Option A, with these binding sub-decisions:
    when — `prepareWorktree` fails in a **daemon** dispatch. The `autoresolve.ts` prepare path
    and manual `/conduct` runs are out of scope (unchanged). Setup exit 0 ⇒ byte-for-byte the
    existing dispatch path.
+
+   > **Amended 2026-08-26 by #1930:** setup no longer runs unconditionally on every daemon
+   > dispatch — a content-addressed success marker
+   > (adr-2026-08-26-setup-once-per-worktree-marker) may skip it when the worktree is already
+   > prepared. Triage's trigger is unchanged: it fires only on a `SetupFailureError` from an
+   > actual setup run (a skipped setup cannot throw), and triage's own `runPrepare`
+   > verification re-runs pass `force: true` so they always execute real setup rather than
+   > being marker-short-circuited. When setup does run and exits 0, the dispatch path remains
+   > byte-for-byte as decided here, plus the marker write.
 2. **Quarantine mechanism:** a commit on a dedicated branch ref
    `wip/setup-quarantine-<slug>` created from the worktree HEAD containing ALL uncommitted
    and untracked state (git add -A of the dirty tree), followed by `reset --hard HEAD` +
@@ -70,6 +79,22 @@ Option A, with these binding sub-decisions:
    on re-run AND the worktree is clean (fix committed). Contract met ⇒ dispatch proceeds
    normally. Contract failed ⇒ diagnostic HALT (existing `.pipeline/HALT` shape) naming the
    setup error tail and the quarantine ref; the feature parks operator-gated exactly as today.
+
+   > **Amended 2026-08-29 by #1346:** the clean-tree contract is engine-owned machinery, not
+   > prompt discipline. Before dispatch, triage records the original HEAD and proves the worktree
+   > clean. After the provider returns, a no-tree-change repair may pass only when forced setup
+   > succeeds without moving HEAD or dirtying the tree; provider-authored commits may pass only
+   > when they are clean forward descendants of the original HEAD and forced setup leaves both
+   > HEAD and the tree unchanged. When HEAD is unchanged and the provider leaves an uncommitted
+   > repair, triage captures its exact Git tree, force-runs setup, and requires the post-setup Git
+   > tree to match byte-for-byte; the engine then commits exactly that tree and verifies the new
+   > commit's parent, tree, and clean worktree before proceeding. Mixed commits plus residue,
+   > rewritten history, setup-added drift, snapshot failure, commit failure, or failed post-commit
+   > verification never pass. Triage preserves the complete attempt on
+   > `wip/setup-quarantine-<slug>` before restoring the original HEAD and parks with the closed
+   > contract outcome, preserved paths, and quarantine ref; if preservation fails, it performs no
+   > reset. Each terminal repair disposition is emitted through the existing `ConductorEvent`
+   > spine. The one-session bound and every downstream build/review gate remain unchanged.
 5. **Surfacing:** the quarantine ref and setup stderr tail are named in the daemon log and in
    any resulting HALT; the resuming build agent is told the quarantine ref exists so
    legitimate WIP can be recovered deliberately.

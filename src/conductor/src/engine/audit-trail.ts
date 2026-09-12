@@ -41,6 +41,11 @@ export type AuditRecord = {
   attempt?: number;
   artifact?: string;
   outcome?: VerdictFreshnessOutcome;
+  /** Present for build-review remediation occurrences. */
+  domain?: string;
+  lapId?: string;
+  caseId?: string;
+  residualEffectId?: string;
   at: number;
   /**
    * #647 D3: for `event: 'kickback'` records, distinguishes a kickback that
@@ -170,6 +175,22 @@ export class AuditTrailWriter {
           reason: event.reason || 'step retry',
           attempt: event.attempt,
         };
+      case 'remediation_case_refuted':
+        return {
+          origin: 'build',
+          event: event.type,
+          reason: `${event.domain} lap ${event.lapId} refuted case ${event.caseId}`,
+          domain: event.domain,
+          lapId: event.lapId,
+          caseId: event.caseId,
+          ...(event.residualEffectId ? { residualEffectId: event.residualEffectId } : {}),
+        };
+      case 'remediation_disposition_rejected':
+        return {
+          origin: 'build',
+          event: event.type,
+          reason: `${event.gapId}: ${event.field ?? 'disposition'} "${event.disposition}" not in [${event.accepted.join(', ')}]`,
+        };
       case 'build_review_disposition_version_invalidated':
         return {
           origin: 'build',
@@ -207,11 +228,33 @@ export class AuditTrailWriter {
           path: event.path,
           reason: event.reason,
         };
+      case 'shipment_evidence_refused':
+        return {
+          origin: 'finish',
+          event: event.type,
+          reason:
+            `${event.code} for ${event.slug} on ${event.pr}` +
+            ` (expected ${event.expected}, observed ${event.observed ?? 'none'})`,
+        };
       case 'halt_cleared':
         return {
           origin: event.step ?? 'build',
           event: 'halt_cleared',
           cause: event.cause,
+        };
+      case 'kickback_budget_adjustment_authorized':
+        return {
+          origin: 'operator',
+          event: event.type,
+          reason: `${event.kind} authorized for ${event.gate}`,
+          cause: event.adjustmentId,
+        };
+      case 'build_review_cache_discarded':
+        return {
+          origin: 'build_review',
+          event: 'build_review_cache_discarded',
+          reason: `${event.rubric}: ${event.reason}`,
+          cause: `cached ${event.cachedEngineStamp ?? 'pre-identity'} -> current ${event.currentEngineStamp}`,
         };
       case 'verdict_freshness':
         return {
@@ -255,6 +298,13 @@ export class AuditTrailWriter {
           event: 'step_refused',
           reason: event.reason,
           cause: event.kind,
+        };
+      case 'step_status_write_refused':
+        return {
+          origin: 'build',
+          event: event.type,
+          reason: `${event.field}: expected ${event.expected}, requested ${event.requested}`,
+          cause: event.intent,
         };
       case 'step_completed':
         // Positive evidence for steps that never produce a gate_verdict

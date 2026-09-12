@@ -1,3 +1,4 @@
+// Covers: task:2
 // ─────────────────────────────────────────────────────────────────────────────
 // Test: daemon-cli wires the REAL progress-gated cross-dispatch re-kick
 // (T8/T9/T10, daemon-halts-a-build-that-is-making-forward-progre) into the
@@ -48,6 +49,14 @@ describe('T14 — daemon-cli wires the real progress-gated re-kick predicate int
     expect(source).toMatch(/buildProgressReKickDeps\(/);
     expect(source).toMatch(/isProgressReKickEligible\s*:/);
     expect(source).toMatch(/progressReKickDispatchCeiling\s*:/);
+  });
+
+  it('the progress re-kick predicate consults the raw halt class before comparing task progress', async () => {
+    const source = await readFile(DAEMON_CLI_SRC, 'utf-8');
+
+    expect(source).toMatch(
+      /resolveHaltRetention\(\(\)\s*=>\s*readRawHaltClass\(slugRoot\)\)/,
+    );
   });
 
   it('enabled=true: reports eligible for a slug whose live resolved count exceeds the sidecar lastResolvedCount', async () => {
