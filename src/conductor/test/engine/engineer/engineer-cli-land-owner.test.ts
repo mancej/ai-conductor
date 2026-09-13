@@ -336,6 +336,19 @@ describe('engineer land — owner-gate wiring (CLI seam)', () => {
     await mkdir(join(worktree, '.docs', 'complexity'), { recursive: true });
     await writeFile(join(worktree, '.docs', 'track', 'dep-bump.md'), '# Track\n\nTrack: product\n');
     await writeFile(join(worktree, '.docs', 'complexity', 'dep-bump.md'), '# Complexity\n\nTier: S\n');
+    await writeFile(join(worktree, '.docs', 'stories', 'dep-bump.md'), [
+      '# Stories: dep bump', '**Status:** Accepted', '## Story 1: bump',
+      '### Happy Path', '- Given X, when Y, then Z.', '',
+    ].join('\n'));
+    await writeFile(join(worktree, '.docs', 'plans', 'dep-bump.md'), [
+      '# Implementation Plan: dep bump', '### Task 1: Bump dependency',
+      '**Story:** Story 1', '**Done when:**', '- Given X, when Y, then Z.',
+      '- The dependency update is documented.',
+      '## Coverage Check', '| Criterion | Task ids | Quote | Disposition |',
+      '| --- | --- | --- | --- |',
+      '| Story 1 happy: Given X, when Y, then Z. | 1 | "Given X, when Y, then Z." | diff-local |', '',
+    ].join('\n'));
+
 
     const store = new EngineerRunStore({ engineerDir, events: new ConductorEventEmitter() });
     const run = await store.create({ repoRoot: repoPath, idea: 'dep bump', attemptKey: 'land-attempt' });

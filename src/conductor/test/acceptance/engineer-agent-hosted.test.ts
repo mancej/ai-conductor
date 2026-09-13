@@ -1,3 +1,4 @@
+// Covers: task:1, task:4
 // engineer-agent-hosted.test.ts
 //
 // Orphaned-primitives guard + agent-hosted execution conformance (ADR-008 Phase 9.3),
@@ -28,7 +29,14 @@ const execFile = promisify(execFileCb);
 // ─── Source-file paths (for static grep guards) ───────────────────────────────
 const CONDUCTOR_SRC = join(process.cwd(), 'src', 'engine');
 const ENGINEER_CLI = join(process.cwd(), 'src', 'engine', 'engineer-cli.ts');
-const ENGINEER_LOOP = join(process.cwd(), 'src', 'engine', 'engineer', 'loop.ts');
+const SUPERSEDED_ENGINEER_MODULES = [
+  'authoring.ts',
+  'handoff-step.ts',
+  'lesson-store.ts',
+  'loop.ts',
+  'routing.ts',
+  'track-marker.ts',
+].map((name) => join(process.cwd(), 'src', 'engine', 'engineer', name));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -66,12 +74,12 @@ async function writeDocsArtifacts(dir: string, idea: string): Promise<void> {
   await writeFile(join(specsDir, `${slug}.md`), `# PRD: ${idea}\n\nApproved spec content.\n`, 'utf-8');
   await writeFile(
     join(storiesDir, `${slug}.md`),
-    `# Stories: ${idea}\n\n**Status:** Accepted\n\n## Story: main\n\n### AC\n- Given x, when y, then z.\n`,
+    `# Stories: ${idea}\n\n**Status:** Accepted\n\n## Story 1 — main\n\n### Acceptance Criteria\n#### Happy Path\n- Given x, when y, then z.\n`,
     'utf-8',
   );
   await writeFile(
     join(plansDir, `${slug}.md`),
-    `# Plan: ${idea}\n\n## Tasks\n\n### Task 1\n**Dependencies:** none\n\n**Done when:**\n- The planned behavior is implemented.\n- The scoped tests pass.\n\n## Task Dependency Graph\n\`\`\`\n1\n\`\`\`\n`,
+    `# Plan: ${idea}\n\n## Tasks\n\n### Task 1\n**Dependencies:** none\n\n**Done when:**\n- Given x, when y, then z.\n- The scoped tests pass.\n\n## Task Dependency Graph\n\`\`\`\n1\n\`\`\`\n\n## Coverage Check\n\n| Criterion | Task | Done when quote | Disposition |\n|---|---|---|---|\n| Story 1 happy: Given x, when y, then z. | 1 | Given x, when y, then z. | diff-local |\n`,
     'utf-8',
   );
 }
@@ -181,6 +189,10 @@ let repoPath: string;
 let registryPath: string;
 let engineerDir: string;
 const savedEnv: Record<string, string | undefined> = {};
+const supportedGhVersion = async () => ({
+  kind: 'ok' as const,
+  version: { major: 2, minor: 73, patch: 0 },
+});
 
 beforeEach(async () => {
   workDir = await mkdtemp(join(tmpdir(), 'agent-hosted-'));
@@ -216,7 +228,13 @@ afterEach(async () => {
 // STATIC ORPHANED-PRIMITIVES GUARDS
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe('static: orphaned-primitive guard — ClaudeProvider + readline must be zero in engineer path', () => {
+describe('static: orphaned-primitive guard — superseded engineer paths stay absent', () => {
+  it('the superseded scripted engineer path has no production modules', async () => {
+    await expect(Promise.all(SUPERSEDED_ENGINEER_MODULES.map(pathExists))).resolves.toEqual(
+      SUPERSEDED_ENGINEER_MODULES.map(() => false),
+    );
+  });
+
   it('engineer-cli.ts contains NO readline import', async () => {
     const src = await readFile(ENGINEER_CLI, 'utf-8');
     expect(src).not.toMatch(/node:readline/);
@@ -226,16 +244,6 @@ describe('static: orphaned-primitive guard — ClaudeProvider + readline must be
   it('engineer-cli.ts contains NO ClaudeProvider import or construction', async () => {
     const src = await readFile(ENGINEER_CLI, 'utf-8');
     expect(src).not.toMatch(/ClaudeProvider/);
-  });
-
-  it('engineer/loop.ts contains NO uuidv4 import', async () => {
-    const src = await readFile(ENGINEER_LOOP, 'utf-8');
-    expect(src).not.toMatch(/uuidv4/);
-  });
-
-  it('engineer/loop.ts contains NO LLMProvider import', async () => {
-    const src = await readFile(ENGINEER_LOOP, 'utf-8');
-    expect(src).not.toMatch(/LLMProvider/);
   });
 
   it('grep: ClaudeProvider has zero occurrences in src/engine/engineer* files', async () => {
@@ -354,7 +362,7 @@ describe('dispatchEngineer({kind:"guide"})', () => {
   it('returns 0 and prints a message mentioning agent-hosted or /engineer skill', async () => {
     const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
     const out: string[] = [];
-    const code = await dispatchEngineer({ kind: 'guide' }, { print: (s) => out.push(s) });
+    const code = await dispatchEngineer({ kind: 'guide' }, { probeGhVersion: supportedGhVersion, print: (s) => out.push(s) });
     expect(code).toBe(0);
     expect(out.join('\n')).toMatch(/agent.hosted|\/engineer|skill/i);
   });
@@ -368,7 +376,7 @@ describe('dispatchEngineer({kind:"launch"})', () => {
   it('invokes the injected interactive launcher and returns its exit code', async () => {
     const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
     const launchInteractive = vi.fn().mockResolvedValue(0);
-    const code = await dispatchEngineer({ kind: 'launch' }, { launchInteractive });
+    const code = await dispatchEngineer({ kind: 'launch' }, { launchInteractive, probeGhVersion: supportedGhVersion });
     expect(launchInteractive).toHaveBeenCalledOnce();
     expect(code).toBe(0);
   });
@@ -378,7 +386,7 @@ describe('dispatchEngineer({kind:"launch"})', () => {
     const out: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'launch' },
-      { insideClaudeSession: true, print: (s) => out.push(s) },
+      { insideClaudeSession: true, print: (s) => out.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).toBe(0);
     expect(out.join('\n')).toMatch(/already inside|run \/engineer directly/i);
@@ -394,7 +402,7 @@ describe('dispatchEngineer({kind:"projects"})', () => {
     await writeFile(registryPath, JSON.stringify([makeRecord(repoPath, 'my-project')], null, 2), 'utf-8');
     const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
     const out: string[] = [];
-    const code = await dispatchEngineer({ kind: 'projects' }, { registryPath, print: (s) => out.push(s) });
+    const code = await dispatchEngineer({ kind: 'projects' }, { registryPath, print: (s) => out.push(s), probeGhVersion: supportedGhVersion });
     expect(code).toBe(0);
     const parsed = JSON.parse(out.join(''));
     expect(Array.isArray(parsed)).toBe(true);
@@ -405,7 +413,7 @@ describe('dispatchEngineer({kind:"projects"})', () => {
     await writeFile(registryPath, JSON.stringify([]), 'utf-8');
     const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
     const out: string[] = [];
-    const code = await dispatchEngineer({ kind: 'projects' }, { registryPath, print: (s) => out.push(s) });
+    const code = await dispatchEngineer({ kind: 'projects' }, { registryPath, print: (s) => out.push(s), probeGhVersion: supportedGhVersion });
     expect(code).toBe(0);
     expect(JSON.parse(out.join(''))).toEqual([]);
   });
@@ -422,7 +430,7 @@ describe('dispatchEngineer({kind:"worktree"})', () => {
     const out: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'worktree', project: 'target-repo', idea: 'add csv export' },
-      { registryPath, print: (s) => out.push(s) },
+      { registryPath, print: (s) => out.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).toBe(0);
     const result = JSON.parse(out.join(''));
@@ -441,7 +449,7 @@ describe('dispatchEngineer({kind:"worktree"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'worktree', project: 'target-repo', idea: 'guarded authoring' },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         readinessDeps: inconclusiveReadinessDeps(repoPath),
@@ -470,7 +478,7 @@ describe('dispatchEngineer({kind:"worktree"})', () => {
         idea: 'permitted authoring',
         permitInconclusive: true,
       },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         readinessDeps: inconclusiveReadinessDeps(repoPath),
@@ -490,7 +498,7 @@ describe('dispatchEngineer({kind:"worktree"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'worktree', project: 'nope', idea: 'x' },
-      { registryPath, printErr: (s) => err.push(s) },
+      { registryPath, printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).toBe(1);
     expect(err.join('')).toMatch(/nope|not found/i);
@@ -512,7 +520,7 @@ describe('dispatchEngineer({kind:"land"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => out.push(s), printErr: (s) => err.push(s) },
+      { registryPath, print: (s) => out.push(s), printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
 
     expect(code).toBe(0);
@@ -532,7 +540,7 @@ describe('dispatchEngineer({kind:"land"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'land', project: 'nonexistent', idea: 'some idea', worktree: join(workDir, 'x') },
-      { registryPath, printErr: (s) => err.push(s) },
+      { registryPath, printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).toBe(1);
     expect(err.join('')).toMatch(/nonexistent|not found/i);
@@ -546,7 +554,7 @@ describe('dispatchEngineer({kind:"land"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree: wt.worktreePath },
-      { registryPath, printErr: (s) => err.push(s) },
+      { registryPath, printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).not.toBe(0);
     // Keep-on-failure: the worktree remains for inspection (FR-6).
@@ -569,7 +577,7 @@ describe('dispatchEngineer({kind:"land"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree: wt.worktreePath },
-      { registryPath, printErr: (s) => err.push(s) },
+      { registryPath, printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).not.toBe(0);
     expect(err.join('')).toMatch(/draft|rejected|invalid/i);
@@ -586,7 +594,7 @@ describe('dispatchEngineer({kind:"land"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, printErr: (s) => err.push(s) },
+      { registryPath, printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).not.toBe(0);
     expect(err.join('')).toMatch(/dirty|uncommitted/i);
@@ -610,7 +618,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     const landCode = await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { registryPath, print: (s) => landOut.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(landCode).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch;
@@ -636,6 +644,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
         gh: fakeGh,
         git: fakeGit,
         ensureRunningLaunch: fakeLaunch,
+        probeGhVersion: supportedGhVersion,
         print: (s) => handoffOut.push(s),
       },
     );
@@ -665,7 +674,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     expect(await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { probeGhVersion: supportedGhVersion, registryPath, print: (s) => landOut.push(s) },
     )).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch as string;
     const { store, run } = await seedMarkedLandedRun({
@@ -676,7 +685,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
 
     const code = await dispatchEngineer(
       { kind: 'handoff', project: 'target-repo', branch, worktree },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         gh,
@@ -699,7 +708,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
       {
         kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
       },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         gh,
@@ -727,7 +736,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     expect(await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { probeGhVersion: supportedGhVersion, registryPath, print: (s) => landOut.push(s) },
     )).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch as string;
     const { store, run } = await seedMarkedLandedRun({
@@ -745,7 +754,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
       {
         kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
       },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         gh,
@@ -775,7 +784,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     expect(await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { probeGhVersion: supportedGhVersion, registryPath, print: (s) => landOut.push(s) },
     )).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch as string;
     await seedMarkedLandedRun({ repoRoot: repoPath, worktree, idea, branch, engineerDir });
@@ -790,7 +799,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
       {
         kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true,
       },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         gh,
@@ -814,7 +823,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     expect(await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { probeGhVersion: supportedGhVersion, registryPath, print: (s) => landOut.push(s) },
     )).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch as string;
     const { store, run } = await seedMarkedLandedRun({
@@ -836,7 +845,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const out: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'handoff', project: 'target-repo', branch, worktree },
-      {
+      { probeGhVersion: supportedGhVersion,
         registryPath,
         engineerDir,
         gh,
@@ -864,7 +873,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { registryPath, print: (s) => landOut.push(s), probeGhVersion: supportedGhVersion },
     );
     const branch = JSON.parse(landOut.join('')).branch;
 
@@ -875,7 +884,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const handoffOut: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'handoff', project: 'target-repo', branch, worktree },
-      { registryPath, engineerDir, gh: noRemoteGh, print: (s) => handoffOut.push(s) },
+      { registryPath, engineerDir, gh: noRemoteGh, print: (s) => handoffOut.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).toBe(0);
     const result = JSON.parse(handoffOut.join(''));
@@ -894,7 +903,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const landOut: string[] = [];
     await dispatchEngineer(
       { kind: 'land', project: 'target-repo', idea, worktree },
-      { registryPath, print: (s) => landOut.push(s) },
+      { registryPath, print: (s) => landOut.push(s), probeGhVersion: supportedGhVersion },
     );
     const branch = JSON.parse(landOut.join('')).branch;
 
@@ -909,6 +918,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
         registryPath,
         engineerDir,
         gh: noUrlGh,
+        probeGhVersion: supportedGhVersion,
         git: async () => ({ stdout: '' }),
         print: (s) => out.push(s),
         printErr: (s) => err.push(s),
@@ -927,7 +937,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const err: string[] = [];
     const code = await dispatchEngineer(
       { kind: 'handoff', project: 'nonexistent', branch: 'spec/x', worktree: join(workDir, 'x') },
-      { registryPath, printErr: (s) => err.push(s) },
+      { registryPath, printErr: (s) => err.push(s), probeGhVersion: supportedGhVersion },
     );
     expect(code).toBe(1);
     expect(err.join('')).toMatch(/nonexistent|not found/i);
@@ -1087,10 +1097,13 @@ describe('landSpec primitive (src/engine/engineer/land-spec.ts)', () => {
     await mkdir(join(dir, '.docs', 'architecture'), { recursive: true });
     await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
     await writeFile(join(dir, '.docs', 'conflicts', `2026-06-28-${slug}.md`), '# Conflicts\n\nNone.\n');
-    await writeFile(join(dir, '.docs', 'architecture', `${slug}.md`), '# Architecture\n\nDiagram.\n');
     await writeFile(
-      join(dir, '.docs', 'decisions', 'adr-001-streaming.md'),
-      `# ADR-001\n\n**Status:** ${opts.adrStatus ?? 'APPROVED'}\n`,
+      join(dir, '.docs', 'architecture', `${slug}.md`),
+      '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n',
+    );
+    await writeFile(
+      join(dir, '.docs', 'decisions', 'adr-2026-09-08-streaming.md'),
+      `# ADR-001\n\n**Status:** ${opts.adrStatus ?? 'APPROVED'}\n\n## Decision\n\n1. **Use streaming.**\n`,
     );
   }
 
@@ -1102,13 +1115,18 @@ describe('landSpec primitive (src/engine/engineer/land-spec.ts)', () => {
     const { landSpec } = await import('../../src/engine/engineer/land-spec.js');
     const result = await landSpec({ name: 'target', canonicalPath: repoPath }, idea, worktree, undefined, {
       ownerConfig: { spec_owner: 'test-owner' },
+      renderDeps: {
+        hasTool: async () => true,
+        writeTemp: async () => '/tmp/agent-hosted-architecture.mmd',
+        runMmdc: async () => ({ ok: true }),
+      },
     });
 
     const tracked = await git(['ls-tree', '-r', '--name-only', result.branch], repoPath);
     expect(tracked).toMatch(/\.docs\/complexity\//);
     expect(tracked).toMatch(/\.docs\/conflicts\//);
     expect(tracked).toMatch(/\.docs\/architecture\//);
-    expect(tracked).toMatch(/\.docs\/decisions\/adr-001-streaming\.md/);
+    expect(tracked).toMatch(/\.docs\/decisions\/adr-2026-09-08-streaming\.md/);
   });
 
   it('Small: commits base artifacts + complexity, no architecture required', async () => {

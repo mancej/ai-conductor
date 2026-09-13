@@ -3,9 +3,6 @@ import type { StepName } from '../types/steps.js';
 // These steps retain exhaustive provider-policy placeholders for StepName
 // type safety, but execute entirely in-process and never dispatch a model.
 export const MODEL_FREE_ENGINE_STEPS = [
-  // Retained only so deprecated StepName resolution remains exhaustive; this
-  // entry no longer represents an executable verifier or model-table row.
-  'wiring_check',
   'test_suite',
 ] as const satisfies readonly StepName[];
 
@@ -13,10 +10,10 @@ export const MODEL_FREE_ENGINE_STEPS = [
 // Model-table metadata
 //
 // Human-readable "Why" text for each engine step, keyed by StepName. This is
-// the single source the generated HARNESS.md model-selection table (and the
+// the single source the generated ARCHITECTURE.md model-selection table (and the
 // completeness test in test/model-table-metadata.test.ts) draw from. It
 // consolidates rationale that used to live beside the autonomous model
-// defaults, plus the prose "Why" column from HARNESS.md's hand-authored
+// defaults, plus the prose "Why" column from ARCHITECTURE.md's hand-authored
 // model-selection table.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -42,19 +39,18 @@ export const STEP_RATIONALE: Record<StepName, string> = {
   architecture_review:
     'Pre-implementation design feasibility and alignment requires a high-capability model from the selected provider policy.',
   worktree: 'Git operations — mechanical branch/worktree management.',
+  coverage_binding: 'Engine-native coverage-claim gate; its later auxiliary judge has a separate model-table row.',
   acceptance_specs: 'Translating acceptance criteria into executable boundary-level specs requires strong reasoning to preserve behavioral intent and negative paths, using MEDIUM effort for S/M and HIGH effort for Large work.',
   build:
     'Launches the implementation session that authors code through the TDD RED/DOMAIN/GREEN cycle — the actual coding lane, not a thin dispatcher. Each provider policy uses its standard model with MEDIUM effort for reliable code authoring, rising to HIGH effort for Large work. S tier keeps the fixed three-attempt retry floor, so small features can still recover from a bad first pass.',
   build_review:
     'Fresh-session grader for explicitly enabled, criterion-bound test-quality concerns — adversarial evidence judgement demands a high-capability model, same class as prd_audit/code-review.',
-  wiring_check: 'Deprecated compatibility no-op; reachability is no longer judged anywhere in BUILD.',
   test_suite:
     'Mechanical aggregate test gate that obtains a current full-suite proof from the shared verifier before SHIP; no generative judgement required.',
   manual_test: 'Structured validation against stories — pattern-following.',
   prd_audit: 'Cross-references PRD intent vs shipped implementation across two domains (spec + code) — deep reasoning, FR-by-FR.',
   architecture_review_as_built:
     'The SHIP --as-built compliance review compares shipped code with approved architecture and wiring contracts; missed drift can invalidate the release, so it uses a high-capability model and HIGH effort.',
-  retro: 'Structured analysis from concrete data; Part C (context efficiency) is checklist-based.',
   rebase:
     'Semantic conflict resolution reasons over both sides of a hunk; a wrong merge can silently revert completed work, so rebase uses a capable provider-native model with HIGH effort.',
   finish: 'Coordinates final test, status, and coverage evidence with MEDIUM effort so completion claims remain grounded.',
@@ -94,6 +90,7 @@ export const SKILL_STEP_MAP: Record<string, StepName> = {
 // compare the pin against.
 export const PIN_EXEMPT_SKILLS: readonly string[] = [
   'code-review', // dispatches an evaluator agent directly; not an engine step
+  'composer', // interactive idea→spec authoring loop; orchestrates DECIDE skills, not an engine step
   'debugging', // standalone investigation skill; not an engine step
   'engineer', // interactive idea→spec loop; orchestrates other skills/steps, isn't one itself
   'simplify', // batch-boundary gate dispatched directly; not an engine step
@@ -103,9 +100,9 @@ export const PIN_EXEMPT_SKILLS: readonly string[] = [
 // Extra model-table rows
 //
 // Rows for skills/agents that are NOT engine steps (no StepName / no entry in
-// CLAUDE_MODEL_POLICY.stepModels) but that HARNESS.md's model-selection table
+// CLAUDE_MODEL_POLICY.stepModels) but that ARCHITECTURE.md's model-selection table
 // still documents on the supported-host interactive path: domain-reviewer/evaluator
-// (dispatched sub-agents), code-review/debugging/simplify/engineer (skills
+// (dispatched sub-agents), code-review/composer/debugging/simplify/engineer (skills
 // with their own model pin but no engine step), conduct/pr (orchestration
 // skills), tdd-red/tdd-green (TDD sub-phases), and the 10 cto-* assess
 // specialists.
@@ -131,22 +128,35 @@ export interface ExtraModelTableRow {
   why: string;
 }
 
-/**
- * Rows for engine-managed auxiliary judgements. These are intentionally not
- * `StepName`s: each row inherits its independently resolved rubric policy
- * from the public build_review gate rather than inventing a lifecycle step.
- */
-export interface AuxiliaryModelTableRow {
+interface AuxiliaryModelTableRowBase {
   name: string;
-  executionPath: 'engine-managed auxiliary rubric';
-  claudeModel: 'inherits resolved rubric policy';
-  claudeEffort: 'inherits resolved rubric policy';
-  codexModel: 'inherits resolved rubric policy';
-  codexEffort: 'inherits resolved rubric policy';
   why: string;
 }
 
+/**
+ * Rows for engine-managed auxiliary judgements. These are intentionally not
+ * `StepName`s: each judge inherits its owning gate's resolved provider policy
+ * rather than inventing a lifecycle step.
+ */
+export type AuxiliaryModelTableRow = AuxiliaryModelTableRowBase & (
+  | {
+      executionPath: 'engine-managed auxiliary rubric';
+      claudeModel: 'inherits resolved rubric policy';
+      claudeEffort: 'inherits resolved rubric policy';
+      codexModel: 'inherits resolved rubric policy';
+      codexEffort: 'inherits resolved rubric policy';
+    }
+  | {
+      executionPath: 'engine-managed auxiliary judge';
+      claudeModel: 'inherits resolved coverage-binding policy';
+      claudeEffort: 'inherits resolved coverage-binding policy';
+      codexModel: 'inherits resolved coverage-binding policy';
+      codexEffort: 'inherits resolved coverage-binding policy';
+    }
+);
+
 const RESOLVED_RUBRIC_POLICY = 'inherits resolved rubric policy' as const;
+const RESOLVED_COVERAGE_BINDING_POLICY = 'inherits resolved coverage-binding policy' as const;
 
 export const AUXILIARY_MODEL_TABLE_ROWS: readonly AuxiliaryModelTableRow[] = [
   {
@@ -157,6 +167,15 @@ export const AUXILIARY_MODEL_TABLE_ROWS: readonly AuxiliaryModelTableRow[] = [
     codexModel: RESOLVED_RUBRIC_POLICY,
     codexEffort: RESOLVED_RUBRIC_POLICY,
     why: 'Judges whether criterion-bound changed tests are insensitive to the behavior they claim to cover; preflight is evidence, never a verdict.',
+  },
+  {
+    name: 'coverage-binding',
+    executionPath: 'engine-managed auxiliary judge',
+    claudeModel: RESOLVED_COVERAGE_BINDING_POLICY,
+    claudeEffort: RESOLVED_COVERAGE_BINDING_POLICY,
+    codexModel: RESOLVED_COVERAGE_BINDING_POLICY,
+    codexEffort: RESOLVED_COVERAGE_BINDING_POLICY,
+    why: 'Fresh per-claim judgement of whether cited Done when checks assert the criterion; the engine scopes inputs, validates the closed verdict, and owns the gate outcome.',
   },
 ];
 
@@ -222,11 +241,18 @@ const EXTRA_MODEL_TABLE_ROW_INPUTS: Array<
     why: 'Pattern matching for duplication and complexity — structured checklist work.',
   },
   {
+    name: 'composer',
+    claudeModel: 'opus',
+    claudeEffort: '',
+    why:
+      'Canonical interactive idea→spec authoring loop: routes a raw idea through the full DECIDE phase and delivers a spec PR, so its high-stakes authoring judgement uses Claude Opus.',
+  },
+  {
     name: 'engineer',
     claudeModel: 'opus',
     claudeEffort: '',
     why:
-      'Interactive idea→spec control plane routing the real DECIDE skills. Kept on Fable for operator-driven interactive quality — this is a capability / operator-preference call, NOT a cost saving: Fable is the premium tier ($10/$50 per 1M, ~2x Opus).',
+      'Deprecated compatibility delegate for existing engineer invocations. It contributes only low-cost routing mechanics and no independent authoring loop; composer owns the canonical DECIDE workflow.',
   },
   {
     name: 'intake',

@@ -13,6 +13,8 @@ import {
 import { writeState } from '../../src/engine/state.js';
 import type { ConductState } from '../../src/types/state.js';
 
+// Covers: S1.1, S1.2, S1.3, S2.1, S2.2, task:1, task:2, task:3, task:4
+
 const temporaryDirectories: string[] = [];
 
 async function createStatePath(): Promise<string> {
@@ -32,7 +34,10 @@ function alreadyExists(): NodeJS.ErrnoException {
   return Object.assign(new Error('lease exists'), { code: 'EEXIST' });
 }
 
-function sharedLeaseFilesystem(): ConductStateLeaseFilesystem & { owner: string | undefined } {
+function sharedLeaseFilesystem(): ConductStateLeaseFilesystem & {
+  owner: string | undefined;
+  hasDirectory(path: string): boolean;
+} {
   const directories = new Set<string>();
   const files = new Map<string, string>();
 
@@ -40,15 +45,25 @@ function sharedLeaseFilesystem(): ConductStateLeaseFilesystem & { owner: string 
     return Object.assign(new Error(`missing ${path}`), { code: 'ENOENT' });
   }
 
+  // A real filesystem refuses to create a file inside a directory that does not
+  // exist. Modelling that is what makes a lease released mid-recovery observable.
+  function requireParentDirectory(path: string): void {
+    if (!directories.has(path.slice(0, path.lastIndexOf('/')))) throw missing(path);
+  }
+
   return {
     get owner(): string | undefined {
       return [...files.entries()].find(([path]) => path.endsWith('/owner.json'))?.[1];
+    },
+    hasDirectory(path: string): boolean {
+      return directories.has(path);
     },
     async acquireDirectory(path): Promise<void> {
       if (directories.has(path)) throw alreadyExists();
       directories.add(path);
     },
     async writeOwner(path, contents): Promise<void> {
+      requireParentDirectory(path);
       if (files.has(path)) throw alreadyExists();
       files.set(path, contents);
     },
@@ -58,6 +73,7 @@ function sharedLeaseFilesystem(): ConductStateLeaseFilesystem & { owner: string 
       return owner;
     },
     async writeRecoveryClaim(path, contents): Promise<void> {
+      requireParentDirectory(path);
       if (files.has(path)) throw alreadyExists();
       files.set(path, contents);
     },
@@ -152,6 +168,214 @@ describe('conduct-state lease', () => {
       ownerPid: 101,
     }]);
     if (recovered.ok) await expect(recovered.handle.release()).resolves.toEqual({ ok: true });
+  });
+
+  it('retries a lease whose owner released it before recovery reads its metadata', async () => {
+    const statePath = '/worktree/vanishing/.pipeline/conduct-state.json';
+    const shared = sharedLeaseFilesystem();
+    const held = await createConductStateLease(statePath, {
+      filesystem: shared,
+      pid: 101,
+      newToken: () => 'departing-owner',
+    }).acquire();
+    if (!held.ok) throw new Error(held.message);
+
+    // The contender sees the held directory, then its filesystem seam releases
+    // the first holder before rethrowing EEXIST. Its subsequent owner read must
+    // therefore observe ENOENT and retry normal acquisition.
+    let holderHasReleased = false;
+    let ownerReadError: NodeJS.ErrnoException | undefined;
+    const filesystem: ConductStateLeaseFilesystem = {
+      ...shared,
+      async acquireDirectory(path): Promise<void> {
+        try {
+          await shared.acquireDirectory(path);
+        } catch (error) {
+          if (!holderHasReleased) {
+            holderHasReleased = true;
+            await held.handle.release();
+          }
+          throw error;
+        }
+      },
+      async readOwner(path): Promise<string> {
+        try {
+          return await shared.readOwner(path);
+        } catch (error) {
+          ownerReadError = error as NodeJS.ErrnoException;
+          throw error;
+        }
+      },
+    };
+    const diagnostics: unknown[] = [];
+    let now = 0;
+
+    const acquired = await createConductStateLease(statePath, {
+      filesystem,
+      label: 'intake ledger',
+      now: () => now,
+      wait: async (milliseconds) => { now += milliseconds; },
+      pid: 202,
+      newToken: () => 'next-owner',
+      processIsLive: () => false,
+      onRecoveryDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    }).acquire();
+
+    expect(acquired).toMatchObject({ ok: true });
+    expect(ownerReadError).toMatchObject({ code: 'ENOENT' });
+    expect(shared.owner).toContain('next-owner');
+    expect(diagnostics).toEqual([]);
+    if (acquired.ok) await expect(acquired.handle.release()).resolves.toEqual({ ok: true });
+  });
+
+  it('refuses an unreadable owner without changing its metadata', async () => {
+    const statePath = '/worktree/unreadable/.pipeline/conduct-state.json';
+    const shared = sharedLeaseFilesystem();
+    const held = await createConductStateLease(statePath, {
+      filesystem: shared,
+      pid: 101,
+      newToken: () => 'existing-owner',
+    }).acquire();
+    if (!held.ok) throw new Error(held.message);
+    const ownerBeforeAttempt = shared.owner;
+    const filesystem: ConductStateLeaseFilesystem = {
+      ...shared,
+      async readOwner(): Promise<string> {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      },
+    };
+    const diagnostics: unknown[] = [];
+
+    await expect(createConductStateLease(statePath, {
+      filesystem,
+      onRecoveryDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    }).acquire()).resolves.toEqual({
+      ok: false,
+      kind: 'recovery_refused',
+      message: 'Unable to recover conduct-state lease: owner metadata is unavailable (permission denied)',
+    });
+    expect(diagnostics).toEqual([{ kind: 'refused', statePath, reason: 'ownership_changed' }]);
+    expect(shared.owner).toBe(ownerBeforeAttempt);
+    await held.handle.release();
+  });
+
+  it('waits between retries when a held lease has no owner metadata', async () => {
+    const statePath = '/worktree/ownerless/.pipeline/conduct-state.json';
+    const shared = sharedLeaseFilesystem();
+    await shared.acquireDirectory(`${statePath}.lease`);
+    let now = 0;
+    let acquisitionAttempts = 0;
+    const waitDelays: number[] = [];
+    const diagnostics: unknown[] = [];
+    const filesystem: ConductStateLeaseFilesystem = {
+      ...shared,
+      async acquireDirectory(path): Promise<void> {
+        acquisitionAttempts += 1;
+        await shared.acquireDirectory(path);
+      },
+    };
+
+    const result = await createConductStateLease(statePath, {
+      filesystem,
+      now: () => now,
+      wait: async (milliseconds) => {
+        waitDelays.push(milliseconds);
+        now += milliseconds;
+      },
+      waitTimeoutMs: 5,
+      retryDelayMs: 5,
+      onRecoveryDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    }).acquire();
+
+    expect(result).toEqual({
+      ok: false,
+      kind: 'timeout',
+      message: 'Unable to acquire conduct-state lease within 5ms',
+    });
+    expect(waitDelays).toEqual([5]);
+    expect(acquisitionAttempts).toBe(waitDelays.length + 1);
+    expect(now).toBe(5);
+    expect(diagnostics).toEqual([]);
+    expect(shared.hasDirectory(`${statePath}.lease`)).toBe(true);
+    expect(shared.owner).toBeUndefined();
+    await expect(shared.readRecoveryClaim(`${statePath}.lease/recovery.json`)).resolves.toBeNull();
+  });
+
+  it('retries a vanished lease without waiting', async () => {
+    const statePath = '/worktree/vanished/.pipeline/conduct-state.json';
+    const shared = sharedLeaseFilesystem();
+    const held = await createConductStateLease(statePath, {
+      filesystem: shared,
+      pid: 101,
+      newToken: () => 'departing-owner',
+    }).acquire();
+    if (!held.ok) throw new Error(held.message);
+    let released = false;
+    const waitDelays: number[] = [];
+    const filesystem: ConductStateLeaseFilesystem = {
+      ...shared,
+      async writeRecoveryClaim(path, contents): Promise<void> {
+        if (!released) {
+          released = true;
+          await held.handle.release();
+        }
+        await shared.writeRecoveryClaim(path, contents);
+      },
+    };
+
+    const acquired = await createConductStateLease(statePath, {
+      filesystem,
+      pid: 202,
+      newToken: () => 'next-owner',
+      processIsLive: () => false,
+      wait: async (milliseconds) => { waitDelays.push(milliseconds); },
+    }).acquire();
+
+    expect(acquired).toMatchObject({ ok: true });
+    expect(waitDelays).toEqual([]);
+    if (acquired.ok) await expect(acquired.handle.release()).resolves.toEqual({ ok: true });
+  });
+
+  it('waits for a concurrent creator to publish owner metadata before recovering the lease', async () => {
+    const statePath = '/worktree/initializing/.pipeline/conduct-state.json';
+    const shared = sharedLeaseFilesystem();
+    let allowOwnerWrite: (() => void) | undefined;
+    const ownerWriteAllowed = new Promise<void>((resolve) => { allowOwnerWrite = resolve; });
+    let ownerWriteStarted: (() => void) | undefined;
+    const ownerWriteHasStarted = new Promise<void>((resolve) => { ownerWriteStarted = resolve; });
+    const filesystem: ConductStateLeaseFilesystem = {
+      ...shared,
+      async writeOwner(path, contents): Promise<void> {
+        ownerWriteStarted?.();
+        await ownerWriteAllowed;
+        await shared.writeOwner(path, contents);
+      },
+    };
+    const first = createConductStateLease(statePath, {
+      filesystem,
+      pid: 101,
+      newToken: () => 'first-writer',
+    }).acquire();
+    await ownerWriteHasStarted;
+
+    let waited = false;
+    const second = createConductStateLease(statePath, {
+      filesystem,
+      pid: 202,
+      newToken: () => 'second-writer',
+      processIsLive: (pid) => pid === 101,
+      wait: async () => {
+        waited = true;
+        allowOwnerWrite?.();
+        const acquired = await first;
+        if (acquired.ok) await acquired.handle.release();
+      },
+    }).acquire();
+
+    await expect(second).resolves.toMatchObject({ ok: true });
+    expect(waited).toBe(true);
+    const acquired = await second;
+    if (acquired.ok) await expect(acquired.handle.release()).resolves.toEqual({ ok: true });
   });
 
   it('names a labelled store in acquire failures and recovery diagnostics', async () => {

@@ -153,31 +153,24 @@ Neither `templates/claude-settings.json.template` nor this repo's own `.claude/s
 
 ## Operator hook scripts
 
-Eleven scripts live in `hooks/claude/`. Alphabetized.
+Ten scripts live in `hooks/claude/`. Alphabetized.
 
 | Script | Trigger | What it does | Can block? |
 | --- | --- | --- | --- |
 | `block-destructive-git.sh` | `PreToolUse` / `Bash` | Strips quoted spans from the command, then pattern-matches destructive git. Emits a non-blocking NOTE on ad-hoc `git rebase`. | **Yes — exit 2** on `git push --force`/`-f`, `git reset --hard`, `git branch -D` of a not-provably-merged branch, `git clean -f`, and `git checkout -- .` / `git restore .`. `--force-with-lease` is explicitly allowed. |
 | `diagram-coverage-check.sh` | `PostToolUse` / `Edit\|Write` | Warns that diagrams may be stale when a structural file is edited (Rails `app/{models,controllers,services,jobs}`, `config/routes.rb`, `db/migrate/`, compose files, `Procfile`, or `src/{models,controllers,services}`) and `.docs/architecture/` exists. | No |
-| `docs-guard.sh` | `PreToolUse` / `Edit\|Write\|NotebookEdit` | Inert (exits 0 without reading stdin) unless `.pipeline/phase-active` exists. Otherwise reads a bounded payload (`timeout 3 head -c 1048576`), extracts `tool_input.file_path` or `tool_input.notebook_path` via `node -e`, normalizes a leading `$PWD/`, and default-denies `.docs/` writes unless an `allow:` prefix in the marker matches. | **Yes — exit 2** on an undeterminable target (fail-closed) and on any unallowlisted `.docs/` write. Block message names the phase and step. |
+| `docs-guard.sh` | `PreToolUse` / `Edit\|Write\|NotebookEdit` | Inert (exits 0 without reading stdin) unless `.pipeline/phase-active` exists. Otherwise reads a bounded payload (`timeout 3 head -c 1048576`), extracts `tool_input.file_path` or `tool_input.notebook_path` via `node -e`, recognizes physical and symlinked project-root spellings, and checks both the requested path and its filesystem-resolved destination. A `.docs/` candidate is default-denied unless its literal `allow:` prefix in the marker matches; both candidates must pass. | **Yes — exit 2** on an undeterminable target (fail-closed) and on any unallowlisted `.docs/` candidate. Block message names the phase and step. |
 | `lint-after-edit.sh` | `PostToolUse` / `Edit\|Write` | Invoked per edit, but does **not** lint per edit. Queues the edited path under `$TMPDIR/ai-conductor-lint/<repo-hash>/` and stays silent until a batch boundary, then lints the whole queue and clears it. A boundary is `.pipeline/current-task` changing, or — outside a pipeline, where no task marker exists — `LINT_DEBOUNCE_SECONDS` (default 120) elapsing since the queue opened. Dispatches by type: `.ts`/`.tsx` → ESLint (one batched invocation), `.sh` and bash-shebang files → `shellcheck --severity=error`, `.rb` → `bundle exec standardrb --no-fix`. Each is skipped silently when its tool or project context is absent. Queue state is deliberately kept out of `.pipeline/`, which is engine-owned. | No — always exits 0 |
-| `post-commit-derive-feedback.sh` | `PostToolUse` / `Bash` | Despite the name, not a git post-commit hook. Invokes `conduct-ts derive-feedback --sha <sha>` for fast advisory feedback on a commit; falls back to a bash `Task:` trailer match. Never writes `task-status.json`. | No — exits 0 on every path |
-| `rate-limit-wait.sh` | `StopFailure` / `rate_limit` | Reads `$CLAUDE_ERROR`, else tails `.pipeline/conduct.log`, and writes `.pipeline/rate-limit-hit` (line 1 epoch, line 2 wait seconds; default 300). | No |
+| `post-commit-derive-feedback.sh` | `PostToolUse` / `Bash` | Despite the name, not a git post-commit hook. Returns immediately unless the executed Bash command uses `git commit`, `merge`, `revert`, `cherry-pick`, `am`, or `rebase` and `HEAD` is newly created. `git pull` is excluded, including pull-created merge commits; an absent, malformed, or command-less payload falls back to evaluating `HEAD`. It then invokes `ai-conductor derive-feedback --sha <sha>` for fast advisory feedback and falls back to a bash `Task:` trailer match. Never writes `task-status.json`. | No — exits 0 on every path |
+| `rate-limit-wait.sh` | `StopFailure` / `rate_limit` | Reads `error_details` and `last_assistant_message` from the host's JSON stdin, with `$CLAUDE_ERROR` and `.pipeline/conduct.log` as compatibility fallbacks, then writes `.pipeline/rate-limit-hit` (line 1 epoch, line 2 wait seconds; default 300). | No |
 | `session-start-context.sh` | `SessionStart` | Prints the whole of `HARNESS.md`, a warning if the consumer `CLAUDE.md` is missing the HARNESS.md reference, the head of `.memory/index.md`, story and plan counts, and `Pipeline: n/m steps done` from `.pipeline/conduct-state.json`. Writes `.pipeline/.memory-count-at-start`. | No |
 | `spec-coverage-check.sh` | `PostToolUse` / `Edit\|Write` | Warns when a Rails `app/{models,controllers,services,jobs}` file has no counterpart under `spec/`. Skips `application_*` files. | No — warn only |
 | `stop-memory-reminder.sh` | `Stop` | Compares the current `.memory/` entry count against `.pipeline/.memory-count-at-start` and reminds when work happened without a memory write. | No — no `{"decision":"block"}` output exists in any Stop hook in this repo |
 | `tdd-commit-gate.sh` | `PreToolUse` / `Bash` | Reads `.pipeline/tdd-phase`. Absent ⇒ exit 0. | **Yes — exit 2** when the phase is anything other than `COMMIT` |
-| `worktree-check.sh` | none | Reads `.pipeline/conduct-state.json`. Present and executable but registered in no settings block anywhere. | No |
 
 **Exactly three of these can block a tool call with exit 2**: `block-destructive-git.sh`,
 `docs-guard.sh`, and `tdd-commit-gate.sh`. Every other script is advisory and exits 0 regardless of what
 it finds.
-
-> **Known limitation.** `rate-limit-wait.sh` is registered under the event name `"StopFailure"`, which
-> is not a Claude Code host event. The registration is inert: the host never fires it, so
-> `.pipeline/rate-limit-hit` is never produced by the hook path and a rate-limit stop is not
-> automatically waited out. Tracked in
-> [#1019](https://github.com/jstoup111/ai-conductor/issues/1019).
 
 > **Known limitation.** Nothing in the engine, and no skill, writes `.pipeline/tdd-phase`. Both TDD gates
 > — `hooks/claude/tdd-commit-gate.sh` and `hooks/pre-commit-tdd-gate.sh` — are therefore dormant unless
@@ -240,7 +233,7 @@ git -C <worktree> config --worktree core.hooksPath <worktree>/.pipeline/git-hook
 All three hooks chain to `$(git rev-parse --git-common-dir)/hooks/<name>` when one exists and is
 executable. `pre-commit` and `prepare-commit-msg` are pure bash plus `git` and POSIX tools (`pre-commit`
 also uses `sed`; `prepare-commit-msg` uses `node -e`). `commit-msg` additionally invokes the installed
-`conduct-ts scope-check <commit-message>` command; none of the three hooks references `dist/`.
+`ai-conductor scope-check <commit-message>` command; none of the three hooks references `dist/`.
 
 `pre-commit` and `commit-msg` both exit 0 immediately for any commit made with `CONDUCT_ENGINE_COMMIT=1`
 — the environment the engine sets for its own bookkeeping commits (rebase mechanics, quarantine, shipped
@@ -303,13 +296,15 @@ dispatched with `--dangerously-skip-permissions`, no OS sandbox, and full enviro
 (`codex` is the sandboxed provider: unattended runs pass `sandbox_mode="workspace-write"`.)
 
 Because a claude self-build dispatch therefore cannot be fenced away from pushing or from `gh`, the
-engine refutes any dispatch output that says otherwise. `environment-claim-audit.ts` runs inside the
-self-host candidate-safety wrapper: when a line carries an environmental cause, a blocking assertion,
-**and** a named remote operation the generated fence provably cannot deny, the attempt is failed and
-the disproof becomes its retry reason, prefixed `ENVIRONMENT_CLAIM_REFUTED`. The deniable-operation
-set is derived from `generateFenceScript` itself, so teaching the fence a real `git push` rule
-retires the refutation automatically. Claims on a sandboxed or unrecognized provider are never
-refuted — the audit only rejects what the engine can positively disprove. See
+engine refutes an operation-specific dispatch claim that says otherwise. `environment-claim-audit.ts`
+runs inside the self-host candidate-safety wrapper: when a line carries an environmental cause, a
+blocking assertion, **and** a named remote operation the generated fence provably cannot deny, the
+attempt is failed and the disproof becomes its retry reason, prefixed `ENVIRONMENT_CLAIM_REFUTED`.
+The deniable-operation set is derived from `generateFenceScript` itself, so teaching the fence a real
+`git push` rule retires the refutation automatically. Output that instead claims the environment
+blocks all, every, or any Bash, shell, tool, or terminal command (or blocks everything) passes through
+unchanged; that broader claim is not selectively refuted. Claims on a sandboxed or unrecognized
+provider are never refuted — the audit only rejects what the engine can positively disprove. See
 [stalled or stuck feature](../runbooks/stalled-or-stuck-feature.md) for triage.
 
 ## Malformed settings.json

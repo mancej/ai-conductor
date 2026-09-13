@@ -1,3 +1,4 @@
+// Covers: task:1
 /**
  * RED acceptance specs — User-level configuration precedence (#1000)
  *
@@ -87,9 +88,24 @@ const AFFECTED_CASES: AffectedCase[] = [
     userYaml: 'build_review:\n  rubrics:\n    testQuality:\n      enabled: false\n      effort: high\n',
     projectYaml: 'build_review:\n  rubrics:\n    testQuality:\n      enabled: true\n      effort: low\n',
     select: (config) => config.build_review,
-    userValue: { enabled: true, maxParallel: 1, rubrics: { testQuality: { enabled: false, effort: 'high' } } },
-    projectValue: { enabled: true, maxParallel: 1, rubrics: { testQuality: { enabled: true, effort: 'low' } } },
-    defaultValue: { enabled: true, maxParallel: 1, rubrics: { testQuality: { enabled: false } } },
+    userValue: {
+      enabled: true,
+      maxParallel: 1,
+      adjudication: { enabled: true },
+      rubrics: { testQuality: { enabled: false, effort: 'high' } },
+    },
+    projectValue: {
+      enabled: true,
+      maxParallel: 1,
+      adjudication: { enabled: true },
+      rubrics: { testQuality: { enabled: true, effort: 'low' } },
+    },
+    defaultValue: {
+      enabled: true,
+      maxParallel: 1,
+      adjudication: { enabled: true },
+      rubrics: { testQuality: { enabled: false } },
+    },
   },
   {
     name: 'auto_restart_on_stale_engine',
@@ -257,5 +273,54 @@ describe('Story 2 — malformed values keep their existing source-aware contract
     expect(result.warnings).toEqual([
       'attribution_audit_sample_pct out of range [0, 100]; clamped to 100.',
     ]);
+  });
+});
+
+describe('merged test_suite verification defaults', () => {
+  it('preserves a user drift budget when project verification defaults materialize after merge', async () => {
+    const root = await makeConfigPair(
+      'test_suite:\n  verification:\n    drift_budget:\n      source: 20\n',
+      'test_suite:\n  command: npm test\n',
+    );
+
+    const result = await loadMergedConfig(root);
+
+    expect(result).toMatchObject({
+      ok: true,
+      config: {
+        test_suite: {
+          verification: {
+            mode: 'aggregate',
+            drift_budget: {
+              additional_inputs: 'none',
+              dependencies: 'none',
+              environment: 'none',
+              migrations: 'none',
+              project_config: 'none',
+              source: 20,
+              test_infrastructure: 'none',
+              tests: 'none',
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('continues to reject an explicitly supplied unbudgetable budget category', async () => {
+    const root = await makeConfigPair(
+      'test_suite:\n  verification:\n    drift_budget:\n      dependencies: none\n',
+      'test_suite:\n  command: npm test\n',
+    );
+
+    const result = await loadMergedConfig(root);
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        type: 'validation_error',
+        message: 'test_suite.verification.drift_budget.dependencies is unbudgetable',
+      },
+    });
   });
 });

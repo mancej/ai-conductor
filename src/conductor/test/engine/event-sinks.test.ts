@@ -1,3 +1,4 @@
+// Covers: task:1, task:3, task:6, task:8, task:15, task:17
 import { describe, expect, it } from 'vitest';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,6 +9,8 @@ import { EventPersister } from '../../src/engine/event-persister.js';
 import {
   EVENT_SINKS,
   auditedEventTypes,
+  otelEventTypes,
+  otelTracedEventTypes,
   persistedEventTypes,
   renderedEventTypes,
   type SinkDeclaration,
@@ -21,6 +24,7 @@ const PRE_REFACTOR_PERSISTED_EVENT_TYPES = [
   'step_completed',
   'step_failed',
   'step_refused',
+  'step_status_write_refused',
   'provider_attempt',
   'scratch_cleanup_reclaimed',
   'scratch_cleanup_retained',
@@ -48,6 +52,7 @@ const PRE_REFACTOR_PERSISTED_EVENT_TYPES = [
   'build_no_progress',
   'build_stall',
   'renderer_error',
+  'pipeline_tail_diagnostic',
   'when_skip',
   'parallel_started',
   'parallel_completed',
@@ -83,6 +88,18 @@ const ENGINEER_LIFECYCLE_EVENT_TYPES = [
 
 const REMEDIATION_SEALED_ARTIFACT_REDIRECT_EVENT_TYPES = [
   'remediation_sealed_artifact_redirect',
+  'remediation_disposition_rejected',
+] satisfies Array<ConductorEvent['type']>;
+
+const REMEDIATION_CASE_LIFECYCLE_EVENT_TYPES = [
+  'remediation_adjudication_started',
+  'remediation_adjudication_completed',
+  'remediation_adjudication_failed',
+  'remediation_case_reconciled',
+  'remediation_effect_reserved',
+  'remediation_effect_applied',
+  'remediation_effect_failed',
+  'remediation_semantic_repeat_halt',
 ] satisfies Array<ConductorEvent['type']>;
 
 const RESEAL_EVENT_TYPES = [
@@ -105,7 +122,6 @@ const PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES = [
   'finish_publication_blocked',
   'finish_publication_disposition',
   'kickback',
-  'deprecated_step',
   'rebase_changed',
   'rebase_gate_invalidated',
   'build_review_repair_context',
@@ -114,16 +130,21 @@ const PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES = [
   'build_review_rubric_result',
   'build_review_rubric_skipped',
   'build_review_cache_hit',
+  'build_review_scope_summary',
+  'build_review_cache_discarded',
   'build_review_rubric_infrastructure_failure',
   'build_review_mechanical_allowance_exhausted',
   'build_review_disposition_version_invalidated',
   'build_review_outer_verdict',
+  'remediation_adjudication_completed',
+  'remediation_case_refuted',
   'build_review_stale_aggregate',
   'loop_halt',
   'halt_marker_write_failed',
   'halt_record_written',
   'halt_record_write_failed',
   'halt_record_push_failed',
+  'shipment_evidence_refused',
   'rebase_conflict_halt',
 ] satisfies Array<ConductorEvent['type']>;
 
@@ -131,22 +152,42 @@ const PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES = [
 // non-halt event must update this contract explicitly.
 const PINNED_PERSISTED_EVENT_TYPES = [
   ...ENGINEER_LIFECYCLE_EVENT_TYPES,
+  'daemon_backlog_snapshot',
+  'feature_dispatch_started',
+  'feature_dispatch_ended',
+  'feature_shipped',
   ...PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES,
   ...BUILD_MEMBER_SETTLE_DECISION_EVENT_TYPES,
+  'test_suite_verification',
+  'gate_verdict',
+  'intake_inbound_sanitized',
+  // S7.5: the budget basis on a post-rebase preservation is only observable
+  // if it reaches .pipeline/events.jsonl — its sibling rebase_gate_invalidated
+  // is already persisted, so an unpersisted preservation reads as silence.
+  'rebase_gate_preserved',
   'operator_rewind',
+  'setup_repair',
+  'project_setup',
+  'memory_setup',
   'plan_growth',
+  'kickback_budget_adjustment_authorized',
+  'coverage_binding_judged',
+  'coverage_binding_disabled',
   'config_deprecated_key',
   'contained_live_checkout_drift',
   'provider_stream_progress',
   'self_host_containment_verdict',
   'over_scope_decision',
+  ...REMEDIATION_CASE_LIFECYCLE_EVENT_TYPES,
+  'remediation_case_refuted',
+  'build_review_scope_summary',
+  'build_review_scope_incomplete',
 ] satisfies Array<ConductorEvent['type']>;
 
 const NON_PERSISTED_REBASE_LIFECYCLE_EVENT_TYPES = [
   'rebase_noop',
   'rebase_mergeable_skip',
   'rebase_gate_reverified',
-  'rebase_gate_preserved',
   'rebase_citation_residue',
   'rebase_resolution_attempt',
   'rebase_resolution_succeeded',
@@ -165,12 +206,26 @@ const PRE_REFACTOR_AUDITED_EVENT_TYPES = [
   'loop_halt',
   'step_completed',
   'step_refused',
+  'step_status_write_refused',
   'halt_cleared',
   'operator_rewind',
+  'kickback_budget_adjustment_authorized',
 ] satisfies Array<ConductorEvent['type']>;
 
 const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
+  'build_review_cache_discarded',
+  'build_review_rubric_started',
+  'build_review_rubric_result',
+  'build_review_rubric_skipped',
+  'build_review_cache_hit',
+  'build_review_rubric_infrastructure_failure',
+  'build_review_outer_verdict',
+  'remediation_adjudication_completed',
+  'remediation_case_refuted',
   'operator_rewind',
+  'setup_repair',
+  'project_setup',
+  'memory_setup',
   'plan_growth',
   'contained_live_checkout_drift',
   'self_host_containment_verdict',
@@ -178,6 +233,7 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   'step_completed',
   'step_failed',
   'step_refused',
+  'step_status_write_refused',
   'step_retry',
   'rate_limit',
   'session_reset',
@@ -187,6 +243,8 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   'build_no_progress',
   'build_stall',
   'pipeline_closeout',
+  'pipeline_tail_diagnostic',
+  'renderer_error',
   'provider_attempt',
   'scratch_cleanup_reclaimed',
   'scratch_cleanup_retained',
@@ -202,6 +260,7 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   'rebase_conflict_halt',
   'ci_failed',
   'build_review_base',
+  'build_review_scope_incomplete',
   'build_review_stale_mirage_regrade',
   'auto_park_contradiction',
   'verdict_freshness',
@@ -211,12 +270,12 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   ...RESEAL_EVENT_TYPES,
   'parallel_started',
   'parallel_completed',
+  'when_skip',
   'rebase_mergeable_skip',
   'operator_park_boundary',
   'finish_publication_transition',
   'finish_publication_blocked',
   'finish_publication_disposition',
-  'deprecated_step',
   ...REMEDIATION_SEALED_ARTIFACT_REDIRECT_EVENT_TYPES,
 ] satisfies Array<ConductorEvent['type']>;
 
@@ -224,10 +283,25 @@ const { verdict_freshness: _omitted, ...missingVerdictFreshness } = EVENT_SINKS;
 // @ts-expect-error -- every ConductorEvent type must declare all three sink decisions.
 missingVerdictFreshness satisfies Record<ConductorEvent['type'], SinkDeclaration>;
 
+const { coverage_binding_judged: _coverageBindingJudgedOmitted, ...missingCoverageBindingJudged } = EVENT_SINKS;
+// @ts-expect-error -- coverage_binding_judged must declare every sink decision.
+missingCoverageBindingJudged satisfies Record<ConductorEvent['type'], SinkDeclaration>;
+
+const { coverage_binding_disabled: _coverageBindingDisabledOmitted, ...missingCoverageBindingDisabled } = EVENT_SINKS;
+// @ts-expect-error -- coverage_binding_disabled must declare every sink decision.
+missingCoverageBindingDisabled satisfies Record<ConductorEvent['type'], SinkDeclaration>;
+
+// @ts-expect-error -- coverage_binding is intentionally terminal-only telemetry.
+const coverageBindingStarted: Extract<ConductorEvent, { type: 'coverage_binding_started' }> = { type: 'coverage_binding_started' };
+// @ts-expect-error -- coverage_binding halts are represented by the ordinary step outcome.
+const coverageBindingHalted: Extract<ConductorEvent, { type: 'coverage_binding_halted' }> = { type: 'coverage_binding_halted' };
+void [coverageBindingStarted, coverageBindingHalted];
+
 const deliberatelyNotPersisted = {
   render: false,
   persist: false,
   audit: false,
+  otel: false,
 } satisfies SinkDeclaration;
 void deliberatelyNotPersisted;
 
@@ -262,6 +336,174 @@ void [
 ];
 
 describe('event sink subscriptions', () => {
+  // Covers: task:1
+  it('persists, renders, and exports memory setup without widening audit', () => {
+    expect({
+      sinks: EVENT_SINKS.memory_setup,
+      persisted: persistedEventTypes(),
+      rendered: renderedEventTypes(),
+      audited: auditedEventTypes(),
+      otel: otelEventTypes(),
+    }).toMatchObject({
+      sinks: { render: true, persist: true, audit: false, otel: true },
+      persisted: expect.arrayContaining(['memory_setup']),
+      rendered: expect.arrayContaining(['memory_setup']),
+      audited: expect.not.arrayContaining(['memory_setup']),
+      otel: expect.arrayContaining(['memory_setup']),
+    });
+  });
+
+  it('persists coverage-binding terminal observations without rendering, audit, or OpenTelemetry', () => {
+    expect({
+      judged: EVENT_SINKS.coverage_binding_judged,
+      disabled: EVENT_SINKS.coverage_binding_disabled,
+      persisted: persistedEventTypes(),
+      rendered: renderedEventTypes(),
+      audited: auditedEventTypes(),
+      otel: otelEventTypes(),
+    }).toMatchObject({
+      judged: { render: false, persist: true, audit: false, otel: false },
+      disabled: { render: false, persist: true, audit: false, otel: false },
+      persisted: expect.arrayContaining(['coverage_binding_judged', 'coverage_binding_disabled']),
+      rendered: expect.not.arrayContaining(['coverage_binding_judged', 'coverage_binding_disabled']),
+      audited: expect.not.arrayContaining(['coverage_binding_judged', 'coverage_binding_disabled']),
+      otel: expect.not.arrayContaining(['coverage_binding_judged', 'coverage_binding_disabled']),
+    });
+  });
+
+  it('pins the OpenTelemetry traced and metrics-only subscription partition', () => {
+    const metricsOnly = [
+      'daemon_backlog_snapshot',
+      'feature_dispatch_started',
+      'feature_dispatch_ended',
+      'feature_shipped',
+      'memory_setup',
+      'feature_usage_total',
+      'feature_cost_snapshot',
+    ] satisfies Array<ConductorEvent['type']>;
+    const traced = [
+      'step_started',
+      'step_completed',
+      'step_failed',
+      'provider_attempt',
+      'step_retry',
+      'feature_complete',
+      'build_stall',
+      'build_progress',
+      'build_no_progress',
+      'pipeline_closeout',
+      'gate_verdict',
+      'kickback',
+      'loop_halt',
+    ] satisfies Array<ConductorEvent['type']>;
+    const otel = [
+      'daemon_backlog_snapshot',
+      'feature_dispatch_started',
+      'feature_dispatch_ended',
+      'feature_shipped',
+      'memory_setup',
+      'step_started',
+      'step_completed',
+      'step_failed',
+      'provider_attempt',
+      'feature_usage_total',
+      'feature_cost_snapshot',
+      'step_retry',
+      'feature_complete',
+      'build_stall',
+      'build_progress',
+      'build_no_progress',
+      'pipeline_closeout',
+      'gate_verdict',
+      'kickback',
+      'loop_halt',
+    ] satisfies Array<ConductorEvent['type']>;
+
+    expect(otelEventTypes()).toEqual(otel);
+    expect(otelTracedEventTypes()).toEqual(traced);
+    for (const type of metricsOnly) {
+      expect(otelEventTypes()).toContain(type);
+      expect(otelTracedEventTypes()).not.toContain(type);
+    }
+    expect(otelEventTypes()).toContain('step_started');
+    expect(otelTracedEventTypes()).toContain('step_started');
+    expect(EVENT_SINKS.unattributed_progress).toEqual({
+      render: true,
+      persist: true,
+      audit: false,
+      otel: false,
+    });
+    expect(otelEventTypes()).not.toContain('unattributed_progress');
+    expect(otelTracedEventTypes()).not.toContain('unattributed_progress');
+  });
+
+  it('declares feature cost snapshots as OpenTelemetry-only ledger projections', () => {
+    expect({
+      sinks: EVENT_SINKS.feature_cost_snapshot,
+      otel: otelEventTypes().includes('feature_cost_snapshot'),
+      rendered: renderedEventTypes().includes('feature_cost_snapshot'),
+      persisted: persistedEventTypes().includes('feature_cost_snapshot'),
+    }).toEqual({
+      sinks: { render: false, persist: false, audit: false, otel: true, otelTrace: false },
+      otel: true,
+      rendered: false,
+      persisted: false,
+    });
+  });
+
+  it('renders and persists renderer errors through the shared event spine', () => {
+    expect({
+      sinks: EVENT_SINKS.renderer_error,
+      rendered: renderedEventTypes().includes('renderer_error'),
+      persisted: persistedEventTypes().includes('renderer_error'),
+    }).toEqual({
+      sinks: { render: true, persist: true, audit: false, otel: false },
+      rendered: true,
+      persisted: true,
+    });
+  });
+
+  it('persists satisfied and unsatisfied gate verdicts through the event ledger', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'gate-verdict-event-sinks-'));
+    const events = new ConductorEventEmitter();
+    const persister = new EventPersister(join(projectRoot, '.pipeline', 'events.jsonl'), events);
+    const verdicts = [
+      {
+        type: 'gate_verdict' as const,
+        step: 'test_suite' as const,
+        satisfied: true,
+        reason: 'evidence is current',
+      },
+      {
+        type: 'gate_verdict' as const,
+        step: 'build_review' as const,
+        satisfied: false,
+        reason: 'blocking finding remains',
+      },
+    ] satisfies ConductorEvent[];
+
+    try {
+      persister.start();
+      for (const verdict of verdicts) await events.emit(verdict);
+      persister.stop();
+
+      const records = (await readFile(join(projectRoot, '.pipeline', 'events.jsonl'), 'utf8'))
+        .trim().split('\n').map((line) => JSON.parse(line));
+      expect({
+        sinks: EVENT_SINKS.gate_verdict,
+        persisted: persistedEventTypes().includes('gate_verdict'),
+        records,
+      }).toEqual({
+        sinks: { render: true, persist: true, audit: true, otel: true },
+        persisted: true,
+        records: verdicts.map((verdict) => ({ ...verdict, ts: expect.any(String) })),
+      });
+    } finally {
+      persister.stop();
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it('persists engine-owned build-review occurrences through the shared ledger exactly once', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'build-review-event-sinks-'));
     const events = new ConductorEventEmitter();
@@ -282,6 +524,29 @@ describe('event sink subscriptions', () => {
       persister.stop();
       await rm(projectRoot, { recursive: true, force: true });
     }
+  });
+
+  it('declares every remediation case lifecycle occurrence for persistence without extra render, audit, or OTel subscriptions', () => {
+    const expected = { render: false, persist: true, audit: false, otel: false };
+
+    expect(
+      Object.fromEntries(
+        REMEDIATION_CASE_LIFECYCLE_EVENT_TYPES.map((type) => [type, EVENT_SINKS[type]]),
+      ),
+    ).toEqual(Object.fromEntries(
+      REMEDIATION_CASE_LIFECYCLE_EVENT_TYPES.map((type) => [type, type === 'remediation_adjudication_completed'
+        ? { ...expected, render: true }
+        : expected]),
+    ));
+  });
+
+  it('renders, persists, and audits a refuted remediation case without exporting it to OpenTelemetry', () => {
+    expect(EVENT_SINKS.remediation_case_refuted).toEqual({
+      render: true,
+      persist: true,
+      audit: true,
+      otel: false,
+    });
   });
 
   it('persists loop_halt events through the emitter into the pipeline ledger', async () => {
@@ -370,7 +635,7 @@ describe('event sink subscriptions', () => {
     const auditTrail = new AuditTrailWriter(projectRoot);
     const kickback = {
       type: 'kickback' as const,
-      from: 'wiring_check' as const,
+      from: 'test_suite' as const,
       to: 'build' as const,
       evidence: 'Task 1: replace stale anchor.',
       count: 1,
@@ -390,7 +655,7 @@ describe('event sink subscriptions', () => {
         auditRecord: {
           origin: 'build',
           event: 'kickback',
-          cause: 'wiring_check evidence: Task 1: replace stale anchor.',
+          cause: 'test_suite evidence: Task 1: replace stale anchor.',
         },
       });
     } finally {
@@ -405,13 +670,13 @@ describe('event sink subscriptions', () => {
 
     try {
       persister.start();
-      await events.emit({ type: 'kickback', from: 'wiring_check', to: 'build', count: 1 });
+      await events.emit({ type: 'kickback', from: 'test_suite', to: 'build', count: 1 });
       persister.stop();
 
       const record = JSON.parse((await readFile(join(projectRoot, '.pipeline', 'events.jsonl'), 'utf-8')).trim());
       expect(record).toEqual({
         type: 'kickback',
-        from: 'wiring_check',
+        from: 'test_suite',
         to: 'build',
         count: 1,
         ts: expect.any(String),
@@ -435,7 +700,7 @@ describe('event sink subscriptions', () => {
 
     expect({ progress, sinks: EVENT_SINKS.credentials_park_progress }).toEqual({
       progress,
-      sinks: { render: true, persist: true, audit: false },
+      sinks: { render: true, persist: true, audit: false, otel: false },
     });
   });
 
@@ -445,9 +710,27 @@ describe('event sink subscriptions', () => {
       rendered: renderedEventTypes().includes('pipeline_closeout'),
       persisted: persistedEventTypes().includes('pipeline_closeout'),
     }).toEqual({
-      sinks: { render: true, persist: false, audit: false },
+      sinks: { render: true, persist: false, audit: false, otel: true },
       rendered: true,
       persisted: false,
+    });
+  });
+
+  it('renders and persists tail diagnostics without widening audit or OTel sinks', () => {
+    expect(EVENT_SINKS.pipeline_tail_diagnostic).toEqual({
+      render: true,
+      persist: true,
+      audit: false,
+      otel: false,
+    });
+  });
+
+  it('renders and persists conditional skips without widening their other sinks', () => {
+    expect(EVENT_SINKS.when_skip).toEqual({
+      render: true,
+      persist: true,
+      audit: false,
+      otel: false,
     });
   });
 
@@ -457,8 +740,8 @@ describe('event sink subscriptions', () => {
       refused: EVENT_SINKS.build_review_disposition_refused,
       persisted: persistedEventTypes(),
     }).toEqual({
-      accepted: { render: false, persist: false, audit: false },
-      refused: { render: false, persist: false, audit: false },
+      accepted: { render: false, persist: false, audit: false, otel: false },
+      refused: { render: false, persist: false, audit: false, otel: false },
       persisted: expect.not.arrayContaining([
         'build_review_disposition_accepted',
         'build_review_disposition_refused',
@@ -468,7 +751,7 @@ describe('event sink subscriptions', () => {
 
   it('audits engine-reported non-binding build-review dispositions', () => {
     expect(EVENT_SINKS.build_review_disposition_version_invalidated).toEqual({
-      render: false, persist: true, audit: true,
+      render: false, persist: true, audit: true, otel: false,
     });
   });
 
@@ -497,6 +780,7 @@ describe('event sink subscriptions', () => {
         render: true,
         persist: true,
         audit: false,
+        otel: false,
       },
     });
   });
@@ -524,7 +808,7 @@ describe('event sink subscriptions', () => {
       persisted: persistedEventTypes().includes('build_review_repair_context'),
     }).toEqual({
       provenance,
-      sink: { render: false, persist: true, audit: false },
+      sink: { render: false, persist: true, audit: false, otel: false },
       persisted: true,
     });
   });
@@ -539,6 +823,7 @@ describe('event sink subscriptions', () => {
       render: true,
       persist: true,
       audit: true,
+      otel: false,
     });
   });
 
@@ -571,8 +856,8 @@ describe('event sink subscriptions', () => {
       refused: EVENT_SINKS.protected_artifact_reseal_refused,
     }).toEqual({
       events,
-      performed: { render: true, persist: false, audit: true },
-      refused: { render: true, persist: false, audit: true },
+      performed: { render: true, persist: false, audit: true, otel: false },
+      refused: { render: true, persist: false, audit: true, otel: false },
     });
   });
 
@@ -586,9 +871,9 @@ describe('event sink subscriptions', () => {
       writeFailed: EVENT_SINKS.halt_record_write_failed,
       pushFailed: EVENT_SINKS.halt_record_push_failed,
     }).toEqual({
-      written: { render: true, persist: true, audit: true },
-      writeFailed: { render: true, persist: true, audit: true },
-      pushFailed: { render: true, persist: true, audit: true },
+      written: { render: true, persist: true, audit: true, otel: false },
+      writeFailed: { render: true, persist: true, audit: true, otel: false },
+      pushFailed: { render: true, persist: true, audit: true, otel: false },
     });
   });
 
@@ -599,7 +884,6 @@ describe('event sink subscriptions', () => {
       'pipeline_closeout',
       'retry_decision',
       'group_member_step',
-      'test_suite_verification',
       ...NON_PERSISTED_REBASE_LIFECYCLE_EVENT_TYPES,
     ] satisfies Array<ConductorEvent['type']>;
 
@@ -615,7 +899,10 @@ describe('event sink subscriptions', () => {
       'halt_record_written',
       'halt_record_write_failed',
       'halt_record_push_failed',
+      'shipment_evidence_refused',
       'build_review_disposition_version_invalidated',
+      'build_review_cache_discarded',
+      'remediation_case_refuted',
       ...REMEDIATION_SEALED_ARTIFACT_REDIRECT_EVENT_TYPES,
       ...RESEAL_EVENT_TYPES,
     ]));
@@ -628,6 +915,7 @@ describe('event sink subscriptions', () => {
       'halt_record_written',
       'halt_record_write_failed',
       'halt_record_push_failed',
+      'shipment_evidence_refused',
     ]));
   });
 });

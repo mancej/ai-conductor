@@ -6,7 +6,7 @@
  * `finish-publication.ts`; this module is deliberately only its real-boundary
  * adapter.
  */
-import { access, lstat, readFile, writeFile } from 'node:fs/promises';
+import { access, lstat, readFile, readdir, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import type { ConductState, FinishPublicationEvent, RunMode } from '../types/index.js';
@@ -42,6 +42,12 @@ import {
   appendRecordedShipmentFindings,
   recordedShipmentFindings,
 } from './shipment-association.js';
+import { resolveShipmentIdentity } from './shipment-identity.js';
+import {
+  extractShipmentPlanDeclarations,
+  upsertShipmentPlanDeclaration,
+  withoutShipmentPlanDeclarations,
+} from './shipment-plan-declaration.js';
 
 export interface ProductionFinishPublicationCoordinator {
   advance(input: {
@@ -166,8 +172,8 @@ function prProse(
   title: unknown,
   body: unknown,
   halted: boolean,
-  acceptedRevision: boolean,
-): 'accepted' | 'stale' | 'placeholder' | 'halt' {
+  verdict: 'accepted' | 'deficient' | 'none',
+): 'accepted' | 'revision_required' | 'stale' | 'placeholder' | 'halt' {
   const prTitle = typeof title === 'string' ? title : '';
   const prBody = typeof body === 'string' ? body : '';
   const text = `${prTitle}\n${prBody}`.trim();
@@ -187,7 +193,9 @@ function prProse(
   // authored that exact revision or received an accepted judgment for it.
   // The PR remains the observation authority; this cache only records the
   // bounded provider work performed by this coordinator lifetime.
-  return acceptedRevision ? 'accepted' : 'stale';
+  if (verdict === 'accepted') return 'accepted';
+  if (verdict === 'deficient') return 'revision_required';
+  return 'stale';
 }
 
 /**
@@ -269,11 +277,12 @@ export function createProductionFinishPublicationCoordinator(
       // Best-effort durability; the in-memory verdict still bounds this run.
     }
   };
-  // A successful coordinator authoring pass owns exactly one mandatory
+  // A successful placeholder-authoring pass owns exactly one mandatory
   // re-observation. Its revision is accepted without a redundant judgment;
-  // independently observed authored prose remains stale and is judged.
+  // a rewrite of prose already judged deficient remains stale and is judged.
   const acceptedProseRevisionByPr = new Map<string, string>();
-  const authoredProsePendingByPr = new Set<string>();
+  const authoredPlaceholderProsePendingByPr = new Set<string>();
+  const authoringOriginByPr = new Map<string, 'placeholder' | 'revision_required'>();
   // Interactive authority is acquired once per coordinator lifetime. A retry
   // must re-observe publication state, not ask the operator to re-authorize
   // the same requested outcome.
@@ -321,6 +330,23 @@ export function createProductionFinishPublicationCoordinator(
     if (acceptedRiskBody.body !== (typeof body === 'string' ? body : '')) {
       await deps.gh(['pr', 'edit', prUrl, '--body', acceptedRiskBody.body], { cwd: deps.projectRoot });
     }
+  };
+  const projectShipmentPlanDeclarationToRetainedPr = async (prUrl: string, requestedSlug: string) => {
+    const planPaths = (await readdir(join(deps.projectRoot, '.docs', 'plans')))
+      .filter((name) => name.endsWith('.md'))
+      .map((name) => join('.docs', 'plans', name));
+    const resolution = resolveShipmentIdentity(requestedSlug, planPaths);
+    if (resolution.kind !== 'resolved') {
+      const detail = resolution.kind === 'ambiguous'
+        ? `ambiguous plan candidates: ${resolution.candidates.join(', ')}`
+        : `plan not found: ${resolution.expected}`;
+      throw new Error(`shipment plan declaration: ${detail}`);
+    }
+    const { stdout } = await deps.gh(['pr', 'view', prUrl, '--json', 'body'], { cwd: deps.projectRoot });
+    const body = (JSON.parse(stdout) as { body?: unknown }).body;
+    if (typeof body !== 'string') throw new Error('shipment plan declaration: PR body is malformed');
+    const next = upsertShipmentPlanDeclaration(body, resolution.identity.slug);
+    if (next !== body) await deps.gh(['pr', 'edit', prUrl, '--body', next], { cwd: deps.projectRoot });
   };
 
   return {
@@ -408,11 +434,20 @@ export function createProductionFinishPublicationCoordinator(
                 };
                 if (typeof pr.url === 'string') {
                   const halted = prHaltState(pr.title, pr.body, pr.labels);
-                  const revision = `${pr.url}\u0000${JSON.stringify([pr.title ?? '', pr.body ?? ''])}`;
+                  // The declaration is mechanically maintained shipment
+                  // metadata, not reader-facing prose. Its append/replacement
+                  // must not invalidate the verdict for an otherwise identical
+                  // title/body revision and trigger another provider judgment.
+                  const proseBody = typeof pr.body === 'string'
+                    ? extractShipmentPlanDeclarations(pr.body).length === 0
+                      ? pr.body
+                      : withoutShipmentPlanDeclarations(pr.body).trimEnd()
+                    : pr.body ?? '';
+                  const revision = `${pr.url}\u0000${JSON.stringify([pr.title ?? '', proseBody])}`;
                   proseRevisionByPr.set(pr.url, revision);
                   await seedJudgmentStore();
-                  if (authoredProsePendingByPr.delete(pr.url) && !halted) {
-                    const observedProse = prProse(pr.title, pr.body, false, false);
+                  if (authoredPlaceholderProsePendingByPr.delete(pr.url) && !halted) {
+                    const observedProse = prProse(pr.title, pr.body, false, 'none');
                     if (observedProse !== 'placeholder') {
                       // The authoring pass, not an independently observed
                       // reader-facing revision, owns this exact replacement.
@@ -424,20 +459,38 @@ export function createProductionFinishPublicationCoordinator(
                       await persistJudgmentStore();
                     }
                   }
-                  if (judgmentByRevision.get(revisionDigest(revision))?.kind === 'accepted') {
+                  const judgment = judgmentByRevision.get(revisionDigest(revision));
+                  if (judgment?.kind === 'accepted') {
                     acceptedProseRevisionByPr.set(pr.url, revision);
                   }
+                  const verdict =
+                    acceptedProseRevisionByPr.get(pr.url) === revision || judgment?.kind === 'accepted'
+                      ? 'accepted' as const
+                      : judgment?.kind === 'revision_required' &&
+                          (judgment.reason === 'placeholder' || judgment.reason === 'structurally_incomplete')
+                        ? 'deficient' as const
+                        : 'none' as const;
+                  const revisionGuidance =
+                    verdict === 'deficient' && judgment?.kind === 'revision_required'
+                      ? judgment.detail
+                      : undefined;
                   const prose = prProse(
                     pr.title,
                     pr.body,
                     halted,
-                    acceptedProseRevisionByPr.get(pr.url) === revision,
+                    verdict,
                   );
+                  if (prose === 'placeholder' || prose === 'revision_required') {
+                    authoringOriginByPr.set(pr.url, prose);
+                  } else {
+                    authoringOriginByPr.delete(pr.url);
+                  }
                   return {
                       state: 'one' as const,
                       url: pr.url,
                       prose,
                       ...(halted ? { halted: true as const } : {}),
+                      ...(revisionGuidance === undefined ? {} : { revisionGuidance }),
                       ready: !pr.isDraft,
                     };
                 }
@@ -479,7 +532,9 @@ export function createProductionFinishPublicationCoordinator(
             ? {
                 authorProse: async (request: PrProseAuthoringRequest) => {
                   await dispatchAuthoring(request);
-                  authoredProsePendingByPr.add(request.pullRequestUrl);
+                  if (authoringOriginByPr.get(request.pullRequestUrl) === 'placeholder') {
+                    authoredPlaceholderProsePendingByPr.add(request.pullRequestUrl);
+                  }
                 },
               }
             : {}),
@@ -552,19 +607,50 @@ export function createProductionFinishPublicationCoordinator(
             await projectAcceptedRiskToRetainedPr(state.pr_url);
             if (deps.repairPresentation) {
               await deps.repairPresentation({ prUrl: state.pr_url, state });
-              return;
+            } else {
+              await deps.gh(['pr', 'ready', state.pr_url], { cwd: deps.projectRoot });
             }
-            await deps.gh(['pr', 'ready', state.pr_url], { cwd: deps.projectRoot });
+            if (!state.feature_desc) throw new Error('missing shipment identity');
+            await projectShipmentPlanDeclarationToRetainedPr(state.pr_url, state.feature_desc);
           },
           recordOutcome: async (request) => {
-            if (request.choice === 'pr') await projectAcceptedRiskToRetainedPr(request.prUrl);
-            await recordFinish(
+            if (request.choice === 'pr') {
+              await projectAcceptedRiskToRetainedPr(request.prUrl);
+              // AB-1: repairPresentation is NOT the only route to a completed PR
+              // outcome. The selector returns record_outcome directly whenever the
+              // retained PR is already non-draft (finish-publication.ts, `if
+              // (!snapshot.pr.ready) return 'ready_pr'`), which covers both a PR
+              // findOrCreatePr reused in ready state and a retry after a ready_pr
+              // effect that marked the PR ready but then failed at declaration
+              // maintenance — that retry observes `ready: !pr.isDraft` and skips
+              // repairPresentation entirely. Binding the declaration to the same
+              // choice === 'pr' rung the accepted-risk projection already occupies
+              // makes the guard unconditional for a PR outcome. The upsert is
+              // idempotent and edits only when the body changes, so the repaired
+              // path re-reads here and issues no second edit. The keep rung
+              // deliberately projects nothing.
+              if (!state.feature_desc) throw new Error('missing shipment identity');
+              await projectShipmentPlanDeclarationToRetainedPr(request.prUrl, state.feature_desc);
+            }
+            // finish-record signals every fail-closed refusal as a non-zero exit
+            // code, never a throw. Discarding it turned a refusal into a silent
+            // no-op, so the loop halted on the generic "record_outcome left
+            // outcomeRecord unchanged at missing" with the actual reason only
+            // ever reaching the daemon log. Raise it so the failure is
+            // attributed to the recorder that refused.
+            const exitCode = await recordFinish(
               request.choice === 'pr'
                 ? { kind: 'record', choice: 'pr', prUrl: request.prUrl, pipelineDir }
                 : { kind: 'record', choice: 'keep', pipelineDir },
               deps.projectRoot,
               finishRecordRunners,
             );
+            if (exitCode !== 0) {
+              throw new Error(
+                `finish-record refused to record the ${request.choice} outcome (exit ${exitCode}); `
+                  + 'see the finish-record diagnostic in the run log for the refusal reason',
+              );
+            }
           },
         },
       });

@@ -25,7 +25,7 @@ notice and links the required branch, validation, documentation, and release-met
 | `src/conductor/test/` | TypeScript test suites using Vitest and flat `node:test` behavior tests. See [testing](testing.md). |
 | `src/conductor/scripts/` | `publish-engine.mjs` (the build), `publish-guard.mjs`, `intake-label-sync-apply.mts`. |
 | `src/conductor/bin/` | `intake-file` — a `tsx` shebang wrapper over `src/intake-file-cli.ts`. |
-| `bin/` | Repo-root bash wrappers: `conduct-ts`, `install`, `setup`, `update`, `migrate`, `generate-model-table`, `generate-docs-guard-hook`, `intake-file`, `intake-backfill`, `quarantine-engineer-signals`. |
+| `bin/` | Repo-root bash wrappers: `ai-conductor`, `install`, `setup`, `update`, `migrate`, `generate-model-table`, `generate-docs-guard-hook`, `intake-file`, `intake-backfill`, `quarantine-engineer-signals`. |
 | `skills/` | Skill catalog. See [skills reference](../reference/skills.md). |
 | `agents/`, `templates/`, `tech-context/` | Prompt templates, scaffolding, stack knowledge. |
 | `hooks/claude/` | Hook scripts. See [settings and hooks](../reference/settings-and-hooks.md). |
@@ -48,10 +48,10 @@ Static-analysis configuration sits at two levels. Anything needing the TypeScrip
 
 | Layer | Files | Owns |
 | --- | --- | --- |
-| `engine/` | 238 | The state machine, step catalogue, gate loop, daemon, engineer loop, config resolution, self-host guardrails — essentially all domain logic. |
+| `engine/` | 238 | The state machine, step catalogue, gate loop, daemon, composer-loop implementation, config resolution, self-host guardrails — essentially all domain logic. |
 | `execution/` | 6 | The third-party process boundary: LLM provider adapters and subprocess/session management. |
 | `types/` | 6 | The shared type surface: `StepName`, `ConductState`, `ConductorEvent`, `HarnessConfig`, plugin kinds. |
-| `ui/` | 11 | Event emitter, subscribers, terminal renderers, dashboard snapshot/text, notifications, prompt host. |
+| `ui/` | 10 | Event emitter, subscriber fan-out, terminal renderer, dashboard snapshot/text, notifications, prompt host. |
 | `tools/` | 3 | Build-time code generators invoked by `bin/` wrappers. Nothing in the runtime imports them. |
 
 ### engine/
@@ -60,11 +60,11 @@ Static-analysis configuration sits at two levels. Anything needing the TypeScrip
 
 | Subpackage | Files | Owns |
 | --- | --- | --- |
-| `engine/engineer/` | 25 | The engineer loop: authoring, routing, handoff, land-time spec and coherence gates, lesson store. |
+| `engine/engineer/` | 25 | The composer-loop implementation: authoring, routing, handoff, land-time spec and coherence gates, lesson store. |
 | `engine/engineer/intake/` | 16 | Intake queue, ledger, GitHub issue read/write-back, label sync, closed-issue reconciliation. |
 | `engine/self-host/` | 16 | Guardrails for the harness building itself: detector, write fence, sandbox build env, build auth, version gate, release gate. |
 | `engine/halt-issues/` | 6 | Halt-monitor issue reconciliation and its CLI. |
-| `engine/otel/` | 6 | OpenTelemetry config, metrics, and the visualizer. |
+| `engine/otel/` | 8 | OpenTelemetry config, metrics, visualizer, and shared entry-point wiring. |
 | `engine/owner-gate/` | 5 | Multi-operator identity partitioning. |
 
 Flat `engine/` files cluster by filename prefix. Use the prefix to find the subsystem:
@@ -83,7 +83,7 @@ Flat `engine/` files cluster by filename prefix. Use the prefix to find the subs
 | markers | `halt-marker.ts`, `park-marker.ts`, `pause-marker.ts`, `phase-marker.ts`, `restart-marker.ts`, `restart-intent.ts` |
 | plugins | `plugin-loader.ts`, `plugin-registry.ts`, `plugin-manifest.ts`, `visualizer-lifecycle.ts` |
 | memory | `memory-store.ts`, `memory-cli.ts`, `memory-migrate.ts`, `local-memory-provider.ts` |
-| worktree / git | `worktree.ts`, `worktree-prepare.ts`, `worktree-shared.ts`, `git-hook-assets.ts` |
+| worktree / git | `worktree.ts`, `worktree-prepare.ts`, `worktree-shared.ts`, `git-blob-batch.ts`, `git-hook-assets.ts` |
 
 Two lookups that are easy to get wrong:
 
@@ -120,7 +120,7 @@ Tests must fake this seam rather than cross it. See [testing](testing.md).
 ### ui/
 
 `events.ts` (`ConductorEventEmitter`), `types.ts` (`UIRenderer`, `UISubscriber`, `StepSnapshot`,
-`DashboardSnapshot`, `ViewMode`, `UIPromptHost`), `create-renderer.ts`, `terminal-renderer.ts`,
+`DashboardSnapshot`, `ViewMode`, `UIPromptHost`), `terminal-renderer.ts`,
 `subscriber.ts`, `dispatch.ts`, `dashboard-snapshot.ts`, `dashboard-text.ts`, `live-region.ts`,
 `notifications.ts`, and `terminal/prompt-host.ts` — the only file under `ui/terminal/`.
 
@@ -131,7 +131,7 @@ triggers `process.exit` or stdio side effects.
 
 | File | Generates |
 | --- | --- |
-| `generate-model-table.ts` | The HARNESS.md model-selection table, from `engine/provider-model-policy.ts` and `engine/model-table-metadata.ts`. |
+| `generate-model-table.ts` | The ARCHITECTURE.md model-selection table, from `engine/provider-model-policy.ts` and `engine/model-table-metadata.ts`. |
 | `generate-docs-guard-hook.ts` | `hooks/claude/docs-guard.sh`, from `engine/session-hook-assets.ts`. |
 | `generate-docs-guard-hook-main.ts` | The direct-execution shell for the above. |
 
@@ -145,7 +145,7 @@ Seven files sit at the top level of `src/conductor/src/`.
 
 | File | Role |
 | --- | --- |
-| `index.ts` | The composition root and argv dispatcher. `bin/conduct-ts` execs `dist/index.js`, built from this file. |
+| `index.ts` | The composition root and argv dispatcher. `bin/ai-conductor` execs `dist/index.js`, built from this file. |
 | `cli.ts` | The commander declaration surface. Builds the help text; most subcommands declared here are help-only. |
 | `daemon-cli.ts` | The daemon runtime. Registers zero commander commands; entered through `runDaemonMode` at `:491`, lazily imported from `index.ts` so non-daemon paths never load it. |
 | `intake-loop-cli.ts` | `detectIntakeLoopCommand` `:49` / `dispatchIntakeLoop` `:106`, wired into `index.ts`. |
@@ -181,7 +181,7 @@ Intended layering is `types ← execution ← engine ← ui ← entry points`. M
 > **Known limitation.** `engine/` and `ui/` import each other, so the layering above is not enforceable
 > as a one-way rule. Engine-side value imports: `engine/conductor.ts:61` and `engine/event-persister.ts:4`
 > (`ConductorEventEmitter`), `engine/plugin-loader.ts:8-9` (`TerminalSubscriber`, `TerminalRenderer`).
-> UI-side value imports: `ui/terminal-renderer.ts:8,10` and `ui/create-renderer.ts:8,10`
+> UI-side value imports: `ui/terminal-renderer.ts:8,10`
 > (`getArtifactStatus`, `STEP_ARTIFACT_GLOBS`, `formatProgressDelta`), `ui/terminal/prompt-host.ts:14`
 > (`getRecoveryOptions`). Moving a symbol between the two layers can therefore create a runtime
 > initialization cycle that the type checker will not flag. Tracked in

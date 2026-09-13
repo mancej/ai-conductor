@@ -1,11 +1,13 @@
+// Covers: task:1, task:3
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, access, mkdir, lstat, realpath } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { execa } from 'execa';
+import { WorktreeLifecycleQueue } from '../../src/engine/worktree.js';
 import type { LLMProvider, InvokeOptions, InvokeResult } from '../../src/execution/llm-provider.js';
 import type { ConductState, ProviderAttemptEvent, StepName } from '../../src/types/index.js';
 import type { HarnessConfig } from '../../src/types/config.js';
@@ -30,8 +32,13 @@ import { scanInheritedState } from '../../src/engine/daemon-dashboard.js';
 import { executeProviderCandidates } from '../../src/engine/provider-execution.js';
 import type { ExecuteProviderCandidatesInput, ProviderExecutionResult } from '../../src/engine/provider-execution.js';
 import type { ProviderLifecycleEpisodeStore } from '../../src/engine/provider-lifecycle-store.js';
-import { readKickbackLedger, writeKickbackLedger } from '../../src/engine/kickback-ledger.js';
+import { readKickbackLedger } from '../../src/engine/kickback-ledger.js';
 import { ConductorEventEmitter } from '../../src/ui/events.js';
+import { RemediationCaseStore } from '../../src/engine/remediation-case-store.js';
+import { projectBuildReviewAggregateSources } from '../../src/engine/build-review-aggregate.js';
+import { scopedRunFailure } from '../../src/engine/build-review-test-quality-preflight.js';
+import type { BuildReviewScopedLauncher } from '../../src/engine/build-review-scoped-run.js';
+import { renderBuildReviewUnresolvedSkillRemedy } from '../../src/engine/build-review-domain.js';
 
 function createMockProvider(): LLMProvider {
   return {
@@ -81,6 +88,159 @@ function expectUniqueFreshSessionIds(sessionIds: ReadonlyArray<string | undefine
 }
 
 describe('DefaultStepRunner', () => {
+  it('writes disabled coverage-binding completion evidence without invoking a provider', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'coverage-binding-disabled-'));
+    const provider = createMockProvider();
+    const runner = new DefaultStepRunner(provider, 'coverage-run-1', projectDir, {
+      featureDesc: 'coverage-binding-feature',
+    });
+
+    try {
+      await expect(runner.run('coverage_binding', emptyState)).resolves.toEqual({
+        success: true,
+        output: 'coverage_binding judge disabled',
+      });
+      expect(JSON.parse(await readFile(join(projectDir, '.pipeline', 'coverage-binding.json'), 'utf8'))).toEqual({
+        version: 1,
+        slug: 'coverage-binding-feature',
+        runId: 'coverage-run-1',
+        status: 'disabled',
+        entries: [],
+      });
+      expect(provider.invoke).not.toHaveBeenCalled();
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('judges each applicable coverage claim in a fresh one-shot session and caches its digest', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'coverage-binding-enabled-'));
+    const planPath = join(projectDir, 'plan.md');
+    const coherenceDir = join(projectDir, '.docs', 'coherence');
+    const featureDesc = 'coverage-binding-feature';
+    const provider = createMockProvider();
+    (provider.invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, output: '{"verdict":"asserts"}', exitCode: 0,
+    });
+    await mkdir(coherenceDir, { recursive: true });
+    await writeFile(planPath, `### Task 1: Bind the claim\n**Done when:**\n- The service emits the required record.\n`);
+    await writeFile(join(coherenceDir, `${featureDesc}.md`), `| Row Class | Criterion | Cited Task Ids | Verdict | Quote | Disposition |\n| --- | --- | --- | --- | --- | --- |\n| criterion | The service emits the required record | task-1 | covered | "emits the required record" | diff-local |\n`);
+    const runner = new DefaultStepRunner(provider, 'coverage-run-2', projectDir, {
+      featureDesc,
+      planPath,
+      config: { coverage_binding: { judge: { enabled: true } } },
+    });
+
+    try {
+      await expect(runner.run('coverage_binding', { complexity_tier: 'M' })).resolves.toMatchObject({ success: true });
+      expect(provider.invoke).toHaveBeenCalledTimes(1);
+      const first = (provider.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0] as InvokeOptions;
+      expect(first).toMatchObject({ resume: false });
+      expect(first.prompt).toContain('The service emits the required record');
+      expect(first.prompt).not.toContain('Steps');
+      const firstEnvelope = JSON.parse(await readFile(join(projectDir, '.pipeline', 'coverage-binding.json'), 'utf8'));
+      expect(firstEnvelope).toMatchObject({ status: 'done', entries: [{ verdict: 'asserts', taskIds: ['1'] }] });
+
+      await expect(runner.run('coverage_binding', { complexity_tier: 'M' })).resolves.toMatchObject({ success: true });
+      expect(provider.invoke).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rewrites a digest cache hit with the current claim identity and emits that identity', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'coverage-binding-rebound-'));
+    const planPath = join(projectDir, 'plan.md');
+    const coherenceDir = join(projectDir, '.docs', 'coherence');
+    const featureDesc = 'coverage-binding-rebound';
+    const provider = createMockProvider();
+    (provider.invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, output: '{"verdict":"asserts"}', exitCode: 0,
+    });
+    const events = new ConductorEventEmitter();
+    const judged: unknown[] = [];
+    events.on('coverage_binding_judged', (event) => { judged.push(event); });
+    await mkdir(coherenceDir, { recursive: true });
+    const writeInputs = async (taskId: string) => {
+      await writeFile(planPath, `### Task ${taskId}: Bind the claim\n**Done when:**\n- The service emits the required record.\n`);
+      await writeFile(join(coherenceDir, `${featureDesc}.md`), `| Row Class | Criterion | Cited Task Ids | Verdict | Quote | Disposition |\n| --- | --- | --- | --- | --- | --- |\n| criterion | The service emits the required record | task-${taskId} | covered | "emits the required record" | diff-local |\n`);
+    };
+    await writeInputs('A');
+    const runner = new DefaultStepRunner(provider, 'coverage-run-rebound', projectDir, {
+      featureDesc, planPath, events, config: { coverage_binding: { judge: { enabled: true } } },
+    });
+
+    try {
+      await expect(runner.run('coverage_binding', { complexity_tier: 'M' })).resolves.toMatchObject({ success: true });
+      await writeInputs('B');
+      await expect(runner.run('coverage_binding', { complexity_tier: 'M' })).resolves.toMatchObject({ success: true });
+
+      expect(provider.invoke).toHaveBeenCalledTimes(1);
+      const envelope = JSON.parse(await readFile(join(projectDir, '.pipeline', 'coverage-binding.json'), 'utf8'));
+      expect(envelope.entries).toMatchObject([{ taskIds: ['B'] }]);
+      expect(judged).toMatchObject([
+        { type: 'coverage_binding_judged', taskIds: ['A'] },
+        { type: 'coverage_binding_judged', taskIds: ['B'] },
+      ]);
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports an invalid coverage-binding payload through its typed classifier input', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'coverage-binding-invalid-payload-'));
+    const planPath = join(projectDir, 'plan.md');
+    const featureDesc = 'coverage-binding-invalid-payload';
+    const provider = createMockProvider();
+    (provider.invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, output: '{"verdict":"partial"}', exitCode: 0,
+    });
+    await mkdir(join(projectDir, '.docs', 'coherence'), { recursive: true });
+    await writeFile(planPath, `### Task 1: Bind the claim\n**Done when:**\n- The service emits the required record.\n`);
+    await writeFile(join(projectDir, '.docs', 'coherence', `${featureDesc}.md`), `| Row Class | Criterion | Cited Task Ids | Verdict | Quote | Disposition |\n| --- | --- | --- | --- | --- | --- |\n| criterion | The service emits the required record | task-1 | covered | "emits the required record" | diff-local |\n`);
+    const runner = new DefaultStepRunner(provider, 'coverage-run-invalid-payload', projectDir, {
+      featureDesc, planPath, config: { coverage_binding: { judge: { enabled: true } } },
+    });
+
+    try {
+      await expect(runner.run('coverage_binding', { complexity_tier: 'M' })).resolves.toMatchObject({
+        success: false,
+        infrastructureFailure: {
+          name: 'CoverageBindingPayloadError', kind: 'coverage-binding-payload',
+        },
+      });
+      const envelope = JSON.parse(await readFile(join(projectDir, '.pipeline', 'coverage-binding.json'), 'utf8'));
+      expect(envelope).toMatchObject({ status: 'failed', entries: [] });
+      await expect(readFile(join(projectDir, '.pipeline', 'HALT'), 'utf8')).rejects.toThrow();
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns a needs-human refusal with the bound checks for a does-not-assert verdict', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'coverage-binding-refusal-'));
+    const planPath = join(projectDir, 'plan.md');
+    const featureDesc = 'coverage-binding-refusal';
+    const provider = createMockProvider();
+    (provider.invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, output: '{"verdict":"does-not-assert","missingAssertion":"No check requires emission."}', exitCode: 0,
+    });
+    await mkdir(join(projectDir, '.docs', 'coherence'), { recursive: true });
+    await writeFile(planPath, `### Task 1: Bind the claim\n**Done when:**\n- The service writes an audit record.\n`);
+    await writeFile(join(projectDir, '.docs', 'coherence', `${featureDesc}.md`), `| Row Class | Criterion | Cited Task Ids | Verdict | Quote | Disposition |\n| --- | --- | --- | --- | --- | --- |\n| criterion | The service emits five records | task-1 | covered | "writes an audit record" | diff-local |\n`);
+    const runner = new DefaultStepRunner(provider, 'coverage-run-3', projectDir, {
+      featureDesc, planPath, config: { coverage_binding: { judge: { enabled: true } } },
+    });
+    try {
+      await expect(runner.run('coverage_binding', { complexity_tier: 'M' })).resolves.toMatchObject({
+        success: false,
+        refusal: { kind: 'needs-human', reason: expect.stringContaining('The service writes an audit record.') },
+      });
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
   async function exhaustLifecycle(projectDir: string) {
     let now = 0;
     const episodeStore: ProviderLifecycleEpisodeStore = {
@@ -246,6 +406,50 @@ describe('DefaultStepRunner', () => {
     expect(result.observedIntervals?.[0]).toBe(observedIntervals[0]);
   });
 
+  it('forwards resolved effort only when the provider-aware result resolves it', async () => {
+    const providerExecutor = vi.fn()
+      .mockResolvedValueOnce({
+        success: true,
+        output: 'done',
+        exitCode: 0,
+        resolvedEffort: 'high',
+        preferredProvider: 'codex',
+        actualProvider: 'codex',
+        attempts: [],
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        output: 'done',
+        exitCode: 0,
+        preferredProvider: 'codex',
+        actualProvider: 'codex',
+        attempts: [],
+      });
+    const runner = new DefaultStepRunner(createMockProvider(), 'session', '/tmp/project', {
+      providerExecution: {
+        configuredProviders: ['codex'],
+        runtimes: new ProviderRuntimeSet([
+          interactiveRuntime('codex', vi.fn(async (): Promise<InvokeResult> => ({ success: true, output: '', exitCode: 0 }))),
+        ]),
+        sessions: new ProviderSessionStore(),
+        executor: providerExecutor,
+      },
+    });
+
+    const results = [
+      await runner.run('build', emptyState),
+      await runner.run('build', emptyState),
+    ];
+
+    expect(results.map((result) => ({
+      hasEffort: Object.hasOwn(result, 'effort'),
+      effort: (result as { effort?: string }).effort,
+    }))).toEqual([
+      { hasEffort: true, effort: 'high' },
+      { hasEffort: false, effort: undefined },
+    ]);
+  });
+
   it('forwards task-local attribution to provider-aware normal dispatch', async () => {
     const providerExecutor = vi.fn(async (_input: ExecuteProviderCandidatesInput) => ({
       success: true,
@@ -311,6 +515,74 @@ describe('DefaultStepRunner', () => {
       lifecyclePhases: ['preparing', 'running', 'settled'],
       settled: true,
     });
+  });
+
+  it('makes the engine-supplied dispatch run id the provider-lifecycle attempt id', async () => {
+    const providerAttempt = vi.fn();
+    const providerExecutor = vi.fn(async (input: ExecuteProviderCandidatesInput) => {
+      input.options.spawnPermit?.();
+      return {
+        success: true,
+        output: 'done',
+        exitCode: 0,
+        preferredProvider: 'claude' as const,
+        actualProvider: 'claude' as const,
+        attempts: [],
+      };
+    });
+    const runner = new DefaultStepRunner(createMockProvider(), 'session', '/tmp/project', {
+      providerExecution: {
+        configuredProviders: ['claude'],
+        runtimes: new ProviderRuntimeSet([interactiveRuntime('claude', vi.fn(async (): Promise<InvokeResult> => ({ success: true, output: '', exitCode: 0 })))]),
+        sessions: new ProviderSessionStore(),
+        executor: providerExecutor,
+      },
+      providerAttempt,
+    });
+
+    await runner.run('build', emptyState, { runId: 'engine-dispatch-identity' });
+
+    const attemptIds = providerAttempt.mock.calls.flatMap(([, metadata]) => {
+      const lifecycle = (metadata as { lifecycle?: { attemptId?: string } }).lifecycle;
+      return lifecycle?.attemptId ? [lifecycle.attemptId] : [];
+    });
+
+    // One identity authority per dispatch: the id the engine stamps into the
+    // verdict sidecar is the id the lifecycle logs, not a second UUID.
+    expect(attemptIds.length).toBeGreaterThan(0);
+    expect(new Set(attemptIds)).toEqual(new Set(['engine-dispatch-identity']));
+  });
+
+  it('keeps its own run-scoped attempt id when no dispatch run id is supplied', async () => {
+    const providerAttempt = vi.fn();
+    const providerExecutor = vi.fn(async (input: ExecuteProviderCandidatesInput) => {
+      input.options.spawnPermit?.();
+      return {
+        success: true,
+        output: 'done',
+        exitCode: 0,
+        preferredProvider: 'claude' as const,
+        actualProvider: 'claude' as const,
+        attempts: [],
+      };
+    });
+    const runner = new DefaultStepRunner(createMockProvider(), 'session', '/tmp/project', {
+      providerExecution: {
+        configuredProviders: ['claude'],
+        runtimes: new ProviderRuntimeSet([interactiveRuntime('claude', vi.fn(async (): Promise<InvokeResult> => ({ success: true, output: '', exitCode: 0 })))]),
+        sessions: new ProviderSessionStore(),
+        executor: providerExecutor,
+      },
+      providerAttempt,
+    });
+
+    await runner.run('build', emptyState);
+
+    const attemptIds = providerAttempt.mock.calls.flatMap(([, metadata]) => {
+      const lifecycle = (metadata as { lifecycle?: { attemptId?: string } }).lifecycle;
+      return lifecycle?.attemptId ? [lifecycle.attemptId] : [];
+    });
+    expect(new Set(attemptIds)).toEqual(new Set(['session:build:1']));
   });
 
   it('forwards the daemon feature diagnostic logger to a streaming provider invocation', async () => {
@@ -1380,12 +1652,15 @@ describe('DefaultStepRunner', () => {
         output: 'codex built',
         tokenUsage: { input: 11, output: 4 },
         model: 'gpt-5.6-terra',
+        effort: 'medium',
         preferredProvider: 'codex',
         actualProvider: 'codex',
         attempts: [
           {
             provider: 'codex',
+            preferredProvider: 'codex',
             model: 'gpt-5.6-terra',
+            effort: 'medium',
             tokenUsage: { input: 11, output: 4 },
             outcome: 'success',
             invoked: true,
@@ -1397,12 +1672,15 @@ describe('DefaultStepRunner', () => {
         output: 'claude explored',
         tokenUsage: { input: 7, output: 3 },
         model: 'opus',
+        effort: 'high',
         preferredProvider: 'claude',
         actualProvider: 'claude',
         attempts: [
           {
             provider: 'claude',
+            preferredProvider: 'claude',
             model: 'opus',
+            effort: 'high',
             tokenUsage: { input: 7, output: 3 },
             outcome: 'success',
             invoked: true,
@@ -1883,7 +2161,6 @@ describe('DefaultStepRunner', () => {
       { step: 'manual_test', prompt: '$manual-test' },
       { step: 'prd_audit', prompt: '$prd-audit' },
       { step: 'architecture_review_as_built', prompt: '$architecture-review --as-built' },
-      { step: 'retro', prompt: '$retro' },
       { step: 'finish', prompt: '$finish' },
     ] satisfies ReadonlyArray<{ step: StepName; prompt: string }>;
     const codexBoundary = vi.fn(
@@ -2351,6 +2628,44 @@ describe('DefaultStepRunner', () => {
     expect(opts.systemPrompt).not.toContain('gh pr create');
     expect(opts.systemPrompt).not.toContain('git push');
     expect(opts.systemPrompt).not.toContain('finish-record');
+  });
+
+  it('finish revision-lap authoring pass quotes the judge objection without calling the body a placeholder', async () => {
+    const provider = createMockProvider();
+    const runner = new DefaultStepRunner(provider, 'session-1', '/wt/feature-x', {
+      mode: 'auto',
+      pipelineDir: '/wt/feature-x/.pipeline',
+    });
+    const guidance = 'Explain how a failed rebase is recovered without losing completed work.';
+
+    await runner.run('finish', emptyState, {
+      finishProsePass: 'author',
+      revisionGuidance: guidance,
+    });
+
+    const opts = (provider.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0] as InvokeOptions;
+    expect(opts.systemPrompt).toContain('FINISH PR PROSE REVISION');
+    expect(opts.systemPrompt).toContain(guidance);
+    expect(opts.systemPrompt).not.toContain('still carries the engine-seeded placeholder body');
+    expect(opts.systemPrompt).not.toContain('no prose to judge yet');
+    expect(opts.systemPrompt).toContain('do not create, push, merge, or ready a pull request');
+    expect(opts.systemPrompt).toContain('do not alter labels, shipment evidence, or completion files');
+    expect(opts.systemPrompt).toContain('The publication coordinator re-reads the pull request afterwards');
+  });
+
+  it('finish authoring pass without revision guidance keeps the placeholder-authoring prompt', async () => {
+    const provider = createMockProvider();
+    const runner = new DefaultStepRunner(provider, 'session-1', '/wt/feature-x', {
+      mode: 'auto',
+      pipelineDir: '/wt/feature-x/.pipeline',
+    });
+
+    await runner.run('finish', emptyState, { finishProsePass: 'author' });
+
+    const opts = (provider.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0] as InvokeOptions;
+    expect(opts.systemPrompt).toContain('FINISH PR PROSE AUTHORING');
+    expect(opts.systemPrompt).toContain('still carries the engine-seeded placeholder body');
+    expect(opts.systemPrompt).not.toContain('FINISH PR PROSE REVISION');
   });
 
   it('finish judgment pass keeps the bounded verdict contract and defers unauthored bodies', async () => {
@@ -3338,11 +3653,10 @@ TIER: M`,
       expect(opts2.interactive).toBe(true);
     });
 
-    it('complexity-adjacent one-shot steps stay print-mode even in default mode', async () => {
+    it('dispatchable one-shot steps stay print-mode even in default mode', async () => {
       const oneShotSteps: StepName[] = [
         'conflict_check',
         'architecture_diagram',
-        'retro',
       ];
       for (const step of oneShotSteps) {
         const provider = createMockProvider();
@@ -3357,12 +3671,10 @@ TIER: M`,
       }
     });
 
-    // Verify that one-shot steps stay print-mode even in interactive mode
-    it('one-shot steps stay print-mode even in interactive mode', async () => {
+    it('surviving one-shot steps stay print-mode even in interactive mode', async () => {
       const oneShotSteps: StepName[] = [
         'conflict_check',
         'architecture_diagram',
-        'retro',
       ];
       for (const step of oneShotSteps) {
         const provider = createMockProvider();
@@ -3503,17 +3815,26 @@ TIER: M`,
       await writeFile(planPath, '# Plan\n\nDo the thing.\n', 'utf-8');
     });
 
-    it('has no provider runner for the retired wiring_check step', async () => {
-      const provider = createMockProvider();
-      const runner = new DefaultStepRunner(provider, 'session-1', dir, {
-        gitRunner: scriptedGit(),
-        planPath,
+    it('routes an expired counterfactual deadline to the guarded scoped-run timeout without launching', async () => {
+      const launcher = vi.fn<BuildReviewScopedLauncher>(() => {
+        throw new Error('the expired deadline must prevent launch');
       });
+      const runner = new DefaultStepRunner(createMockProvider(), 'session-1', dir, {
+        config: { test_suite: { scoped_command: 'npm test -- {selectors}' } } as HarnessConfig,
+        buildReviewScopedLauncher: launcher,
+      });
+      const controller = new AbortController();
+      controller.abort();
 
-      const result = await runner.run('wiring_check', emptyState);
+      const result = await (runner as unknown as {
+        runScopedTautologyCommand(cwd: string, selectors: readonly string[], signal: AbortSignal): Promise<{
+          kind: 'timeout'; stdout: string; stderr: string;
+        }>;
+      }).runScopedTautologyCommand('/counterfactual', ['test/engine/example.test.ts'], controller.signal);
 
-      expect(result.success).toBe(false);
-      expect(provider.invoke).not.toHaveBeenCalled();
+      expect(launcher).not.toHaveBeenCalled();
+      expect(result).toEqual({ kind: 'timeout', stdout: '', stderr: '' });
+      expect(scopedRunFailure(result)).toBe('scoped-run-timeout');
     });
 
     it('retains one public build_review step while delegating fan-out orchestration without a legacy provider call', async () => {
@@ -3536,6 +3857,59 @@ TIER: M`,
       expect(provider.invoke).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['failed', false, 'review failed: missing coverage'],
+      ['passed', true, 'review passed'],
+    ])('places a containment advisory around %s review output without changing its success result', async (_caseName, success, reviewOutput) => {
+      const provider = createMockProvider();
+      const warnings: string[] = [];
+      const coordinate = vi.fn(async () => ({ success, output: reviewOutput }));
+      const runner = new DefaultStepRunner(provider, 'session-1', dir, {
+        gitRunner: scriptedGit(),
+        planPath,
+        config: { build_review: { scopeContainmentEnforced: true } } as HarnessConfig,
+        buildReviewCoordinator: coordinate,
+        log: (message) => warnings.push(message),
+        ...currentBuildReviewProof(),
+      });
+
+      const result = await runner.run('build_review', emptyState);
+
+      expect(result.success).toBe(success);
+      const advisory =
+        'Advisory: containment-floor: git repository check failed: fatal: not a git repository (or any of the parent directories): .git.';
+      expect(result.output).toContain(advisory);
+      expect(result.output?.startsWith(success
+        ? advisory
+        : reviewOutput)).toBe(true);
+      expect(warnings).toEqual([
+        `WARNING: ${advisory}`,
+      ]);
+      expect(coordinate).toHaveBeenCalledOnce();
+    });
+
+    it('leaves coordinator output untouched when containment is off or non-string', async () => {
+      const provider = createMockProvider();
+      const coordinator = vi.fn()
+        .mockResolvedValueOnce({ success: false, output: 'review failed: untouched' })
+        .mockResolvedValueOnce({ success: false });
+      const withoutContainment = new DefaultStepRunner(provider, 'session-1', dir, {
+        gitRunner: scriptedGit(), planPath, buildReviewCoordinator: coordinator, ...currentBuildReviewProof(),
+      });
+      const withNonStringOutput = new DefaultStepRunner(provider, 'session-1', dir, {
+        gitRunner: scriptedGit(), planPath,
+        config: { build_review: { scopeContainmentEnforced: true } } as HarnessConfig,
+        buildReviewCoordinator: coordinator, ...currentBuildReviewProof(),
+      });
+
+      await expect(withoutContainment.run('build_review', emptyState)).resolves.toMatchObject({
+        success: false, output: 'review failed: untouched',
+      });
+      const nonStringResult = await withNonStringOutput.run('build_review', emptyState);
+      expect(nonStringResult.success).toBe(false);
+      expect('output' in nonStringResult).toBe(false);
+    });
+
     it('empty-passes opted-in test quality when no feature plan resolves', async () => {
       const provider = createMockProvider();
       const runner = new DefaultStepRunner(provider, 'session-1', dir, {
@@ -3553,10 +3927,94 @@ TIER: M`,
       );
     });
 
+    it('refuses an unresolvable plan corpus before publishing a verdict or dispatching a provider', async () => {
+      const invoke = vi.fn();
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'another-feature.md'), '# Another plan\n');
+      await writeFile(join(dir, '.docs', 'plans', 'unrelated-work.md'), '# Unrelated plan\n');
+      const runner = new DefaultStepRunner({ invoke }, 'session-1', dir, {
+        featureDesc: 'this-feature-has-no-plan',
+        gitRunner: scriptedGit(),
+        ...testQualityOptIn(),
+      });
+
+      const result = await runner.run('build_review', emptyState);
+
+      expect(result).toMatchObject({
+        success: false,
+        refusal: {
+          kind: 'needs-human',
+          reason: expect.stringContaining('this-feature-has-no-plan'),
+        },
+      });
+      expect(result.refusal?.reason).toContain('another-feature');
+      expect(result.refusal?.reason).toContain('unrelated-work');
+      await expect(access(join(dir, '.pipeline', 'build-review.json'))).rejects.toThrow();
+      expect(invoke).not.toHaveBeenCalled();
+    });
+
+    it('uses an explicit plan override over an otherwise unresolvable plan corpus', async () => {
+      const provider = createMockProvider();
+      const coordinate = vi.fn(async () => ({ success: true, output: 'reviewed explicit plan' }));
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'another-feature.md'), '# Another plan\n');
+      await writeFile(join(dir, '.docs', 'plans', 'unrelated-work.md'), '# Unrelated plan\n');
+      const runner = new DefaultStepRunner(provider, 'session-1', dir, {
+        featureDesc: 'this-feature-has-no-plan',
+        planPath,
+        gitRunner: scriptedGit(),
+        buildReviewCoordinator: coordinate,
+        ...currentBuildReviewProof(),
+      });
+
+      await expect(runner.run('build_review', emptyState)).resolves.toMatchObject({
+        success: true,
+        output: 'reviewed explicit plan',
+      });
+      expect(coordinate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      { name: 'a singleton plan', plans: ['this-feature-has-no-plan.md'] },
+      { name: 'a stem-matched plan in a multi-plan corpus', plans: ['another-feature.md', 'this-feature-has-no-plan.md'] },
+    ])('reviews $name instead of empty-passing', async ({ plans }) => {
+      const provider = createMockProvider();
+      const coordinate = vi.fn(async () => ({ success: true, output: 'reviewed resolved plan' }));
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await Promise.all(plans.map((name) => writeFile(join(dir, '.docs', 'plans', name), '# Plan\n')));
+      const runner = new DefaultStepRunner(provider, 'session-1', dir, {
+        featureDesc: 'this-feature-has-no-plan',
+        gitRunner: scriptedGit('.docs/plans/this-feature-has-no-plan.md'),
+        buildReviewCoordinator: coordinate,
+        ...currentBuildReviewProof(),
+      });
+
+      await expect(runner.run('build_review', emptyState)).resolves.toMatchObject({
+        success: true,
+        output: 'reviewed resolved plan',
+      });
+      expect(coordinate).toHaveBeenCalledOnce();
+      await expect(access(join(dir, '.pipeline', 'build-review.json'))).rejects.toThrow();
+    });
+
+    it('publishes the no-rubrics PASS when no plan files exist', async () => {
+      const provider = createMockProvider();
+      const runner = new DefaultStepRunner(provider, 'session-1', dir, { gitRunner: scriptedGit() });
+
+      await expect(runner.run('build_review', emptyState)).resolves.toMatchObject({
+        success: true,
+        output: expect.stringContaining('build_review_no_rubrics'),
+      });
+      await expect(readFile(join(dir, '.pipeline/build-review.json'), 'utf8')).resolves.toContain(
+        '"reason": "build_review_no_rubrics"',
+      );
+      expect(provider.invoke).not.toHaveBeenCalled();
+    });
+
     it('materializes checkout-local dependencies before uuid- and execa-importing counterfactual selectors run', async () => {
       const repository = await mkdtemp(join(tmpdir(), 'build-review-checkout-dependencies-'));
       const featureRoot = join(repository, '.worktrees', 'feature');
-      const selector = 'src/conductor/spec/example_spec.mjs';
+      const selector = 'src/conductor/spec/example.test.mjs';
       const sourceDependencies = join(featureRoot, 'src/conductor/node_modules');
       const selectorMarker = join(repository, 'counterfactual-selector-ran');
       const selectorMarkerEnv = 'BUILD_REVIEW_COUNTERFACTUAL_SELECTOR_MARKER';
@@ -3572,7 +4030,7 @@ TIER: M`,
         await mkdir(join(repository, 'src/conductor/src'), { recursive: true });
         await mkdir(join(repository, 'src/conductor/spec'), { recursive: true });
         await mkdir(join(repository, '.docs/plans'), { recursive: true });
-        await writeFile(join(repository, '.docs/plans/feature.md'), `### Task 1: distinguish the selector\n- Update ${selector}.\n`);
+        await writeFile(join(repository, '.docs/plans/feature.md'), `### Task 1: distinguish the selector\n**Files:** ${selector}\n`);
         await writeFile(join(repository, 'src/conductor/src/example.mjs'), 'export const answer = 1;\n');
         await writeFile(join(repository, selector), "import { v4 as uuidv4 } from 'uuid';\nimport { answer } from '../src/example.mjs';\nif (!uuidv4() || answer !== 1) process.exit(1);\n");
         await execa('git', ['add', '.'], { cwd: repository });
@@ -3583,7 +4041,7 @@ TIER: M`,
         await mkdir(join(repository, '.worktrees'), { recursive: true });
         await execa('git', ['worktree', 'add', '-q', '-b', 'feature/proof', featureRoot], { cwd: repository });
         await writeFile(join(featureRoot, 'src/conductor/src/example.mjs'), 'export const answer = 2;\n');
-        await writeFile(join(featureRoot, selector), "// Covers: task:1\nimport { writeFile } from 'node:fs/promises';\nimport { v4 as uuidv4 } from 'uuid';\nimport { execa } from 'execa';\nimport { answer } from '../src/example.mjs';\nif (!uuidv4() || !execa || answer !== 2) { await writeFile(process.env.BUILD_REVIEW_COUNTERFACTUAL_SELECTOR_MARKER, 'selector-loaded-checkout-dependencies'); process.exit(1); }\n");
+        await writeFile(join(featureRoot, selector), "import { writeFile } from 'node:fs/promises';\nimport { v4 as uuidv4 } from 'uuid';\nimport { execa } from 'execa';\nimport { answer } from '../src/example.mjs';\nfunction it(_title, body) { body(); }\n// Covers: task:1\nit('loads checkout dependencies', () => { if (!uuidv4() || !execa || answer !== 2) { writeFile(process.env.BUILD_REVIEW_COUNTERFACTUAL_SELECTOR_MARKER, 'selector-loaded-checkout-dependencies').then(() => process.exit(1)); } });\n");
         await execa('git', ['add', 'src/conductor'], { cwd: featureRoot });
         await execa('git', ['commit', '-q', '-m', 'change behavior and selector'], { cwd: featureRoot });
         await mkdir(join(sourceDependencies, 'uuid'), { recursive: true });
@@ -3597,13 +4055,36 @@ TIER: M`,
           invoke: vi.fn(async (options) => {
             const projection = JSON.parse(options.prompt.split('\n\n').at(-1)!) as typeof observedProjections[number];
             observedProjections.push(projection);
+            const scopeContext = JSON.parse(options.prompt.match(/Candidate-resolution authority \(use only these ids, regions, and obligations\):\n(\{[\s\S]*?\})\n\nYour final/)![1]);
             return { success: true, exitCode: 0, output: JSON.stringify({
               kind: 'judged', rubric: 'testQuality', lapId: (projection as any).lapId,
-              snapshotDigest: (projection as any).snapshotDigest, contractVersion: (projection as any).contractVersion, findings: [],
+              snapshotDigest: (projection as any).snapshotDigest, contractVersion: (projection as any).contractVersion,
+              findings: [],
+              scopeResolutions: scopeContext.candidates.map((candidate: any) => ({
+                candidateId: candidate.candidateId,
+                status: 'resolved',
+                sourceRegion: candidate.sourceRegion,
+                obligationReferences: candidate.obligationReferences,
+                associationReason: 'The pinned declaration is a test target.',
+              })),
             }) };
           }),
         };
+        // AB-1 (Task 20): every shared-`.git` worktree mutation the preflight
+        // issues must flow through the dispatcher-owned lifecycle queue, so a
+        // concurrent slug's add/remove/prune can never overlap it.
+        let queueDepth = 0;
+        const queuedMutations: string[] = [];
+        const worktreeLifecycle = new WorktreeLifecycleQueue();
+        const originalRun = worktreeLifecycle.run.bind(worktreeLifecycle);
+        worktreeLifecycle.run = (operation) => originalRun(async () => {
+          queueDepth += 1;
+          try { return await operation(); } finally { queueDepth -= 1; }
+        });
         const gitRunner = async (args: string[]) => {
+          if (args[0] === 'worktree' && (args[1] === 'add' || args[1] === 'remove')) {
+            queuedMutations.push(queueDepth > 0 ? `${args[1]}:queued` : `${args[1]}:unqueued`);
+          }
           if (args[0] === 'worktree' && args[1] === 'add') checkoutRoot = args[3];
           if (args[0] === 'worktree' && args[1] === 'remove') return { exitCode: 0, stdout: '', stderr: '' };
           const result = await execa('git', args, { cwd: featureRoot, reject: false });
@@ -3613,6 +4094,7 @@ TIER: M`,
         process.env[selectorMarkerEnv] = selectorMarker;
         const runner = new DefaultStepRunner(provider, 'checkout-proof', featureRoot, {
           gitRunner,
+          worktreeLifecycle,
           planPath: join(featureRoot, '.docs/plans/feature.md'),
           pipelineDir: join(featureRoot, '.pipeline'),
           config: { test_suite: { scoped_command: 'node {selectors}' }, build_review: {
@@ -3633,8 +4115,9 @@ TIER: M`,
         expect(await readFile(selectorMarker, 'utf8')).toBe('selector-loaded-checkout-dependencies');
         // The preflight reaches the grader as typed evidence only: its
         // classification plus a bounded excerpt, never a verdict.
-        expect(observedProjections[0]).toMatchObject({ preflight: { classification: 'red' } });
+        expect(observedProjections[0]).toMatchObject({ preflight: { classification: 'nonzero-exit' } });
         expect(typeof observedProjections[0].preflight.excerpt).toBe('string');
+        expect(queuedMutations).toEqual(['add:queued', 'remove:queued']);
       } finally {
         if (priorSelectorMarker === undefined) delete process.env[selectorMarkerEnv];
         else process.env[selectorMarkerEnv] = priorSelectorMarker;
@@ -3675,8 +4158,8 @@ TIER: M`,
             ok: true as const,
             feature: { version: 'v1' as const, repository: '/repo', feature: 'feature' },
             effective: {
-              rawVerdict: 'FAIL' as const, verdict: 'PASS' as const, acceptedFindingIds: ['accepted'], unresolvedFindingIds: [],
-              skippedRubrics: [], infrastructureFailureRubrics: [],
+              rawVerdict: 'FAIL' as const, verdict: 'PASS' as const, acceptedFindingIds: ['accepted'], unresolvedFindingIds: [], suppressedFindingIds: [],
+              skippedRubrics: [], infrastructureFailureRubrics: [], uncoveredInfrastructureFailureRubrics: [],
             },
           };
         }),
@@ -3699,6 +4182,65 @@ TIER: M`,
       expect(events.emit).toHaveBeenCalledWith(expect.objectContaining({
         type: 'build_review_outer_verdict', rawVerdict: 'FAIL', effectiveVerdict: 'PASS',
       }));
+    });
+
+    // adr-2026-08-29 D4.4 keeps a fully suppressed lap out of post-join
+    // judgement: the runner returns success, so the conductor's adjudication
+    // branch — the coordinator that used to be the only suppression writer —
+    // is never entered. D4.6 still requires the durable entry, so the seam
+    // must run here, before that pass/fail fork.
+    it('persists durable suppression entries on a fully suppressed lap that never reaches adjudication', async () => {
+      await scopedPlan();
+      const provider = createMockProvider();
+      const events = { emit: vi.fn(async (): Promise<InvokeResult> => ({ success: true, output: '', exitCode: 0 })) } as any;
+      const feature = { version: 'v1' as const, repository: '/repo', feature: 'feature' };
+      let suppressedFindingId: string | undefined;
+      const runner = new DefaultStepRunner(provider, 'session-1', dir, {
+        gitRunner: scopedTestGit(), planPath, events,
+        config: {
+          test_suite: { scoped_command: 'exit 1' },
+          build_review: { enabled: true, rubrics: { testQuality: { enabled: true, min_confidence: 70 } } },
+        } as HarnessConfig,
+        buildReviewEffectiveResolver: vi.fn(async (_projectRoot, aggregate) => {
+          suppressedFindingId = projectBuildReviewAggregateSources(aggregate as never)![0]!.findingId;
+          return {
+            ok: true as const,
+            feature,
+            effective: {
+              rawVerdict: 'FAIL' as const, verdict: 'PASS' as const, acceptedFindingIds: [],
+              unresolvedFindingIds: [], suppressedFindingIds: [suppressedFindingId],
+              skippedRubrics: [], infrastructureFailureRubrics: [], uncoveredInfrastructureFailureRubrics: [],
+            },
+          };
+        }),
+        ...currentBuildReviewProof(),
+      });
+      vi.spyOn(runner as any, 'dispatchBuildReviewRubric').mockImplementation(async (branch: any, projection: any) => ({
+        kind: 'judged', rubric: branch.rubric, lapId: projection.lapId, snapshotDigest: projection.snapshotDigest,
+        contractVersion: 'v3',
+        findings: [{
+          concernKind: 'test-insensitive', summary: 'The changed test does not observe the behavior it should.',
+          evidenceLocations: ['x:1'],
+          anchor: { rubric: 'testQuality', locus: SCOPED_TEST_REGION },
+          confidence: 40,
+        }],
+        verdict: 'FAIL',
+      }));
+
+      // `success: true` is exactly the route selector the conductor reads to
+      // skip adjudication, so no remediate dispatch can follow this lap.
+      await expect(runner.run('build_review', emptyState)).resolves.toMatchObject({ success: true });
+
+      const persisted = await new RemediationCaseStore(dir, feature).read();
+      if (!persisted.ok) throw new Error(`unexpected case-store failure: ${persisted.reason}`);
+      expect(persisted.state.suppressions).toEqual([{
+        findingId: suppressedFindingId,
+        rubric: 'testQuality',
+        summary: 'The changed test does not observe the behavior it should.',
+        confidence: 40,
+        floor: 70,
+        lastSeenLap: 'lap-head',
+      }]);
     });
 
     it('publishes an empty registered-rubric set as a reasoned PASS without dispatch', async () => {
@@ -3788,15 +4330,41 @@ TIER: M`,
       });
     });
 
+    it('persists a preflight materialization excerpt when the mechanical allowance is exhausted', async () => {
+      await scopedPlan();
+      const runner = new DefaultStepRunner(createMockProvider(), 'session-1', dir, {
+        gitRunner: scopedGit(), planPath,
+        ...testQualityOptIn(),
+        ...currentBuildReviewProof(),
+        buildReviewEffectiveResolver: vi.fn(async () => ({ ok: false, reason: 'fixture disposition failure' }) as never),
+      });
+      vi.spyOn(runner as any, 'runTautologyPreflight').mockResolvedValue({
+        classification: 'infrastructure-failure', reason: 'materialization-failed', failureExcerpt: 'boom-checkout',
+        changedPaths: [], changedTestSelectors: [], sourceIdentities: { mergeBase: 'abc123', headSha: 'head' },
+      });
+
+      await runner.run('build_review', emptyState);
+      await runner.run('build_review', emptyState);
+      await runner.run('build_review', emptyState);
+
+      await expect(readFile(join(dir, '.pipeline/build-review.json'), 'utf8')).resolves.toContain(
+        '"detail": "materialization-failed: boom-checkout"',
+      );
+    });
+
     it.each([
       {
         name: 'test-quality is enabled explicitly',
-        config: { build_review: { enabled: true, rubrics: { testQuality: { enabled: true } } } } as HarnessConfig,
+        config: {
+          test_suite: { scoped_command: 'true' },
+          build_review: { enabled: true, rubrics: { testQuality: { enabled: true } } },
+        } as HarnessConfig,
         expectedInvokeCalls: 2,
       },
       {
         name: 'test-quality uses its configured policy',
         config: {
+          test_suite: { scoped_command: 'true' },
           build_review: {
             enabled: true,
             rubrics: { testQuality: { enabled: true, model: 'opus' } },
@@ -3854,11 +4422,17 @@ TIER: M`,
       await rm(dir, { recursive: true, force: true });
     });
 
-    function scriptedGit() {
+    function scriptedGit(planRepoPath = 'plan.md') {
       const git = async (args: string[]) => {
         if (args[0] === 'symbolic-ref') return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+        if (args[0] === 'rev-parse') return { exitCode: 0, stdout: args[1] === 'HEAD' ? 'head\n' : 'base-tip\n', stderr: '' };
         if (args[0] === 'merge-base') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
+        if (args[0] === 'diff' && args.includes('--name-status')) return { exitCode: 0, stdout: 'M\u0000x\u0000', stderr: '' };
         if (args[0] === 'diff') return { exitCode: 0, stdout: 'diff --git a/x b/x\n', stderr: '' };
+        if (args[0] === 'show' && args[1] === `head:${planRepoPath}`) return { exitCode: 0, stdout: '# Plan\n', stderr: '' };
+        if (args[0] === 'show' && args[1] === `head:.docs/stories/${basename(planRepoPath)}`) return { exitCode: 0, stdout: '# Stories\n', stderr: '' };
+        if (args[0] === 'show' && args[1] === 'head:x') return { exitCode: 0, stdout: 'export const x = true;\n', stderr: '' };
+        if (args[0] === 'ls-tree') return { exitCode: 0, stdout: '', stderr: '' };
         return { exitCode: 1, stdout: '', stderr: '' };
       };
       return git;
@@ -3866,7 +4440,10 @@ TIER: M`,
 
     function testQualityOptIn() {
       return {
-        config: { build_review: { enabled: true, rubrics: { testQuality: { enabled: true } } } } as HarnessConfig,
+        config: {
+          test_suite: { scoped_command: 'true' },
+          build_review: { enabled: true, rubrics: { testQuality: { enabled: true } } },
+        } as HarnessConfig,
       };
     }
 
@@ -3888,14 +4465,56 @@ TIER: M`,
     function scopedGit() {
       const git = async (args: string[]) => {
         if (args[0] === 'symbolic-ref') return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+        if (args[0] === 'rev-parse') return { exitCode: 0, stdout: args[1] === 'HEAD' ? 'head\n' : 'base-tip\n', stderr: '' };
         if (args[0] === 'merge-base') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
-        if (args[0] === 'diff') return { exitCode: 0, stdout: `diff --git a/${SCOPED_SELECTOR} b/${SCOPED_SELECTOR}\n`, stderr: '' };
-        if (args[0] === 'show' && args[1]?.endsWith(`:${SCOPED_SELECTOR}`)) {
-          return { exitCode: 0, stdout: '// Covers: task:1\nexport const covered = true;\n', stderr: '' };
+        if (args[0] === 'diff' && args.includes('--name-status')) return { exitCode: 0, stdout: `M\u0000${SCOPED_SELECTOR}\u0000M\u0000${SCOPED_TEST}\u0000`, stderr: '' };
+        if (args[0] === 'diff') return { exitCode: 0, stdout: `diff --git a/${SCOPED_SELECTOR} b/${SCOPED_SELECTOR}\ndiff --git a/${SCOPED_TEST} b/${SCOPED_TEST}\n`, stderr: '' };
+        if (args[0] === 'show' && args[1]?.startsWith('head:') && args[1].endsWith('.md')) {
+          return { exitCode: 0, stdout: `# Plan\n\n### Task 1: Cover the thing\n**Files:** ${SCOPED_SELECTOR}\n`, stderr: '' };
         }
+        if (args[0] === 'show' && args[1]?.endsWith(`:${SCOPED_TEST}`)) {
+          return { exitCode: 0, stdout: args[1].startsWith('head:')
+            ? "// Covers: task:1\nit('covered', () => {});\n"
+            : "it('covered', () => {});\n", stderr: '' };
+        }
+        if (args[0] === 'show' && args[1]?.endsWith(`:${SCOPED_SELECTOR}`)) {
+          return { exitCode: 0, stdout: args[1].startsWith('head:')
+            ? '// Covers: task:1\nexport const covered = true;\n'
+            : 'export const covered = false;\n', stderr: '' };
+        }
+        if (args[0] === 'worktree' && args[1] === 'add') {
+          await mkdir(join(args[3]!, 'test'), { recursive: true });
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        if (args[0] === 'worktree' && args[1] === 'remove') return { exitCode: 0, stdout: '', stderr: '' };
         return { exitCode: 1, stdout: '', stderr: '' };
       };
       return git;
+    }
+    function equivalentScopedGit() {
+      const git = scopedGit();
+      return async (args: string[]) => {
+        if (args[0] === 'cherry') {
+          return { exitCode: 0, stdout: '- 1234567 replayed upstream patch\n', stderr: '' };
+        }
+        if (args[0] === 'log') {
+          return { exitCode: 0, stdout: '1234567\0\0\nsrc/replayed.ts\0', stderr: '' };
+        }
+        return git(args);
+      };
+    }
+    function failedPatchEquivalentProvenanceGit(diffCalls: string[][]) {
+      const git = scopedGit();
+      return async (args: string[]) => {
+        if (args[0] === 'cherry') {
+          return { exitCode: 0, stdout: '- 1234567 replayed upstream patch\n', stderr: '' };
+        }
+        if (args[0] === 'log') {
+          return { exitCode: 1, stdout: '', stderr: 'attribution unavailable' };
+        }
+        if (args[0] === 'diff') diffCalls.push(args);
+        return git(args);
+      };
     }
     async function scopedPlan(path = planPath) {
       await writeFile(path, `# Plan\n\n### Task 1: Cover the thing\n**Files:** ${SCOPED_SELECTOR}\n`, 'utf-8');
@@ -3914,18 +4533,29 @@ TIER: M`,
     function scopedTestGit() {
       const git = async (args: string[]) => {
         if (args[0] === 'symbolic-ref') return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+        if (args[0] === 'rev-parse') return { exitCode: 0, stdout: args[1] === 'HEAD' ? 'head\n' : 'base-tip\n', stderr: '' };
         if (args[0] === 'merge-base') return { exitCode: 0, stdout: 'abc123\n', stderr: '' };
         if (args[0] === 'diff') {
+          if (args.includes('--name-status')) {
+            return { exitCode: 0, stdout: `M\u0000${SCOPED_SELECTOR}\u0000M\u0000${SCOPED_TEST}\u0000`, stderr: '' };
+          }
           return { exitCode: 0, stdout: [
             `diff --git a/${SCOPED_SELECTOR} b/${SCOPED_SELECTOR}`,
             `diff --git a/${SCOPED_TEST} b/${SCOPED_TEST}`,
           ].join('\n') + '\n', stderr: '' };
         }
+        if (args[0] === 'show' && args[1]?.startsWith('head:') && args[1].endsWith('.md')) {
+          return { exitCode: 0, stdout: `# Plan\n\n### Task 1: Cover the thing\n**Files:** ${SCOPED_SELECTOR}\n`, stderr: '' };
+        }
         if (args[0] === 'show' && args[1]?.endsWith(`:${SCOPED_TEST}`)) {
-          return { exitCode: 0, stdout: "// Covers: task:1\nit('covered', () => {});\n", stderr: '' };
+          return { exitCode: 0, stdout: args[1].startsWith('head:')
+            ? "// Covers: task:1\nit('covered', () => {});\n"
+            : "it('covered', () => {});\n", stderr: '' };
         }
         if (args[0] === 'show' && args[1]?.endsWith(`:${SCOPED_SELECTOR}`)) {
-          return { exitCode: 0, stdout: 'export const covered = false;\n', stderr: '' };
+          return { exitCode: 0, stdout: args[1].startsWith('head:')
+            ? 'export const covered = false;\n'
+            : 'export const covered = true;\n', stderr: '' };
         }
         if (args[0] === 'worktree' && args[1] === 'add') {
           const checkout = args[3]!;
@@ -4061,6 +4691,61 @@ TIER: M`,
         trackingRefSha: null,
         remoteHeadSha: null,
         fresh: false,
+      });
+    });
+
+    it('carries patch-equivalent exclusions on baseFreshness', async () => {
+      await scopedPlan();
+      const invoke = vi.fn().mockResolvedValue({ success: true, output: '{"verdict":"PASS"}', exitCode: 0 });
+      const runner = new DefaultStepRunner({ invoke }, 'session-1', dir, {
+        gitRunner: equivalentScopedGit(),
+        planPath,
+        ...testQualityOptIn(),
+        ...currentBuildReviewProof(),
+      });
+
+      const result = await runner.run('build_review', emptyState);
+
+      expect(result.baseFreshness).toMatchObject({
+        filteredCommits: [{ sha: '1234567', subject: 'replayed upstream patch' }],
+        excludedPaths: ['src/replayed.ts'],
+      });
+    });
+
+    it('leaves the build review result and graded diff unchanged when patch-equivalent provenance fails', async () => {
+      await scopedPlan();
+      const invoke = vi.fn().mockResolvedValue({ success: true, output: '{"verdict":"PASS"}', exitCode: 0 });
+      const baselineDiffCalls: string[][] = [];
+      const failedProvenanceDiffCalls: string[][] = [];
+      const baseline = new DefaultStepRunner({ invoke }, 'session-1', dir, {
+        gitRunner: async (args) => {
+          if (args[0] === 'diff') baselineDiffCalls.push(args);
+          return scopedGit()(args);
+        },
+        planPath,
+        ...testQualityOptIn(),
+        ...currentBuildReviewProof(),
+      });
+      const failedProvenance = new DefaultStepRunner({ invoke }, 'session-2', dir, {
+        gitRunner: failedPatchEquivalentProvenanceGit(failedProvenanceDiffCalls),
+        planPath,
+        ...testQualityOptIn(),
+        ...currentBuildReviewProof(),
+      });
+
+      const baselineResult = await baseline.run('build_review', emptyState);
+      const failedProvenanceResult = await failedProvenance.run('build_review', emptyState);
+
+      expect({
+        success: failedProvenanceResult.success,
+        output: failedProvenanceResult.output,
+        baseFreshness: failedProvenanceResult.baseFreshness,
+        diff: failedProvenanceDiffCalls,
+      }).toEqual({
+        success: baselineResult.success,
+        output: baselineResult.output,
+        baseFreshness: baselineResult.baseFreshness,
+        diff: baselineDiffCalls,
       });
     });
 
@@ -4306,8 +4991,86 @@ TIER: M`,
       expect(opts.resume).toBe(false);
       expect(opts.dangerouslySkipPermissions).toBe(true);
       expect(opts.cwd).toBe('/wt/feature-x');
+      expect(opts.systemPrompt).toContain('Do not run tests');
+      expect(opts.systemPrompt).toContain('Do not push');
+      expect(opts.systemPrompt).toContain('The daemon owns all test execution');
       expect(opts.prompt).toContain("TypeError: Cannot read properties of undefined (reading 'foo')");
     });
+  });
+});
+
+describe('auxiliary provider dispatch tier telemetry', () => {
+  const rubric = { rubric: 'testQuality' as const, skillName: 'build-review-test-quality', policy: {
+    enabled: true, llm_provider: 'claude' as const, model: 'opus', effort: 'high' as const,
+    model_fallback_ladder: ['opus'], max_retries: 1, escalate: false,
+  } };
+  const projection = {
+    rubric: 'testQuality', contractVersion: 'v3', projectionVersion: 'v2',
+    lapId: 'lap-a237011e9f263dd47ca1a2c7cfe929865c2e99b8', snapshotDigest: 'sha256:projection',
+    digest: 'sha256:projection', mergeBase: 'base', headSha: 'head', changedFiles: [],
+    removalContext: { deletedFiles: [], removedDeclarations: [], removedMembers: [] }, changedTestSelectors: [],
+    testSuiteProof: {}, revertedProductionManifest: [], preflight: {}, repairContext: [],
+  } as unknown as import('../../src/engine/build-review-projections.js').BuildReviewRubricProjection;
+
+  it.each([
+    ['M' as const, { tier: 'M' }],
+    [undefined, {}],
+  ])('records tier metadata for a build-review rubric dispatch (%s)', async (tier, expected) => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'build-review-tier-'));
+    const attempts: ProviderAttemptEvent[] = [];
+    const invoke = vi.fn().mockResolvedValue({ success: true, output: '{"findings":[]}', exitCode: 0 });
+    const runner = new DefaultStepRunner(createMockProvider(), 'tier-build-review', projectDir, {
+      config: { llm_provider: ['claude'] },
+      providerRuntimes: new ProviderRuntimeSet([interactiveRuntime('claude', invoke)]),
+      sessionStore: new ProviderSessionStore(), configuredProviders: ['claude'],
+      providerAttempt: (step, attempt) => { attempts.push({ type: 'provider_attempt', step, ...attempt }); },
+    });
+
+    try {
+      await (runner as unknown as {
+        dispatchBuildReviewRubric: (branch: typeof rubric, value: typeof projection, valueTier?: ConductState['complexity_tier']) => Promise<unknown>;
+      }).dispatchBuildReviewRubric(rubric, projection, tier);
+
+      const invocation = attempts.find((attempt) => attempt.invoked);
+      expect(invocation).toBeDefined();
+      expect(invocation).toMatchObject(expected);
+      expect('tier' in invocation!).toBe(tier !== undefined);
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['M' as const, { tier: 'M' }],
+    [undefined, {}],
+  ])('records tier metadata for a coverage-binding dispatch (%s)', async (tier, expected) => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'coverage-binding-tier-'));
+    const featureDesc = 'coverage-binding-tier';
+    const planPath = join(projectDir, 'plan.md');
+    const attempts: ProviderAttemptEvent[] = [];
+    const invoke = vi.fn().mockResolvedValue({ success: true, output: '{"verdict":"asserts"}', exitCode: 0 });
+    await mkdir(join(projectDir, '.docs', 'coherence'), { recursive: true });
+    await writeFile(planPath, '### Task 1: Bind the claim\n**Done when:**\n- The service emits the required record.\n');
+    await writeFile(join(projectDir, '.docs', 'coherence', `${featureDesc}.md`), '| Row Class | Criterion | Cited Task Ids | Verdict | Quote | Disposition |\n| --- | --- | --- | --- | --- | --- |\n| criterion | The service emits the required record | task-1 | covered | "emits the required record" | diff-local |\n');
+    const runner = new DefaultStepRunner(createMockProvider(), 'tier-coverage-binding', projectDir, {
+      featureDesc, planPath, config: {
+        coverage_binding: { judge: { enabled: true } }, llm_provider: ['claude'],
+        steps: { coverage_binding: { llm_provider: 'claude' } },
+      },
+      providerRuntimes: new ProviderRuntimeSet([interactiveRuntime('claude', invoke)]),
+      sessionStore: new ProviderSessionStore(), configuredProviders: ['claude'],
+      providerAttempt: (step, attempt) => { attempts.push({ type: 'provider_attempt', step, ...attempt }); },
+    });
+
+    try {
+      await expect(runner.run('coverage_binding', tier === undefined ? {} : { complexity_tier: tier })).resolves.toMatchObject({ success: true });
+      const invocation = attempts.find((attempt) => attempt.invoked);
+      expect(invocation).toBeDefined();
+      expect(invocation).toMatchObject(expected);
+      expect('tier' in invocation!).toBe(tier !== undefined);
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -4393,6 +5156,45 @@ describe('build_review rubric dispatch: validate-and-repair loop', () => {
     );
   });
 
+  it('records an unresolved rubric skill command as a named dispatch failure without a repair turn', async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      success: false,
+      output: 'unknown skill command',
+      exitCode: 1,
+      commandUnresolved: true,
+      commandUnresolvedName: '$build-review-test-quality',
+    });
+    const runner = new DefaultStepRunner({ invoke }, 'session-1', '/tmp/project');
+
+    const result = await dispatch(runner);
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      kind: 'dispatch-failure',
+      detail: renderBuildReviewUnresolvedSkillRemedy(
+        'build-review-test-quality',
+        '$build-review-test-quality',
+      ),
+    });
+  });
+
+  it('preserves contract-violation repair behavior without adding an unresolved-command remedy', async () => {
+    const invoke = vi.fn()
+      .mockResolvedValueOnce({ success: true, output: incidentShapedOutput, exitCode: 0 })
+      .mockResolvedValueOnce({ success: true, output: 'still invalid after repair', exitCode: 0 });
+    const runner = new DefaultStepRunner({ invoke }, 'session-1', '/tmp/project');
+
+    const result = await dispatch(runner);
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      kind: 'dispatch-failure',
+      detail: expect.stringContaining('judged-result contract not satisfied after one repair turn'),
+    });
+    expect((result as { detail: string }).detail).not.toContain('could not be dispatched');
+    expect((result as { detail: string }).detail).not.toContain('retrying cannot make the command resolvable');
+  });
+
   it('diagnoses findings-only output through the same v3-stamped candidate it validates', async () => {
     const findingsOnlyOutput = JSON.stringify({
       findings: [{
@@ -4430,14 +5232,14 @@ describe('build_review rubric dispatch: validate-and-repair loop', () => {
     expect(prompt).toContain('never flattened');
   });
 
-  it('instructs graders with a findings-only structured-anchor payload', async () => {
+  it('instructs graders with findings and optional counterfactual sensitivity in the structured-anchor payload', async () => {
     const invoke = vi.fn().mockResolvedValue({ success: true, output: validOutput, exitCode: 0 });
     const runner = new DefaultStepRunner({ invoke }, 'session-1', '/tmp/project');
 
     await dispatch(runner);
 
     const prompt = (invoke.mock.calls[0][0] as InvokeOptions).prompt;
-    expect(prompt).toContain('only top-level field is `findings`');
+    expect(prompt).toContain('`findings` is an array; `scopeResolutions` has exactly one entry per supplied candidate');
     expect(prompt).not.toContain('`contractVersion` is "v3"');
     expect(prompt).not.toContain('`contractVersion` is "v2"');
     expect(prompt).not.toContain('every anchor value is a plain string');
@@ -4553,3 +5355,5 @@ describe('build_review rubric dispatch: validate-and-repair loop', () => {
     );
   });
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

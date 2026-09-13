@@ -1,3 +1,4 @@
+// Covers: task:2, task:3, task:4, task:6
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
@@ -53,19 +54,6 @@ describe('renderDaemonEvent', () => {
       .toEqual(['·   build ✓ done']);
   });
 
-  it('renders deterministic build verification group boundaries', () => {
-    expect(lines({
-      type: 'parallel_started',
-      step: 'wiring_check',
-      branches: ['wiring_check', 'test_suite'],
-    })).toEqual(['· ▶ wiring_check [wiring_check, test_suite]']);
-    expect(lines({
-      type: 'parallel_completed',
-      step: 'wiring_check',
-      branches: ['wiring_check', 'test_suite'],
-    })).toEqual(['·   wiring_check [wiring_check, test_suite] ✓ done']);
-  });
-
   it('renders failures', () => {
     expect(lines({ type: 'step_failed', step: 'build', error: 'boom', retryCount: 2 })).toEqual([
       '· ✗ build failed (try 2): boom',
@@ -76,6 +64,42 @@ describe('renderDaemonEvent', () => {
       kind: 'needs-human',
       reason: 'operator judgement required',
     })).toEqual(['· ✋ build refused (needs-human): operator judgement required']);
+    expect(lines({
+      type: 'step_status_write_refused',
+      field: 'manual_test',
+      expected: 'skipped',
+      requested: 'stale',
+      intent: 'restage ship tail after build kickback',
+    })).toEqual(['· ✋ manual_test status write refused: skipped → stale (restage ship tail after build kickback)']);
+  });
+
+  it('renders every confidence-suppressed build-review finding alongside the outer verdict', () => {
+    expect(lines({
+      type: 'build_review_outer_verdict', lapId: 'lap-current', rawVerdict: 'FAIL', effectiveVerdict: 'PASS',
+      suppressedFindings: [
+        { rubric: 'testQuality', findingId: 'sha256:one', confidence: 69, floor: 70 },
+        { rubric: 'testQuality', findingId: 'sha256:two', confidence: 40, floor: 50 },
+      ],
+    })).toEqual([
+      '· build_review suppressed testQuality:sha256:one (confidence 69 < floor 70)',
+      '· build_review suppressed testQuality:sha256:two (confidence 40 < floor 50)',
+      '·   build_review [lap-current] outer verdict: PASS (raw: FAIL)',
+    ]);
+  });
+
+  it('emits the outer verdict without suppression lines when suppressed findings are absent or empty', () => {
+    expect(lines({ type: 'build_review_outer_verdict', lapId: 'lap-current', rawVerdict: 'FAIL', effectiveVerdict: 'PASS' }))
+      .toEqual(['·   build_review [lap-current] outer verdict: PASS (raw: FAIL)']);
+    expect(lines({
+      type: 'build_review_outer_verdict', lapId: 'lap-current', rawVerdict: 'FAIL', effectiveVerdict: 'PASS', suppressedFindings: [],
+    })).toEqual(['·   build_review [lap-current] outer verdict: PASS (raw: FAIL)']);
+  });
+
+  it('renders tail diagnostics without source record contents', () => {
+    expect(lines({
+      type: 'pipeline_tail_diagnostic', reason: 'malformed-line',
+      path: '.pipeline/pipeline-events.jsonl', byteOffset: 42,
+    })).toEqual(['· ⚠ pipeline tail malformed-line: .pipeline/pipeline-events.jsonl at byte 42']);
   });
 
   it('renders exact operator park boundaries without lifecycle semantics', () => {
@@ -167,6 +191,40 @@ describe('renderDaemonEvent', () => {
       target: 'build',
       demoted: ['build', 'test_suite', 'build_review'],
     })).toEqual(['↶ REWIND: build (operator; demoted build, test_suite, build_review)']);
+  });
+
+  it.each([
+    [{ type: 'project_setup', ran: true, reason: 'no-marker' } as const, '· project setup ran (no-marker)'],
+    [{ type: 'project_setup', ran: false, reason: 'marker-valid' } as const, '· project setup skipped (marker-valid)'],
+    [{ type: 'project_setup', ran: false, reason: 'no-script' } as const, '· project setup skipped (no-script)'],
+  ])('renders project setup state and reason for %#', (event, expected) => {
+    expect(lines(event)).toEqual([expected]);
+  });
+
+  it.each([
+    'engine-committed',
+    'accepted-existing-commit',
+    'verified-no-tree-change',
+  ] as const)('renders setup repair success disposition %s', (disposition) => {
+    expect(lines({ type: 'setup_repair', disposition, preservedPaths: [] })).toEqual([
+      `· setup repair ${disposition}`,
+    ]);
+  });
+
+  it('renders setup repair rejections with only the evidence that exists', () => {
+    expect(lines({
+      type: 'setup_repair',
+      disposition: 'rejected',
+      reason: 'setup-drift',
+      quarantineRef: 'wip/setup-quarantine-render',
+      preservedPaths: ['src/repair.ts'],
+    })).toEqual(['· setup repair rejected (setup-drift; wip/setup-quarantine-render)']);
+    expect(lines({
+      type: 'setup_repair',
+      disposition: 'rejected',
+      reason: 'preservation-failed',
+      preservedPaths: [],
+    })).toEqual(['· setup repair rejected (preservation-failed)']);
   });
 
   it('renders plan-growth counts with each gate and the current cap', () => {
@@ -268,6 +326,39 @@ describe('renderDaemonEvent', () => {
     ]);
   });
 
+  it('renders a sealed-artifact redirect with its quoted directing clause and source', () => {
+    expect(lines({
+      type: 'remediation_sealed_artifact_redirect',
+      gapId: 'sealed-gap',
+      artifact: '.docs/specs/another-feature.md',
+      directingClause: 'Amend .docs/specs/another-feature.md with the corrected assertion.',
+      directingSource: 'task title',
+    } as unknown as ConductorEvent)).toEqual([
+      '· ↩ remediation gap sealed-gap → plan — sealed artifact .docs/specs/another-feature.md '
+        + '— task title: "Amend .docs/specs/another-feature.md with the corrected assertion."',
+    ]);
+  });
+
+  it('renders rejected remediation dispositions with the accepted vocabulary', () => {
+    expect(lines({
+      type: 'remediation_disposition_rejected',
+      gapId: 'gap-1',
+      disposition: 'unknown-disposition',
+      accepted: ['build', 'plan'],
+    })).toEqual([
+      '· ✗ remediation gap gap-1 dropped — disposition "unknown-disposition" not in [build, plan]',
+    ]);
+    expect(lines({
+      type: 'remediation_disposition_rejected',
+      gapId: 'gap-2',
+      disposition: 'unknown-category',
+      accepted: ['build', 'plan'],
+      field: 'category',
+    })).toEqual([
+      '· ✗ remediation gap gap-2 dropped — category "unknown-category" not in [build, plan]',
+    ]);
+  });
+
   it('renders each protected-artifact reseal event as one human-readable line', () => {
     expect([
       lines({
@@ -293,8 +384,23 @@ describe('renderDaemonEvent', () => {
     ]);
   });
 
-  it('shows only UNSATISFIED gate verdicts (satisfied ones are routine)', () => {
-    expect(lines({ type: 'gate_verdict', step: 'plan', satisfied: true })).toEqual([]);
+  it('renders a satisfied verdict separately from its provider-completion line', () => {
+    expect([
+      lines({ type: 'provider_attempt', step: 'plan', provider: 'codex', outcome: 'success', invoked: true }),
+      lines({ type: 'gate_verdict', step: 'plan', satisfied: true, reason: 'covered' }),
+    ]).toEqual([
+      ['·   plan via codex ✓'],
+      ['· gate plan: satisfied — covered'],
+    ]);
+  });
+
+  it('renders a reasonless satisfied verdict without a trailing separator', () => {
+    expect(
+      lines({ type: 'gate_verdict', step: 'plan', satisfied: true }),
+    ).toEqual(['· gate plan: satisfied']);
+  });
+
+  it('keeps the unsatisfied gate verdict line byte-identical', () => {
     expect(
       lines({ type: 'gate_verdict', step: 'plan', satisfied: false, reason: 'uncovered' }),
     ).toEqual(['· gate plan: unsatisfied — uncovered']);
@@ -405,6 +511,51 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
     expect(stale[0]).toContain('fresh: false');
   });
 
+  it('renders the patch-equivalent filtered-commit count alongside the base freshness summary', () => {
+    expect(lines({
+      type: 'build_review_base',
+      mergeBase: 'abc1234567890def',
+      trackingRefSha: 'abc1234567890def',
+      remoteHeadSha: 'abc1234567890def',
+      fresh: true,
+      filteredCommits: [
+        { sha: '111111111111111', subject: 'first equivalent change' },
+        { sha: '222222222222222', subject: 'second equivalent change' },
+      ],
+    })).toEqual(['· build_review base abc123456789 — fresh: true; filtered 2 commits']);
+  });
+
+  it('keeps the baseline build-review base line byte-identical when no commits were filtered', () => {
+    const baseEvent = {
+      type: 'build_review_base',
+      mergeBase: 'abc1234567890def',
+      trackingRefSha: 'abc1234567890def',
+      remoteHeadSha: 'abc1234567890def',
+      fresh: true,
+    } as const;
+    const baseline = ['· build_review base abc123456789 — fresh: true'];
+
+    expect(lines(baseEvent)).toEqual(baseline);
+    expect(lines({ ...baseEvent, filteredCommits: [] })).toEqual(baseline);
+  });
+
+  it('renders conditional skips with their expression and undefined-key reason', () => {
+    expect(lines({
+      type: 'when_skip',
+      step: 'manual_test',
+      expression: "tier == 'S'",
+    })).toEqual(["· ⊘ manual_test skipped: tier == 'S'"]);
+
+    expect(lines({
+      type: 'when_skip',
+      step: 'build_review',
+      expression: 'feature.enabled',
+      undefinedKey: 'feature.enabled',
+    })).toEqual([
+      '· ⊘ build_review skipped: feature.enabled (key "feature.enabled" undefined → false)',
+    ]);
+  });
+
   it('renders exactly the previously-rendering event types plus navigation_back', () => {
     // One minimal, valid sample per ConductorEvent variant (see types/events.ts).
     // Some variants (e.g. gate_verdict) only render conditionally; the sample
@@ -415,6 +566,7 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
       { type: 'step_completed', step: 'build', status: 'done' },
       { type: 'step_failed', step: 'build', error: 'boom', retryCount: 1 },
       { type: 'step_refused', step: 'build', kind: 'seal', reason: 'protected artifact changed' },
+      { type: 'step_status_write_refused', field: 'manual_test', expected: 'skipped', requested: 'stale', intent: 'restage ship tail after build kickback' },
       { type: 'step_retry', step: 'build', attempt: 1, maxAttempts: 3, reason: 'retry' },
       { type: 'checkpoint_reached', step: 'build' },
       { type: 'recovery_needed', step: 'build', options: ['retry'] },
@@ -490,6 +642,7 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
       'step_completed',
       'step_failed',
       'step_refused',
+      'step_status_write_refused',
       'step_retry',
       'gate_verdict',
       'kickback',
@@ -506,9 +659,11 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
       'build_progress',
       'build_no_progress',
       'build_stall',
+      'renderer_error',
       'build_review_base',
       'parallel_started',
       'parallel_completed',
+      'when_skip',
       'rebase_mergeable_skip',
       'rebase_conflict_halt',
       'operator_park_boundary',

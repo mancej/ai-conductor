@@ -1,3 +1,4 @@
+// Covers: task:3, task:4, task:5, task:6
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -12,6 +13,7 @@ import {
   sweepStaleReviewArtifacts,
   type ArtifactResolutionContext,
 } from '../src/engine/artifacts.js';
+import { appendRemediationTasks } from '../src/engine/remediation-append.js';
 
 const prdAuditSkillPath = fileURLToPath(
   new URL('../../../skills/prd-audit/SKILL.md', import.meta.url),
@@ -24,14 +26,13 @@ describe('prd-audit skill contract', () => {
 
     expect(report).toEqual(expect.any(String));
     expect(report).toMatch(/^# PRD Audit: <Feature Name>/m);
-    expect(report).toMatch(/^\*\*PRD:\*\* present \| none/m);
+    expect(report).toMatch(/^\*\*PRD:\*\* present/m);
     expect(report).toMatch(/^\*\*Intent sources:\*\* /m);
     expect(report).toMatch(/^\| Criterion \| Grade \| Plan task \| PRD: \| Intent relation \| Evidence \|/m);
     expect(report).toMatch(/^\| S6\.1 \| PASS \| — \| FR-7 \| /m);
     expect(report).toMatch(/^\| S6\.2 \| FIXABLE \| 4 \| FR-7 \| /m);
 
     expect(skill).toContain('PASS | FIXABLE | PLAN_GAP | OVER_SCOPE');
-    expect(skill).toContain('FIXABLE names an owning plan task');
     expect(skill).toContain('every OVER_SCOPE row must use exactly one of `within`, `outside-harmless`, or `outside-visible`');
   });
 });
@@ -51,12 +52,13 @@ describe('parsePrdAuditReport', () => {
       '| S2.2 | PLAN_GAP | | No plan task owns this |',
     ].join('\n');
 
-    expect(parsePrdAuditReport(report)).toEqual({
+    expect(parsePrdAuditReport(report, activePlan)).toEqual({
       ok: true,
       value: {
         prd: 'present',
+        rejectedRows: [],
         findings: [
-          { criterion: 'S2.1', grade: 'FIXABLE', planTask: 4, prdIds: [], evidence: 'Missing guard' },
+          { criterion: 'S2.1', grade: 'FIXABLE', planTask: '4', prdIds: [], evidence: 'Missing guard' },
           { criterion: 'S2.2', grade: 'PLAN_GAP', prdIds: [], evidence: 'No plan task owns this' },
         ],
       },
@@ -83,9 +85,10 @@ describe('parsePrdAuditReport', () => {
       ok: true,
       value: {
         prd: 'present',
+        rejectedRows: [],
         findings: [
           { criterion: 'S6.1', grade: 'PASS', prdIds: ['FR-7'], evidence: 'Implemented' },
-          { criterion: 'S6.2', grade: 'FIXABLE', planTask: 4, prdIds: ['FR-7'], evidence: 'Missing guard' },
+          { criterion: 'S6.2', grade: 'FIXABLE', planTask: '4', prdIds: ['FR-7'], evidence: 'Missing guard' },
           {
             criterion: 'S6.3',
             grade: 'PLAN_GAP',
@@ -127,13 +130,122 @@ describe('parsePrdAuditReport', () => {
     ].join('\n');
 
     expect(parsePrdAuditReport(report)).toEqual({
-      ok: false,
-      class: 'mechanical-fault',
-      error: 'PRD audit finding S2.1 has an invalid Grade.',
+      ok: true,
+      value: {
+        prd: 'none',
+        findings: [],
+        rejectedRows: [{
+          key: 'S2.1',
+          rowText: '| S2.1 | MAYBE | | Unclear |',
+          reason: 'PRD audit finding S2.1 has an invalid Grade.',
+        }],
+      },
     });
   });
 
   const activePlan = '### Task 4: Existing task\n\n**Files:** src/example.ts';
+
+  it('resolves annotated and remediation Plan task citations against the active plan', () => {
+    const report = [
+      '**PRD:** present',
+      '',
+      '## Verdict Table',
+      '',
+      '| Criterion | Grade | Plan task | Evidence |',
+      '| --- | --- | --- | --- |',
+      '| S1.1 | PASS | rem-prd-audit-rem-s1-6-1 (landed) | Implemented |',
+      '| S1.2 | FIXABLE | rem-as-built-rem-ab1-3 | Missing guard |',
+    ].join('\n');
+    const remediationPlan = [
+      '### Task rem-prd-audit-rem-s1-6-1: Existing task',
+      '',
+      '### Task rem-as-built-rem-ab1-3: Existing task',
+    ].join('\n');
+
+    expect(parsePrdAuditReport(report, remediationPlan)).toEqual({
+      ok: true,
+      value: {
+        prd: 'present',
+        rejectedRows: [],
+        findings: [
+          {
+            criterion: 'S1.1',
+            grade: 'PASS',
+            planTask: 'rem-prd-audit-rem-s1-6-1',
+            prdIds: [],
+            evidence: 'Implemented',
+          },
+          {
+            criterion: 'S1.2',
+            grade: 'FIXABLE',
+            planTask: 'rem-as-built-rem-ab1-3',
+            prdIds: [],
+            evidence: 'Missing guard',
+          },
+        ],
+      },
+    });
+  });
+
+  it('#2064 keeps an unchanged report parseable after appending remediation tasks', () => {
+    const basePlan = [
+      '### Task 1: Existing work',
+      '',
+      '### Task 2: Existing work',
+    ].join('\n');
+    const appended = appendRemediationTasks(basePlan, [{
+      id: 'S1.1',
+      disposition: 'build',
+      category: null,
+      rationale: 'Repair the first missing behavior.',
+      tasks: [{ id: 'rem-s1-6-1', title: 'Repair the cited behavior' }],
+    }], 'prd-audit');
+    const report = [
+      '**PRD:** present',
+      '',
+      '## Verdict Table',
+      '',
+      '| Criterion | Grade | Plan task | Evidence |',
+      '| --- | --- | --- | --- |',
+      '| S1.1 | PASS | rem-prd-audit-rem-s1-6-1 (landed) | Implemented |',
+      '| S1.2 | FIXABLE | 2 | Missing guard |',
+    ].join('\n');
+    const extended = appendRemediationTasks(appended.planText, [{
+      id: 'AB1',
+      disposition: 'build',
+      category: null,
+      rationale: 'Repair the as-built gap.',
+      tasks: [{ id: 'rem-ab1-2', title: 'Repair the as-built behavior' }],
+    }], 'as-built');
+    const expected = {
+      ok: true,
+      value: {
+        prd: 'present' as const,
+        rejectedRows: [],
+        findings: [
+          {
+            criterion: 'S1.1',
+            grade: 'PASS',
+            planTask: 'rem-prd-audit-rem-s1-6-1',
+            prdIds: [],
+            evidence: 'Implemented',
+          },
+          {
+            criterion: 'S1.2',
+            grade: 'FIXABLE',
+            planTask: '2',
+            prdIds: [],
+            evidence: 'Missing guard',
+          },
+        ],
+      },
+    };
+
+    expect([
+      parsePrdAuditReport(report, appended.planText),
+      parsePrdAuditReport(report, extended.planText),
+    ]).toEqual([expected, expected]);
+  });
 
   it('rejects a FIXABLE finding with no owning plan task, naming the finding', () => {
     const report = [
@@ -147,13 +259,20 @@ describe('parsePrdAuditReport', () => {
     ].join('\n');
 
     expect(parsePrdAuditReport(report, activePlan)).toEqual({
-      ok: false,
-      class: 'mechanical-fault',
-      error: 'PRD audit finding S2.1 is FIXABLE but has no Plan task.',
+      ok: true,
+      value: {
+        prd: 'present',
+        findings: [],
+        rejectedRows: [{
+          key: 'S2.1',
+          rowText: '| S2.1 | FIXABLE | | Missing guard |',
+          reason: 'PRD audit finding S2.1 is FIXABLE but has no Plan task.',
+        }],
+      },
     });
   });
 
-  it('rejects a FIXABLE finding whose task is absent from the active plan', () => {
+  it('rejects a FIXABLE finding whose remediation task is absent from the active plan', () => {
     const report = [
       '**PRD:** present',
       '',
@@ -161,13 +280,70 @@ describe('parsePrdAuditReport', () => {
       '',
       '| Criterion | Grade | Plan task | Evidence |',
       '| --- | --- | --- | --- |',
-      '| S2.1 | FIXABLE | 99 | Missing guard |',
+      '| S2.1 | FIXABLE | rem-prd-audit-zz-1 | Missing guard |',
     ].join('\n');
 
     expect(parsePrdAuditReport(report, activePlan)).toEqual({
-      ok: false,
-      class: 'mechanical-fault',
-      error: 'PRD audit finding S2.1 names Plan task 99, which is absent from the active plan.',
+      ok: true,
+      value: {
+        prd: 'present',
+        findings: [],
+        rejectedRows: [{
+          key: 'S2.1',
+          rowText: '| S2.1 | FIXABLE | rem-prd-audit-zz-1 | Missing guard |',
+          reason: 'PRD audit finding S2.1 names Plan task rem-prd-audit-zz-1, which is absent from the active plan.',
+        }],
+      },
+    });
+  });
+
+  it('names the criterion and unresolved Plan task reference in its diagnostic', () => {
+    const report = [
+      '**PRD:** present',
+      '',
+      '## Verdict Table',
+      '',
+      '| Criterion | Grade | Plan task | Evidence |',
+      '| --- | --- | --- | --- |',
+      '| S2.3 | FIXABLE | rem-x-1 | Missing guard |',
+    ].join('\n');
+
+    expect(parsePrdAuditReport(report, activePlan)).toEqual({
+      ok: true,
+      value: {
+        prd: 'present',
+        findings: [],
+        rejectedRows: [{
+          key: 'S2.3',
+          rowText: '| S2.3 | FIXABLE | rem-x-1 | Missing guard |',
+          reason: 'PRD audit finding S2.3 names Plan task rem-x-1, which is absent from the active plan.',
+        }],
+      },
+    });
+  });
+
+  it('names the criterion and malformed Plan task reference in its diagnostic', () => {
+    const report = [
+      '**PRD:** present',
+      '',
+      '## Verdict Table',
+      '',
+      '| Criterion | Grade | Plan task | Evidence |',
+      '| --- | --- | --- | --- |',
+      '| S2.3 | FIXABLE | task#7 | Missing guard |',
+    ].join('\n');
+
+    expect(parsePrdAuditReport(report, activePlan)).toEqual({
+      ok: true,
+      value: {
+        prd: 'present',
+        findings: [],
+        rejectedRows: [{
+          key: 'S2.3',
+          rowText: '| S2.3 | FIXABLE | task#7 | Missing guard |',
+          reason: 'PRD audit finding S2.3 has malformed Plan task task#7.',
+        }],
+      },
     });
   });
 
@@ -183,9 +359,16 @@ describe('parsePrdAuditReport', () => {
     ].join('\n');
 
     expect(parsePrdAuditReport(report, activePlan)).toEqual({
-      ok: false,
-      class: 'mechanical-fault',
-      error: 'PRD audit finding S2.1 has an invalid Grade.',
+      ok: true,
+      value: {
+        prd: 'present',
+        findings: [],
+        rejectedRows: [{
+          key: 'S2.1',
+          rowText: '| S2.1 | FIXABLE, PLAN_GAP | 4 | Missing guard |',
+          reason: 'PRD audit finding S2.1 has an invalid Grade.',
+        }],
+      },
     });
   });
 
@@ -205,8 +388,9 @@ describe('parsePrdAuditReport', () => {
       ok: true,
       value: {
         prd: 'present',
+        rejectedRows: [],
         findings: [
-          { criterion: 'S2.1', grade: 'FIXABLE', planTask: 4, prdIds: [], evidence: 'Missing guard' },
+          { criterion: 'S2.1', grade: 'FIXABLE', planTask: '4', prdIds: [], evidence: 'Missing guard' },
           { criterion: 'S2.2', grade: 'PLAN_GAP', prdIds: [], evidence: 'No plan task owns this' },
         ],
       },
@@ -232,6 +416,7 @@ describe('parsePrdAuditReport', () => {
       ok: true,
       value: {
         prd: 'present',
+        rejectedRows: [],
         findings: [{ criterion: 'S1.1', grade: 'PASS', prdIds: ['FR-1'], evidence: 'Implemented' }],
       },
     });
@@ -401,10 +586,17 @@ describe('prd_audit completion predicate coverage', () => {
     root = await mkdtemp(join(tmpdir(), 'prd-audit-predicate-coverage-'));
     await mkdir(join(root, '.docs/specs'), { recursive: true });
     await mkdir(join(root, '.docs/stories'), { recursive: true });
+    await mkdir(join(root, '.docs/plans'), { recursive: true });
     await mkdir(join(root, '.pipeline'), { recursive: true });
     await writeFile(
       join(root, '.docs/specs/current-feature.md'),
       '# PRD\n\n## Functional Requirements\n\nFR-1\nFR-2\nFR-3\nFR-4\nFR-5',
+    );
+    // The predicate resolves this plan as the authority for every `Plan task`
+    // cell `criterionReport` emits; without it a cited task is unverifiable.
+    await writeFile(
+      join(root, '.docs/plans/current-feature.md'),
+      '### Task 1: Existing work\n\n**Files:** src/example.ts\n',
     );
     await writeFile(
       join(root, '.docs/stories/current-feature.md'),

@@ -1,12 +1,34 @@
 # ai-conductor project configuration
 # See the harness config schema (src/conductor/src/types/config.ts) for all keys.
 
+otel:
+  exporter: otlp
+  endpoint: http://localhost:4318
+  attributes:
+    verification.marker: a6227ff34d1a221e
+
 # Auto-reconciliation of parked features, explicitly enabled (operator order,
 # 2026-07-30, matches the documented default but pinned here so it survives
 # regardless of a future default change). A merged parked slug with a
 # shipped-record on origin/main (or branch ancestry into it) is cleaned up
 # automatically: worktree removed, branch deleted, unparked.
 reconcile_parked_auto_cleanup: true
+
+# Feature-executor pool width. Above 1 the daemon warns at startup: more rebase
+# kickbacks as siblings land first, and provider spend scales with the width.
+daemon_concurrency: 3
+
+# Repair watched PRs after main advances. Both recovery paths run the suite
+# from their isolated worktree root before publishing; conflicts take priority
+# over CI repair. Read at daemon startup; restart after landing to apply.
+mergeable_autoresolve:
+  enabled: true
+  cooldownMinutes: 60
+  suiteCommand: npm --prefix src/conductor test
+
+ci_watch:
+  enabled: true
+  cooldownMinutes: 60
 
 # Self-host guardrails: declared version freeze (PR #262).
 #
@@ -76,6 +98,32 @@ test_suite:
   scoped_command: './node_modules/.bin/vitest run {selectors}'
   working_directory: src/conductor
   timeout_seconds: 1800
+  # One full-suite run per feature, then hold that PASS across small laps.
+  #
+  # `aggregate` stays the mode deliberately. `scoped` derives its selectors
+  # from the feature's changed *test* paths only, so a source change that
+  # breaks an untouched test would not be executed by the build loop's only
+  # regression gate.
+  #
+  # The budget is a count of changed files since the attested PASS, per
+  # category. Within budget the PASS is preserved and nothing re-runs; over
+  # it, the aggregate command runs again and re-attests. The v1.0 cutover
+  # build dispatched `test_suite` five times at ~4m20s each — roughly 22
+  # minutes — while its individual commits touched 1-2 files, occasionally
+  # 5-7. Six holds the PASS across an ordinary remediation lap and re-attests
+  # on a large one.
+  #
+  # `source` is the catch-all classification, so `docs/`, `.docs/`, `bin/`,
+  # `skills/`, and `HARNESS.md` churn in the SHIP tail counts against it
+  # exactly as engine code does; the budget cannot tell them apart. Left
+  # undeclared, `dependencies`, `environment`, `migrations`, and
+  # `project_config` remain `none` — those are unbudgetable and always
+  # re-run.
+  verification:
+    mode: aggregate
+    drift_budget:
+      source: 6
+      tests: 3
 
 # Per-step overrides.
 #
@@ -95,6 +143,38 @@ llm_provider: [codex, claude]
 
 conflict_check:
   adr_corpus: repo_wide
+
+# Remediation append allowance. The effective cap is
+# min(max_appended_tasks, floor(authored_count * max_appended_ratio)), so BOTH
+# terms bind: raising only the fixed cap leaves a small plan pinned by the ratio.
+#
+# Raised from the 5 / 0.25 defaults on 2026-09-02. Two features were halting a
+# task or three over an allowance that, on plans of 15 and 24 authored tasks,
+# resolved to 4 and 5 — small enough that an ordinary as-built round could not
+# fit inside it. The cap exists to stop a plan being rewritten by remediation
+# rather than re-planned; at 8 it still does that, and a feature needing 26
+# appended tasks against a 19-task plan (the case that prompted this review)
+# remains far outside it and still halts for an operator.
+prd_audit:
+  # TEMPORARY (operator, 2026-09-04): 8 / 0.5 raised to 10 / 0.6 with the
+  # lap grant below — a-coverage's second as-built lap needs 5 tasks with
+  # 4 of 8 spent. Revert with the lap grant.
+  max_appended_tasks: 10
+  # Operator, 2026-09-06: 0.6 raised to 0.8. On a 4-task plan the ratio term
+  # resolved to 3 while an ordinary as-built round asked for 4, so small plans
+  # halted kickback-cap on a one-task overrun (sweep-stale-vitest). Note the
+  # authored count also includes the "Task Dependency Graph" heading.
+  max_appended_ratio: 0.8
+  # TEMPORARY (operator, 2026-09-04): second lap granted to clear the
+  # bin-setup S4.2 and a-coverage AB-1/AB-2 halts; revert to the default 1
+  # once both features pass (see #2147 for the per-feature grant design).
+  max_remediation_laps: 2
+
+# TEMPORARY (operator, 2026-09-04, laps raised 2026-09-05): third lap granted —
+# AB-1 converged to the conductor-consumption half only. Worktree-local
+# recovery, not feature scope; revert with the grant above.
+architecture_review_as_built:
+  max_remediation_laps: 3
 
 steps:
   explore:

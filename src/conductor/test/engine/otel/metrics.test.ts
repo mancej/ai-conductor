@@ -1,38 +1,63 @@
+// Covers: task:1, task:2, task:3, task:4, task:5, task:8, task:10, task:11
 /**
- * metrics.test.ts — unit tests for MetricsRecorder via OtelVisualizer.
+ * Covers: task:1, task:2, task:3, task:4, task:10
+ * metrics.test.ts — unit tests for MetricsRecorder through MetricsListener.
  *
- * Tests T15–T16 using OtelVisualizer + InMemoryMetricExporter:
+ * Tests T15–T16 using MetricsListener + InMemoryMetricExporter:
  *   T15: Duration histogram and retries counter
  *   T16: Token metrics — skip when absent, record only present kinds
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { ConductorEventEmitter } from '../../../src/ui/events.js';
-import { resolveOtelConfig } from '../../../src/engine/otel/otel-config.js';
-import { OtelVisualizer } from '../../../src/engine/otel/otel-visualizer.js';
-import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
-import { InMemoryMetricExporter, AggregationTemporality } from '@opentelemetry/sdk-metrics';
+import { computeCostRollup } from '../../../src/engine/cost-rollup.js';
+import { EventPersister } from '../../../src/engine/event-persister.js';
+import {
+  DURATION_BUCKET_BOUNDARIES_MS,
+  MetricsRecorder,
+  RESERVED_CONDUCTOR_LABEL_KEYS,
+} from '../../../src/engine/otel/metrics.js';
+import { MetricsListener } from '../../../src/engine/otel/metrics-listener.js';
+import type { Meter } from '@opentelemetry/api';
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+  type HistogramMetricData,
+} from '@opentelemetry/sdk-metrics';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+interface MetricTestListener {
+  start(emitter: ConductorEventEmitter): void;
+  stop(): Promise<void>;
+}
+
 function makeVisualizer(
-  spanExporter: InMemorySpanExporter,
   metricExporter: InMemoryMetricExporter,
-  pipelineDir: string,
-): OtelVisualizer {
-  const resolved = resolveOtelConfig(
-    { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-    pipelineDir,
-  );
-  return new OtelVisualizer(resolved, {
-    runId: `test-${Date.now()}`,
-    feature: 'test-feature',
-    project: 'test-project',
-    spanExporter,
-    metricExporter,
+  _pipelineDir: string,
+  _runId = `test-${Date.now()}`,
+): MetricTestListener {
+  const provider = new MeterProvider({
+    readers: [new PeriodicExportingMetricReader({ exporter: metricExporter, exportIntervalMillis: 60_000 })],
   });
+  const listener = new MetricsListener(
+    new MetricsRecorder(provider.getMeter('metrics-listener-test'), {
+      project: 'test-project', worker: 'unknown', feature: 'test-feature',
+    }),
+    () => Date.now(),
+    'test-feature',
+  );
+  return {
+    start: (emitter) => listener.start(emitter),
+    stop: async () => {
+      listener.stop();
+      await provider.shutdown();
+    },
+  };
 }
 
 function getMetricNames(exporter: InMemoryMetricExporter): string[] {
@@ -48,18 +73,208 @@ function findMetric(exporter: InMemoryMetricExporter, name: string) {
     .find((m) => m.descriptor.name === name);
 }
 
+async function captureFeatureShippedAttributes(
+  meterName: string,
+  customAttrs?: Record<string, string>,
+) {
+  const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+  const provider = new MeterProvider({
+    readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+  });
+  try {
+    new MetricsRecorder(
+      provider.getMeter(meterName),
+      { project: 'conductor-project', worker: 'conductor-worker' },
+      customAttrs,
+    ).onFeatureShipped();
+    await provider.forceFlush();
+    return findMetric(exporter, 'conductor.feature.shipped')?.dataPoints[0]?.attributes;
+  } finally {
+    await provider.shutdown();
+  }
+}
+
+async function recordMetricsWithIdentity(identityAttrs: { project: string; worker: string; feature: string }) {
+  const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+  const meterProvider = new MeterProvider({
+    readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+  });
+  const recorder = new MetricsRecorder(meterProvider.getMeter('metrics-recorder-test'), identityAttrs);
+
+  recorder.onStepClose('build', 25, 1, { input: 100, output: 50 }, 'test-model');
+  recorder.onPipelineCloseout({
+    type: 'pipeline_closeout',
+    obligation: 'simplify',
+    startedAt: 1_000,
+    endedAt: 1_125,
+    ts: 1_130,
+  });
+  await meterProvider.forceFlush();
+
+  return exporter;
+}
+
+describe('Task 3: dispatch dimensions', () => {
+  it('records only defined dispatch dimensions on step metric attributes', async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+    });
+    const recorder = new MetricsRecorder(
+      provider.getMeter('task-3'),
+      { project: 'test-project', worker: 'test-worker', feature: 'test-feature' },
+    );
+
+    try {
+      const dimensions = { model: 'opus', effort: 'high', provider: 'claude', tier: 'M', fallback: true };
+      recorder.onStepClose('full', 10, 0, undefined, undefined, false, dimensions);
+      recorder.onRetry('full', dimensions);
+      recorder.onDispatch('full', undefined, undefined, dimensions);
+      recorder.onStepClose('model-only', 10, 0, undefined, undefined, false, { model: 'opus' });
+      await provider.forceFlush();
+
+      const attributes = (name: string, step: string) => findMetric(exporter, name)?.dataPoints
+        .find((point) => point.attributes.step === step)?.attributes;
+      const full = { step: 'full', model: 'opus', effort: 'high', provider: 'claude', tier: 'M', project: 'test-project', worker: 'test-worker', feature: 'test-feature' };
+      const allowedKeys = {
+        'conductor.step.duration': ['step', 'model', 'effort', 'provider', 'tier', 'project', 'worker', 'feature'],
+        'conductor.step.retries': ['step', 'model', 'effort', 'provider', 'tier', 'project', 'worker', 'feature'],
+        'conductor.step.dispatches': ['step', 'metering', 'model', 'effort', 'provider', 'tier', 'fallback', 'project', 'worker', 'feature'],
+      } as const;
+
+      expect({
+        duration: attributes('conductor.step.duration', 'full'),
+        retries: attributes('conductor.step.retries', 'full'),
+        dispatches: attributes('conductor.step.dispatches', 'full'),
+        modelOnly: attributes('conductor.step.duration', 'model-only'),
+        allowedKeys: Object.entries(allowedKeys).every(([name, keys]) => (
+          findMetric(exporter, name)?.dataPoints.every((point) => (
+            Object.keys(point.attributes).every((key) => (keys as readonly string[]).includes(key))
+          )) ?? true
+        )),
+      }).toEqual({
+        duration: full,
+        retries: full,
+        dispatches: { ...full, metering: 'unmetered', fallback: true },
+        modelOnly: { step: 'model-only', model: 'opus', project: 'test-project', worker: 'test-worker', feature: 'test-feature' },
+        allowedKeys: true,
+      });
+    } finally {
+      await provider.shutdown();
+    }
+  });
+});
+
+describe('Task 8: TokenUsage detail remains span-only', () => {
+  it('does not export usage detail, cost source, or fallback reason on any metric series', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'build',
+      status: 'done',
+      tokenUsage: {
+        input: 100,
+        output: 50,
+        reasoningOutput: 1200,
+        numTurns: 7,
+        durationMs: 84_000,
+        costSource: 'provider',
+      },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const forbidden = [
+      'fallback.reason',
+      'usage.reasoning_output',
+      'usage.turns',
+      'usage.duration_ms',
+      'cost.source',
+    ];
+    const metricAttributeKeys = metricExporter.getMetrics().flatMap((resource) => (
+      resource.scopeMetrics.flatMap((scope) => (
+        scope.metrics.flatMap((metric) => metric.dataPoints.flatMap((point) => Object.keys(point.attributes)))
+      ))
+    ));
+
+    expect(metricAttributeKeys.some((key) => forbidden.some((suffix) => key.endsWith(suffix)))).toBe(false);
+  });
+});
+
+describe('Task 5: operator attributes at the metrics identity seam', () => {
+  it('exports custom attributes on per-feature and daemon metric points without replacing later labels', async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+    });
+    const custom = {
+      environment: 'staging',
+      ...Object.fromEntries(RESERVED_CONDUCTOR_LABEL_KEYS.map((key) => [key, `operator-${key}`])),
+    };
+    const recorder = new MetricsRecorder(
+      provider.getMeter('task-5-custom-attributes'),
+      { project: 'conductor-project', worker: 'conductor-worker' },
+      custom,
+    );
+    const featureRecorder = recorder.forFeature('bound-feature');
+
+    try {
+      featureRecorder.onStepClose('build', 10, 1, undefined, false);
+      featureRecorder.onDispatch('build');
+      featureRecorder.onFeatureUsageTotal({
+        type: 'feature_usage_total', dispatches: 1, meteredDispatches: 1, unmeteredDispatches: 0,
+        costUsd: 1, inputTokens: 1, outputTokens: 1,
+      });
+      featureRecorder.onGateVerdict('build', 'pass');
+      recorder.onDaemonBacklog({
+        type: 'daemon_backlog_snapshot',
+        counts: { eligible: 1, waiting: 0, blocked: 0, gated: 0, parked: 0 },
+        oldestAgeSeconds: {}, slots: { busy: 1, free: 0 }, inFlight: [],
+        blocked: { paused: false, build_auth_missing: false, gh_version: false, episode_active: false }, pollDurationMs: 1,
+      });
+      await provider.forceFlush();
+
+      const point = (name: string) => findMetric(exporter, name)?.dataPoints[0]?.attributes;
+      expect({
+        duration: point('conductor.step.duration'),
+        retries: point('conductor.step.retries'),
+        dispatches: point('conductor.step.dispatches'),
+        featureCost: point('conductor.feature.cost'),
+        gateVerdict: point('conductor.gate.verdicts'),
+        daemonBacklog: point('conductor.daemon.backlog'),
+        sameMapFirst: await captureFeatureShippedAttributes('task-5-same-map-first', custom),
+        sameMapSecond: await captureFeatureShippedAttributes('task-5-same-map-second', custom),
+        noMap: await captureFeatureShippedAttributes('task-5-no-map'),
+      }).toEqual({
+        duration: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker', feature: 'bound-feature', step: 'build' },
+        retries: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker', feature: 'bound-feature', step: 'build' },
+        dispatches: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker', feature: 'bound-feature', step: 'build', metering: 'unmetered' },
+        featureCost: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker', feature: 'bound-feature', cost_complete: true },
+        gateVerdict: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker', feature: 'bound-feature', step: 'build', outcome: 'pass' },
+        daemonBacklog: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker', state: 'eligible' },
+        sameMapFirst: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker' },
+        sameMapSecond: { environment: 'staging', project: 'conductor-project', worker: 'conductor-worker' },
+        noMap: { project: 'conductor-project', worker: 'conductor-worker' },
+      });
+    } finally {
+      await provider.shutdown();
+    }
+  });
+});
+
 // ── Shared setup ──────────────────────────────────────────────────────────────
 
 let tempDir: string;
 let pipelineDir: string;
-let spanExporter: InMemorySpanExporter;
 let metricExporter: InMemoryMetricExporter;
 let emitter: ConductorEventEmitter;
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'otel-metrics-'));
   pipelineDir = join(tempDir, '.pipeline');
-  spanExporter = new InMemorySpanExporter();
   metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
   emitter = new ConductorEventEmitter();
 });
@@ -68,11 +283,160 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
 });
 
+// ── Task 1: duration bucket boundaries ──────────────────────────────────────
+
+describe('Task 1: duration bucket boundaries', () => {
+  it('are strictly increasing and span 10 ms through 8 hours', () => {
+    expect(DURATION_BUCKET_BOUNDARIES_MS.every(
+      (boundary, index) => index === 0 || boundary > DURATION_BUCKET_BOUNDARIES_MS[index - 1],
+    )).toBe(true);
+    expect(DURATION_BUCKET_BOUNDARIES_MS[0]).toBeLessThanOrEqual(10);
+    expect(DURATION_BUCKET_BOUNDARIES_MS.at(-1)).toBeGreaterThanOrEqual(28_800_000);
+    expect(DURATION_BUCKET_BOUNDARIES_MS.some((boundary) => boundary >= 252_464)).toBe(true);
+  });
+
+  it('resolves representative durations to six distinct buckets', () => {
+    const resolvedBoundaries = [240, 4_000, 90_000, 600_000, 2_700_000, 20_000_000].map((durationMs) =>
+      DURATION_BUCKET_BOUNDARIES_MS.find((boundary) => boundary >= durationMs),
+    );
+
+    expect(resolvedBoundaries).not.toContain(undefined);
+    expect(new Set(resolvedBoundaries).size).toBe(6);
+  });
+});
+
+// ── Task 2: step-duration histogram advice ─────────────────────────────────
+
+describe('Task 2: step-duration histogram advice', () => {
+  it('passes the shared duration boundaries as advice when creating conductor.step.duration', () => {
+    const createHistogram = vi.fn();
+    const meter = {
+      createHistogram,
+      createCounter: vi.fn(),
+      createGauge: vi.fn(),
+    } as unknown as Meter;
+
+    new MetricsRecorder(meter);
+
+    const stepDurationCall = createHistogram.mock.calls.find(
+      ([name]) => name === 'conductor.step.duration',
+    );
+    expect(stepDurationCall?.[1]?.advice?.explicitBucketBoundaries)
+      .toEqual([
+        10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000,
+        30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+        3_600_000, 7_200_000, 14_400_000, 28_800_000,
+      ]);
+  });
+});
+
+// ── Task 3: closeout-duration histogram advice and descriptions ─────────────
+
+describe('Task 3: closeout-duration histogram advice and descriptions', () => {
+  it('shares duration advice and declares the 8-hour saturation bound for both duration instruments', () => {
+    const createHistogram = vi.fn();
+    const meter = {
+      createHistogram,
+      createCounter: vi.fn(),
+      createGauge: vi.fn(),
+    } as unknown as Meter;
+
+    new MetricsRecorder(meter);
+
+    const durationOptions = Object.fromEntries(createHistogram.mock.calls) as Record<string, {
+      advice?: { explicitBucketBoundaries?: number[] };
+      description?: string;
+    }>;
+
+    expect({
+      closeoutAdvice: durationOptions['conductor.pipeline.closeout.duration']?.advice
+        ?.explicitBucketBoundaries,
+      stepDescription: durationOptions['conductor.step.duration']?.description,
+      closeoutDescription: durationOptions['conductor.pipeline.closeout.duration']?.description,
+    }).toEqual({
+      closeoutAdvice: DURATION_BUCKET_BOUNDARIES_MS,
+      stepDescription: expect.stringContaining('quantiles saturate above 8 h (largest finite bucket boundary)'),
+      closeoutDescription: expect.stringContaining('quantiles saturate above 8 h (largest finite bucket boundary)'),
+    });
+  });
+});
+
+// ── Task 4: step-duration overflow and zero observations ───────────────────
+
+describe('Task 4: step-duration overflow and zero observations', () => {
+  it('keeps overflow and zero observations in their exact histogram buckets', async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter })],
+    });
+
+    try {
+      const recorder = new MetricsRecorder(provider.getMeter('task-4'));
+      recorder.onStepClose('overflow-and-zero', 30_000_000, 0);
+      recorder.onStepClose('overflow-and-zero', 0, 0);
+
+      await provider.forceFlush();
+
+      const metric = findMetric(exporter, 'conductor.step.duration');
+      const point = (metric as HistogramMetricData | undefined)?.dataPoints.find(
+        (dataPoint) => dataPoint.attributes['step'] === 'overflow-and-zero',
+      );
+
+      expect(point).toBeDefined();
+      expect(point?.value.count).toBe(2);
+      expect(point?.value.sum).toBe(30_000_000);
+      expect(point?.value.buckets.boundaries.at(-1)).toBe(DURATION_BUCKET_BOUNDARIES_MS.at(-1));
+      expect(point?.value.buckets.counts.at(-1)).toBe(1);
+      expect(point?.value.buckets.counts[0]).toBe(1);
+    } finally {
+      await provider.shutdown();
+    }
+  });
+});
+
+// ── Task 5: closeout-duration overflow observation ─────────────────────────
+
+describe('Task 5: closeout-duration overflow observation', () => {
+  it('keeps a closeout overflow observation in the bucket above the largest finite boundary', async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter })],
+    });
+
+    try {
+      const recorder = new MetricsRecorder(provider.getMeter('task-5'));
+      const closeout = {
+        type: 'pipeline_closeout',
+        obligation: 'summary',
+        startedAt: 1_000,
+        endedAt: 30_001_000,
+        ts: 30_001_000,
+      } as const;
+
+      expect(() => recorder.onPipelineCloseout(closeout)).not.toThrow();
+      await provider.forceFlush();
+
+      const metric = findMetric(exporter, 'conductor.pipeline.closeout.duration');
+      const point = (metric as HistogramMetricData | undefined)?.dataPoints.find(
+        (dataPoint) => dataPoint.attributes['obligation'] === 'summary',
+      );
+
+      expect(point).toBeDefined();
+      expect(point?.value.count).toBe(1);
+      expect(point?.value.sum).toBe(30_000_000);
+      expect(point?.value.buckets.boundaries.at(-1)).toBe(DURATION_BUCKET_BOUNDARIES_MS.at(-1));
+      expect(point?.value.buckets.counts.at(-1)).toBe(1);
+    } finally {
+      await provider.shutdown();
+    }
+  });
+});
+
 // ── T15: Duration histogram and retries counter ───────────────────────────────
 
 describe('T15: step duration histogram and retries counter', () => {
   it('conductor.step.duration histogram is recorded for each completed step', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
@@ -85,7 +449,7 @@ describe('T15: step duration histogram and retries counter', () => {
   });
 
   it('duration data points carry the step attribute', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
@@ -102,7 +466,7 @@ describe('T15: step duration histogram and retries counter', () => {
   });
 
   it('conductor.step.retries counter is incremented by N for N retries', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -124,7 +488,7 @@ describe('T15: step duration histogram and retries counter', () => {
   });
 
   it('retries counter has NO data point for steps with zero retries', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
@@ -144,7 +508,7 @@ describe('T15: step duration histogram and retries counter', () => {
   });
 
   it('two retries for a step → counter value is 2', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -164,9 +528,9 @@ describe('T15: step duration histogram and retries counter', () => {
 
 // ── T16: Token metrics — skip absent, record only present kinds ───────────────
 
-describe('T16: token metrics — skip-absent, partial kinds', () => {
+describe.skip('T16: superseded per-dispatch token counters', () => {
   it('conductor.step.tokens counter is recorded when tokenUsage is present', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -184,7 +548,7 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 
   it('token data points contain the step attribute for a step with tokenUsage', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -203,7 +567,7 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 
   it('tokenUsage absent → zero token data points for that step (no NaN / zero-fill)', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'plan', index: 2 });
@@ -221,7 +585,7 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 
   it('partial tokenUsage (input + output only) → only those two kinds recorded', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -247,7 +611,7 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 
   it('full tokenUsage (all four kinds) → all four kinds recorded', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -272,7 +636,7 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 
   it('mix: one step with tokenUsage, one without → only the token step has data points', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -295,7 +659,7 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 
   it('token counter values match the actual token counts', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
@@ -320,11 +684,473 @@ describe('T16: token metrics — skip-absent, partial kinds', () => {
   });
 });
 
+// ── Task 1: step cost counter ───────────────────────────────────────────────
+
+describe.skip('Task 1: superseded step cost counter', () => {
+  it('records provider cost with step, model, and source attributes', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'explore',
+      status: 'done',
+      model: 'gpt-5.6-terra',
+      tokenUsage: { input: 100, output: 50, costUsd: 0.42, costSource: 'provider' },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const costMetric = findMetric(metricExporter, 'conductor.step.cost')!;
+    const point = costMetric.dataPoints.find((dataPoint) => dataPoint.attributes['step'] === 'explore');
+    expect(point?.value).toBe(0.42);
+    expect(point?.attributes).toMatchObject({
+      step: 'explore',
+      model: 'gpt-5.6-terra',
+      source: 'provider',
+      project: 'test-project',
+      feature: 'test-feature',
+    });
+  });
+
+  it('records rate-card cost with the rate-card source attribute', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'plan', index: 2 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'plan',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50, costUsd: 0.12, costSource: 'rate-card' },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const costMetric = findMetric(metricExporter, 'conductor.step.cost')!;
+    const point = costMetric.dataPoints.find((dataPoint) => dataPoint.attributes['step'] === 'plan');
+    expect(point?.attributes['source']).toBe('rate-card');
+  });
+
+  it('records an explicit zero-cost observation', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 3 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'build',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50, costUsd: 0, costSource: 'provider' },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const costMetric = findMetric(metricExporter, 'conductor.step.cost')!;
+    const point = costMetric.dataPoints.find((dataPoint) => dataPoint.attributes['step'] === 'build');
+    expect(point?.value).toBe(0);
+  });
+});
+
+// ── Task 2: cost counter guards ─────────────────────────────────────────────
+
+describe.skip('Task 2: superseded cost counter guards', () => {
+  it('omits the cost metric when costUsd is absent while retaining token metrics', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'explore',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50 },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    expect({
+      costMetric: findMetric(metricExporter, 'conductor.step.cost'),
+      tokenMetric: findMetric(metricExporter, 'conductor.step.tokens'),
+    }).toMatchObject({ costMetric: undefined, tokenMetric: expect.anything() });
+  });
+
+  it('omits cost points for NaN costUsd', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'explore',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50, costUsd: Number.NaN },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    expect(findMetric(metricExporter, 'conductor.step.cost')).toBeUndefined();
+  });
+
+  it('omits cost points for infinite costUsd', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'explore',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50, costUsd: Number.POSITIVE_INFINITY },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    expect(findMetric(metricExporter, 'conductor.step.cost')).toBeUndefined();
+  });
+
+  it('records finite costUsd without a source attribute when costSource is absent', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'explore',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50, costUsd: 0.42 },
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const costMetric = findMetric(metricExporter, 'conductor.step.cost')!;
+    const point = costMetric.dataPoints.find((dataPoint) => dataPoint.attributes['step'] === 'explore');
+    expect({ value: point?.value, attributes: point?.attributes }).toEqual({
+      value: 0.42,
+      attributes: { step: 'explore', project: 'test-project', feature: 'test-feature' },
+    });
+  });
+});
+
+// ── Task 4: cumulative feature cost and token gauges ────────────────────────
+
+describe('Task 4: cumulative feature cost and token gauges', () => {
+  const snapshot = {
+    type: 'feature_cost_snapshot' as const,
+    costUsd: 3.5,
+    costComplete: true,
+    byDimension: [
+      { step: 'build', model: 'm1', source: 'provider' as const, costUsd: 1.5 },
+      { step: 'build_review', model: 'm2', source: 'rate-card' as const, costUsd: 2 },
+    ],
+    tokensByDimension: [{ step: 'build', model: 'm1', tokens: { input: 150, output: 15 } }],
+  };
+
+  async function makeRecorder() {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+    });
+    return { exporter, provider, recorder: new MetricsRecorder(provider.getMeter('task-4'), { project: 'test-project', worker: 'test-worker', feature: 'test-feature' }) };
+  }
+
+  it('records cost and token dimensions with bounded feature identity', async () => {
+    const { exporter, provider, recorder } = await makeRecorder();
+    try {
+      recorder.onFeatureCostSnapshot(snapshot);
+      await provider.forceFlush();
+      expect(findMetric(exporter, 'conductor.feature.step.cost')?.dataPoints).toEqual([
+        expect.objectContaining({ value: 1.5, attributes: { step: 'build', model: 'm1', source: 'provider', project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+        expect.objectContaining({ value: 2, attributes: { step: 'build_review', model: 'm2', source: 'rate-card', project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+      ]);
+      expect(findMetric(exporter, 'conductor.feature.cost')?.dataPoints).toEqual([
+        expect.objectContaining({ value: 3.5, attributes: { cost_complete: true, project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+      ]);
+      expect(findMetric(exporter, 'conductor.feature.step.tokens')?.dataPoints).toEqual([
+        expect.objectContaining({ value: 150, attributes: { step: 'build', model: 'm1', kind: 'input', project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+        expect.objectContaining({ value: 15, attributes: { step: 'build', model: 'm1', kind: 'output', project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+      ]);
+    } finally { await provider.shutdown(); }
+  });
+
+  it('records incomplete totals, omits optional model, and retains an unchanged gauge value', async () => {
+    const { exporter, provider, recorder } = await makeRecorder();
+    try {
+      const incomplete = { ...snapshot, costComplete: false, byDimension: [{ step: 'build', costUsd: 1.5 }], tokensByDimension: [] };
+      recorder.onFeatureCostSnapshot(incomplete);
+      recorder.onFeatureCostSnapshot(incomplete);
+      await provider.forceFlush();
+      expect(findMetric(exporter, 'conductor.feature.cost')?.dataPoints).toEqual([
+        expect.objectContaining({ value: 3.5, attributes: { cost_complete: false, project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+      ]);
+      expect(findMetric(exporter, 'conductor.feature.step.cost')?.dataPoints).toEqual([
+        expect.objectContaining({ value: 1.5, attributes: { step: 'build', project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+      ]);
+    } finally { await provider.shutdown(); }
+  });
+
+  it('keeps only dispatch counting on usage-bearing dispatches and limits usd instruments to feature gauges', async () => {
+    const { exporter, provider, recorder } = await makeRecorder();
+    try {
+      recorder.onDispatch('build', { input: 1, output: 2, costUsd: 0.5, costSource: 'provider' }, 'm1');
+      recorder.onFeatureCostSnapshot(snapshot);
+      await provider.forceFlush();
+      const names = getMetricNames(exporter);
+      expect(names).toEqual(expect.arrayContaining(['conductor.step.dispatches', 'conductor.feature.cost', 'conductor.feature.step.cost']));
+      expect(names).not.toEqual(expect.arrayContaining(['conductor.step.cost', 'conductor.step.tokens']));
+      const usdNames = exporter.getMetrics().flatMap((rm) => rm.scopeMetrics.flatMap((sm) => sm.metrics))
+        .filter((metric) => metric.descriptor.unit === 'usd').map((metric) => metric.descriptor.name);
+      expect(usdNames).toEqual(['conductor.feature.cost', 'conductor.feature.step.cost']);
+      for (const metric of ['conductor.feature.cost', 'conductor.feature.step.cost']) {
+        for (const point of findMetric(exporter, metric)?.dataPoints ?? []) {
+          expect(point.attributes).toMatchObject({ project: 'test-project', worker: 'test-worker', feature: 'test-feature' });
+          expect(Object.keys(point.attributes)).not.toEqual(expect.arrayContaining(['run', 'run_id', 'conductor.run.id']));
+        }
+      }
+    } finally { await provider.shutdown(); }
+  });
+
+  it('does not record a non-finite snapshot total or any of its buckets', async () => {
+    const { exporter, provider, recorder } = await makeRecorder();
+    try {
+      recorder.onFeatureCostSnapshot({
+        ...snapshot,
+        costUsd: Number.NaN,
+        byDimension: [{ step: 'build', costUsd: 1.5 }],
+      });
+      await provider.forceFlush();
+
+      expect(findMetric(exporter, 'conductor.feature.cost')).toBeUndefined();
+      expect(findMetric(exporter, 'conductor.feature.step.cost')).toBeUndefined();
+    } finally { await provider.shutdown(); }
+  });
+
+  it('skips a non-finite dimension bucket while preserving a finite incomplete total', async () => {
+    const { exporter, provider, recorder } = await makeRecorder();
+    try {
+      recorder.onFeatureCostSnapshot({
+        ...snapshot,
+        costUsd: 0,
+        costComplete: false,
+        byDimension: [{ step: 'build', costUsd: Number.NaN }],
+        tokensByDimension: [],
+      });
+      await provider.forceFlush();
+
+      expect(findMetric(exporter, 'conductor.feature.cost')?.dataPoints).toEqual([
+        expect.objectContaining({ value: 0, attributes: { cost_complete: false, project: 'test-project', worker: 'test-worker', feature: 'test-feature' } }),
+      ]);
+      expect(findMetric(exporter, 'conductor.feature.step.cost')).toBeUndefined();
+    } finally { await provider.shutdown(); }
+  });
+
+  it('records only a finite present input kind for an unknown-model token bucket', async () => {
+    const { exporter, provider, recorder } = await makeRecorder();
+    try {
+      recorder.onFeatureCostSnapshot({
+        ...snapshot,
+        byDimension: [],
+        tokensByDimension: [{
+          step: 'unknown_model',
+          tokens: {
+            input: 10,
+            output: Number.NaN,
+            cacheRead: Number.POSITIVE_INFINITY,
+          },
+        }],
+      });
+      await provider.forceFlush();
+
+      expect(findMetric(exporter, 'conductor.feature.step.tokens')?.dataPoints).toEqual([
+        expect.objectContaining({
+          value: 10,
+          attributes: {
+            step: 'unknown_model',
+            kind: 'input',
+            project: 'test-project',
+            worker: 'test-worker',
+            feature: 'test-feature',
+          },
+        }),
+      ]);
+    } finally { await provider.shutdown(); }
+  });
+});
+
+// ── Task 3: dispatch metering classification ───────────────────────────────
+
+describe('Task 3: dispatch metering classification', () => {
+  it('records one dispatch for each fully-metered, cost-unmetered, and unmetered close', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'explore', index: 1 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'explore',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50, costUsd: 0.42 },
+    });
+    await emitter.emit({ type: 'step_started', step: 'plan', index: 2 });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'plan',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50 },
+    });
+    await emitter.emit({ type: 'step_started', step: 'build', index: 3 });
+    await emitter.emit({ type: 'step_completed', step: 'build', status: 'done', actualProvider: 'claude' });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const dispatches = findMetric(metricExporter, 'conductor.step.dispatches')!;
+    expect(dispatches.dataPoints.map((dataPoint) => ({
+      value: dataPoint.value,
+      attributes: dataPoint.attributes,
+    }))).toEqual([
+      { value: 1, attributes: { step: 'explore', metering: 'fully-metered', project: 'test-project', worker: 'unknown', feature: 'test-feature' } },
+      { value: 1, attributes: { step: 'plan', metering: 'cost-unmetered', project: 'test-project', worker: 'unknown', feature: 'test-feature' } },
+      { value: 1, attributes: { step: 'build', metering: 'unmetered', provider: 'claude', project: 'test-project', worker: 'unknown', feature: 'test-feature' } },
+    ]);
+  });
+});
+
+// ── Task 4: unmetered close observability ──────────────────────────────────
+
+describe('Task 4: unmetered close observability', () => {
+  it('records an unmetered dispatch and duration, with no token or cost points', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 3 });
+    await emitter.emit({ type: 'step_completed', step: 'build', status: 'done', actualProvider: 'claude' });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const dispatches = findMetric(metricExporter, 'conductor.step.dispatches')!;
+    expect(dispatches.dataPoints
+      .filter((dataPoint) => dataPoint.attributes['step'] === 'build')
+      .map((dataPoint) => ({ value: dataPoint.value, attributes: dataPoint.attributes }))).toEqual([
+        { value: 1, attributes: { step: 'build', metering: 'unmetered', provider: 'claude', project: 'test-project', worker: 'unknown', feature: 'test-feature' } },
+      ]);
+    expect(findMetric(metricExporter, 'conductor.step.duration')?.dataPoints).toContainEqual(
+      expect.objectContaining({ attributes: expect.objectContaining({ step: 'build' }) }),
+    );
+    expect(findMetric(metricExporter, 'conductor.step.tokens')?.dataPoints.filter(
+      (dataPoint) => dataPoint.attributes['step'] === 'build',
+    ) ?? []).toHaveLength(0);
+    expect(findMetric(metricExporter, 'conductor.step.cost')?.dataPoints.filter(
+      (dataPoint) => dataPoint.attributes['step'] === 'build',
+    ) ?? []).toHaveLength(0);
+  });
+});
+
+// ── Task 3: shipped-record / OTel dispatch parity ──────────────────────────
+
+describe('Task 3: shipped-record / OTel dispatch parity', () => {
+  it('keeps the exported dispatch total aligned with the persisted ledger and excludes provider-free closes', async () => {
+    const persister = new EventPersister(join(pipelineDir, 'events.jsonl'), emitter);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    persister.start();
+    vis.start(emitter);
+
+    try {
+      await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+      await emitter.emit({
+        type: 'provider_attempt',
+        step: 'build',
+        provider: 'claude',
+        outcome: 'success',
+        invoked: true,
+        model: 'opus',
+        tokenUsage: { input: 20, output: 2, costUsd: 0.3, costSource: 'provider' },
+      });
+      await emitter.emit({
+        type: 'step_completed',
+        step: 'build',
+        status: 'done',
+        actualProvider: 'claude',
+        model: 'opus',
+        tokenUsage: { input: 20, output: 2, costUsd: 0.3, costSource: 'provider' },
+      });
+      await emitter.emit({
+        type: 'provider_attempt',
+        step: 'explore',
+        provider: 'codex',
+        outcome: 'failure',
+        invoked: true,
+        model: 'gpt-5.6-terra',
+      });
+      await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 1 });
+      await emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
+      await emitter.emit({ type: 'step_started', step: 'build_review', index: 2 });
+      await emitter.emit({ type: 'step_completed', step: 'build_review', status: 'done', unmetered: true });
+      await emitter.emit({ type: 'feature_complete' });
+    } finally {
+      persister.stop();
+      await vis.stop();
+    }
+
+    const rollup = await computeCostRollup(tempDir);
+    const otelDispatches = findMetric(metricExporter, 'conductor.step.dispatches')!.dataPoints
+      .reduce((sum, point) => sum + Number(point.value), 0);
+    const bootstrapDispatches = findMetric(metricExporter, 'conductor.step.dispatches')!.dataPoints
+      .filter((point) => point.attributes['step'] === 'bootstrap');
+    const bootstrapDurations = findMetric(metricExporter, 'conductor.step.duration')!.dataPoints
+      .filter((point) => point.attributes['step'] === 'bootstrap');
+
+    expect({ otelDispatches, rollupDispatches: rollup.dispatches }).toEqual({
+      otelDispatches: 2,
+      rollupDispatches: 2,
+    });
+    expect(rollup).toMatchObject({
+      costUsd: 0.3,
+      dispatches: 2,
+      unmetered: { count: 1 },
+      tokens: { input: 20, output: 2 },
+    });
+    expect(bootstrapDurations).toHaveLength(1);
+    expect(bootstrapDispatches).toHaveLength(0);
+  });
+});
+
+describe('feature usage total cost export', () => {
+  it('exports the authoritative feature cost carried by feature_usage_total', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({
+      type: 'feature_usage_total',
+      dispatches: 4,
+      meteredDispatches: 3,
+      unmeteredDispatches: 1,
+      costUnmeteredDispatches: 1,
+      costUsd: 7.4679372,
+      inputTokens: 500,
+      outputTokens: 50,
+    });
+    await vis.stop();
+
+    expect(findMetric(metricExporter, 'conductor.feature.cost')?.dataPoints).toEqual([
+      expect.objectContaining({
+        value: 7.4679372,
+        attributes: {
+          project: 'test-project',
+          worker: 'unknown',
+          feature: 'test-feature',
+          cost_complete: false,
+        },
+      }),
+    ]);
+  });
+});
+
 // ── Task 19: closeout duration histogram ────────────────────────────────────
 
 describe('Task 19: closeout duration histogram', () => {
   it('records the closeout duration with its obligation attribute', async () => {
-    const vis = makeVisualizer(spanExporter, metricExporter, pipelineDir);
+    const vis = makeVisualizer(metricExporter, pipelineDir);
     vis.start(emitter);
 
     await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
@@ -345,4 +1171,177 @@ describe('Task 19: closeout duration histogram', () => {
     );
     expect(point?.value).toMatchObject({ count: 1, sum: 125 });
   });
+});
+
+describe('Task 3: metric identity attributes', () => {
+  it('adds identity without removing each instrument’s existing attributes', async () => {
+    const exporter = await recordMetricsWithIdentity({
+      project: 'project-a',
+      worker: 'worker-a',
+      feature: 'feature-a',
+    });
+
+    expect({
+      duration: findMetric(exporter, 'conductor.step.duration')!.dataPoints.map((point) => point.attributes),
+      retries: findMetric(exporter, 'conductor.step.retries')!.dataPoints.map((point) => point.attributes),
+      dispatches: findMetric(exporter, 'conductor.step.dispatches')!.dataPoints.map((point) => point.attributes),
+      closeout: findMetric(exporter, 'conductor.pipeline.closeout.duration')!.dataPoints.map((point) => point.attributes),
+    }).toEqual({
+      duration: [{ step: 'build', project: 'project-a', worker: 'worker-a', feature: 'feature-a' }],
+      retries: [{ step: 'build', project: 'project-a', worker: 'worker-a', feature: 'feature-a' }],
+      dispatches: [{ step: 'build', metering: 'cost-unmetered', project: 'project-a', worker: 'worker-a', feature: 'feature-a' }],
+      closeout: [{ obligation: 'simplify', project: 'project-a', worker: 'worker-a', feature: 'feature-a' }],
+    });
+  });
+
+  it('keeps project identity distinct between recorder instances', async () => {
+    const first = await recordMetricsWithIdentity({ project: 'project-a', worker: 'worker-a', feature: 'shared-feature' });
+    const second = await recordMetricsWithIdentity({ project: 'project-b', worker: 'worker-b', feature: 'shared-feature' });
+
+    expect([
+      findMetric(first, 'conductor.step.duration')!.dataPoints[0].attributes['project'],
+      findMetric(second, 'conductor.step.duration')!.dataPoints[0].attributes['project'],
+    ]).toEqual(['project-a', 'project-b']);
+  });
+});
+
+describe('Task 4: bounded metric identity', () => {
+  it('pinning: full-run data points omit the injected run id', async () => {
+    const runId = 'run-id-that-must-not-label-metrics';
+    const vis = makeVisualizer(metricExporter, pipelineDir, runId);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({ type: 'step_retry', step: 'build', attempt: 2, maxAttempts: 3, reason: 'flaky' });
+    await emitter.emit({
+      type: 'step_completed',
+      step: 'build',
+      status: 'done',
+      tokenUsage: { input: 100, output: 50 },
+    });
+    await emitter.emit({
+      type: 'pipeline_closeout',
+      obligation: 'simplify',
+      startedAt: 1_000,
+      endedAt: 1_125,
+      ts: 1_130,
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const dataPointAttributes = metricExporter
+      .getMetrics()
+      .flatMap((resource) => resource.scopeMetrics.flatMap((scope) => scope.metrics))
+      .flatMap((metric) => metric.dataPoints.map((dataPoint) => dataPoint.attributes));
+
+    expect(dataPointAttributes).not.toHaveLength(0);
+    expect(dataPointAttributes.every((attributes) => (
+      !Object.keys(attributes).some((key) => /run[._-]?id/i.test(key))
+      && !Object.values(attributes).includes(runId)
+    ))).toBe(true);
+  });
+
+  it('pinning: counters aggregate across projects without changing instrument names', async () => {
+    const first = await recordMetricsWithIdentity({ project: 'project-a', worker: 'worker-a', feature: 'shared-feature' });
+    const second = await recordMetricsWithIdentity({ project: 'project-b', worker: 'worker-b', feature: 'shared-feature' });
+    const retries = (exporter: InMemoryMetricExporter) => (
+      findMetric(exporter, 'conductor.step.retries')!.dataPoints[0].value as number
+    );
+
+    expect({
+      firstInstrumentNames: getMetricNames(first),
+      secondInstrumentNames: getMetricNames(second),
+      retriesTotal: retries(first) + retries(second),
+    }).toEqual({
+      firstInstrumentNames: [
+        'conductor.step.duration',
+        'conductor.step.retries',
+        'conductor.step.dispatches',
+        'conductor.pipeline.closeout.duration',
+      ],
+      secondInstrumentNames: [
+        'conductor.step.duration',
+        'conductor.step.retries',
+        'conductor.step.dispatches',
+        'conductor.pipeline.closeout.duration',
+      ],
+      retriesTotal: 2,
+    });
+  });
+});
+
+// ── Run outcome counter ──────────────────────────────────────────────────────────────
+
+describe('run outcome counter', () => {
+  it('records a completed run as outcome=complete', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({ type: 'step_completed', step: 'build', status: 'done' });
+    await emitter.emit({ type: 'feature_complete' });
+    await vis.stop();
+
+    const metric = findMetric(metricExporter, 'conductor.run.outcomes');
+    expect(metric?.dataPoints).toEqual([
+      expect.objectContaining({
+        attributes: { outcome: 'complete', project: 'test-project', worker: 'unknown', feature: 'test-feature' },
+        value: 1,
+      }),
+    ]);
+  });
+
+  it('records a halted run as outcome=halted', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({ type: 'loop_halt', step: 'build', reason: 'needs human' });
+    await vis.stop();
+
+    const metric = findMetric(metricExporter, 'conductor.run.outcomes');
+    expect(metric?.dataPoints).toEqual([
+      expect.objectContaining({
+        attributes: { outcome: 'halted', project: 'test-project', worker: 'unknown', feature: 'test-feature' },
+        value: 1,
+      }),
+    ]);
+  });
+
+  it('records an interrupted run as outcome=terminated', async () => {
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter: metricExporter, exportIntervalMillis: 60_000 })],
+    });
+    new MetricsRecorder(provider.getMeter('terminated-run'), {
+      project: 'test-project', worker: 'unknown', feature: 'test-feature',
+    }).onRunClose('terminated');
+    await provider.shutdown();
+
+    const metric = findMetric(metricExporter, 'conductor.run.outcomes');
+    expect(metric?.dataPoints).toEqual([
+      expect.objectContaining({
+        attributes: { outcome: 'terminated', project: 'test-project', worker: 'unknown', feature: 'test-feature' },
+        value: 1,
+      }),
+    ]);
+  });
+
+  it('does not double-count a completed run when a late halt arrives', async () => {
+    const vis = makeVisualizer(metricExporter, pipelineDir);
+    vis.start(emitter);
+
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({ type: 'feature_complete' });
+    await emitter.emit({ type: 'loop_halt', reason: 'late arrival' });
+    await vis.stop();
+
+    const metric = findMetric(metricExporter, 'conductor.run.outcomes');
+    expect(metric?.dataPoints).toEqual([
+      expect.objectContaining({
+        attributes: { outcome: 'complete', project: 'test-project', worker: 'unknown', feature: 'test-feature' },
+        value: 1,
+      }),
+    ]);
+  });
+
 });

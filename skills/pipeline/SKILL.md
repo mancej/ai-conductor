@@ -96,8 +96,9 @@ DEPENDENCY ORDER — Dispatch tasks in topological order respecting declared dep
                   implementer runs `/code-removal` for that task instead of opening a RED cycle — a
                   deletion has no failing test to write, and an absence assertion is never the subject.
                   `/code-removal` carries the survivor method, test triage, and completeness sweep; the
-                  evidence is the deletion diff plus the full surviving suite green.
-3. VERIFY       — Run `conduct-ts scoped-run <selectors...>` for the scoped affected-test set (see Scoped VERIFY below) to confirm the implementer's work
+                  evidence is the deletion diff plus scoped survivor-test evidence;
+                  `test_suite` owns configured suite verification.
+3. VERIFY       — Inspect the implementer's scoped test evidence (see Scoped VERIFY below); run only a minimal targeted check if the evidence is missing or a concrete defect needs reproduction
 4. FIX          — If tests fail, VERIFY failure first (see below), then dispatch implementer with error context
 5. COMMIT       — Verify the implementer's commit carries the `Task: <id>` trailer with <id> as the bare plan id
                   (e.g. Task: 9, not Task: task-9). The trailer is non-authoritative routing
@@ -189,7 +190,13 @@ dispatch it — report BLOCKED and escalate as a conformance finding. Writing co
 deletion is wasted effort; the cheapest check (one ADR/PRD read) precedes the most expensive
 action (a full TDD subagent dispatch + review cycle).
 
-**Failure verification (step 4):** Before re-dispatching a failed task, run the **task's scoped set** (the same set used in step 3 VERIFY, or the full suite if a fallback trigger fired in step 3) to confirm the failure is real. Running the same scope ensures comparable signal — same false-positive/false-negative risk. If tests pass and commits exist for the task, mark as completed — do not trust JSON state alone. JSON state can become stale after connection interruptions or subagent context loss.
+**Failure verification (step 4):** Before re-dispatching a failed task, run the **task's scoped
+set** from step 3 VERIFY to confirm the failure is real. On a suite-failure kickback, include
+the affected tests identified by the engine's failure evidence; never run the full suite.
+If no scoped set can be identified, record that limitation rather than claiming verification
+passed. If the scoped tests pass, required task evidence exists, and commits exist for the
+task, mark it completed; aggregate proof remains pending at `test_suite`. Do not trust JSON
+state alone: it can become stale after connection interruptions or subagent context loss.
 
 **Superseded-symbol check (step 5 — replacement tasks):** Before marking a task `completed`
 whose plan says it **replaces or supersedes** an existing symbol/behavior ("replace X",
@@ -273,14 +280,16 @@ Changes to unrelated code in the same file (e.g., changing a CI command while fi
 definition, or "improving" a method signature while adding a validation) are scope violations.
 The evaluator should flag scope violations as IMPORTANT severity.
 
-**Scoped VERIFY (step 3):** Per-task VERIFY runs only the affected-test set, not the full suite.
+**Scoped VERIFY (step 3):** Inspect the implementer's scoped evidence without routine reruns.
+Missing evidence or a concrete suspected defect may require a minimal targeted check, never a suite.
 Scoping logic:
 1. Collect the task's diff (`git diff <pre-task-commit>..HEAD`) to identify new/modified production files.
 2. Build the scoped test set: (a) all new/modified test files in the diff, plus (b) existing test
    files covering the modified production modules. Discover these by naming convention (e.g.,
    `src/foo/bar.ts` → `test/foo/bar.test.ts`) and by grepping test files for imports of or
    references to modified modules.
-3. The agent derives the selectors from that scoped set and runs `conduct-ts scoped-run <selectors...>`.
+3. Match the supplied results to the changed behavior. If a targeted check is needed, derive
+   minimal selectors from that set and use `ai-conductor scoped-run <selectors...>`.
 4. Retain the named affected-test set for the batch-boundary union described below.
 
 **Broad fallback:**
@@ -289,23 +298,30 @@ Scoping logic:
 - The scoped/affected set is empty.
 - Module-to-test mapping is low-confidence and cannot be made confidently.
 
-For per-task VERIFY, uncertainty resolves toward this fallback scope — scoping is an
-optimization, never a gate change.
+For per-task VERIFY, uncertainty defers aggregate proof; it does not waive known scoped
+failures or the task's required RED/GREEN evidence.
 
-When a trigger fires, state `Aggregate fallback: <exact trigger and reason>` and invoke the
-repository-configured aggregate verifier interface. Do not call the project's aggregate command
-directly. The task REPORT names the trigger and fallback scope.
+When a trigger fires, state `Aggregate fallback: <exact trigger and reason>` in the task REPORT
+and DEFER aggregate verification to the engine's dedicated aggregate gate (the `test_suite`
+step), which owns whole-suite execution and its evidence. Never run the full suite — and never
+invoke the aggregate verifier — inside the build session; the dedicated step will surface any
+cross-cutting regression and route it back.
+
+**Suite-failure kickback:** Read the engine's retry diagnostics and referenced
+`.pipeline/test-suite-evidence.json`. Pass the relevant failure evidence and affected-test
+selectors to repair subagents. Fix the failure, verify the scoped affected-test union
+through `ai-conductor scoped-run <selectors...>`, then commit and leave the aggregate rerun to
+`test_suite`. A scoped PASS does not establish an aggregate PASS.
 
 **Batch affected-test union:** At each batch boundary, compute one named
-`BATCH_AFFECTED_TESTS` union by deduplicating every task's scoped affected-test set, then run
-that union once to catch regressions from task interactions.
-
-Batch verification MUST run only the named `BATCH_AFFECTED_TESTS` union.
+`BATCH_AFFECTED_TESTS` union by deduplicating every task's scoped affected-test set and retain
+the supplied results. Do not rerun the union routinely. A concrete task-interaction risk or
+changed behavior may justify a minimal targeted check through `ai-conductor scoped-run <selectors...>`.
 The evaluator MUST receive that same `BATCH_AFFECTED_TESTS` union and its result set.
-Only when `BATCH_AFFECTED_TESTS` cannot be determined with confidence MUST the full test suite run instead.
+When `BATCH_AFFECTED_TESTS` cannot be determined with confidence, record that in the REPORT and defer aggregate proof to the engine's dedicated aggregate gate — the build session never runs the full test suite.
 
 **REPORT requirement (step 6):** The task's step 6 REPORT must list the files included in the
-scoped test set (or, if a fallback trigger fired, state the trigger and fallback scope).
+scoped test set (or, if a fallback trigger fired, state the trigger, the tests actually run, and the deferred aggregate proof).
 This provides audit-trail visibility into the scoping decision.
 
 ### Quality Gates
@@ -323,7 +339,7 @@ this marker; a missing or malformed line 1 blocks the dispatch. Provide the eval
 - The **git diff** for this batch only (not the full codebase)
 - The **acceptance criteria** for this batch's tasks (extracted from stories, not full story files)
 - The named **`BATCH_AFFECTED_TESTS` union and its result summary** (pass/fail counts + failure
-  snippets, not full verbose output), or the full-suite fallback result when the union was indeterminate
+  snippets, not full verbose output), plus any scope uncertainty deferred to `test_suite`
 - The tech-context review checklist if loaded in session
 - The same focused **current-HEAD pattern basis** supplied to each affected task's implementer:
   current-checkout paths, stable symbol or role hints, and the relevant semantic traits. The
@@ -349,7 +365,7 @@ runs the full 3-stage review from the `code-review` skill on this scoped context
 Rationale: intermediate-batch reviews check compliance against a narrow diff + a handful
 of acceptance criteria — a task Sonnet handles well. The final batch review evaluates
 cross-batch integration and the full architectural picture, which is where Opus's deeper
-reasoning pays off. Retro on the 2026-04-17 Medium run (31 tasks, 7 batches) showed all
+reasoning pays off. A review of the 2026-04-17 Medium run (31 tasks, 7 batches) showed all
 4 intermediate evaluators could have run on Sonnet without verdict drift — they were the
 largest single token line item in that run.
 
@@ -371,7 +387,7 @@ atomically before advancing one single token further:
 3. Stat-check `test -s .pipeline/audit-trail/batch-N/review.json` — non-empty file must
    exist before the next batch starts
 4. Record the completed `evaluator` closeout obligation with
-   `conduct-ts closeout-event evaluator <started-at-ms> <ended-at-ms>`, then verify that
+   `ai-conductor closeout-event evaluator <started-at-ms> <ended-at-ms>`, then verify that
    `.pipeline/pipeline-events.jsonl` contains a parseable `pipeline_closeout` record whose
    `obligation` is exactly `evaluator`. An event for another obligation does not satisfy this check.
 
@@ -513,7 +529,7 @@ as a halt — **not** as a successful exit. Before exiting, you MUST:
 
 This contract is mandatory. Without the marker, the conductor reads
 `task-status.json`, sees nothing in flight, and concludes the build step
-is done — silently cascading through `manual-test` / `retro` / `finish`
+is done — silently cascading through `manual-test` / `finish`
 to mark the entire feature complete while the user's actual blocker is
 still open. The build-completion predicate in
 the build-completion predicate checks for the
@@ -550,7 +566,7 @@ If stories in `.docs/stories/` have been modified since the plan was created:
 
 ### State Management
 
-Track all state in `.pipeline/`: `config.yaml` (autonomy level, project refs), `plan-ref.md` (active plan path), `task-status.json` (per-task status and rework cycle counts), and `audit-trail/` (per-task `review.json`, `rework-N.json`, `commit.txt`, plus `summary.json` for retro).
+Track all state in `.pipeline/`: `config.yaml` (autonomy level, project refs), `plan-ref.md` (active plan path), `task-status.json` (per-task status and rework cycle counts), and `audit-trail/` (per-task `review.json`, `rework-N.json`, `commit.txt`, plus `summary.json` for final pipeline metrics).
 
 ### Parallel Execution (Standard and Full Autonomy)
 
@@ -590,9 +606,10 @@ isolation does not make dependent or overlapping-file tasks eligible for the sam
 3. Dispatch all selected tasks in one host-native fan-out operation
 4. Each agent receives: the task description, the test directory, the source directory
 5. Wait for every concurrent dispatch to complete before verification
-6. Compute `BATCH_AFFECTED_TESTS` from every task's scoped affected-test set and run that union
-   once to verify no conflicts; use the full-suite fallback only if the union is indeterminate
-7. If tests fail: identify the conflict, fix sequentially, re-run
+6. Collect `BATCH_AFFECTED_TESTS` and supplied results without routine reruns. If a concrete
+   interaction risk needs checking, run only the relevant tests. Uncertain scope returns
+   configured suite proof to `test_suite`; never use a full-suite fallback here.
+7. If tests fail: identify the conflict, fix sequentially, and verify only the affected behavior
 
 **Worktree-based parallelism (Full autonomy only):**
 For mutually independent tasks that need stronger isolation:
@@ -601,7 +618,8 @@ For mutually independent tasks that need stronger isolation:
   isolated-worktree responsibility.
 - Each worktree gets its own task batch
 - After completion, merge results back sequentially
-- The worktree-manager handles merge order, conflict resolution, and post-merge testing
+- The worktree-manager handles merge order and conflict resolution, using targeted checks
+  only for changed behavior and leaving configured suite verification to `test_suite`
 - Never place dependent or overlapping-file tasks in the same ready frontier; defer them even when
   separate worktrees could be created.
 
@@ -612,9 +630,10 @@ For mutually independent tasks that need stronger isolation:
 At natural batch boundaries (after completing a group of related tasks):
 
 **Pre-batch verification (before starting next batch):**
-- Compute `BATCH_AFFECTED_TESTS` as the union of every task's scoped affected-test set and run
-  the named union once. If ANY test fails that is NOT an expected RED test, stop and fix before
-  proceeding. If the union cannot be determined confidently, run the full suite instead.
+- Inspect the supplied results for `BATCH_AFFECTED_TESTS`; do not rerun the union as a
+  batch-boundary ritual. If ANY test fails that is NOT an expected RED test, stop and fix before
+  proceeding. If the union cannot be determined confidently, record that and defer aggregate
+  proof to the engine's dedicated aggregate gate — never run the full suite in this session.
   Previous session bugs must not accumulate.
 - Verify the current branch is merge-ready: no WIP commits, no TODO-fixme code added this batch,
   all new code has tests. The branch should be shippable at any batch boundary, even if the
@@ -629,17 +648,12 @@ At natural batch boundaries (after completing a group of related tasks):
 - Verify architecture diagrams are current (if structural files changed in this batch, run the
   `architecture-diagram` workflow in verification mode; Claude `/architecture-diagram`; Codex
   `$architecture-diagram`)
-- Run a **micro-retro** (see below)
 - Append to `.pipeline/progress.log` — a chronological narrative of what was done, what was
   tried, what worked, and what's next (see Progress Log below)
 - Report batch status as a single line: `Batch N: X/Y PASS, Z rework`
 - In Conservative mode: get explicit approval to continue
 - In Standard mode: continue unless the user intervenes
 - In Full mode: continue automatically
-
-### Micro-Retros (Per-Phase)
-
-At each batch boundary, perform a lightweight retro: spec compliance, duplication, complexity, gate accuracy, and autonomy friction. Record findings in `.pipeline/audit-trail/batch-N-retro.md`. These feed the full `/retro` with phase-level granularity. If dispatched through the selected host's available subagent facility, the micro-retro dispatch prompt's first line MUST be `Task: none` (session-hook marker contract, see Per-Task Execution).
 
 ### Memory Checkpoint (Per-Batch)
 
@@ -665,8 +679,8 @@ When the rework budget is exhausted, consider reverting to the last clean batch 
 ### Pipeline Summary
 
 **GATE: At final-task completion, write `.pipeline/summary.json` before marking the
-pipeline done.** The retro skill reads this file; if it is missing, retro has to spawn an
-Explore agent to recompute stats from git log + task-status.json. That is wasted tokens.
+pipeline done.** It preserves final pipeline metrics without recomputing them from git log
+and `task-status.json`.
 
 Required fields (all numeric unless noted):
 
@@ -694,8 +708,7 @@ Counts come from `.pipeline/task-status.json` and `.pipeline/audit-trail/`. Time
 come from `session-created` (start) and the write time (end). Commit SHAs come from
 `git log --format=%H --reverse <plan-ref-commit>..HEAD` (first + last).
 
-Do NOT defer this to the `/retro` skill — by retro time the session may have compacted
-mid-task telemetry. Write the file while the data is still in context.
+Write the file while the data is still in context.
 
 ## Verification
 
@@ -711,4 +724,4 @@ mid-task telemetry. Write the file while the data is still in context.
 - [ ] State tracked in `.pipeline/` with audit trail
 - [ ] Conflict check re-run if stories changed
 - [ ] Batch summaries presented at natural boundaries
-- [ ] Pipeline summary available for retro
+- [ ] Pipeline summary available for final metrics

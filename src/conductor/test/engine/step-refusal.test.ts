@@ -14,8 +14,8 @@ const VALIDATION_GROUP_PREREQS = {
   worktree: 'done', memory: 'done', explore: 'done', complexity: 'done',
   stories: 'done', conflict_check: 'done', plan: 'done', coherence_check: 'done',
   architecture_diagram: 'done', architecture_review: 'done', acceptance_specs: 'done',
-  build: 'done', build_review: 'done', wiring_check: 'done', test_suite: 'done',
-  retro: 'done', rebase: 'done', finish: 'done',
+  build: 'done', build_review: 'done', test_suite: 'done',
+  rebase: 'done', finish: 'done',
 } as ConductState;
 
 const MANUAL_TEST_PASS = '# Results\n\n| Story | Result |\n|--|--|\n| s1 | PASS |\n';

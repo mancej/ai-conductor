@@ -1,7 +1,7 @@
 ---
 title: Running the daemon
 parent: Guides
-nav_order: 5
+nav_order: 7
 ---
 
 # Running the daemon
@@ -17,9 +17,10 @@ so an unmerged `spec/<slug>` branch is invisible to it.
 
 | Requirement | Check |
 | --- | --- |
-| `conduct-ts` on PATH | `conduct-ts --help` |
+| `ai-conductor` on PATH | `ai-conductor --help` |
+| GitHub CLI 2.73.0 or later, authenticated | `gh --version` reports 2.73.0 or later; `gh auth status` succeeds |
 | `tmux` installed (for `daemon start` and every management verb) | `tmux -V` |
-| The repo registered | `conduct-ts register <path>` |
+| The repo registered | `ai-conductor register <path>` |
 | A fresh install | `bin/install --check` exits 0 or 2 — the freshness gate accepts both |
 | At least one merged spec on the default branch | `.docs/plans/<slug>.md` present on `main` |
 
@@ -36,19 +37,24 @@ skip <slug>: merged spec cannot build — plan has no dependency tree ("## Task 
 skip <slug>: merged spec cannot build — missing or unparseable coherence artifact (.docs/coherence/<slug>.md) required for tier <tier>. Author it on the default branch; logged once.
 ```
 
-The first rejects an unapproved stories artifact. The second rejects a non-conforming ADR corpus:
+The first rejects an unapproved stories artifact. Before a spec can land, each newly added ADR must
+be named `adr-YYYY-MM-DD-lowercase-hyphenated-slug.md` using a real calendar date; ADRs already on
+the default branch keep their legacy names. The second rejects a non-conforming ADR corpus:
 discovery scans every `.docs/decisions/adr-*.md` file on the default branch once per pass, and any
 merged spec is blocked while any ADR's first declared status is not `APPROVED` or `SUPERSEDED`
 (including an ADR with no status declaration at all) — approving the offending ADR unblocks every
 spec the next pass, with no daemon restart. The third rejects a plan without a task dependency
 tree. The fourth applies only outside tier S: author a parseable `.docs/coherence/<stem>.md` on the
-default branch, or verify that the feature is correctly classified as tier S. Fix the indicated
-artifact on the default branch; the next discovery pass replaces the blocked snapshot, clearing a
-repaired spec without manual cleanup. Each reason is logged once per slug (the ADR reason once per
+default branch, or verify that the feature is correctly classified as tier S. For a structural
+parse failure, the `BLOCKED` remedy and skip line append `Detail: line <n>: <message>`; correct that
+row or table separator in the committed artifact. Missing, empty, and table-less artifacts have no
+source row, so they do not report a line number. Fix the indicated artifact on the default branch;
+the next discovery pass replaces the blocked snapshot, clearing a repaired spec without manual
+cleanup. Each reason is logged once per slug (the ADR reason once per
 pass for the whole corpus) through `.daemon/warned/<slug>`; the marker suppresses repeated poll
 warnings until the spec is fixed.
 
-Run `conduct-ts daemon status` to read the persisted `BLOCKED` section. It lists each blocked slug,
+Run `ai-conductor daemon status` to read the persisted `BLOCKED` section. It lists each blocked slug,
 machine-readable reason, remedy, and the latest scan age without invoking Git or the network. An
 empty snapshot reports that no specs are blocked; no valid snapshot means the blocked state is
 unknown until discovery completes. The startup dashboard does not yet render blocked specs;
@@ -60,7 +66,7 @@ tier-skipped steps as skipped) and starts at BUILD; it never authors or reruns D
 ## Start the daemon
 
 ```bash
-conduct-ts daemon start
+ai-conductor daemon start
 ```
 
 `start` refuses to launch on a stale install: it runs `bin/install --check` first, and on drift it
@@ -74,16 +80,16 @@ the daemon resolves the main repository root first, so runtime files always live
 
 | Variant | Result |
 | --- | --- |
-| `conduct-ts daemon start` on a TTY | Starts and attaches read-only |
-| `conduct-ts daemon start -D` | Prints `daemon started (detached). Attach with 'conduct daemon connect'.` |
-| `conduct-ts daemon start` with no TTY | Prints `daemon started (no interactive terminal to attach to)…` |
+| `ai-conductor daemon start` on a TTY | Starts and attaches read-only |
+| `ai-conductor daemon start -D` | Prints `daemon started (detached). Attach with 'conduct daemon connect'.` |
+| `ai-conductor daemon start` with no TTY | Prints `daemon started (no interactive terminal to attach to)…` |
 
 Exit 1 on any error, including a missing `tmux`.
 
 ## Watch it work
 
 ```bash
-conduct-ts daemon status
+ai-conductor daemon status
 ```
 
 Sweeps the whole project registry and prints one badge line per repo — state, path, pid, since,
@@ -112,10 +118,10 @@ siblings. The manifest, entrypoint contract, discovery precedence, and test seam
 For the log:
 
 ```bash
-conduct-ts daemon logs                  # this repo, whole file
-conduct-ts daemon logs --lines 200      # last 200 lines
-conduct-ts daemon logs --follow         # stream new lines until Ctrl-C
-conduct-ts daemon logs --all            # every registered repo, with ==> path <== headers
+ai-conductor daemon logs                  # this repo, whole file
+ai-conductor daemon logs --lines 200      # last 200 lines
+ai-conductor daemon logs --follow         # stream new lines until Ctrl-C
+ai-conductor daemon logs --all            # every registered repo, with ==> path <== headers
 ```
 
 `--lines`/`-n`, `-f`, and `--repo=<path>` all work but are absent from `--help`. `--follow` with
@@ -134,9 +140,28 @@ readable and greppable:
 [daemon][my-feature-254] ·   build via claude (opus) ✓ — 54 turns, 8m7s, $4.96
 ```
 
-Filter one feature's narrative with `conduct-ts daemon logs | grep '\[<slug>\]'`. Untagged `[daemon]`
+Filter one feature's narrative with `ai-conductor daemon logs | grep '\[<slug>\]'`. Untagged `[daemon]`
 lines are daemon-wide, not feature work. The exact shapes and the slug length bound are in
 [artifacts](../reference/artifacts.md#line-shapes).
+
+### Build-review rubric progress
+
+During `build_review`, the daemon log names each rubric branch and its full lap identifier. This
+lets you distinguish concurrent or retried review laps without reading `.pipeline/events.jsonl`:
+
+```text
+·   build_review [<lap-id>] <rubric> started
+·   build_review [<lap-id>] <rubric> cache hit
+·   build_review [<lap-id>] <rubric> PASS
+·   build_review [<lap-id>] <rubric> skipped: <reason>
+·   build_review [<lap-id>] <rubric> infrastructure failure: <reason> — <excerpt>
+·   build_review [<lap-id>] outer verdict: <effective> (raw: <raw>)
+```
+
+`skipped` is not a judged failure. An infrastructure failure is also distinct from a judged `FAIL`;
+it means the rubric could not run. The `raw:` suffix appears only when a deterministic policy changed
+the effective verdict. The optional excerpt, deterministic reason, and unresolved-marker count are
+included only when the event supplies them.
 
 ### Protected-artifact rebaselines
 
@@ -154,14 +179,19 @@ read its condition and path, then follow the
 [stalled-feature runbook](../runbooks/stalled-or-stuck-feature.md#the-halt-is-a-protected-artifact-violation).
 Never delete or rewrite `.pipeline/protected-artifact-seal.json` by hand.
 
+`engine-append-unvouched` means a recorded remediation-task heading exists, but the committed
+artifact is not an exact append of the base-tip or fingerprint-verified sealed content. The refusal
+also reports the operator-reseal and engine-append exit outcomes; review that content before deciding
+whether an approved amendment needs a reseal.
+
 An approved plan or architecture amendment after first BUILD intentionally makes the existing seal
 baseline stale. Review the amendment, then reseal the approved paths with
-[`conduct-ts reseal`](../reference/cli.md#conduct-ts-reseal) before clearing the HALT (`--clear-halt`
+[`ai-conductor reseal`](../reference/cli.md#ai-conductor-reseal) before clearing the HALT (`--clear-halt`
 clears it in the same command). If the refusal occurs during REKICK before git starts, the HALT
 begins `protected-artifact seal error`; it is not a rebase conflict and must not be sent through
 `git rebase --continue`.
 
-A `conduct-ts reseal` outcome also logs:
+A `ai-conductor reseal` outcome also logs:
 
 ```text
 protected artifacts resealed: <paths>
@@ -173,13 +203,16 @@ protected artifact reseal refused [<path>] — <condition>
 A related but distinct line covers remediation, not the seal itself:
 
 ```text
-↩ remediation gap <gapId> → plan — sealed artifact <artifact>
+↩ remediation gap <gapId> → plan — sealed artifact <artifact> — <task title|rationale>: "<directing clause>"
 ```
 
 This fires when a remediation gap's target — its task scope or, absent a `**Files:**` declaration, a
 directed reference in its rationale prose — names another feature's sealed DECIDE artifact. The gap is
 redirected to the owning DECIDE step instead of routing to `build`; see
-[gates](../explanation/gates.md#kickback-and-remediation-routing).
+[gates](../explanation/gates.md#kickback-and-remediation-routing). When available, the suffix names
+whether the directing text came from the task title or rationale and quotes the clause the engine
+read. The quote is whitespace-normalized and capped at 160 characters so the daemon event ledger
+remains line-oriented. Older redirect events without this evidence retain the shorter line.
 
 ### Provider attribution and result summaries
 
@@ -199,7 +232,10 @@ necessarily the repo default.
   dispatch. `grep ' via '` over the log answers "which provider ran this step" without inspecting
   process argv. A provider skipped from a cached availability result dispatches no process and is
   not logged; a fallback between providers still prints its own `⚠ PROVIDER FALLBACK` line.
-- **`·   finish: total usage — <dispatches>, <cost>, <fresh> fresh + <cached> cached→<out> tok, <n> cost-unmetered (tokens counted, cost not), <n> unmetered`**
+- **`· gate <step>: satisfied`** or **`· gate <step>: unsatisfied — <reason>`** states the
+  objective gate verdict. A satisfied line may include a reason; neither verdict line uses the
+  provider-completion check glyph, so it is distinct from the preceding dispatch attribution.
+- **`·   finish: total usage — <dispatches>, <cost> (<n> cost-metered dispatches), <fresh> fresh + <cached> cached→<out> tok, <n> cost-unmetered (tokens counted, cost not), <n> unmetered`**
   is logged once,
   when the feature's `finish` step completes. `<fresh>` counts non-cached input tokens; `<cached>`
   counts prompt-cache reads and creation — the conversation an agentic dispatch resubmits on every
@@ -215,15 +251,18 @@ necessarily the repo default.
   its tree exactly matches the verified refresh; unrelated branch content still fails closed under
   the ordinary shipment-evidence gates.
 
-  A non-zero `cost-unmetered` count means `<cost>` is a PARTIAL figure: those dispatches reported
-  token counts that ARE in the token totals, but no dollars. That happens when a provider reports no
-  cost of its own (codex) and the model it ran has no entry in the committed
+  The `(<n> cost-metered dispatches)` clause appears only when `<cost>` covers fewer recorded
+  dispatches than the feature total. A non-zero `cost-unmetered` count means `<cost>` is a PARTIAL
+  figure: those dispatches reported token counts that ARE in the token totals, but no dollars. That
+  happens when a provider reports no cost of its own (codex) and the model it ran has no entry in the committed
   `.ai-conductor/rate-card.json` — see the rate-card section of the configuration reference, and run
-  `conduct-ts rate-card refresh` to close the gap. The clause is omitted when every metered dispatch
+  `ai-conductor rate-card refresh` to close the gap. The clause is omitted when every metered dispatch
   also carried a cost.
 
-  Cost and token figures appear only when at least one dispatch was actually metered. A build whose
-  provider reported no usage prints its dispatch count and an explicit `<n> unmetered` instead of a
+  Token figures appear when at least one dispatch was metered. Cost appears only when at least one
+  of those dispatches was cost-metered; if all reported tokens but no price, the token and
+  `cost-unmetered` segments remain while the money figure is withheld. A build whose provider
+  reported no usage prints its dispatch count and an explicit `<n> unmetered` instead of a
   fabricated `$0.00` — "never measured" must not read as "free". Unreadable or missing event records
   are counted as unmetered for the same reason. The line is best-effort: a feature never fails to
   ship because its cost could not be computed.
@@ -234,9 +273,9 @@ necessarily the repo default.
 To watch the session itself:
 
 ```bash
-conduct-ts daemon connect             # attach READ-ONLY
-conduct-ts daemon connect --write     # attach READ-WRITE (same as `debug`)
-conduct-ts daemon debug               # attach READ-WRITE
+ai-conductor daemon connect             # attach READ-ONLY
+ai-conductor daemon connect --write     # attach READ-WRITE (same as `debug`)
+ai-conductor daemon debug               # attach READ-WRITE
 ```
 
 `Ctrl-b d` detaches from any of these.
@@ -247,11 +286,18 @@ hits tmux's own nesting guard (`sessions should be nested with care, unset $TMUX
 tmux server instead of taking over the current process's terminal:
 
 ```bash
-conduct-ts daemon connect --write --attach-into mywindow:1.0
+ai-conductor daemon connect --write --attach-into mywindow:1.0
 ```
 
 `<target>` is a tmux session, `session:window`, or `session:window.pane` string. This also works on
 `daemon start`.
+
+Everything the daemon spawns — provider sessions (Claude, Codex) and the test or verification
+subprocesses it runs (full-suite, scoped-run, smoke, closeout) — starts with `TMUX` and `TMUX_PANE`
+scrubbed from its environment. A child that inherited them and ran a targetless tmux command
+(`tmux respawn-pane -k`, `tmux new-session`) would have tmux resolve the target to the daemon's own
+pane and kill the daemon silently. A dispatched test or agent that genuinely needs tmux must name its
+target explicitly with `-t`; see [environment](../reference/environment.md#written-into-child-process-environments).
 
 If an enforcement script still cannot be restored, the build remains halted rather than dispatching
 without its attribution gate. The recheck after a repair is authoritative and strict: a script must
@@ -280,8 +326,11 @@ What the draft window does and does not mean:
   is never asked to grade a body nobody wrote. Only after prose is accepted does the coordinator write
   and push the shipped record and mark the PR ready for review. That order is deliberate: the shipped
   record is the daemon backlog's dedup key, so committing it before the prose survived used to make a
-  prose halt permanently un-redispatchable. It re-enters FINISH after each verified transition, so a
-  retry resumes instead of replaying publication effects.
+  prose halt permanently un-redispatchable. When the judgment finds an authored body structurally
+  incomplete, FINISH re-observes that exact revision and routes it back to `author_pr_prose` with the
+  judgment's objection, rather than treating the author→judge lap as an ordinary retry. It re-enters
+  FINISH after each verified transition, so a revision or retry resumes instead of replaying
+  publication effects.
 - **The placeholder body already has the right shape.** It is the `/pr` body template — `## Why`,
   `## What Changed`, `## Testing`, and the `Closes` reference — with each section explicitly marked
   "not yet authored", so a reader landing on the PR mid-build, and the FINISH authoring pass filling
@@ -318,8 +367,7 @@ There is no configuration for this; the timing is fixed.
 ## Provider preparation timeout and activity telemetry
 
 `daemon.log` records step boundaries, provider activity, build progress, and verdict-freshness
-decisions. The deterministic BUILD group retains the `wiring_check` and `test_suite` names before
-`build_review`; `wiring_check` logs its deprecation notice and `test_suite` logs its verification.
+decisions. The deterministic BUILD verification path runs `test_suite` before `build_review`.
 For
 `build_review`, `prd_audit`, `architecture_review_as_built`, and preserved
 `manual_test` evidence, the freshness line names the step and artifact:
@@ -332,11 +380,12 @@ For
 
 `preserved` means the code changed outside the gate's judged surface, so the prior passing verdict
 remains valid. `invalidated` means the judged surface changed and the stale verdict was rejected;
-the gate must run again. `rewritten` means the current judging attempt produced the artifact.
+the gate must run again. For SHIP-tail gates, a stale verdict can mean that the report belongs to
+an earlier dispatch; the daemon treats it as no verdict, retries within the existing step budget,
+and never routes its findings. `rewritten` means the current judging attempt produced the artifact.
 
-After a BUILD repair, the group still runs its non-skipped members. `wiring_check` remains an
-observable compatibility no-op; `test_suite` is the active verifier, and a prior evidence file does
-not skip it. The suite member logs its settle decision after the join evaluates current evidence:
+After a BUILD repair, `test_suite` still runs. A prior evidence file does not skip it. The suite
+verifier logs its settle decision after it evaluates current evidence:
 
 ```text
 · BUILD member test_suite settled: reuse (fingerprint-match)
@@ -411,12 +460,12 @@ A pause stops the daemon starting **new** work while leaving in-flight work and 
 alone. It is the right tool when you want the loop to go quiet without killing it.
 
 ```bash
-conduct-ts daemon pause
-conduct-ts daemon resume
+ai-conductor daemon pause
+ai-conductor daemon resume
 ```
 
 `pause` prints `daemon paused`, or `already paused` when the marker exists. `resume` prints
-`daemon resumed`, or `not paused`. Both are listed in `conduct-ts daemon --help`.
+`daemon resumed`, or `not paused`. Both are listed in `ai-conductor daemon --help`.
 
 The marker is `.daemon/PAUSED`. Its existence is authoritative; its JSON body is informational only.
 Reads fail closed — an unreadable marker counts as paused.
@@ -428,7 +477,7 @@ delete, and its resume path re-kicks git errors with no backoff. Removing a work
 a live daemon produces a `git worktree add` failure loop, not a clean stop.
 
 ```bash
-conduct-ts daemon park <slug>
+ai-conductor daemon park <slug>
 ```
 
 You should see:
@@ -456,14 +505,14 @@ inside the active unit. Interactive `conduct` runs are unchanged.
 To release:
 
 ```bash
-conduct-ts daemon unpark <slug>
+ai-conductor daemon unpark <slug>
 ```
 
 `unpark` resets the no-evidence attempt counter **first** and removes the park marker only after that
 succeeds — a failed reset deliberately leaves the marker in place for retry. You should see
 `Unparked '<slug>' and reset no-evidence counter — normal dispatch and re-kick resume.`
 
-> **Known limitation.** `conduct-ts daemon park` with no slug does not print a park usage error. The
+> **Known limitation.** `ai-conductor daemon park` with no slug does not print a park usage error. The
 > park detector returns null without a slug, `park` is a known sub-verb so the unknown-sub-verb guard
 > passes it through, and the invocation falls all the way to the inline refusal, printing
 > `conduct: the inline SDLC pipeline now runs under the \`inline\` subcommand.` and exiting 1 — a
@@ -474,7 +523,7 @@ succeeds — a failed reset deliberately leaves the marker in place for retry. Y
 
 On startup and on every idle poll tick, the daemon classifies each parked slug: `merged`, `orphan`
 (its source issue is closed but the work never merged), `normal`, or `unclassified` (the check was
-unavailable). `conduct-ts daemon status` annotates the parked list accordingly — `— orphan — needs
+unavailable). `ai-conductor daemon status` annotates the parked list accordingly — `— orphan — needs
 manual review` or `— merged — ready to reconcile`.
 
 A slug counts as `merged` on either of two signals:
@@ -534,7 +583,7 @@ reconciles on a later tick once the record lands. Set `reconcile_parked_auto_cle
 disable the automatic cleanup step and only classify/annotate, then reconcile explicitly per slug:
 
 ```bash
-conduct-ts daemon reconcile-parked <slug>
+ai-conductor daemon reconcile-parked <slug>
 ```
 
 See [`daemon reconcile-parked`](../reference/cli.md#daemon-reconcile-parked) for its exact output
@@ -551,11 +600,55 @@ to the daemon prefix and explains the next action for every nonzero outcome, for
 [daemon][parked-reconciliation] reconciled=0 deferred=1 orphaned=0 parked=7 refused=2 skipped=56; refusals: unmerged-commits=2; next: 1 deferred awaits shipped-record repair; 2 refusals requires resolving unmerged-commits; 7 parked remain parked; 56 skipped retry when merge/issue evidence is available
 ```
 
+## Project setup runs once per worktree
+
+When the daemon prepares a worktree it runs the project's `bin/setup`, and a **successful** run
+records a marker at `<worktree>/.daemon/setup-ok.json`. The marker names the `bin/setup` that ran
+(a content-and-mode fingerprint) and the base SHA the worktree was prepared against, plus the
+commit the worktree was actually at — provenance for reading the record, never part of the skip
+decision.
+
+A later dispatch re-reads the marker and skips setup **only** when the recorded fingerprint and the
+recorded base SHA both still match what it resolves now. Everything else re-runs setup: no marker,
+a marker that cannot be read or is from an older format, an edited `bin/setup`, or a base moved by
+a rebase or re-kick — which is exactly when migrations and dependency changes arrive. Task commits
+made by the build move the worktree's `HEAD` but not its base, so they never re-run setup. A failed
+setup leaves no marker, and the marker is deleted before each re-run, so a broken setup can never
+be skipped.
+
+When setup fails, the daemon uses a bounded recovery ladder before it parks the feature. If the
+worktree is dirty, it first preserves the residue on `wip/setup-quarantine-<slug>`, resets to a
+clean `HEAD`, and retries setup once. A successful retry resumes the feature and leaves
+`.pipeline/QUARANTINE` as a notice for reviewing the preserved changes. The daemon starts its one
+provider repair session only when setup still fails at that clean `HEAD`; a successful dirty-tree
+retry never spends that repair attempt.
+
+The repair session is accepted only after the daemon re-runs `bin/setup` and mechanically verifies
+the candidate state. It retains a verified uncommitted repair in an engine commit, accepts an
+existing repair commit when its history is forward from the original `HEAD`, and rejects rewritten
+history, setup drift, a still-failing setup, or an unpreserved candidate. Rejections park the
+feature; when preservation succeeds, the same quarantine branch holds the rejected attempt and the
+original `HEAD` is restored. A provider failure that leaves the worktree unchanged also parks, but
+does not create repair or quarantine state.
+
+Triage verification never trusts the marker: all of its verification re-runs are forced, so they
+always execute `bin/setup` for real. A forced run that succeeds records a fresh marker — a project
+repaired by triage skips setup on its next dispatch instead of paying for it again.
+
+Under the daemon each setup decision is emitted as a `project_setup` event, persisted in the
+feature's `.pipeline/events.jsonl` and rendered into the daemon log, so the log says whether setup
+ran and what made it run. A completed or rejected repair also emits `setup_repair`; a rejected
+event names its reason and, when available, its quarantine branch and preserved paths.
+
+The marker lives with the worktree and dies with it: a worktree recreated from its branch has no
+marker and re-provisions from scratch. To force a single re-run by hand, delete
+`<worktree>/.daemon/setup-ok.json`.
+
 ## Project teardown hook
 
 To clean project-owned resources before the daemon removes a feature worktree, add an executable
 `bin/teardown` to the project. The daemon runs it from the worktree immediately before an already
-authorized removal: post-ship reaping, `conduct-ts daemon reclaim-worktree <slug>`, or parked-feature
+authorized removal: post-ship reaping, `ai-conductor daemon reclaim-worktree <slug>`, or parked-feature
 reconciliation. It never runs for a retained worktree or before the removal safety proofs pass.
 
 The hook inherits the daemon's process environment, with `CI=true` and `WORKTREE_NAMESPACE` overlaid.
@@ -581,6 +674,26 @@ See [configuration](../reference/configuration.md#teardown_timeout_seconds) for 
 [environment variables](../reference/environment.md#written-into-child-process-environments) for its
 process contract.
 
+## Per-dispatch hook
+
+Before project preparation, every daemon dispatch ensures the worktree's `.memory/` path is linked
+to the canonical project memory store. A legacy directory containing entries is migrated at that point;
+an empty directory receives the canonical symlink through fresh setup, without a migration backup. The daemon
+logs the observed pre-setup state and whether the final path is canonical; setup or telemetry failure
+is reported as a non-canonical result and does not prevent project preparation or dispatch.
+
+With OpenTelemetry enabled, `conductor.memory.setup` counts these observations by `before` and
+`canonical`, using the existing project, worker, and feature identity. Failure text remains in the
+event and daemon log rather than becoming a metric label.
+
+An executable `bin/dispatch-start` runs at the end of worktree preparation on every daemon dispatch,
+including a redispatch whose successful `bin/setup` marker skips provisioning. It receives the same
+`CI=true` and `WORKTREE_NAMESPACE` environment as setup and teardown. The hook is optional and silent
+when absent. Its output is shown only with `daemon_verbose: true`; a non-zero exit, timeout, or
+unrunnable script is logged and contained so the dispatch proceeds. Configure its bounded timeout
+with `dispatch_start_timeout_seconds` (default 120 seconds); see
+[configuration](../reference/configuration.md#dispatch_start_timeout_seconds).
+
 ## Retained worktrees
 
 ### Engineer authoring review worktrees
@@ -599,8 +712,8 @@ helper. If identity validation or removal fails, typed failure evidence and the 
 time remain visible in the run's `cleanup` projection. The terminal run stays terminal and a retired
 path stays unauthorized; later sweeps honor the retry backoff and never append a second retirement
 event. Use
-`conduct-ts engineer maintenance` for an immediate reconciliation pass, or
-`conduct-ts engineer worktree-cleanup --run-id <id> --reason operator_cleanup` for one explicit run.
+`ai-conductor compose maintenance` for an immediate reconciliation pass, or
+`ai-conductor compose worktree-cleanup --run-id <id> --reason operator_cleanup` for one explicit run.
 
 The exact fallback default and supported range are defined by
 [`engineer_review_retention_days`](../reference/configuration.md#engineer_review_retention_days).
@@ -633,18 +746,18 @@ proof-gated cleanup paths.
   `daemon reclaim-worktree` and parked reconciliation surface their actual Git removal failures and
   retain the worktree for recovery.
 
-`conduct-ts daemon status`'s startup dashboard groups every retained worktree under
+`ai-conductor daemon status`'s startup dashboard groups every retained worktree under
 `RETAINED WORKTREES (<n>)`. A retained row includes an evidence-derived reason and a `remedy:`
 line. `pr-open-awaiting-main` appears only after the daemon has verified that the ledger's PR URL
 is still open; an unavailable, failed, or mismatched PR lookup reports `pr-state-unknown` instead.
 Legacy ships with no recorded URL report `shipped-no-pr-reference`. Closed-unmerged, unknown, and
-legacy retained rows name `conduct daemon reclaim-worktree <slug>` as the available operator
+legacy retained rows name `ai-conductor daemon reclaim-worktree <slug>` as the available operator
 action; an open PR states that retention ends when the PR lands on main.
 
 `NEVER-STARTED (<n>)` is separate from retained worktrees. It means the dashboard found no readable
 `.pipeline/conduct-state.json`; it remains dispatchable and needs no operator action. PARKED and a
 live HALTED marker take precedence over both groups: their rows state the reason and print the corresponding
-`conduct daemon unpark <slug>` or HALT-clear remedy. A slug appears in only its highest-precedence
+`ai-conductor daemon unpark <slug>` or HALT-clear remedy. A slug appears in only its highest-precedence
 dashboard group.
 
 To remove a single retained worktree by hand — a closed-unmerged one you've decided not to
@@ -652,7 +765,7 @@ resume, or one you want gone before its shipped record lands — use
 [`daemon reclaim-worktree`](../reference/cli.md#daemon-reclaim-worktree):
 
 ```bash
-conduct-ts daemon reclaim-worktree <slug>
+ai-conductor daemon reclaim-worktree <slug>
 ```
 
 It refuses a slug with a resume in progress, refuses anything but a single plain slug (no globs, no
@@ -679,8 +792,8 @@ Each of these encodes a failure that has already corrupted daemon state.
 4. **A manual PR is not a harness finish.** Opening a PR by hand tells the daemon nothing, so it
    re-dispatches the feature forever and parking is the only stopgap. Record the ship instead —
    see the next section.
-5. **Dispatched sessions cannot run `conduct-ts`.** Every session the daemon dispatches carries
-   `CONDUCT_DAEMON_SESSION=1`, and `conduct-ts` refuses to run under it (exit 1) except for the
+5. **Dispatched sessions cannot run `ai-conductor`.** Every session the daemon dispatches carries
+   `CONDUCT_DAEMON_SESSION=1`, and `ai-conductor` refuses to run under it (exit 1) except for the
    session-sanctioned worker commands its skills mandate — so a maker session can never park,
    unpark, restart, or reseal the daemon that dispatched it. See the
    [CLI reference](../reference/cli.md#daemon-session-refusal).
@@ -688,7 +801,7 @@ Each of these encodes a failure that has already corrupted daemon state.
 ## Record a manual finish
 
 ```bash
-conduct-ts shipped-record --slug <slug> --pr <url>
+ai-conductor shipped-record --slug <slug> --pr <url>
 ```
 
 Use `--pr local` for a merge-local finish. This writes and commits `.docs/shipped/<slug>.md` on the
@@ -703,7 +816,7 @@ rely on it. See
 ## Restart after an engine change
 
 ```bash
-conduct-ts daemon restart
+ai-conductor daemon restart
 ```
 
 Behavior depends on what the daemon is doing:
@@ -726,9 +839,9 @@ after the verb. With a selector the verb iterates the project registry instead o
 current directory. None of these selectors appear in `--help`.
 
 ```bash
-conduct-ts daemon pause --all
-conduct-ts daemon resume <repo-a> <repo-b>
-conduct-ts daemon restart --all
+ai-conductor daemon pause --all
+ai-conductor daemon resume <repo-a> <repo-b>
+ai-conductor daemon restart --all
 ```
 
 Each repo is handled in its own try/catch, so one failure never aborts the sweep. Per-repo `restart`
@@ -738,7 +851,7 @@ outcomes are: paused → respawn, idle → respawn, busy → queued, stopped wit
 ## Stop the daemon
 
 ```bash
-conduct-ts daemon stop
+ai-conductor daemon stop
 ```
 
 Kills the tmux session. Exit 1 on error.
@@ -748,24 +861,28 @@ To halt one in-flight feature rather than the whole loop, see
 
 ## Run the daemon in the foreground
 
-Bare `conduct-ts daemon` runs the loop in the current terminal, with no tmux session and no
+Bare `ai-conductor daemon` runs the loop in the current terminal, with no tmux session and no
 supervisor. Use it for a bounded drain or for debugging.
 
 ```bash
-conduct-ts daemon --continuous --max-items 3 --idle-poll 30
+ai-conductor daemon --continuous --max-items 3 --idle-poll 30
 ```
 
 Three things shape the run itself. Every flag, its default, and its exact parsing behavior are in
 [cli reference](../reference/cli.md#running-the-daemon) — several real flags are absent from
 `--help`, and integer flags fall back to their defaults silently rather than erroring.
 
-1. **The run is always serial.** `--concurrency` is accepted, but any value above 1 is clamped to 1.
+1. **Choose the worker-pool width.** `--concurrency <n>` runs up to `n` eligible features at once.
+   Without the flag, the daemon uses [`daemon_concurrency`](../reference/configuration.md#daemon_concurrency)
+   from merged configuration; without either, it uses the serial default, `1`. The explicit flag wins.
+   At `N=1`, the daemon preserves the recorded serial dispatch and maintenance ordering.
 2. **Bound a `--continuous` run.** With no `--max-items`, `--max-cost`, `--max-runtime`, or
-   `--max-idle-polls` it warns and then runs until you `Ctrl-C` it.
+   `--max-idle-polls` it warns and then runs until you `Ctrl-C` it. Dispatching a feature restarts
+   the consecutive empty-poll count used by `--max-idle-polls`.
 3. **Pass `--idle-poll` explicitly** if the polling interval matters. Its effective default does not
    match its help text.
 
-`conduct-ts daemon --help` (or `-h`) anywhere after `daemon` prints the daemon help and exits 0. That
+`ai-conductor daemon --help` (or `-h`) anywhere after `daemon` prints the daemon help and exits 0. That
 guard runs before every daemon dispatcher on purpose: without it, `--help` would be treated as an
 unknown flag and would **launch a daemon run**.
 
@@ -774,6 +891,16 @@ A typo'd sub-verb — anything outside `status`, `logs`, `park`, `unpark`, `reco
 subcommand '<token>'.` followed by the daemon help, and exits 1.
 
 ## Finish-time mergeability
+
+After publication, watched PRs have a separate recovery loop controlled by
+`mergeable_autoresolve.enabled` and `ci_watch.enabled`. Conflicts take precedence
+over CI repair. The harness repository explicitly enables both; see
+[self-host open-PR recovery](self-hosting.md#open-pr-recovery) for its suite command
+and activation requirements. This does not enable automatic merging.
+
+An autoresolve attempt whose rebase completes without conflicts still runs the preservation
+checks and configured suite before pushing with a lease. `refreshed` is reported only after that
+push succeeds; failed verification or a rejected push reports `escalated`.
 
 At the daemon-only `rebase` step immediately before `finish`, the engine first checks whether the
 feature can merge cleanly with the current base. Textual cleanliness alone is **not** enough to skip
@@ -812,35 +939,58 @@ When a feature halts, the daemon leaves `.pipeline/HALT` in its worktree and sto
 On a genuine advance of the base branch SHA, the re-kick sweep runs over every halted worktree and,
 per feature:
 
-1. Skips it entirely if it is operator-parked, already shipped, or already re-kicked at this SHA.
+1. Skips it entirely if it is operator-parked, already shipped, or already re-kicked at this SHA;
+   the last condition reads the durable per-slug record in the main checkout's `.daemon/rekicked/` state directory.
 2. Skips it, on every sweep regardless of SHA, if `.pipeline/HALT.class` reads `needs-human` or
-   `unclassified` — only `mechanical`, `legacy`, and `protected-artifact` are retryable. See the
+   `unclassified` — only `mechanical` and `legacy` are ordinarily retryable. See the
    classification table in
    [stalled or stuck feature](../runbooks/stalled-or-stuck-feature.md#1-read-the-halt-marker-first).
 3. Aborts a paused rebase if one is mid-flight — a failed abort leaves the HALT marker intact rather
    than half-clearing it.
 4. Renames `.pipeline/HALT` to `.pipeline/HALT.cleared`, preserving the reason.
-5. Drops a `.pipeline/REKICK` sentinel and records the triggering SHA.
+5. Drops a `.pipeline/REKICK` sentinel and records the triggering SHA in that durable per-slug record.
 
 The sweep never dispatches directly; the cleared feature is re-dispatched on the next poll. That is
 why a git error left in a feature's worktree gets retried without backoff, and why parking is the
 only reliable way to make a feature stay stopped.
 
+Restarting the daemon no longer grants a fresh re-kick at an unchanged base SHA; clearing the halt
+or unparking the feature remains the sanctioned operator lever.
+
+### Budget-cap halts need an authorization
+
+A budget-cap halt is the one exception to the ordinary `needs-human` retention rule. From the main
+repository checkout, inspect the feature and then authorize either more allowance or a fresh count:
+
+```bash
+ai-conductor kickback-budget inspect --feature <slug>
+ai-conductor kickback-budget raise --feature <slug> --gate <gate> --by <positive-integer> --rationale "<why more allowance is justified>"
+# or
+ai-conductor kickback-budget reset --feature <slug> --gate <gate> --rationale "<why this count may restart>"
+```
+
+The command accepts only the live cap halt and generation it inspected, records the operator and
+rationale, and the daemon clears that matching halt on its next loop iteration. Do not delete the
+markers by hand. If the feature was already parked, unpark it after the authorization; an operator
+park deliberately prevents automatic consumption. See the [kickback-budget CLI reference](../reference/cli.md#ai-conductor-kickback-budget)
+for its exact gate and terminal requirements.
+
 ### DECIDE-entry halts need a grant
 
 A `needs-human` HALT that begins `DECIDE entry refused` is not retryable. After deciding that the
-named DECIDE step should be authored, record a one-use grant from the main repository checkout, then
-clear the halt:
+named DECIDE step should be authored, record a one-use grant from any directory inside that
+repository, then clear the halt:
 
 ```bash
-conduct-ts decide-grant --slug <slug> --step <step> --reason "<why this authoring pass is approved>"
+ai-conductor decide-grant --slug <slug> --step <step> --reason "<why this authoring pass is approved>"
 rm -f .worktrees/<slug>/.pipeline/HALT .worktrees/<slug>/.pipeline/HALT.class
 ```
 
-The grant is written to `.daemon/grants/<slug>.json` in the main checkout — deliberately outside the
-feature worktree, so a build agent cannot authorize its own DECIDE entry by writing a file into
-`.pipeline/`. `plan` is never grantable: the command rejects it and the entry policy refuses it
-regardless, so a halt requesting a plan revision is driven by hand and then cleared.
+The command resolves the main checkout and writes the grant to `.daemon/grants/<slug>.json` there —
+deliberately outside the feature worktree, so a build agent cannot authorize its own DECIDE entry by
+writing a file into `.pipeline/`. Outside a repository, it refuses without recording a grant. `plan`
+is never grantable: the command rejects it and the entry policy refuses it regardless, so a halt
+requesting a plan revision is driven by hand and then cleared.
 
 The grant is scoped to the exact step and consumed immediately before its provider dispatch. Clearing
 the halt alone only makes the feature eligible to be checked again; with no matching grant, it halts
@@ -962,9 +1112,9 @@ kickback-ping-pong guard classify that halt `needs-human`, so the re-kick sweep 
 clears it. `test_suite`'s cap halt stays `mechanical` and can still be cleared by the re-kick sweep
 on a base-branch advance.
 
-Read the marker and fix the reported gate failure before resuming. Use the recovery procedure in
-[stalled or stuck feature](../runbooks/stalled-or-stuck-feature.md#clear-a-halt-and-let-the-feature-resume);
-do not clear the marker merely to retry the same unchanged loop.
+Read the marker and fix the reported gate failure before resuming. To authorize a justified retry,
+use [`ai-conductor kickback-budget`](../reference/cli.md#ai-conductor-kickback-budget); do not clear
+the marker merely to retry the same unchanged loop.
 
 The former terminal-less park caused by a passing stale BUILD-member verdict is retired. A repaired
 BUILD round re-verifies all non-skipped members, so it proceeds to its join or records an explicit
@@ -974,11 +1124,16 @@ missing terminal verdict.
 ## Troubleshooting
 
 **`status` shows `⚠ session-up/process-dead`.** The tmux session outlived the daemon process. Run
-`conduct-ts daemon restart`, which reconciles the orphan (SIGTERM, then SIGKILL) and reclaims the
+`ai-conductor daemon restart`, which reconciles the orphan (SIGTERM, then SIGKILL) and reclaims the
 lock before respawning.
 
+**The daemon reports that `gh` cannot satisfy version 2.73.0.** Dispatch is paused before any
+feature is claimed. Upgrade or repair GitHub CLI, confirm `gh --version` reports 2.73.0 or later,
+then let the next poll resume dispatch. If `finish-record` reports an unsupported JSON field, it
+also refuses without writing a finish outcome; upgrade `gh` and rerun the command.
+
 **The daemon keeps re-dispatching a feature you already shipped by hand.** You are missing the
-shipped record. Park it, then run `conduct-ts shipped-record`. See
+shipped record. Park it, then run `ai-conductor shipped-record`. See
 [shipped-record reconciliation](../runbooks/shipped-record-reconciliation.md).
 
 **An intake command reports a corrupt ledger or a `ledger.json.lease` timeout.** Do not bypass the
@@ -1013,6 +1168,6 @@ kicked back. Nothing is written back into the missing path: a stub there makes t
 [worktree and evidence recovery](../runbooks/worktree-and-evidence-recovery.md).
 
 **The daemon is alive but nothing moves.** Check for `.daemon/PAUSED`, a park marker under
-`.daemon/parked/`, and the `GATED:` section of `conduct-ts daemon status`. See
+`.daemon/parked/`, and the `GATED:` section of `ai-conductor daemon status`. See
 [stalled or stuck feature](../runbooks/stalled-or-stuck-feature.md) and
 [daemon recovery](../runbooks/daemon-recovery.md).

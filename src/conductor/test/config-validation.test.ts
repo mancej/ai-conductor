@@ -2,7 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { loadConfig, validateConfig } from '../src/engine/config.js';
+import {
+  loadConfig,
+  resolveGateCodeValidityConfig,
+  validateConfig,
+} from '../src/engine/config.js';
 import type { HarnessConfig } from '../src/types/config.js';
 
 describe('project config load errors', () => {
@@ -35,9 +39,55 @@ describe('project config load errors', () => {
       if (result.ok) return;
       expect(result.error.type).toBe(expectedType);
       if (expectedType === 'missing') {
-        expect.soft(result.error.message).toContain('conduct-ts config init');
+        expect.soft(result.error.message).toContain('ai-conductor config init');
         expect.soft(result.error.message).not.toContain('bin/migrate');
       }
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('gate_code_validity project config', () => {
+  it('loads enabled: false from YAML and preserves it through runtime resolution', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'gate-code-validity-config-'));
+    try {
+      await mkdir(join(projectRoot, '.ai-conductor'));
+      await writeFile(
+        join(projectRoot, '.ai-conductor', 'config.yml'),
+        'gate_code_validity:\n  enabled: false\n',
+        'utf-8',
+      );
+
+      const result = await loadConfig(projectRoot);
+
+      expect(result).toMatchObject({
+        ok: true,
+        config: { gate_code_validity: { enabled: false } },
+      });
+      if (!result.ok) return;
+      expect(resolveGateCodeValidityConfig(result.config)).toEqual({ enabled: false });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['a non-object block', 'gate_code_validity: false\n'],
+    ['a non-boolean enabled value', 'gate_code_validity:\n  enabled: no\n'],
+    ['an unknown inner key', 'gate_code_validity:\n  enabled: true\n  typo: true\n'],
+  ])('rejects %s', async (_name, contents) => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'gate-code-validity-invalid-'));
+    try {
+      await mkdir(join(projectRoot, '.ai-conductor'));
+      await writeFile(join(projectRoot, '.ai-conductor', 'config.yml'), contents, 'utf-8');
+
+      const result = await loadConfig(projectRoot);
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error).toMatchObject({ type: 'validation_error' });
+      expect(result.error.message).toMatch(/gate_code_validity/);
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
@@ -418,6 +468,16 @@ describe('engineer_review_retention_days config field', () => {
     expect(validateConfig({ engineer_review_retention_days: value })).toMatchObject({
       ok: false,
       error: { message: expect.stringMatching(/engineer_review_retention_days.*1 through 90/i) },
+    });
+  });
+});
+
+describe('dispatch_start_timeout_seconds config field', () => {
+  it('accepts a finite positive override without treating it as an unknown key', () => {
+    expect(validateConfig({ dispatch_start_timeout_seconds: 0.1 })).toMatchObject({
+      ok: true,
+      config: { dispatch_start_timeout_seconds: 0.1 },
+      warnings: [],
     });
   });
 });

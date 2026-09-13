@@ -1,7 +1,7 @@
 ---
 name: architecture-diagram
 implicit_invocation: required
-description: "Generate and maintain C4 architecture diagrams using Mermaid in Markdown. Runs at bootstrap, plan, and post-implementation. Gating — diagrams must reflect current architecture."
+description: "Use only within an active harness lifecycle when its architecture-diagram step is current. Generates and maintains C4 Mermaid diagrams; do not invoke for ordinary code changes or general architecture questions."
 enforcement: gating
 phase: all
 standalone: true
@@ -122,13 +122,15 @@ false-fails on a box without a browser.)
 > `mmdc` is unavailable (an unvalidated diagram never lands). So a broken diagram cannot reach a
 > merged spec regardless of whether this step was run by hand. Install `@mermaid-js/mermaid-cli`
 > (a `bin/install` mermaid preset) so the gate can validate.
+> A non-Small architecture artifact with no fenced Mermaid block is also refused at land, so an
+> ASCII sketch is not an acceptable substitute.
 
 Present all diagrams to the engineer for validation before proceeding.
 
 > **Render diagrams for review.** When a mermaid renderer is configured (set at
 > install, stored as `mermaid_renderer` in `~/.ai-conductor/config.yml`), the
 > engineer should review the diagrams as visuals, not raw Mermaid. Under
-> `conduct-ts` this happens automatically at the approval gate. Otherwise run
+> `ai-conductor` this happens automatically at the approval gate. Otherwise run
 > `conduct render-diagrams .docs/architecture/*.md` to render and open them. If no
 > renderer is configured the diagrams fall back to raw Markdown — never a blocker.
 

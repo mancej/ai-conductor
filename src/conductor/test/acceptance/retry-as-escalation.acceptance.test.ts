@@ -502,7 +502,7 @@ describe('#188 retry-as-escalation — S8 availability composition', () => {
 
 describe('#188 retry-as-escalation — S3 budgets', () => {
   it('explore/prd/plan/build resolve to max_retries 3 by default', () => {
-    for (const step of ['explore', 'prd', 'plan', 'build'] as StepName[]) {
+    for (const step of ['explore', 'prd', 'plan', 'build', 'coverage_binding'] as StepName[]) {
       expect(DEFAULT_STEP_RETRIES[step]).toBe(3);
       // Phase does not affect max_retries when no config is supplied (the
       // phase-config lookup is always undefined in that case) — any valid
@@ -522,7 +522,7 @@ describe('#188 retry-as-escalation — S3 budgets', () => {
   });
 });
 
-// ── S4: escalation is logged and aggregated for retro Part C ──────────────────
+// ── S4: escalation is logged and aggregated for the terminal scenario ─────────
 
 describe('#188 retry-as-escalation — S4 logging', () => {
   let dir: string;

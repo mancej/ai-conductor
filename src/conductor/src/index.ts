@@ -1,5 +1,6 @@
 export * from './types/index.js';
-export { parseArgs, createProgram, detectBuildReviewAcceptCommand, detectBuildReviewFindingsCommand, detectBuildReviewRecordReducedCoverageCommand, type CLIOptions } from './cli.js';
+export { wireOtelVisualizer } from './engine/otel/wire.js';
+export { parseArgs, createProgram, detectBuildReviewAcceptCommand, detectBuildReviewFindingsCommand, detectBuildReviewRecordReducedCoverageCommand, detectKickbackBudgetCommand, type CLIOptions } from './cli.js';
 export { runShipmentReconcileAction } from './engine/shipment-reconcile-action.js';
 export { runReleaseMetadataCheckAction } from './engine/release-metadata-check-action.js';
 export { runReleasePrAction } from './engine/release-pr-action.js';
@@ -17,16 +18,19 @@ export function deriveMode(opts: { auto: boolean; interactive: boolean }): RunMo
     process.exit(1);
   }
   if (opts.auto) {
-    console.error('Error: --auto is deprecated. Use `conduct-ts daemon start` instead.');
+    console.error(
+      'Error: --auto is deprecated. Use `ai-conductor daemon start` instead; see docs/guides/running-the-daemon.md.',
+    );
     process.exit(1);
   }
-  return opts.auto ? 'auto' : opts.interactive ? 'interactive' : 'default';
+  return opts.interactive ? 'interactive' : 'default';
 }
 
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdir, readFile } from 'node:fs/promises';
 import { realpathSync, writeSync } from 'node:fs';
+import { execa } from 'execa';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 import { v4 as uuidv4 } from 'uuid';
@@ -64,6 +68,7 @@ import {
   detectBuildReviewRecordReducedCoverageCommand,
   detectDecideGrantCommand,
   dispatchDecideGrantCommand,
+  detectKickbackBudgetCommand,
   detectPlanProtectedTargetsCommand,
   planProtectedTargetsCommand,
   createProgram,
@@ -75,9 +80,9 @@ import {
   userConfigSetCommand,
   type CLIOptions,
 } from './cli.js';
+import { dispatchKickbackBudgetCommand } from './engine/kickback-budget-cli.js';
 import { dispatchBuildReviewAccept, dispatchBuildReviewFindings, dispatchBuildReviewRecordReducedCoverage } from './engine/build-review-cli.js';
 import type { ConductState, StepName } from './types/index.js';
-import { createRenderer } from './ui/create-renderer.js';
 import { ALL_STEPS, validateFromStep } from './engine/steps.js';
 import { sendNotification } from './ui/notifications.js';
 import { scanResumableFeatures, selectFeature, formatResumeMenu } from './engine/resume.js';
@@ -97,15 +102,28 @@ import { registerCliBuiltins } from './engine/cli-builtins.js';
 import { PluginRegistry } from './engine/plugin-registry.js';
 import {
   buildVisualizers,
+  selectVisualizers,
   startRegisteredVisualizers,
   stopVisualizers,
   withRegisteredVisualizers,
 } from './engine/visualizer-lifecycle.js';
 import { EventPersister } from './engine/event-persister.js';
 import { AuditTrailWriter } from './engine/audit-trail.js';
+import { wireInteractiveOtelMetrics, wireOtelVisualizer } from './engine/otel/wire.js';
+import type { OtelVisualizerStartContext } from './engine/otel/wire.js';
+import { resolveEngineVersion } from './engine/shipped-record.js';
+import {
+  detectVersionCommand,
+  dispatchVersionCommand,
+  resolveHarnessVersion,
+} from './engine/version-report.js';
 import { renderReport, ReportError } from './engine/report-renderer.js';
-import type { UISubscriber } from "./ui/types.js";
-import type { VisualizerPlugin } from './types/plugin.js';
+import type { UIRenderer } from "./ui/types.js";
+import type {
+  VisualizerFactoryContext,
+  VisualizerPlugin,
+} from './types/plugin.js';
+import type { HarnessConfig } from './types/config.js';
 import { detectRegistryCommand, dispatchRegistry } from './engine/registry-cli.js';
 import { detectEngineerCommand, dispatchEngineer } from './engine/engineer-cli.js';
 import { detectIntakeLoopCommand, dispatchIntakeLoop } from './intake-loop-cli.js';
@@ -192,12 +210,10 @@ import { createBlockerResolver } from './engine/blocker-resolver.js';
 import { runOverlapScan, renderReport as renderOverlapReport } from './engine/overlap-scan.js';
 import { makeProductionGh } from './engine/pr-labels.js';
 import { hasSession, sessionNameForRepo, respawnPane } from './engine/daemon-tmux.js';
-import { resolveOtelConfig } from './engine/otel/otel-config.js';
-import { OtelVisualizer, type OtelVisualizerContext } from './engine/otel/otel-visualizer.js';
-import type { ResolvedOtelConfig } from './engine/otel/otel-config.js';
 
 export {
   buildVisualizers,
+  selectVisualizers,
   startRegisteredVisualizers,
   stopVisualizers,
   withRegisteredVisualizers,
@@ -208,16 +224,61 @@ export function runInlineVisualizerLifecycle<T>(
   emitter: ConductorEventEmitter,
   run: () => Promise<T>,
   builtIns: VisualizerPlugin[] = [],
+  context?: VisualizerFactoryContext,
 ): Promise<T> {
-  return withRegisteredVisualizers(registry, emitter, run, builtIns);
+  return withRegisteredVisualizers(registry, emitter, run, builtIns, context);
 }
+
+/**
+ * Start configured connectors and the built-in OTel connector for an
+ * interactive run. OTel starts through its shared helper, while the returned
+ * list keeps the existing caller-owned stop lifecycle intact.
+ */
+export function buildInteractiveVisualizers(
+  registry: PluginRegistry,
+  config: HarnessConfig,
+  context: VisualizerFactoryContext & { startContext: OtelVisualizerStartContext },
+): VisualizerPlugin[] {
+  const started = buildVisualizers(
+    selectVisualizers(registry, config, context),
+    context.emitter,
+    context.startContext,
+  );
+  const otel = wireOtelVisualizer(
+    config,
+    { ...context.startContext, pipelineDir: context.pipelineDir, metrics: false },
+    context.emitter,
+  );
+  const metrics = wireInteractiveOtelMetrics(
+    config,
+    { ...context.startContext, pipelineDir: context.pipelineDir },
+    context.emitter,
+  );
+  return [...started, ...(otel ? [otel] : []), ...(metrics ? [metrics] : [])];
+}
+
 
 export function runEngineerVisualizerLifecycle<T>(
   registry: PluginRegistry,
   emitter: ConductorEventEmitter,
   run: () => Promise<T>,
+  context?: VisualizerFactoryContext,
 ): Promise<T> {
-  return withRegisteredVisualizers(registry, emitter, run);
+  return withRegisteredVisualizers(registry, emitter, run, [], context);
+}
+
+/** Render root help with the public compose alias as the canonical spelling. */
+export function renderCanonicalFullHelp(): string {
+  return renderFullHelp()
+    .replace(
+      /engineer\/brain idea→spec loop \(`engineer`, or `engineer --help` for its full\s+command reference\)/,
+      'compose/brain idea→spec loop (`compose`; `engineer` is a deprecated alias, and `compose --help` shows its full command reference)',
+    )
+    .replace(/^  engineer(\s)/m, '  compose$1')
+    .replaceAll('ai-conductor engineer', 'ai-conductor compose')
+    .replace('Supervisor engineer:', 'Compose:')
+    .replaceAll('`engineer worktree`', '`compose worktree`')
+    .replaceAll('`engineer land`', '`compose land`');
 }
 
 /**
@@ -268,58 +329,62 @@ export async function resolveDaemonProjectRoot(startCwd: string): Promise<string
   return resolved.root;
 }
 
-/**
- * Construct an OtelVisualizer with production wiring (FR-8).
- *
- * Bridges `onWarning` to a `renderer_error` ConductorEvent on the shared bus so
- * transport failures surface to the operator as structured events instead of
- * silent drops. Constructor errors (e.g. disabled config passed by mistake) are
- * caught, surfaced as `renderer_error`, and null is returned so the run proceeds
- * with OTel disabled.
- *
- * Exported so integration tests can drive the exact production construction path
- * and verify the onWarning wiring without invoking main().
- */
-export function createOtelVisualizer(
-  resolved: ResolvedOtelConfig,
-  ctx: Omit<OtelVisualizerContext, 'onWarning'>,
-  events: ConductorEventEmitter,
-): OtelVisualizer | null {
-  const onWarning = (msg: string): void => {
-    void events.emit({ type: 'renderer_error', rendererName: 'otel', error: msg });
-  };
+// Harness VERSION lookup for the migration check. Probes the invocation cwd
+// first, then falls back to the shared module-relative probe in
+// engine/version-report.ts — the installed layout is a symlink chain
+// (~/.local/bin/ai-conductor → <harness>/bin/ai-conductor →
+// <harness>/src/conductor/dist-versions/<id>/index.js), so only the running
+// module's own path identifies the harness. Returns '0.0.0' on failure so
+// `defaultHasMigration` returns false (no re-bootstrap triggered).
+async function readHarnessVersion(): Promise<string> {
+  // A checkout the CLI was invoked from wins (the migration check is about the
+  // repo in hand); otherwise fall back to the shared module-relative probe that
+  // `--version` reports, so the two never drift.
   try {
-    return new OtelVisualizer(resolved, { ...ctx, onWarning });
-  } catch (err) {
-    onWarning(err instanceof Error ? err.message : String(err));
-    return null;
+    const raw = await readFile(join(process.cwd(), 'VERSION'), 'utf-8');
+    const v = raw.trim();
+    if (/^\d+\.\d+\.\d+/.test(v)) return v;
+  } catch {
+    /* fall through to the module-relative probe */
   }
+  return resolveHarnessVersion(__dirname);
 }
 
-// Harness VERSION lookup: probes a few candidate locations because the
-// installed layout can be a symlink chain (~/.local/bin/conduct-ts →
-// <harness>/bin/conduct-ts → <harness>/src/conductor/dist/index.js).
-// Returns '0.0.0' on failure so `defaultHasMigration` returns false (no
-// re-bootstrap triggered).
-async function readHarnessVersion(): Promise<string> {
-  // Resolve relative to the bundled entry: <harness>/src/conductor/dist/index.js
-  // or the dev path <harness>/src/conductor/src/index.ts. Either way VERSION
-  // is two levels up from the conductor package root.
-  const candidates = [
-    join(process.cwd(), 'VERSION'),
-    join(__dirname, '..', '..', '..', 'VERSION'),
-    join(__dirname, '..', '..', '..', '..', 'VERSION'),
-  ];
-  for (const path of candidates) {
-    try {
-      const raw = await readFile(path, 'utf-8');
-      const v = raw.trim();
-      if (/^\d+\.\d+\.\d+/.test(v)) return v;
-    } catch {
-      /* try next */
-    }
+interface VisualizerStartContextInput {
+  runId: string;
+  project: string;
+  feature?: string;
+  pipelineDir: string;
+  branch: string | undefined;
+  engineVersion: string | undefined;
+  harnessVersion: string | undefined;
+}
+
+/** Build identity for every visualizer without fabricating unavailable values. */
+export function createVisualizerStartContext(
+  input: VisualizerStartContextInput,
+): OtelVisualizerStartContext {
+  return {
+    runId: input.runId,
+    project: input.project,
+    feature: input.feature,
+    branch: input.branch,
+    engineVersion: input.engineVersion,
+    harnessVersion: input.harnessVersion,
+    pipelineDir: input.pipelineDir,
+  };
+}
+
+export async function resolveCurrentBranch(projectRoot: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execa('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd: projectRoot,
+    });
+    const branch = stdout.trim();
+    return branch && branch !== 'HEAD' ? branch : undefined;
+  } catch {
+    return undefined;
   }
-  return '0.0.0';
 }
 
 // --- Merged worktree cleanup ---
@@ -387,7 +452,7 @@ export interface OverlapScanDispatch {
 
 /**
  * Parse argv for the `overlap-scan` subcommand.
- *   conduct-ts overlap-scan --files a.ts,b.ts --source-ref owner/repo#5 --base main --cwd <dir>
+ *   ai-conductor overlap-scan --files a.ts,b.ts --source-ref owner/repo#5 --base main --cwd <dir>
  * Mirrors the detectXCommand pattern used by the other non-interactive
  * subcommands (registry, engineer, evidence, ...): pure argv parsing, no I/O.
  */
@@ -464,7 +529,7 @@ export async function overlapScanCommand(
 // --- Main ---
 
 async function main(): Promise<void> {
-  // Boundary enforcement, before any subcommand parsing: a conduct-ts
+  // Boundary enforcement, before any subcommand parsing: an ai-conductor
   // invocation from inside an engine-dispatched provider session (daemon
   // builds, reviews, self-host candidates — marked CONDUCT_DAEMON_SESSION=1)
   // is refused, except for the session-sanctioned worker subcommands the
@@ -473,6 +538,14 @@ async function main(): Promise<void> {
   if (!daemonSessionVerdict.allowed) {
     console.error(`Error: ${daemonSessionVerdict.message}`);
     process.exitCode = 1;
+    return;
+  }
+
+  // Version report (`ai-conductor --version` / `-V` / `version`). Read-only and
+  // dispatched before every other subcommand so it can never be shadowed by a
+  // pipeline or daemon handler.
+  if (detectVersionCommand(process.argv)) {
+    process.exitCode = await dispatchVersionCommand({ moduleDir: __dirname });
     return;
   }
 
@@ -521,6 +594,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  const kickbackBudgetCmd = detectKickbackBudgetCommand(process.argv);
+  if (kickbackBudgetCmd) {
+    process.exitCode = await dispatchKickbackBudgetCommand(kickbackBudgetCmd);
+    return;
+  }
+
   const rewindCmd = detectRewindCommand(process.argv);
   if (rewindCmd) {
     process.exitCode = await dispatchRewindCommand(rewindCmd);
@@ -550,7 +629,7 @@ async function main(): Promise<void> {
 
   // Memory setup subcommand (`conduct memory setup [dir]`, adr-2026-06-29-shared-memory-store-placement-and-durability) runs
   // NON-INTERACTIVELY and exits — creates/migrates the canonical per-project
-  // store + .memory symlink. Dispatched first so bin/conduct can call it
+  // store + .memory symlink. Dispatched first before the pipeline begins.
   // before the interactive pipeline or Claude sessions start.
   const memoryCmd = detectMemoryCommand(process.argv);
   if (memoryCmd) {
@@ -609,10 +688,31 @@ async function main(): Promise<void> {
       registry,
     );
     registry.markInitialized();
+    const visualizerConfig = await loadConfig(projectRoot);
+    if (!visualizerConfig.ok && visualizerConfig.error.type !== 'missing') {
+      console.error(visualizerConfig.error.message);
+      process.exitCode = 1;
+      return;
+    }
+    const pipelineDir = join(projectRoot, '.pipeline');
+    const visualizerContext: VisualizerFactoryContext = {
+      config: visualizerConfig.ok ? visualizerConfig.config : {},
+      emitter: events,
+      pipelineDir,
+      startContext: {
+        runId: 'runId' in engineerCmd ? engineerCmd.runId : undefined,
+        project: projectRoot,
+        branch: await resolveCurrentBranch(projectRoot),
+        engineVersion: resolveEngineVersion(__dirname),
+        harnessVersion: await resolveHarnessVersion(__dirname),
+        pipelineDir,
+      },
+    };
     const code = await runEngineerVisualizerLifecycle(
       registry,
       events,
       () => dispatchEngineer(engineerCmd, { events }),
+      visualizerContext,
     );
     process.exit(code);
   }
@@ -627,7 +727,7 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
-  // Brain subcommand (`conduct-ts brain start|stop|status`, Task 18) runs
+  // Brain subcommand (`ai-conductor brain start|stop|status`, Task 18) runs
   // NON-INTERACTIVELY and exits — it hosts the intake-loop (Task 17) under a
   // dedicated `cc-brain-*` tmux session (no cron, no external scheduler).
   // Dispatched before parseArgs, mirroring the daemon/intake-loop subcommand
@@ -893,7 +993,7 @@ async function main(): Promise<void> {
   // surface lives in createProgram(). Subcommand-specific help is already handled
   // by the dispatchers above, so any `--help` reaching here is top-level.
   if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
-    process.stdout.write(renderFullHelp());
+    process.stdout.write(renderCanonicalFullHelp());
     process.exit(0);
   }
 
@@ -912,6 +1012,10 @@ async function main(): Promise<void> {
   // --help were all dispatched above, so anything here targets the pipeline.)
   const { isInline, rest } = detectInline(process.argv);
   if (!isInline) {
+    const bareCommand = process.argv[2];
+    if (bareCommand && !bareCommand.startsWith('-') && !/\s/.test(bareCommand)) {
+      console.error(`error: unknown command '${bareCommand}'`);
+    }
     console.error(
       'conduct: the inline SDLC pipeline now runs under the `inline` subcommand.\n' +
         '  Run:        conduct inline "<feature description>"\n' +
@@ -928,6 +1032,10 @@ async function main(): Promise<void> {
     console.error(e instanceof Error ? e.message : 'Failed to parse arguments');
     process.exit(1);
   }
+
+  // Reject the retired unattended inline mode before creating any pipeline
+  // state or initializing provider-facing runtime.
+  const mode = deriveMode(opts);
 
   let projectRoot = process.cwd();
   let pipelineDir = join(projectRoot, '.pipeline');
@@ -1042,7 +1150,7 @@ async function main(): Promise<void> {
       } else {
         // orphaned-state: surface the same message --resume would
         console.error(
-          `\nOrphaned conductor state in ${detection.stateFilePath}.\n  Run conduct-ts --reset to clear, or recreate the worktree.\n`,
+          `\nOrphaned conductor state in ${detection.stateFilePath}.\n  Run ai-conductor --reset to clear, or recreate the worktree.\n`,
         );
         process.exit(1);
       }
@@ -1057,8 +1165,8 @@ async function main(): Promise<void> {
     console.error(formatGapReport(targetFeatureDesc, targetWorktree, verification));
     console.error(
       '  To roll back feature_status and resume at the first failing step, run:\n' +
-        `    conduct-ts ${targetFeatureDesc ? `"${targetFeatureDesc}"` : ''}\n` +
-        '  …and answer "y" at the recovery prompt. To inspect raw state: conduct-ts --status\n',
+        `    ai-conductor ${targetFeatureDesc ? `"${targetFeatureDesc}"` : ''}\n` +
+        '  …and answer "y" at the recovery prompt. To inspect raw state: ai-conductor --status\n',
     );
     process.exit(1);
   }
@@ -1097,8 +1205,8 @@ async function main(): Promise<void> {
         );
         if (answer === 'n' || answer === 'q') {
           console.log(
-            '\nNo changes made. To inspect: conduct-ts --status\n' +
-              `  To start over: conduct-ts --fresh ${opts.featureDesc ? `"${opts.featureDesc}"` : ''}\n`,
+            '\nNo changes made. To inspect: ai-conductor --status\n' +
+              `  To start over: ai-conductor --fresh ${opts.featureDesc ? `"${opts.featureDesc}"` : ''}\n`,
           );
           return;
         }
@@ -1147,7 +1255,7 @@ async function main(): Promise<void> {
           detection.expectedLocations.map((p) => `    - ${p}`).join('\n') +
           `\n\n  Either:\n` +
           `    1) Recreate the missing worktree at one of those paths, OR\n` +
-          `    2) Run \`conduct-ts --reset\` from this directory to clear the stale state\n` +
+          `    2) Run \`ai-conductor --reset\` from this directory to clear the stale state\n` +
           `       (you'll lose the recorded progress, but the actual code on the\n` +
           `       feature branch — if it exists — is untouched).\n` +
           `\n  Refusing to continue here so artifacts don't land on the wrong branch.\n`,
@@ -1213,7 +1321,6 @@ async function main(): Promise<void> {
   } catch {
     sessionId = uuidv4();
   }
-  const mode = deriveMode(opts);
 
   // Set up terminal UI with live dashboard (needed before registry initialization)
   const rendererOpts = {
@@ -1227,8 +1334,6 @@ async function main(): Promise<void> {
     viewMode: opts.view,
     tailLines: opts.tailLines,
   };
-  const renderEvent = createRenderer(rendererOpts);
-
   // Initialize plugin registry and discover plugins
   const registry = new PluginRegistry();
 
@@ -1238,7 +1343,7 @@ async function main(): Promise<void> {
 
   // Discover and register external plugins, then built-ins
   await discoverPlugins(globalPluginsDir, projectPluginsDir, registry);
-  registerCliBuiltins(registry, events, renderEvent, config, rendererOpts);
+  const subscriber = registerCliBuiltins(registry, events, config, rendererOpts);
   registry.markInitialized();
   validateRegisteredProviderSelections({
     config: config ?? {},
@@ -1268,12 +1373,8 @@ async function main(): Promise<void> {
   );
 
   // Select UI subscriber based on config (default: 'terminal')
-  const subscriber = registry.get<UISubscriber>(
-    'ui_renderer',
-    config?.ui_renderer ?? 'terminal'
-  );
-
-  subscriber.start();
+  const renderer = registry.get<UIRenderer>('ui_renderer', config?.ui_renderer ?? 'terminal');
+  subscriber.start([renderer]);
 
   // Wire EventPersister: appends every ConductorEvent as a JSON line to .pipeline/events.jsonl
   const eventsLogPath = join(pipelineDir, 'events.jsonl');
@@ -1283,28 +1384,33 @@ async function main(): Promise<void> {
 
   // Wire AuditTrailWriter: appends friction/positive-evidence records to
   // .pipeline/audit-trail/events.jsonl, rooted at the resolved projectRoot
-  // (never process.cwd()) so retro can reconstruct this run's history.
+  // (never process.cwd()) so the audit trail preserves this run's history.
   const auditWriter = new AuditTrailWriter(projectRoot);
   auditWriter.subscribe(events);
 
-  // Wire visualizer plugins (FR-1 gate: OTel visualizer only when enabled).
-  const builtInVisualizers: VisualizerPlugin[] = [];
-  const otelResolved = resolveOtelConfig(config ?? {}, pipelineDir);
-  if (otelResolved.enabled) {
-    const otelVis = createOtelVisualizer(
-      otelResolved,
-      {
-        pipelineDir,
-        feature: opts.featureDesc ?? 'unknown',
-        project: projectRoot,
-      },
-      events,
-    );
-    if (otelVis) {
-      builtInVisualizers.push(otelVis);
-    }
-  }
-  await runInlineVisualizerLifecycle(registry, events, async () => {
+  // Build configured visualizers plus OTel, whose shared helper retains
+  // ownership of its `otel:` configuration gate and start lifecycle.
+  const visualizerContext: VisualizerFactoryContext & { startContext: OtelVisualizerStartContext } = {
+    config: config ?? {},
+    pipelineDir,
+    emitter: events,
+    startContext: createVisualizerStartContext({
+      runId: sessionId,
+      project: projectRoot,
+      feature: opts.featureDesc,
+      branch: await resolveCurrentBranch(projectRoot),
+      engineVersion: resolveEngineVersion(__dirname),
+      harnessVersion: await resolveHarnessVersion(__dirname),
+      pipelineDir,
+    }),
+  };
+  const visualizerList = buildInteractiveVisualizers(
+    registry,
+    visualizerContext.config,
+    visualizerContext,
+  );
+
+  try {
   const stepRunner = new DefaultStepRunner(compatibilityRuntime.provider, sessionId, projectRoot, {
     featureDesc: opts.featureDesc,
     pipelineDir,
@@ -1422,10 +1528,11 @@ async function main(): Promise<void> {
   });
 
   await conductor.run();
-  }, builtInVisualizers);
-
-  persister.stop();
-  subscriber.stop();
+  } finally {
+    await stopVisualizers(visualizerList);
+    persister.stop();
+    await subscriber.stop();
+  }
 }
 
 // Only run the CLI when executed directly (e.g. `node dist/index.js` via

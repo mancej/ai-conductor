@@ -18,14 +18,13 @@ import type { GitRunner } from '../../src/engine/pr-labels.js';
 import { writeVerdict } from '../../src/engine/gate-verdicts.js';
 import { parsePlanTaskPaths } from '../../src/engine/plan-task-parse.js';
 import { createTaskEvidence } from '../../src/engine/task-evidence.js';
-import { currentCommitSha } from '../../src/engine/project-prelude.js';
 
 // Drives the gate-driven tail (build…finish) with verifyArtifacts on. The front
 // half is pre-marked done and the loop is started at `build` (fromStep), so each
 // test exercises the selector-driven tail directly. Medium (M) tier so
 // manual_test still runs (S-tier now legitimately skips manual_test per D5;
 // see steps.ts skippableForTiers) — the tail is build → manual_test →
-// (retro tier-skipped only at S, so it runs at M too) → finish.
+// (the surviving SHIP tail completes) → finish.
 
 const FRONT_DONE: ConductState = {
   complexity_tier: 'M',
@@ -39,6 +38,7 @@ const FRONT_DONE: ConductState = {
   conflict_check: 'skipped',
   plan: 'done',
   coherence_check: 'done',
+  coverage_binding: 'done',
   architecture_diagram: 'skipped',
   architecture_review: 'skipped',
   acceptance_specs: 'skipped',
@@ -115,6 +115,9 @@ describe('integration/gate-loop', () => {
         join(dir, '.pipeline/task-status.json'),
         JSON.stringify({ tasks: taskIds.map((id) => ({ id, status: 'completed' })) }),
       );
+    } else if (step === 'coverage_binding') {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline/coverage-binding.json'), JSON.stringify({ version: 1, slug: 'add-foo', runId: 'test-run', status: 'disabled', entries: [] }));
     } else if (step === 'build_review') {
       // The build_review judgement gate's completion predicate requires a
       // fresh, valid PASS verdict at .pipeline/build-review.json (see
@@ -127,27 +130,6 @@ describe('integration/gate-loop', () => {
         JSON.stringify({
           verdict: 'PASS',
           rubric: { testQuality: false },
-        }),
-      );
-    } else if (step === 'wiring_check') {
-      // The wiring-reachability gate (Task 9) requires a fresh, valid,
-      // zero-gap evidence artifact at .pipeline/wiring-evidence.json (see
-      // WIRING_EVIDENCE/validateWiringEvidence in artifacts.ts). The
-      // predicate compares evidence.head against ctx.getHeadSha(), which
-      // shells out to `git rev-parse HEAD` in `dir` — null (no comparison)
-      // when `dir` isn't a real git repo, a real sha for the suites below
-      // that do `initRepo()`. Resolve it dynamically so both cases match.
-      await mkdir(join(dir, '.pipeline'), { recursive: true });
-      const head = (await currentCommitSha(dir)) ?? '2'.repeat(40);
-      await writeFile(
-        join(dir, '.pipeline/wiring-evidence.json'),
-        JSON.stringify({
-          schema: 1,
-          base: '1'.repeat(40),
-          head,
-          layer2: { applicable: false },
-          waivers: [],
-          tasks: [],
         }),
       );
     } else if (step === 'manual_test') {
@@ -209,7 +191,6 @@ describe('integration/gate-loop', () => {
     expect(ran).toContain('build');
     expect(ran).toContain('manual_test');
     expect(ran).toContain('finish');
-    expect(ran).toContain('retro'); // M tier: retro is not tier-skipped
     expect(completed).toBe(true);
     expect(converged).toBe(true); // loop_converged event emitted
     await expect(access(join(dir, '.pipeline/DONE'))).resolves.toBeUndefined();
@@ -872,7 +853,6 @@ describe('integration/gate-loop', () => {
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
-      'retro',
       'finish',
     ]) delete state[name];
     await writeState(statePath, {
@@ -922,14 +902,13 @@ describe('integration/gate-loop', () => {
     });
     await conductor.run();
 
-    // build, the three-member product validation group, retro, and finish
+    // build, the three-member product validation group, rebase, and finish
     // each receive one fresh session.
     expect(ran).toEqual([
       'build',
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
-      'retro',
       'finish',
     ]);
     expect(resetSession.mock.calls.map(([step]) => step)).toEqual([
@@ -937,7 +916,6 @@ describe('integration/gate-loop', () => {
       'manual_test',
       'prd_audit',
       'architecture_review_as_built',
-      'retro',
       'finish',
     ]);
   });
@@ -1398,7 +1376,6 @@ describe('integration/gate-loop', () => {
       expect(result.buildRuns).toBe(2); // initial + one kickback rebuild
       expect(result.retryReasons.join('\n')).toContain('tautological test padding');
       expect(result.ran.filter((step) => step === 'build_review')).toHaveLength(2);
-      expect(result.ran).not.toContain('wiring_check');
       expect(result.completed).toBe(true);
     });
 
@@ -1413,10 +1390,9 @@ describe('integration/gate-loop', () => {
 
       expect(result.completed).toBe(false);
       expect(result.ran).toContain('build_review');
-      expect(result.ran).not.toContain('wiring_check');
     });
 
-    it('routes a completeness finding through build_review\'s ordinary FAIL kickback, without dispatching wiring_check', async () => {
+    it('routes a completeness finding through build_review\'s ordinary FAIL kickback', async () => {
       const result = await runWithGraderVerdicts([
         {
           verdict: 'FAIL',
@@ -1429,7 +1405,6 @@ describe('integration/gate-loop', () => {
 
       expect(result.kicks).toContainEqual({ from: 'build_review', to: 'build' });
       expect(result.retryReasons.join('\n')).toContain('[testQuality] changed test does not observe the new behavior');
-      expect(result.ran).not.toContain('wiring_check');
       expect(result.completed).toBe(true);
     });
 
@@ -2002,9 +1977,20 @@ describe('integration/gate-loop', () => {
         options?: import('execa').Options,
       ) => Promise<import('execa').Result>;
       const mockExeca = vi.mocked(execa) as unknown as import('vitest').Mock<ExecaInvocation>;
-      mockExeca.mockImplementation(async (_command: string, args: readonly string[] = []) => {
+      mockExeca.mockImplementation(async (_command: string, args: readonly string[] = [], options?: import('execa').Options) => {
         if (args[0] === 'ls-tree') return { stdout: '.docs/plans/p.md\0' } as never;
         if (args[0] === 'show') return { stdout: planText } as never;
+        if (args[0] === 'cat-file' && args.includes('--batch')) {
+          const requestedPaths = String(options?.input ?? '')
+            .trim()
+            .split('\n')
+            .filter(Boolean);
+          const response = Buffer.concat(requestedPaths.map((request) => {
+            const content = Buffer.from(planText);
+            return Buffer.concat([Buffer.from(`${request.split(':', 1)[0]} blob ${content.length}\n`), content, Buffer.from('\n')]);
+          }));
+          return { stdout: response } as never;
+        }
         return { stdout: '' } as never;
       });
       await writeState(statePath, { ...FRONT_DONE, rebase: 'skipped' } as ConductState);
@@ -2469,9 +2455,7 @@ describe('prd_audit coverage recheck through a real repository (Task 11)', () =>
           );
           return { success: true };
         }
-        if (step === 'retro') {
-          await writeFile(join(repoDir, '.pipeline/retro.md'), '# Retro\n');
-        } else if (step === 'finish') {
+        if (step === 'finish') {
           await writeFile(join(repoDir, '.pipeline/finish-choice'), 'pr\n');
           const state = JSON.parse(await readFile(realStatePath, 'utf-8'));
           state.pr_url = 'https://example.com/pr/1';

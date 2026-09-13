@@ -1,3 +1,4 @@
+// Covers: task:4
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, readFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,6 +7,7 @@ import { execa } from 'execa';
 import {
   countResolvedTasks,
   resolveTaskIds,
+  resolveTaskIdsWithDiagnostics,
   haltMarkerExists,
   clearHaltMarker,
   haltMarkerPath,
@@ -21,6 +23,8 @@ import {
   dispatchTaskCommand,
   runTaskStart,
 } from '../../src/engine/task-cli.js';
+import { checkStepCompletion } from '../../src/engine/artifacts.js';
+import { createRepairObligationStore } from '../../src/engine/repair-obligations.js';
 
 describe('task-progress', () => {
   let dir: string;
@@ -335,6 +339,173 @@ describe('task-progress', () => {
       const resolved = await resolveTaskIds(dir, ['1', '2']);
 
       expect(resolved).toEqual(new Set(['1']));
+    });
+  });
+
+  describe('current repair freshness', () => {
+    it('keeps pre-reopen trailer and completed-row evidence unresolved at the build boundary', async () => {
+      await execa('git', ['init', '-b', 'main'], { cwd: dir });
+      await execa('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+      await execa('git', ['config', 'user.name', 'Test'], { cwd: dir });
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'feature.md'), '### Task 2: repaired task\n');
+      await writeFile(join(dir, '.pipeline', 'engine-state.json'), JSON.stringify({
+        activePlanPath: '.docs/plans/feature.md',
+      }));
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '2', status: 'completed' }],
+      }));
+      await writeFile(join(dir, 'old.txt'), 'old');
+      await execa('git', ['add', '.'], { cwd: dir });
+      await execa('git', ['commit', '-m', 'old completion\n\nTask: 2'], { cwd: dir });
+      const boundary = (await execa('git', ['rev-parse', 'HEAD'], { cwd: dir })).stdout.trim();
+
+      const repairs = createRepairObligationStore(dir, join(dir, '.pipeline', 'engine-state.json'));
+      const admitted = await repairs.admitOrReplay('key-1', {
+        id: 'reopened-round',
+        planPath: '.docs/plans/feature.md',
+        taskIds: ['T2'],
+        source: { findingId: 'finding-1', authority: 'build_review', instruction: 'repair it' },
+        baseline: { head: boundary, tree: 'tree-before-reopen', resolvedTaskIds: ['T2'] },
+      });
+      if (!admitted.ok) throw new Error(admitted.message);
+
+      const completion = await checkStepCompletion(dir, 'build', {
+        projectRoot: dir,
+        planPath: join(dir, '.docs', 'plans', 'feature.md'),
+      });
+
+      expect(completion).toMatchObject({ done: false, reason: expect.stringMatching(/2/) });
+    });
+
+    it('accepts a canonical task alias only when its trailer is after the repair boundary', async () => {
+      await execa('git', ['init', '-b', 'main'], { cwd: dir });
+      await execa('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+      await execa('git', ['config', 'user.name', 'Test'], { cwd: dir });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline', 'engine-state.json'), JSON.stringify({
+        activePlanPath: '.docs/plans/feature.md',
+      }));
+      await writeFile(join(dir, 'baseline.txt'), 'baseline');
+      await execa('git', ['add', '.'], { cwd: dir });
+      await execa('git', ['commit', '-m', 'baseline\n\nTask: T2'], { cwd: dir });
+      const boundary = (await execa('git', ['rev-parse', 'HEAD'], { cwd: dir })).stdout.trim();
+      const repairs = createRepairObligationStore(dir, join(dir, '.pipeline', 'engine-state.json'));
+      await repairs.admitOrReplay('key-2', {
+        id: 'post-boundary-round',
+        planPath: '.docs/plans/feature.md',
+        taskIds: ['T2'],
+        source: { findingId: 'finding-2', authority: 'build_review', instruction: 'repair it' },
+        baseline: { head: boundary, tree: 'tree', resolvedTaskIds: [] },
+      });
+
+      // The pre-boundary alias remains visible to the legacy trailer union,
+      // so only current-repair resolution can keep it unresolved here.
+      expect(await resolveTaskIds(dir, ['2'])).toEqual(new Set());
+
+      await writeFile(join(dir, 'repair.txt'), 'repair');
+      await execa('git', ['add', '.'], { cwd: dir });
+      await execa('git', ['commit', '-m', 'repair\n\nTask: T2'], { cwd: dir });
+
+      expect(await resolveTaskIds(dir, ['2'])).toEqual(new Set(['2']));
+    });
+
+    it('keeps an open obligation authoritative when engine state records no activePlanPath', async () => {
+      // #1831/#2261: a daemon-dispatched feature never runs the plan step that
+      // records activePlanPath, so the obligation is keyed by the
+      // convention-resolved plan. Reading the repair section through
+      // activePlanPath alone reported "no repair state" and let the
+      // pre-boundary trailer re-close the re-staged task.
+      await execa('git', ['init', '-b', 'main'], { cwd: dir });
+      await execa('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+      await execa('git', ['config', 'user.name', 'Test'], { cwd: dir });
+      await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.docs', 'plans', 'feature.md'), '### Task 2: repaired task\n');
+      await writeFile(
+        join(dir, '.pipeline', 'conduct-state.json'),
+        JSON.stringify({ feature_desc: 'feature' }),
+      );
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '2', status: 'completed' }],
+      }));
+      await writeFile(join(dir, 'old.txt'), 'old');
+      await execa('git', ['add', '.'], { cwd: dir });
+      await execa('git', ['commit', '-m', 'old completion\n\nTask: 2'], { cwd: dir });
+      const boundary = (await execa('git', ['rev-parse', 'HEAD'], { cwd: dir })).stdout.trim();
+
+      const repairs = createRepairObligationStore(dir, join(dir, '.pipeline', 'engine-state.json'));
+      const admitted = await repairs.admitOrReplay('key-no-active-plan', {
+        id: 'reopened-round',
+        planPath: '.docs/plans/feature.md',
+        taskIds: ['T2'],
+        source: { findingId: 'finding-1', authority: 'build_review', instruction: 'repair it' },
+        baseline: { head: boundary, tree: 'tree-before-reopen', resolvedTaskIds: ['T2'] },
+      });
+      if (!admitted.ok) throw new Error(admitted.message);
+
+      const engineState = JSON.parse(
+        await readFile(join(dir, '.pipeline', 'engine-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      expect(engineState.activePlanPath).toBeUndefined();
+
+      expect(await resolveTaskIds(dir, ['2'])).toEqual(new Set());
+    });
+
+    it('refuses the legacy union when obligations exist but no plan resolves', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '2', status: 'completed' }],
+      }));
+      const repairs = createRepairObligationStore(dir, join(dir, '.pipeline', 'engine-state.json'));
+      const admitted = await repairs.admitOrReplay('key-unresolvable-plan', {
+        id: 'orphan-round',
+        planPath: '.docs/plans/feature.md',
+        taskIds: ['2'],
+        source: { findingId: 'finding-1', authority: 'build_review', instruction: 'repair it' },
+        baseline: { head: 'no-such-commit', tree: 'tree', resolvedTaskIds: [] },
+      });
+      if (!admitted.ok) throw new Error(admitted.message);
+
+      const resolution = await resolveTaskIdsWithDiagnostics(dir, ['2']);
+
+      expect(resolution.resolved).toEqual(new Set());
+      expect(resolution.unavailableReasons.get('2')).toContain('no active plan could be resolved');
+    });
+
+    it('leaves the legacy union alone when no obligation has ever been admitted', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline', 'engine-state.json'), JSON.stringify({}));
+      await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+        tasks: [{ id: '2', status: 'completed' }],
+      }));
+
+      expect(await resolveTaskIds(dir, ['2'])).toEqual(new Set(['2']));
+    });
+
+    it('retains a persisted current closure when its historical boundary is unavailable', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline', 'engine-state.json'), JSON.stringify({
+        activePlanPath: '.docs/plans/feature.md',
+      }));
+      const repairs = createRepairObligationStore(dir, join(dir, '.pipeline', 'engine-state.json'));
+      const admitted = await repairs.admitOrReplay('key-3', {
+        id: 'closed-round',
+        planPath: '.docs/plans/feature.md',
+        taskIds: ['2'],
+        source: { findingId: 'finding-3', authority: 'build_review', instruction: 'repair it' },
+        baseline: { head: 'no-such-commit', tree: 'tree', resolvedTaskIds: [] },
+      });
+      if (!admitted.ok) throw new Error(admitted.message);
+      await repairs.close({
+        planPath: '.docs/plans/feature.md',
+        taskId: '2',
+        obligationId: admitted.obligation.id,
+        evidence: { kind: 'task-done', value: 'current' },
+      });
+
+      expect(await resolveTaskIds(dir, ['2'])).toEqual(new Set(['2']));
     });
   });
 
@@ -705,15 +876,4 @@ describe('task-progress', () => {
     });
   });
 
-  // Task 16 (#773, verify-only): the demolition of the per-task
-  // evidence-ledger GATING apparatus (Tasks 10-14) and the repointing of
-  // resolved-count telemetry at Task:-trailered commits (Task 15, above)
-  // must leave the wiring_check gate — a same-named-but-unrelated gate,
-  // not part of the deleted evidence-ledger — completely untouched. This
-  // is a lock-in regression assertion, not new production behavior.
-  describe('Task 16: wiring_check gate survives the telemetry demotion (regression lock-in)', () => {
-    it('CUSTOM_COMPLETION_PREDICATES still registers wiring_check', () => {
-      expect(typeof CUSTOM_COMPLETION_PREDICATES.wiring_check).toBe('function');
-    });
-  });
 });

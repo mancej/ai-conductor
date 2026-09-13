@@ -24,7 +24,6 @@ import {
 } from '../../src/engine/halt-marker.js';
 import {
   readKickbackLedger,
-  writeKickbackLedger,
   MAX_KICKBACKS_PER_GATE,
   KICKBACK_LEDGER_PATH,
 } from '../../src/engine/kickback-ledger.js';
@@ -100,6 +99,7 @@ const FRONT_DONE: ConductState = {
   conflict_check: 'skipped',
   plan: 'done',
   coherence_check: 'done',
+  coverage_binding: 'done',
   architecture_diagram: 'skipped',
   architecture_review: 'skipped',
   acceptance_specs: 'skipped',
@@ -133,6 +133,12 @@ describe('acceptance: daemon-mode DECIDE kickbacks HALT instead of re-running (#
     events = new ConductorEventEmitter();
     await mkdir(join(dir, '.pipeline'), { recursive: true });
     await mkdir(join(dir, '.docs'), { recursive: true });
+    // The default-off coverage_binding gate predates this fixture; satisfy its
+    // run-scoped envelope up front so it never interleaves with the steps
+    // these specs assert on.
+    await writeFile(join(dir, '.pipeline/coverage-binding.json'), JSON.stringify({
+      version: 1, slug: 'decide-kickback-halt', runId: 'test-run', status: 'disabled', entries: [],
+    }));
   });
 
   afterEach(async () => {
@@ -390,7 +396,6 @@ describe('acceptance: daemon-mode DECIDE kickbacks HALT instead of re-running (#
       await writeState(statePath, {
         ...FRONT_DONE,
         build: 'done',
-        wiring_check: 'done',
         test_suite: 'done',
       } as ConductState);
       await writeVerdict(dir, 'plan', {
@@ -823,12 +828,12 @@ describe('acceptance: daemon-mode DECIDE kickbacks HALT instead of re-running (#
       expect(ran).not.toContain('explore');
       expect(ran).not.toContain('architecture_review');
       // The guard halted immediately after `build` satisfied its gate, so the
-      // earliest unsatisfied gate under the current ALL_STEPS order is the
-      // first declared BUILD gate that still dispatches — `wiring_check`
-      // precedes it but is a deprecated no-op that settles in-process —
-      // never a re-dispatch of `build` or a walk back into DECIDE.
+      // earliest unsatisfied gate under the current ALL_STEPS order is
+      // build_review — never a re-dispatch of build or a walk into DECIDE.
       expect(ran.length).toBeGreaterThan(0);
       expect(ran[0]).toBe('build_review');
     });
   });
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

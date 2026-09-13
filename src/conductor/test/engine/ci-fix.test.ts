@@ -4,13 +4,21 @@
  * All gh interactions use fake runners; no real `gh` binary required.
  */
 
-import { describe, it, expect } from 'vitest';
-import { buildCiFixHint, isEligibleForCiFix, runCiFix, productionCiFixRunner } from '../../src/engine/ci-fix.js';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  buildCiFixHint,
+  isEligibleForCiFix,
+  nonTerminalCheckNames,
+  runCiFix,
+  productionCiFixRunner,
+} from '../../src/engine/ci-fix.js';
 import type { GhRunner } from '../../src/engine/pr-labels.js';
 import type { WatchEntry } from '../../src/engine/mergeable-sweep.js';
 import type { PrMergeState } from '../../src/engine/pr-labels.js';
 import type { HarnessConfig } from '../../src/types/config.js';
 import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { WorktreeLifecycleQueue } from '../../src/engine/worktree.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -371,7 +379,13 @@ describe('ci-fix: isEligibleForCiFix terminal-CI-state gate', () => {
 
   /** A `failed` rollup — the state the sweep hands to the CI-fix dispatch. */
   function stateWithChecks(
-    statusCheckRollup: Array<{ status?: string | null; conclusion?: string | null; name?: string }>,
+    statusCheckRollup: Array<{
+      status?: string | null;
+      conclusion?: string | null;
+      state?: string | null;
+      name?: string;
+      context?: string;
+    }>,
   ): PrMergeState {
     return {
       state: 'OPEN',
@@ -414,6 +428,95 @@ describe('ci-fix: isEligibleForCiFix terminal-CI-state gate', () => {
     const state = stateWithChecks([
       { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
       { status: 'PENDING', conclusion: 'PENDING', name: 'deploy-preview' },
+    ]);
+
+    const result = await isEligibleForCiFix(entry, state, config, NOW);
+
+    expect(result.eligible).toBe(false);
+    expect(result.reason).toContain('checks-not-terminal');
+  });
+
+  it.each(['SUCCESS', 'FAILURE', 'ERROR'])(
+    'a completed commit status reporting %s alongside a failure → eligible',
+    async (reportedState) => {
+      const state = stateWithChecks([
+        { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+        { state: reportedState, name: 'external-status' },
+      ]);
+
+      expect(nonTerminalCheckNames(state.statusCheckRollup)).toEqual([]);
+      const result = await isEligibleForCiFix(entry, state, config, NOW);
+
+      expect(result).toEqual({ eligible: true });
+    },
+  );
+
+  it.each(['PENDING', 'EXPECTED'])(
+    'a commit status reporting %s alongside a failure → ineligible(checks-not-terminal)',
+    async (reportedState) => {
+      const state = stateWithChecks([
+        { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+        { state: reportedState, name: 'external-status' },
+      ]);
+
+      expect(nonTerminalCheckNames(state.statusCheckRollup)).toEqual(['external-status']);
+      const result = await isEligibleForCiFix(entry, state, config, NOW);
+
+      expect(result.eligible).toBe(false);
+      expect(result.reason).toContain('checks-not-terminal');
+    },
+  );
+
+  it('a pending commit status with context but no name → identifies its context in the refusal', async () => {
+    const state = stateWithChecks([
+      { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+      { state: 'PENDING', context: 'deploy-preview' },
+    ]);
+
+    const result = await isEligibleForCiFix(entry, state, config, NOW);
+
+    expect(result.reason).toContain('deploy-preview');
+  });
+
+  it('a pending entry with no identifier → uses the existing placeholder in the refusal', async () => {
+    const state = stateWithChecks([
+      { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+      { state: 'PENDING' },
+    ]);
+
+    const result = await isEligibleForCiFix(entry, state, config, NOW);
+
+    expect(result.reason).toContain('(unnamed check)');
+  });
+
+  it('a pending entry with whitespace-only identifiers → uses the existing placeholder in the refusal', async () => {
+    const state = stateWithChecks([
+      { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+      { state: 'PENDING', name: '  ', context: '\t' },
+    ]);
+
+    const result = await isEligibleForCiFix(entry, state, config, NOW);
+
+    expect(result.reason).toContain('(unnamed check)');
+  });
+
+  it('all completed entries → eligible without a deferral log', async () => {
+    const state = stateWithChecks([
+      { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+      { state: 'SUCCESS' },
+    ]);
+    const logs: string[] = [];
+
+    const result = await isEligibleForCiFix(entry, state, config, NOW, (message) => logs.push(message));
+
+    expect(result).toEqual({ eligible: true });
+    expect(logs).toEqual([]);
+  });
+
+  it('a check run with neither conclusion nor reported state → ineligible(checks-not-terminal)', async () => {
+    const state = stateWithChecks([
+      { status: 'COMPLETED', conclusion: 'FAILURE', name: 'unit' },
+      { status: 'COMPLETED', name: 'integration' },
     ]);
 
     const result = await isEligibleForCiFix(entry, state, config, NOW);
@@ -538,7 +641,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
         },
       };
 
-      const result = await runCiFix(entry, branch, hint, { fixRunner }, logger);
+      const result = await runCiFix(entry, branch, hint, { fixRunner, verify: async () => 0 }, logger);
 
       // Verify the result
       expect(result.kind).toBe('changed');
@@ -577,7 +680,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
 
       let threwError = false;
       try {
-        await runCiFix(entry, branch, hint, { fixRunner }, logger);
+        await runCiFix(entry, branch, hint, { fixRunner, verify: async () => 0 }, logger);
       } catch (err) {
         threwError = true;
       }
@@ -617,7 +720,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
       };
 
       // Should not throw, but should log the issue
-      const result = await runCiFix(entry, branch, hint, { fixRunner }, logger);
+      const result = await runCiFix(entry, branch, hint, { fixRunner, verify: async () => 0 }, logger);
 
       // Should return an aborted outcome (not throw)
       expect(result.kind).toBe('branch-gone');
@@ -653,7 +756,15 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
         },
       };
 
-      const result = await runCiFix(entry, branch, hint, { fixRunner }, logger);
+      const verify = vi.fn(async (worktreePath: string) => {
+        expect(execSync('git log -1 --format=%s', { cwd: worktreePath }).toString().trim())
+          .toBe('ci fix commit');
+        expect(execSync('git log -1 --format=%s feat/fix', { cwd: originPath }).toString().trim())
+          .toBe('feature work');
+        return 0;
+      });
+      const result = await runCiFix(entry, branch, hint, { fixRunner, verify }, logger);
+      expect(verify).toHaveBeenCalledOnce();
 
       expect(result.kind).toBe('changed');
 
@@ -662,6 +773,29 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
       expect(originLog).toContain('ci fix commit');
 
       expect(logs.some((l) => l.includes('refreshed'))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  }, REAL_GIT_TIMEOUT_MS);
+
+  it('missing project suite configuration blocks publication through the production verifier', async () => {
+    const { repoPath, originPath, cleanup } = await createFixtureRepo();
+    try {
+      const logs: string[] = [];
+      const beforeSha = execSync('git rev-parse feat/fix', { cwd: originPath }).toString().trim();
+      const fixRunner = {
+        run: async ({ worktreePath }: { worktreePath: string }) => {
+          execSync('git commit --allow-empty -m "ci fix commit"', { cwd: worktreePath });
+          return { kind: 'changed' as const };
+        },
+      };
+      await runCiFix(
+        { prUrl: PR_URL, slug: SLUG, repoCwd: repoPath, ciFixAttempts: 0 },
+        'feat/fix', 'hint', { fixRunner }, (message) => logs.push(message),
+      );
+      expect(execSync('git rev-parse feat/fix', { cwd: originPath }).toString().trim()).toBe(beforeSha);
+      expect(logs.some((message) => message.includes('missing_config'))).toBe(true);
+      expect(logs.some((message) => message.includes('ci-fix-suite-gate') && message.includes('escalated'))).toBe(true);
     } finally {
       await cleanup();
     }
@@ -692,7 +826,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
         entry,
         branch,
         hint,
-        { fixRunner, suiteCommand: 'exit 1' },
+        { fixRunner, verify: async () => 1 },
         logger,
       );
 
@@ -734,7 +868,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
         },
       };
 
-      const result = await runCiFix(entry, branch, hint, { fixRunner }, logger);
+      const result = await runCiFix(entry, branch, hint, { fixRunner, verify: async () => 0 }, logger);
 
       expect(result.kind).toBe('changed');
 
@@ -773,7 +907,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
         },
       };
 
-      const result = await runCiFix(entry, branch, hint, { fixRunner }, logger);
+      const result = await runCiFix(entry, branch, hint, { fixRunner, verify: async () => 0 }, logger);
 
       // Verify callback ran (stale worktree was cleaned)
       expect(callbackRan).toBe(true);
@@ -809,7 +943,7 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
         },
       };
 
-      const result = await runCiFix(entry, branch, hint, { fixRunner }, logger);
+      const result = await runCiFix(entry, branch, hint, { fixRunner, verify: async () => 0 }, logger);
       expect(result.kind).toBe('changed');
 
       // Primary checkout must be fully clean — no staged/unstaged/untracked pollution.
@@ -823,6 +957,73 @@ describe('ci-fix: runCiFix resolver worktree lifecycle (Task 17)', () => {
       const afterHead = execSync(`git rev-parse HEAD`, { cwd: repoPath }).toString().trim();
       expect(afterBranch).toBe(beforeBranch);
       expect(afterHead).toBe(beforeHead);
+    } finally {
+      await cleanup();
+    }
+  }, REAL_GIT_TIMEOUT_MS);
+
+  it('AB-2 (Task 20): routes the transient worktree add/remove through the injected dispatcher lifecycle queue', async () => {
+    const { repoPath, cleanup } = await createFixtureRepo();
+    try {
+      let queueDepth = 0;
+      let queuedOperations = 0;
+      const observed: string[] = [];
+      const worktreeLifecycle = new WorktreeLifecycleQueue();
+      const originalRun = worktreeLifecycle.run.bind(worktreeLifecycle);
+      worktreeLifecycle.run = (operation) => originalRun(async () => {
+        queueDepth += 1;
+        queuedOperations += 1;
+        try { return await operation(); } finally { queueDepth -= 1; }
+      });
+      const worktreePath = join(repoPath, '.worktrees', `resolve-${SLUG}`);
+      const fixRunner = {
+        run: async () => {
+          // The worktree exists while the callback runs, and it was created
+          // by a queued mutation (the queue drained before fn ran).
+          observed.push(existsSync(worktreePath) ? 'worktree-present' : 'worktree-missing');
+          return { kind: 'noop' as const };
+        },
+      };
+      const entry = { prUrl: PR_URL, slug: SLUG, repoCwd: repoPath, ciFixAttempts: 0 };
+
+      const result = await runCiFix(entry, 'feat/fix', 'hint', { fixRunner, liveness: { worktreeLifecycle } }, () => {});
+
+      expect(result.kind).toBe('noop');
+      expect(observed).toEqual(['worktree-present']);
+      expect(queueDepth).toBe(0);
+      expect(existsSync(worktreePath)).toBe(false);
+      // The stale-registration reap, add, and final remove all go through
+      // the shared lifecycle queue.
+      expect(queuedOperations).toBe(3);
+    } finally {
+      await cleanup();
+    }
+  }, REAL_GIT_TIMEOUT_MS);
+
+  it('AB-3 (Task 21): refuses transient worktree removal while the slug holds an active work claim, naming the slug', async () => {
+    const { repoPath, cleanup } = await createFixtureRepo();
+    try {
+      const logs: string[] = [];
+      let claimed = false;
+      const worktreePath = join(repoPath, '.worktrees', `resolve-${SLUG}`);
+      const fixRunner = {
+        run: async () => {
+          // The daemon claims the slug while the fix-runner is mid-flight.
+          claimed = true;
+          return { kind: 'noop' as const };
+        },
+      };
+      const entry = { prUrl: PR_URL, slug: SLUG, repoCwd: repoPath, ciFixAttempts: 0 };
+
+      const result = await runCiFix(entry, 'feat/fix', 'hint', {
+        fixRunner,
+        liveness: { isFeatureInFlight: async () => claimed, log: (m) => logs.push(m) },
+      }, () => {});
+
+      expect(result.kind).toBe('noop');
+      expect(existsSync(worktreePath)).toBe(true);
+      expect(logs.some((line) => line.includes('worktree removal refused') && line.includes(SLUG) && line.includes('active work claim'))).toBe(true);
+      execSync(`git worktree remove --force "${worktreePath}"`, { cwd: repoPath });
     } finally {
       await cleanup();
     }

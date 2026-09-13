@@ -1,4 +1,7 @@
-import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   materializeTautologyPreflight,
@@ -23,14 +26,29 @@ function scopedCommandResult(command: string) {
 
 describe('build-review test-quality preflight', () => {
   it.each([
-    [{ classification: 'red', cacheable: true, cacheProvenance: 'miss', changedPaths: [], changedTestSelectors: ['test/a.test.ts'], revertedProductionManifest: [], sourceIdentities: { mergeBase: 'base', headSha: 'head' }, scopedRun: { exitCode: 1, runKind: 'nonzero-exit', ranSelectors: ['test/a.test.ts'], failureExcerpt: 'assertion failed' } }, 'assertion failed'],
+    [{ classification: 'nonzero-exit', cacheable: true, cacheProvenance: 'miss', changedPaths: [], changedTestSelectors: ['test/a.test.ts'], revertedProductionManifest: [], sourceIdentities: { mergeBase: 'base', headSha: 'head' }, scopedRun: { exitCode: 1, runKind: 'nonzero-exit', ranSelectors: ['test/a.test.ts'], failureExcerpt: 'assertion failed' } }, 'assertion failed'],
     [{ classification: 'stayed-green', cacheable: true, cacheProvenance: 'miss', changedPaths: [], changedTestSelectors: ['test/a.test.ts'], revertedProductionManifest: [], sourceIdentities: { mergeBase: 'base', headSha: 'head' }, scopedRun: { exitCode: 0, runKind: 'passed', ranSelectors: ['test/a.test.ts'], failureExcerpt: '' } }, ''],
     [{ classification: 'approved-exception', exception: 'removal-maintenance', cacheable: true, cacheProvenance: 'miss', changedPaths: [], changedTestSelectors: ['test/a.test.ts'], revertedProductionManifest: [], sourceIdentities: { mergeBase: 'base', headSha: 'head' } }, ''],
   ] as const)('projects %s as typed evidence without synthesizing an engine finding', (result, excerpt) => {
     const projection = preflightProjection(result);
 
-    expect(projection.preflight).toEqual({ classification: result.classification, excerpt });
+    expect(projection.preflight).toMatchObject({ classification: result.classification, excerpt });
     expect(projection).not.toHaveProperty('findings');
+  });
+
+  it('forwards a completed nonzero exit as descriptive evidence without a sensitivity verdict', () => {
+    const projection = preflightProjection({
+      classification: 'nonzero-exit', cacheable: true, cacheProvenance: 'miss',
+      changedPaths: ['src/a.ts', 'test/a.test.ts'], changedTestSelectors: ['test/a.test.ts'],
+      revertedProductionManifest: [], sourceIdentities: { mergeBase: 'base', headSha: 'head' },
+      scopedRun: { exitCode: 7, runKind: 'nonzero-exit', ranSelectors: ['test/a.test.ts'], failureExcerpt: 'assertion failed' },
+    });
+
+    expect(projection.preflight).toEqual({
+      classification: 'nonzero-exit', exitCode: 7, runKind: 'nonzero-exit',
+      ranSelectors: ['test/a.test.ts'], excerpt: 'assertion failed',
+    });
+    expect(projection.preflight).not.toHaveProperty('counterfactualSensitivity');
   });
 
   it('classifies a scoped command execution error as a mechanical fault with bounded projection evidence', async () => {
@@ -43,7 +61,9 @@ describe('build-review test-quality preflight', () => {
     });
 
     expect(result).toMatchObject({ classification: 'infrastructure-failure', reason: 'scoped-run-failed' });
-    expect(preflightProjection(result).preflight).toEqual({ classification: 'infrastructure-failure', excerpt: '' });
+    expect(preflightProjection(result).preflight).toMatchObject({
+      classification: 'infrastructure-failure', excerpt: expect.stringContaining('command unavailable'),
+    });
   });
 
   it.each([
@@ -72,11 +92,11 @@ describe('build-review test-quality preflight', () => {
     expect(scopedRunFailure({ kind: 'nonzero-exit', exitCode: 1, stdout: 'RED', stderr: '' })).toBeUndefined();
   });
 
-  it('accepts a nonzero process exit as counterfactual RED evidence', async () => {
+  it('records completed exits neutrally, retaining only bounded nonzero output', async () => {
     const nonzeroExit: TautologyScopedRunResult = { kind: 'nonzero-exit', exitCode: 1, stdout: 'RED', stderr: '' };
     expectTypeOf(nonzeroExit).toMatchTypeOf<TautologyScopedRunResult>();
 
-    const result = await materializeTautologyPreflight({
+    const nonzero = await materializeTautologyPreflight({
       scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
       diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
       createCheckout: async () => {}, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
@@ -84,10 +104,62 @@ describe('build-review test-quality preflight', () => {
       removeCheckout: async () => {},
     });
 
-    expect(result).toMatchObject({
-      classification: 'red',
-      scopedRun: { exitCode: 1, runKind: 'nonzero-exit' },
+    expect(nonzero).toMatchObject({
+      classification: 'nonzero-exit',
+      scopedRun: { exitCode: 1, runKind: 'nonzero-exit', failureExcerpt: 'RED' },
     });
+
+    const zero = await materializeTautologyPreflight({
+      scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+      diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
+      createCheckout: async () => {}, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
+      runScoped: async () => ({ exitCode: 0, stdout: 'verbose output', stderr: '' }),
+      removeCheckout: async () => {},
+    });
+
+    expect(zero).toMatchObject({
+      classification: 'stayed-green',
+      scopedRun: { exitCode: 0, runKind: 'passed', failureExcerpt: '' },
+    });
+  });
+
+  it.each([
+    ['checkout', { createCheckout: async () => { throw new Error('boom-checkout'); } }],
+    ['merge-base read', { readMergeBaseFile: async () => { throw new Error('boom-read'); } }],
+    ['materialized write', { writeFile: async () => { throw new Error('boom-write'); } }],
+  ])('retains the %s materialization error as bounded infrastructure evidence', async (_operation, overrides) => {
+    const result = await materializeTautologyPreflight({
+      scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+      diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
+      createCheckout: async () => {}, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
+      runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'RED', stderr: '' }), removeCheckout: async () => {},
+      ...overrides,
+    });
+
+    expect(result).toMatchObject({ classification: 'infrastructure-failure', reason: 'materialization-failed' });
+    if (result.classification !== 'infrastructure-failure') throw new Error('expected infrastructure failure');
+    expect(result.failureExcerpt).toContain(`boom-${_operation === 'checkout' ? 'checkout' : _operation === 'merge-base read' ? 'read' : 'write'}`);
+  });
+
+  it('retains non-Error and truncated materialization throws as bounded evidence', async () => {
+    const nonError = await materializeTautologyPreflight({
+      scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+      diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
+      createCheckout: async () => { throw 'non-error materialization failure'; }, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
+      runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'RED', stderr: '' }), removeCheckout: async () => {},
+    });
+    const oversized = await materializeTautologyPreflight({
+      scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+      diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
+      createCheckout: async () => { throw new Error(`HEAD ${'x'.repeat(TAUTOLOGY_EXCERPT_CAP_BYTES * 2)} TAIL`); }, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
+      runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'RED', stderr: '' }), removeCheckout: async () => {},
+    });
+
+    expect(nonError).toMatchObject({ failureExcerpt: 'non-error materialization failure' });
+    if (oversized.classification !== 'infrastructure-failure') throw new Error('expected infrastructure failure');
+    expect(Buffer.byteLength(oversized.failureExcerpt!, 'utf8')).toBeLessThanOrEqual(TAUTOLOGY_EXCERPT_CAP_BYTES);
+    expect(oversized.failureExcerpt).toMatch(/\[\.\.\.truncated \d+ bytes\.\.\.\]/);
+    expect(oversized.failureExcerpt).toContain('TAIL');
   });
 
   it('derives removal-maintenance eligibility per changed selector rather than per diff', () => {
@@ -148,7 +220,7 @@ describe('build-review test-quality preflight', () => {
       tests: ['test/a.test.ts'], testSupport: [], production: ['src/a.ts'],
     });
     expect(result).toMatchObject({
-      classification: 'red', changedTestSelectors: ['test/a.test.ts'],
+      classification: 'nonzero-exit', changedTestSelectors: ['test/a.test.ts'],
       sourceIdentities: { mergeBase: 'base-sha', headSha: 'head-sha' },
       // Content-free manifest: the sha is git's own blob identity for
       // 'BASE production' (pinned via `git hash-object`), never the bytes.
@@ -163,6 +235,33 @@ describe('build-review test-quality preflight', () => {
       'remove:/feature/.pipeline/build-review-preflight/head-sha',
     ]);
     expect(JSON.stringify(rootSnapshot)).toBe(featureSnapshot);
+  });
+
+  it('executes an engine-selected conservative file union without changing diff-derived test evidence', async () => {
+    const runScoped = vi.fn(async () => ({ exitCode: 0 as const, stdout: '', stderr: '' }));
+    const result = await materializeTautologyPreflight({
+      scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+      diff: [
+        'diff --git a/src/a.ts b/src/a.ts',
+        'diff --git a/test/established.test.ts b/test/established.test.ts',
+      ].join('\n'),
+      // An affected opted-in candidate is intentionally run even though it is
+      // not an established review target. This is an execution selector only.
+      counterfactualFileSelectors: ['test/candidate-group.test.ts', 'test/established.test.ts'],
+      createCheckout: async () => {}, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
+      runScoped, removeCheckout: async () => {},
+    });
+
+    expect(runScoped).toHaveBeenCalledWith(
+      expect.any(String),
+      ['test/candidate-group.test.ts', 'test/established.test.ts'],
+      expect.any(AbortSignal),
+    );
+    expect(result).toMatchObject({
+      changedTestSelectors: ['test/established.test.ts'],
+      counterfactualFileSelectors: ['test/candidate-group.test.ts', 'test/established.test.ts'],
+      scopedRun: { ranSelectors: ['test/candidate-group.test.ts', 'test/established.test.ts'] },
+    });
   });
 
   it('reverts a renamed production file to its merge-base path before running the counterfactual', async () => {
@@ -189,7 +288,7 @@ describe('build-review test-quality preflight', () => {
     });
 
     expect(result).toMatchObject({
-      classification: 'red',
+      classification: 'nonzero-exit',
       revertedProductionManifest: [{ path: '.docs/conflicts/original.md' }],
     });
     expect(calls).toEqual([
@@ -289,7 +388,7 @@ describe('build-review test-quality preflight', () => {
     });
 
     expect(result).toMatchObject({
-      classification: 'red', changedTestSelectors: ['test/engine/build-review-cli.test.ts'],
+      classification: 'nonzero-exit', changedTestSelectors: ['test/engine/build-review-cli.test.ts'],
       revertedProductionManifest: [{ path: 'src/engine/build-review.ts', mergeBaseBlobSha: '6d072882cd6d41f5e04eda24ee5bbafac54c2c77' }],
     });
     expect(readMergeBaseFile).toHaveBeenCalledTimes(1);
@@ -306,7 +405,7 @@ describe('build-review test-quality preflight', () => {
     );
   });
 
-  it('treats every nonzero scoped process exit as RED evidence', async () => {
+  it('records every nonzero scoped process exit neutrally', async () => {
     const result = await materializeTautologyPreflight({
       scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
       diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
@@ -315,10 +414,10 @@ describe('build-review test-quality preflight', () => {
       removeCheckout: async () => {},
     });
 
-    expect(result).toMatchObject({ classification: 'red', scopedRun: { runKind: 'nonzero-exit' } });
+    expect(result).toMatchObject({ classification: 'nonzero-exit', scopedRun: { runKind: 'nonzero-exit' } });
   });
 
-  it('classifies a reverted-tree nonzero process exit as RED', async () => {
+  it('classifies a reverted-tree nonzero process exit as nonzero-exit', async () => {
     const result = await materializeTautologyPreflight({
       scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
       diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
@@ -327,7 +426,7 @@ describe('build-review test-quality preflight', () => {
       removeCheckout: async () => {},
     });
 
-    expect(result).toMatchObject({ classification: 'red', cacheable: true });
+    expect(result).toMatchObject({ classification: 'nonzero-exit', cacheable: true });
   });
 
   it('cleans up a partially-created checkout and reports materialization failure as infrastructure', async () => {
@@ -341,14 +440,14 @@ describe('build-review test-quality preflight', () => {
     expect(removeCheckout).toHaveBeenCalledWith('/feature/.pipeline/build-review-preflight/head');
   });
 
-  it('keeps RED, stayed-green, and approved exceptions distinct and caches only completed evidence', async () => {
+  it('keeps nonzero exits, stayed-green, and approved exceptions distinct and caches only completed evidence', async () => {
     const base = {
       scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
       diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
       createCheckout: vi.fn(async () => {}), readMergeBaseFile: vi.fn(async () => 'BASE'), writeFile: vi.fn(async () => {}),
       removeCheckout: vi.fn(async () => {}), readCache: vi.fn(async () => undefined), writeCache: vi.fn(async () => {}),
     };
-    const red = await materializeTautologyPreflight({ ...base, runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'failed', stderr: '' }) });
+    const nonzeroExit = await materializeTautologyPreflight({ ...base, runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'failed', stderr: '' }) });
     const stayedGreen = await materializeTautologyPreflight({ ...base, runScoped: async () => ({ exitCode: 0, stdout: 'passed', stderr: '' }) });
     const qualifyingDiff = 'diff --git a/src/a.ts b/src/a.ts\n-export function retired() {}\ndiff --git a/test/a.test.ts b/test/a.test.ts\n+expect(retired).toBeUndefined()';
     const eligible = deriveRemovalMaintenanceSelectors(qualifyingDiff, ['test/a.test.ts'], {
@@ -356,7 +455,7 @@ describe('build-review test-quality preflight', () => {
     });
     const exception = await materializeTautologyPreflight({ ...base, diff: qualifyingDiff, approvedException: 'removal-maintenance', removalMaintenanceSelectors: eligible, runScoped: async () => ({ exitCode: 0, stdout: '', stderr: '' }) });
 
-    expect(red).toMatchObject({ classification: 'red', cacheable: true });
+    expect(nonzeroExit).toMatchObject({ classification: 'nonzero-exit', cacheable: true });
     expect(stayedGreen).toMatchObject({ classification: 'stayed-green', cacheable: true });
     expect(exception).toMatchObject({ classification: 'approved-exception', exception: 'removal-maintenance', cacheable: true });
     expect(base.writeCache).toHaveBeenCalledTimes(3);
@@ -393,7 +492,7 @@ describe('build-review test-quality preflight', () => {
     ['cleanup failure', () => ({ removeCheckout: async () => { throw new Error('cleanup failed'); } }), 'cleanup-failed'],
     ['cache read failure', () => ({ readCache: async () => { throw new Error('cache unavailable'); } }), 'cache-read-failed'],
     ['cache write failure', () => ({ writeCache: async () => { throw new Error('cache unavailable'); } }), 'cache-write-failed'],
-  ])('does not fabricate an excerpt for %s', async (_name, overrides, reason) => {
+  ])('keeps non-throwing %s infrastructure failures output-free', async (_name, overrides, reason) => {
     const result = await materializeTautologyPreflight({
       scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
       diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
@@ -404,11 +503,15 @@ describe('build-review test-quality preflight', () => {
     });
 
     expect(result).toMatchObject({ classification: 'infrastructure-failure', reason });
-    expect(result).not.toHaveProperty('failureExcerpt');
+    if (_name === 'materialization failure') {
+      expect(result).toMatchObject({ failureExcerpt: expect.stringContaining('disk full') });
+    } else {
+      expect(result).not.toHaveProperty('failureExcerpt');
+    }
   });
 
   it('reuses an exact cached completed result without another checkout or scoped command', async () => {
-    const cached = { classification: 'red', cacheable: true, cacheProvenance: 'miss', changedPaths: ['src/a.ts', 'test/a.test.ts'], changedTestSelectors: ['test/a.test.ts'], revertedProductionManifest: [{ path: 'src/a.ts', mergeBaseBlobSha: 'e79120aab4682bfe81153595c7d2ec1ad3bd3dd8' }], sourceIdentities: { mergeBase: 'base', headSha: 'head' }, scopedRun: { exitCode: 1, runKind: 'nonzero-exit', ranSelectors: ['test/a.test.ts'], failureExcerpt: 'RED' } } as const;
+    const cached = { classification: 'nonzero-exit', cacheable: true, cacheProvenance: 'miss', changedPaths: ['src/a.ts', 'test/a.test.ts'], changedTestSelectors: ['test/a.test.ts'], revertedProductionManifest: [{ path: 'src/a.ts', mergeBaseBlobSha: 'e79120aab4682bfe81153595c7d2ec1ad3bd3dd8' }], sourceIdentities: { mergeBase: 'base', headSha: 'head' }, scopedRun: { exitCode: 1, runKind: 'nonzero-exit', ranSelectors: ['test/a.test.ts'], failureExcerpt: 'RED' } } as const;
     const createCheckout = vi.fn(async () => {});
     const runScoped = vi.fn(async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: '', stderr: '' }));
     const result = await materializeTautologyPreflight({
@@ -416,7 +519,7 @@ describe('build-review test-quality preflight', () => {
       createCheckout, readMergeBaseFile: async () => 'BASE', writeFile: async () => {}, runScoped, removeCheckout: async () => {},
       readCache: async () => cached, writeCache: async () => {},
     });
-    expect(result).toMatchObject({ classification: 'red', cacheProvenance: 'hit' });
+    expect(result).toMatchObject({ classification: 'nonzero-exit', cacheProvenance: 'hit' });
     expect(createCheckout).not.toHaveBeenCalled();
     expect(runScoped).not.toHaveBeenCalled();
   });
@@ -453,7 +556,7 @@ describe('build-review test-quality preflight', () => {
     ['timeout', async () => ({ runScoped: async () => ({ kind: 'timeout' as const, stdout: '', stderr: '' }) }), 'scoped-run-timeout'],
     ['signal termination', async () => ({ runScoped: async () => ({ kind: 'signal' as const, signal: 'SIGTERM', stdout: '', stderr: '' }) }), 'scoped-run-signaled'],
     ['scoped command rejection', async () => ({ runScoped: async () => { throw new Error('command failed'); } }), 'scoped-run-failed'],
-  ])('fails closed for %s without producing RED evidence', async (_name, overrides, reason) => {
+  ])('fails closed for %s without producing a completed-run classification', async (_name, overrides, reason) => {
     const removeCheckout = vi.fn(async () => {});
     const result = await materializeTautologyPreflight({
       scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
@@ -464,9 +567,22 @@ describe('build-review test-quality preflight', () => {
     });
 
     expect(result).toMatchObject({ classification: 'infrastructure-failure', reason });
-    expect(result.classification).not.toBe('red');
+    expect(result.classification).not.toBe('nonzero-exit');
     if (reason === 'missing-scoped-configuration') expect(removeCheckout).not.toHaveBeenCalled();
     else expect(removeCheckout).toHaveBeenCalledOnce();
+  });
+
+  it('retains a thrown scoped-run error as bounded infrastructure evidence', async () => {
+    const result = await materializeTautologyPreflight({
+      scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+      diff: 'diff --git a/src/a.ts b/src/a.ts\ndiff --git a/test/a.test.ts b/test/a.test.ts',
+      createCheckout: async () => {}, readMergeBaseFile: async () => 'BASE', writeFile: async () => {},
+      runScoped: async () => { throw new Error('boom-run'); }, removeCheckout: async () => {},
+    });
+
+    expect(result).toMatchObject({ classification: 'infrastructure-failure', reason: 'scoped-run-failed' });
+    if (result.classification !== 'infrastructure-failure') throw new Error('expected infrastructure failure');
+    expect(result.failureExcerpt).toContain('boom-run');
   });
 
   it.each([
@@ -534,7 +650,7 @@ describe('build-review test-quality preflight', () => {
       removeCheckout: async () => {},
     });
 
-    if (result.classification !== 'red') throw new Error('expected RED evidence');
+    if (result.classification !== 'nonzero-exit') throw new Error('expected nonzero-exit evidence');
     expect(result.scopedRun).toMatchObject({ exitCode: 7, runKind: 'nonzero-exit', ranSelectors: ['test/a.test.ts'] });
     const excerpt = result.scopedRun!.failureExcerpt;
     expect(excerpt).not.toBe('');
@@ -590,5 +706,130 @@ describe('build-review test-quality preflight', () => {
     });
 
     expect(result).toMatchObject({ classification: 'infrastructure-failure', reason: 'cleanup-failed' });
+  });
+  // #1961: a diff that DELETES a directory leaves the counterfactual checkout
+  // without a parent for the merge-base file being restored. The real
+  // filesystem is the boundary under test here, so these exercise the actual
+  // default write path rather than a mocked one.
+  describe('restores merge-base content into directories the diff deleted', () => {
+    let workdir = '';
+
+    beforeEach(async () => { workdir = await mkdtemp(join(tmpdir(), 'tautology-preflight-')); });
+    afterEach(async () => { await rm(workdir, { recursive: true, force: true }); });
+
+    async function materializeOnDisk(options: {
+      readonly diff: string;
+      readonly mergeBase: Readonly<Record<string, string>>;
+      readonly seedCheckout?: (checkout: string) => Promise<void>;
+    }) {
+      const checkout = join(workdir, '.pipeline', 'build-review-preflight', 'head');
+      const result = await materializeTautologyPreflight({
+        scopedWorkingDirectory: workdir, mergeBase: 'base', headSha: 'head', diff: options.diff,
+        createCheckout: async (path) => {
+          await mkdir(path, { recursive: true });
+          await options.seedCheckout?.(path);
+        },
+        readMergeBaseFile: async (path) => options.mergeBase[path],
+        writeFile: async (path, content) => { await writeFile(path, content); },
+        removeFile: async (path) => { await rm(path, { force: true }); },
+        runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'RED', stderr: '' }),
+        // Retained so the materialized tree can be asserted; production
+        // cleanup is covered by the checkout-lifecycle tests above.
+        removeCheckout: async () => {},
+      });
+      return { result, checkout };
+    }
+
+    it('materializes a changed production file whose parent directory the diff deleted', async () => {
+      const { result, checkout } = await materializeOnDisk({
+        diff: [
+          'diff --git a/skills/retro/SKILL.md b/skills/retro/SKILL.md',
+          'diff --git a/test/a.test.ts b/test/a.test.ts',
+        ].join('\n'),
+        mergeBase: { 'skills/retro/SKILL.md': 'BASE skill' },
+      });
+
+      expect(result).toMatchObject({ classification: 'nonzero-exit' });
+      expect(await readFile(join(checkout, 'skills/retro/SKILL.md'), 'utf-8')).toBe('BASE skill');
+    });
+
+    it('creates every missing intermediate directory for a deeply nested restore', async () => {
+      const { result, checkout } = await materializeOnDisk({
+        diff: [
+          'diff --git a/src/a/b/c/d/deep.ts b/src/a/b/c/d/deep.ts',
+          'diff --git a/test/a.test.ts b/test/a.test.ts',
+        ].join('\n'),
+        mergeBase: { 'src/a/b/c/d/deep.ts': 'BASE deep' },
+      });
+
+      expect(result).toMatchObject({ classification: 'nonzero-exit' });
+      expect(await readFile(join(checkout, 'src/a/b/c/d/deep.ts'), 'utf-8')).toBe('BASE deep');
+    });
+
+    it('reverts a rename whose old path directory does not exist in the checkout', async () => {
+      const { result, checkout } = await materializeOnDisk({
+        diff: [
+          'diff --git a/skills/retro/SKILL.md b/skills/kept/SKILL.md',
+          'similarity index 100%',
+          'rename from skills/retro/SKILL.md',
+          'rename to skills/kept/SKILL.md',
+          'diff --git a/test/a.test.ts b/test/a.test.ts',
+        ].join('\n'),
+        mergeBase: { 'skills/retro/SKILL.md': 'BASE renamed-away' },
+        seedCheckout: async (path) => {
+          await mkdir(join(path, 'skills/kept'), { recursive: true });
+          await writeFile(join(path, 'skills/kept/SKILL.md'), 'HEAD skill');
+        },
+      });
+
+      expect(result).toMatchObject({
+        classification: 'nonzero-exit',
+        revertedProductionManifest: [{ path: 'skills/retro/SKILL.md' }],
+      });
+      expect(await readFile(join(checkout, 'skills/retro/SKILL.md'), 'utf-8')).toBe('BASE renamed-away');
+      await expect(readFile(join(checkout, 'skills/kept/SKILL.md'), 'utf-8')).rejects.toThrow();
+    });
+
+    it('leaves an existing parent directory and its unrelated contents intact', async () => {
+      const { result, checkout } = await materializeOnDisk({
+        diff: [
+          'diff --git a/src/a.ts b/src/a.ts',
+          'diff --git a/test/a.test.ts b/test/a.test.ts',
+        ].join('\n'),
+        mergeBase: { 'src/a.ts': 'BASE production' },
+        seedCheckout: async (path) => {
+          await mkdir(join(path, 'src'), { recursive: true });
+          await writeFile(join(path, 'src/a.ts'), 'HEAD production');
+          await writeFile(join(path, 'src/sibling.ts'), 'HEAD sibling');
+        },
+      });
+
+      expect(result).toMatchObject({ classification: 'nonzero-exit' });
+      expect(await readFile(join(checkout, 'src/a.ts'), 'utf-8')).toBe('BASE production');
+      expect(await readFile(join(checkout, 'src/sibling.ts'), 'utf-8')).toBe('HEAD sibling');
+    });
+
+    it('creates the parent through the injected seam immediately before each write', async () => {
+      const calls: string[] = [];
+      const result = await materializeTautologyPreflight({
+        scopedWorkingDirectory: '/feature', mergeBase: 'base', headSha: 'head',
+        diff: [
+          'diff --git a/skills/retro/SKILL.md b/skills/retro/SKILL.md',
+          'diff --git a/test/a.test.ts b/test/a.test.ts',
+        ].join('\n'),
+        createCheckout: async () => {},
+        readMergeBaseFile: async () => 'BASE skill',
+        ensureDir: async (path) => { calls.push(`ensure:${path}`); },
+        writeFile: async (path) => { calls.push(`write:${path}`); },
+        runScoped: async () => ({ kind: 'nonzero-exit' as const, exitCode: 1, stdout: 'RED', stderr: '' }),
+        removeCheckout: async () => {},
+      });
+
+      expect(result).toMatchObject({ classification: 'nonzero-exit' });
+      expect(calls).toEqual([
+        'ensure:/feature/.pipeline/build-review-preflight/head/skills/retro/SKILL.md',
+        'write:/feature/.pipeline/build-review-preflight/head/skills/retro/SKILL.md',
+      ]);
+    });
   });
 });

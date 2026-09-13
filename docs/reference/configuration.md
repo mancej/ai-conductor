@@ -17,6 +17,7 @@ code that consumes it, and what a bad value does. Sections follow the loader's o
 | Project config | `<project>/.ai-conductor/config.yml` | `PROJECT_CONFIG_DIR` / `PROJECT_CONFIG_FILE`, `src/conductor/src/engine/config.ts:94-95` |
 | User config | `~/.ai-conductor/config.yml` | `src/conductor/src/engine/user-config.ts:13-19` |
 | Project rate card | `<project>/.ai-conductor/rate-card.json` | `RATE_CARD_RELATIVE_PATH`, `src/conductor/src/execution/rate-card.ts` |
+| Global rate card (fallback) | `~/.ai-conductor/rate-card.json` | `globalRateCardPath`, `src/conductor/src/execution/rate-card.ts` |
 | Legacy project dir | `<project>/.harness/config.yml` | `LEGACY_PROJECT_CONFIG_DIR`, `config.ts:96` |
 | Legacy user JSON seed | `~/.claude/ai-conductor.config.json` (flat camelCase) | One-time migration input; after a successful seed it is renamed to `ai-conductor.config.json.migrated` |
 
@@ -30,9 +31,9 @@ projects.
 already exists, and returns `false` silently on any failure without touching either file
 (`config.ts:112-123`, called at `:132`).
 
-`conduct-ts create <name>` writes a new repository's project config from
+`ai-conductor create <name>` writes a new repository's project config from
 `templates/project-config.yml.template`. For an existing Git repository, run
-`conduct-ts config init`; it writes the same template when the file is absent, reports success
+`ai-conductor config init`; it writes the same template when the file is absent, reports success
 without changing bytes when the file already exists, and refuses a non-Git directory. The missing-file
 error names this command as its remedy. `bin/install` and `bin/migrate` continue to write only the
 user file.
@@ -41,7 +42,7 @@ user file.
 
 A committed, project-scoped JSON file of per-model token prices. It is durable state read by name,
 not configuration: it has no keys in `config.yml`, no user-scoped counterpart, and no precedence
-rules. Maintain it with `conduct-ts rate-card refresh` (see the CLI reference) and commit the result.
+rules. Maintain it with `ai-conductor rate-card refresh` (see the CLI reference) and commit the result.
 `.github/workflows/rate-card-refresh.yml` also runs that refresh daily and opens a bot pull
 request on `automation/rate-card` when the published rates change, so the card does not rot
 between manual refreshes. Review such a PR as a **cost change**: merging it alters every
@@ -51,6 +52,14 @@ which is why the card is committed rather than fetched live.
 
 The card's `as_of` therefore tracks when the rates last **changed**, not when they were last
 checked: a refresh that finds identical rates leaves the committed file untouched.
+
+The **global card** at `~/.ai-conductor/rate-card.json` takes precedence, so every project prices
+codex from one current source — not just projects that ran their own refresh. `bin/install` and
+`bin/update` maintain it as a symlink to the harness checkout's committed card
+(`sync_global_rate_card`, `bin/lib/harness-common.sh`) — the same idiom as skill installs — so a
+merged rate-card bot PR updates every project at once with no re-install. A regular file already at
+that path is treated as operator-owned and left alone. A committed project card applies only where
+no global card exists (e.g. an environment that never ran `bin/install`).
 
 It exists because providers disagree about reporting cost. Claude Code returns `total_cost_usd` on
 every dispatch, so its `TokenUsage.costUsd` is provider truth. Codex returns token counts and no
@@ -97,8 +106,8 @@ Rules that govern how the card is used:
   and `rate-card` for a harness estimate. A provider-reported cost is never overwritten.
 - **Cost-unmetered dispatches are visible.** The finish usage line names them explicitly
   (`N cost-unmetered (tokens counted, cost not)`), so a partial cost can never be read as a total.
-- **Refreshes are picked up live.** The card is re-read when its mtime changes; refreshing it
-  mid-run does not require a daemon restart.
+- **The card is read once per process.** Rates change rarely (a merged bot PR); a daemon or CLI
+  restart picks up the new card.
 
 ## Load order and precedence
 
@@ -122,7 +131,7 @@ key. Explicit project values remain authoritative, including their existing reje
 clamping, and warning behavior. Step 4 materializes runtime defaults once for values absent from both
 scopes. This applies uniformly to every defaulted key, including `attribution_audit_sample_pct`,
 `auto_restart_on_stale_engine`, `engine_refresh_min_interval_seconds`, `build_review`, `ci_watch`,
-`build_progress_halt`, `kickback_escalation`, and `retry_routing`.
+`build_progress_halt`, `kickback_escalation`, `gate_code_validity`, and `retry_routing`.
 
 > **Known limitation.** `loadMergedConfig`'s own docstring says "User-config parse errors become warnings,
 > not hard failures" (`config.ts:1700-1705`), but the code returns a hard `parse_error`
@@ -154,7 +163,7 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 
 ## Key index
 
-42 top-level keys are allow-listed (plus one retired, no-op key - `wiring`, see
+44 top-level keys are allow-listed (plus one retired, no-op key — `wiring`, see
 [build_review](#build_review)). Everything else fails the load.
 
 | Key | Type | Default | Section |
@@ -172,6 +181,7 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 | `test_suite` | object | none | [test_suite](#test_suite) |
 | `llm_provider` | string \| string[] | `['claude']` | [llm_provider](#llm_provider) |
 | `ui_renderer` | string | `terminal` | [ui_renderer](#ui_renderer) |
+| `visualizers` | string[] | unset | [visualizers](#visualizers) |
 | `memory_provider` | string | `local` | [memory_provider](#memory_provider) |
 | `otel` | object | disabled | [otel](#otel) |
 | `build_progress` | object | see section | [build_progress](#build_progress) |
@@ -181,6 +191,7 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 | `attribution_audit_sample_pct` | number | `10` | [attribution telemetry](#attribution-telemetry) |
 | `rebase_resolution_attempts` | number | `3` | [rebase_resolution_attempts](#rebase_resolution_attempts) |
 | `validation_concurrency` | number | `4` | [validation_concurrency](#validation_concurrency) |
+| `daemon_concurrency` | number | `1` | [daemon_concurrency](#daemon_concurrency) |
 | `harness_self_host` | object | see section | [harness_self_host](#harness_self_host) |
 | `model_fallback_ladder` | string[] | provider policy | [model_fallback_ladder](#model_fallback_ladder) |
 | `auto_restart_on_stale_engine` | boolean | `false` | [auto_restart_on_stale_engine](#auto_restart_on_stale_engine) |
@@ -196,10 +207,12 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 | `retry_routing` | object | `{ enabled: true }` | [retry_routing](#retry_routing) |
 | `kickback_escalation` | object | `{ enabled: true }` | [kickback_escalation](#kickback_escalation) |
 | `cumulative_kickback_bound` | object | `{ enabled: true }` | [cumulative_kickback_bound](#cumulative_kickback_bound) |
+| `gate_code_validity` | object | `{ enabled: true }` | [gate_code_validity](#gate_code_validity) |
 | `daemon_verbose` | boolean | `false` | [daemon_verbose](#daemon_verbose) |
 | `reconcile_parked_auto_cleanup` | boolean | `true` | [reconcile_parked_auto_cleanup](#reconcile_parked_auto_cleanup) |
 | `provider_preparation_timeout_minutes` | number | `5` | [provider_preparation_timeout_minutes](#provider_preparation_timeout_minutes) |
 | `teardown_timeout_seconds` | number | `120` | [teardown_timeout_seconds](#teardown_timeout_seconds) |
+| `dispatch_start_timeout_seconds` | number | `120` | [dispatch_start_timeout_seconds](#dispatch_start_timeout_seconds) |
 | `step_heartbeat_stall_minutes` | number | deprecated no-op | [step_heartbeat_stall_minutes](#step_heartbeat_stall_minutes) |
 | `stale_claim_window_hours` | number | `24` | [stale_claim_window_hours](#stale_claim_window_hours) |
 | `engineer_review_retention_days` | integer | `14` | [engineer_review_retention_days](#engineer_review_retention_days) |
@@ -232,16 +245,11 @@ Baseline knobs applied to every step that does not override them. Validated by
 | `defaults.effort` | string | `low`, `medium`, `high`, `xhigh`, `max` | provider policy per step | Sets `CLAUDE_CODE_EFFORT_LEVEL` for the dispatch |
 | `defaults.max_retries` | number | any number, no range check | `DEFAULT_STEP_RETRIES[step]` | Attempt budget before a step fails |
 | `defaults.escalate` | boolean | `true`, `false` | `true` | Whether retries climb the escalation ladder |
-| `defaults.by_tier` | object | keys `S`, `M`, `L`; each `{ model?, effort?, max_retries? }` | none | Accepted by the validator, never read |
 
 `defaults.max_retries` interacts with [`build_progress_halt.attempt_ceiling`](#build_progress_halt):
 raising it above an **explicitly set** ceiling makes the config fail to load.
 
-> **Known limitation.** `defaults.by_tier` validates but has no consumer. `DefaultsConfig`
-> (`src/conductor/src/types/config.ts:189-195`) does not declare the field, and
-> `resolveProviderNativeStepConfig` reads `by_tier` only from `steps.*` and `phases.*`
-> (`src/conductor/src/engine/resolved-config.ts:236-237, 348-349`). Put tier overrides on a phase or a
-> step. Tracked in [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
+Tier overrides belong on a phase or step; `defaults.by_tier` is rejected.
 
 ## phases
 
@@ -271,7 +279,7 @@ Per-step overrides, keyed by step name. A key matching a built-in step name over
 other key declares a custom step. `steps` must be an object, and each value must be an object
 (`config.ts:303-330`).
 
-"Built-in" here means a member of `ALL_STEPS` — the 22 sequential steps. The four out-of-band steps
+"Built-in" here means a member of `ALL_STEPS` — the 21 sequential steps. The four out-of-band steps
 (`bootstrap`, `assess`, `remediate`, `attribution_verify`) live in `OUT_OF_BAND_STEPS`
 (`src/conductor/src/engine/steps.ts:304-345`) and are not part of that set. See [steps](steps.md).
 
@@ -287,7 +295,7 @@ other key declares a custom step. `steps` must be an object, and each value must
 
 ### Per-step keys
 
-15 keys are allow-listed (`knownStepKeys`, `config.ts:334-350`). An unknown key is a hard error
+16 keys are allow-listed (`knownStepKeys`, `config.ts`). An unknown key is a hard error
 `Unknown key in steps.<name>: "<k>"`.
 
 | Key | Type | Validation | Default | Consumer |
@@ -301,12 +309,13 @@ other key declares a custom step. `steps` must be an object, and each value must
 | `skill` | string | Must be a string path (`config.ts:384-386`); for custom steps the file must exist on disk (`config.ts:516-525`) | the built-in skill | `resolved-config.ts:381`, `src/conductor/src/engine/steps.ts:603` |
 | `hooks` | object | Object with optional string `before` / `after` paths (`config.ts:398-408`) | none | `resolved-config.ts:382-385` |
 | `by_tier` | object | See [by_tier](#by_tier) | none | `resolved-config.ts:236, 348` |
-| `when` | string | Grammar-checked at load time; see [when](#when) | none | `src/conductor/src/engine/when-expression.ts:97-136` |
+| `when` | string | Grammar-checked at load time and limited by step enforcement; see [when](#when) | none | `src/conductor/src/engine/when-expression.ts:97-136` |
 | `parallel` | array | See [parallel](#parallel) | none | `config.ts:422-466` |
-| `tdd` | object | Only valid on `steps.build`; see [steps.build.tdd](#stepsbuildtdd) | none | build agent |
 | `after` | string | **Custom steps only** — a built-in step with `after` is a hard error (`config.ts:529-531`) | required for custom steps | `steps.ts:561` |
 | `enforcement` | string | **Custom steps only** (`config.ts:532-534`); `structural`\|`advisory`\|`gating` | `advisory` | `steps.ts:599` |
 | `completion_artifact` | string | **Custom steps only** (`config.ts:535-537`); 7 constraints below | none | `src/conductor/src/engine/artifacts.ts:3086-3135` |
+| `gate` | boolean | **Custom steps only**; a built-in step is a hard error | inherits the `after` target | `steps.ts:605` |
+| `kickback_target` | boolean | **Custom steps only**; a built-in step is a hard error | `false` | `steps.ts:606` |
 
 `steps.<name>.hooks` takes two sub-keys, `before` and `after`, each a project-relative script path.
 
@@ -330,8 +339,12 @@ Tier overrides sit above the flat `steps.<name>` values in the precedence chain.
 
 ### when
 
-A guard expression evaluated per run; when false the step is skipped and a `when_skip` event is emitted.
-Syntax is validated at config-load time by `validateWhenSyntax`
+A guard expression evaluated per run. It is accepted for advisory steps and for a built-in gating
+step that opts into `configDisableAllowed` (currently `manual_test`); it is rejected for every other
+gating step and for structural steps. A custom step is conditional only when its enforcement is
+advisory (including the default). When false, the step is skipped and the daemon renders and persists
+a `when_skip` event. If a state key is undefined, the rendered line identifies that key and records
+that it evaluated false. Syntax is validated at config-load time by `validateWhenSyntax`
 (`src/conductor/src/engine/when-expression.ts:97-136`), which never evaluates the expression.
 
 Supported forms, exhaustively:
@@ -377,43 +390,14 @@ Each branch writes a synthetic state key `<step_name>__<branch_name>` into
 Branch fan-out is bounded by [`validation_concurrency`](#validation_concurrency), clamped to the branch
 count (`src/conductor/src/engine/conductor.ts:6357`).
 
-### steps.build.tdd
-
-Per-sub-phase model hints for the TDD loop inside the build step. Valid only on `steps.build` — anywhere
-else is a hard error `steps.<name>.tdd is only valid for the build step` (`config.ts:387-389`).
-
-```yaml
-llm_provider: claude
-steps:
-  build:
-    tdd:
-      red:
-        model: sonnet
-      green:
-        model: opus
-```
-
-Validated by `validateTddModelConfig` (`config.ts:47-92`):
-
-- The block must be an object with only `red` and `green` keys.
-- Each must be an object containing only a `model` key holding a non-empty string.
-- The model must be a member of the resolved provider's `modelEscalationOrder` — `haiku`, `sonnet`,
-  `opus`, `fable` for `claude`; `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` for `codex`.
-- The provider key comes from top-level `llm_provider` when it is a string, otherwise `claude`
-  (`config.ts:394`). A top-level `llm_provider` **array** is a hard error:
-  `steps.build.tdd requires llm_provider to be a string`.
-- A provider outside `{claude, codex}` fails with `… has no native TDD model policy.`
-
-The values are advisory: the build agent passes the model to its RED or GREEN child dispatch. No separate
-conductor step is created (`src/conductor/src/types/config.ts:59-75`).
-
 ### Disabling a step
 
-`disable: true` is checked against the step's enforcement level (`config.ts:539-554`):
+`disable: true` is checked against the step's enforcement level:
 
 | Step kind | Disableable |
 | --- | --- |
-| Custom step | Yes, always |
+| Custom `advisory` | Yes |
+| Custom `gating` or `structural` | No |
 | Built-in `advisory` | Yes |
 | Built-in `gating` | Only when the step definition sets `configDisableAllowed: true` |
 | Built-in `structural` | Never |
@@ -421,10 +405,8 @@ conductor step is created (`src/conductor/src/types/config.ts:59-75`).
 `manual_test` is the only built-in step with `configDisableAllowed: true`
 (`src/conductor/src/engine/steps.ts:214`). Per-step enforcement values are listed in [steps](steps.md).
 
-> **Known limitation.** The rejection message reads `Cannot disable <enforcement> step: "<name>". Only
-> advisory steps may be disabled.` (`config.ts:550-552`), which understates the rule — `manual_test` is
-> a gating step and is disableable. Tracked in
-> [#1026](https://github.com/jstoup111/ai-conductor/issues/1026).
+The rejection message says that only advisory steps may be disabled. That wording describes the
+default rule; the explicitly opted-in `manual_test` exception remains valid.
 
 ### Custom step registry contract
 
@@ -433,7 +415,7 @@ Any `steps.<name>` key that is not a built-in step name declares a custom step
 `indexOf(after) + 1` using an iterative fixed-point loop, so chains of custom steps resolve
 (`steps.ts:578-620`). Siblings sharing an `after` target keep config-file order.
 
-Six fields are available to a custom step:
+Six fields are custom-step-only:
 
 | Field | Required | Effect |
 | --- | --- | --- |
@@ -441,8 +423,12 @@ Six fields are available to a custom step:
 | `skill` | Yes | Path to the `SKILL.md` to dispatch. Missing: `Custom step "<n>" requires 'skill: <path-to-SKILL.md>'`. The file must exist relative to the project root, else `Custom step "<n>" skill file not found: <path>` (`config.ts:511-525`) |
 | `enforcement` | No | `structural`, `advisory`, or `gating`. Defaults to `advisory` (`steps.ts:563`) |
 | `completion_artifact` | No | Path the step must write to be considered done; see below |
-| `disable` | No | Boolean; custom steps bypass the `configDisableAllowed` check entirely |
-| `when` / `parallel` / `model` / `effort` / `max_retries` / `escalate` / `hooks` / `by_tier` / `llm_provider` | No | Same semantics as for built-in steps |
+| `gate` | No | Boolean. Overrides loop-gate membership; when omitted, inherits the `after` target's membership |
+| `kickback_target` | No | Boolean. Makes this step reopenable by a downstream kickback; defaults to `false` |
+
+`disable`, `when`, `parallel`, `model`, `effort`, `max_retries`, `escalate`, `hooks`, `by_tier`, and
+`llm_provider` use the same semantics as for built-in steps. A custom step's own enforcement controls
+whether it may be disabled or conditional: advisory is allowed; gating and structural are rejected.
 
 The derived `StepDefinition` (`steps.ts:595-609`) sets `label = name`, inherits `phase` from the `after`
 target, sets `prerequisites = [after]`, `skippableForTiers = []`, `isCheckpoint = false`, and takes
@@ -478,14 +464,10 @@ its `mtimeMs` must be at or above the attempt or session freshness floor; a stal
 `… is stale — <step> must rewrite it during this attempt`, and a missing floor reports that completion
 `cannot be verified without an attempt or session freshness floor`.
 
-> **Known limitation.** `steps.<custom>.gate` and `steps.<custom>.kickback_target` are declared with full
-> semantics in `src/conductor/src/types/config.ts:134-146` and read by `buildStepRegistry`
-> (`steps.ts:607-608`), but neither is in `knownStepKeys` (`config.ts:334-350`). Setting either fails
-> the load with `Unknown key in steps.<n>: "gate"` / `"kickback_target"`. The legacy adapter
-> `customStepEntries()` (`config.ts:1765-1785`) also drops both fields. A custom step's loop-gate
-> membership can only be inherited from its `after` target, and it can never be a kickback target.
-> Tracked in
-> [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
+`completion_artifact` is completion evidence, not an artifact-review declaration. In default and
+interactive runs, the conductor opens an artifact-review prompt only for a step with built-in artifact
+contracts or configured extra artifact globs. A custom step that declares only a completion marker
+therefore completes without an empty review prompt; its marker is still checked fail-closed.
 
 This repo's own custom step is documented in [self-hosting](../guides/self-hosting.md).
 
@@ -493,12 +475,8 @@ This repo's own custom step is documented in [self-hosting](../guides/self-hosti
 
 | Key | Type | Allowed | Default | Consumer |
 | --- | --- | --- | --- | --- |
-| `complexity.default_tier` | string | `S`, `M`, `L` (`config.ts:565`) | none | none |
 
-> **Known limitation.** `complexity.default_tier` validates and is echoed back unchanged, but no engine
-> code reads it — the only two references in the repo are the type declaration
-> (`src/conductor/src/types/config.ts:409-411`) and the validator. Setting it does not preselect a tier.
-> Tracked in [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
+The block remains reserved; any key inside it is rejected.
 
 For what does resolve a tier, see
 [where the tier comes from](steps.md#where-the-tier-comes-from).
@@ -508,7 +486,8 @@ For what does resolve a tier, see
 The sole update-check configuration surface. `bin/install` and the update flow read and write the
 user-level `conductor:` block in `~/.ai-conductor/config.yml`; it is validated by
 `validateConductorBlock` (`config.ts:1133-1165`), and an unknown key inside the block is a hard
-error.
+error. A project `.ai-conductor/config.yml` that contains `conductor` is rejected; move the block
+to the user configuration so one repository cannot override another operator's update settings.
 
 | Key | Type | Allowed | Written by |
 | --- | --- | --- | --- |
@@ -531,17 +510,12 @@ kept for a later repair, but the read still proceeds and decides fail-closed on 
 block alone. A *write* stays fail-closed on the seed, so an explicit value can never be replayed
 over by legacy JSON on a later run. Without this split, an unseedable `~/.claude` file disabled the
 update check outright even with a perfectly readable `config.yml` — most visibly mid-update, where a
-`conduct-ts` build old enough to predate `config set` failed the seed's write while `config read`
+`ai-conductor` build old enough to predate `config set` failed the seed's write while `config read`
 still worked.
 
 Fresh installs default to `stable`, whose branch advances only after release CI publishes the matching
 semver tag and GitHub Release. `tagged` retains semver tag checkout behavior, and `main` follows every
 merge. Existing configured channels and version pins are preserved by installer updates.
-
-> **Known limitation.** `src/conductor/src/types/config.ts:198-201` states "Project configs should not
-> override this block — it's per-user, not per-repo," but nothing enforces it. Unlike `spec_owner`, a
-> `conductor` block in a project config loads and wins the merge. Tracked in
-> [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
 
 ## markdown_viewer and mermaid_renderer
 
@@ -621,11 +595,13 @@ The project-owned aggregate verification command run by the pre-SHIP `test_suite
 | Key | Type | Required | Validation | Default |
 | --- | --- | --- | --- | --- |
 | `test_suite.command` | string | Yes, unless `test_suite.scoped_command` is configured | Non-empty after trim (`config.ts:1217-1221`) | — |
-| `test_suite.scoped_command` | string | No | Non-empty after trim and must contain `{selectors}`. `conduct-ts scoped-run <selectors...>` replaces that placeholder with the selected tests; it never falls back to `command`. (`config.ts:1223-1236`) | none; scoped runs are unavailable |
-| `test_suite.working_directory` | string | No | Must be relative and resolve inside the project root. Absolute paths, `..` escapes, and symlinks whose realpath escapes the root are hard errors. A non-ENOENT/ENOTDIR realpath error fails closed (`config.ts:1239-1262`). Applies to both the aggregate `command` and `scoped_command`; `conduct-ts scoped-run` rebases project-root-relative selectors onto it | project root |
+| `test_suite.scoped_command` | string | No | Non-empty after trim and must contain `{selectors}`. `ai-conductor scoped-run <selectors...>` replaces that placeholder with the selected tests; it never falls back to `command`. (`config.ts:1223-1236`) | none; scoped runs are unavailable |
+| `test_suite.working_directory` | string | No | Must be relative and resolve inside the project root. Absolute paths, `..` escapes, and symlinks whose realpath escapes the root are hard errors. A non-ENOENT/ENOTDIR realpath error fails closed (`config.ts:1239-1262`). Applies to both the aggregate `command` and `scoped_command`; `ai-conductor scoped-run` rebases project-root-relative selectors onto it | project root |
 | `test_suite.timeout_seconds` | number | No | Finite and `> 0` (`config.ts:1264-1274`) | 1800 s (`DEFAULT_FULL_SUITE_TIMEOUT_MS`, `src/conductor/src/engine/full-suite-executor.ts:7`) |
 | `test_suite.inputs` | string[] | No | Array of strings (`config.ts:1276-1287`) | none |
 | `test_suite.environment` | string[] | No | Array of strings | none |
+| `test_suite.verification.mode` | `aggregate` \| `scoped` | No | `scoped` requires `test_suite.scoped_command`; unknown modes are rejected | `aggregate` |
+| `test_suite.verification.drift_budget` | category → `none` \| positive integer \| `unlimited` | No | Only budgetable fingerprint categories are accepted; dependency, migration, environment, and project-config drift always re-runs | all categories `none` |
 
 `environment` holds environment variable **names**, not values. Each value is HMAC'd into the full-suite
 fingerprint (`src/conductor/src/engine/full-suite-fingerprint.ts:209-228`) so that changing it
@@ -636,6 +612,13 @@ The block must configure at least one of `command` or `scoped_command`. `command
 the aggregate pre-SHIP gate. Omitting the block entirely is a gating failure at SHIP: the verifier returns
 `{ status: 'FAILED', reason: 'missing_config' }` (`src/conductor/src/engine/full-suite-verifier.ts:717-724`)
 and the run HALTs. The gate itself is described in [gates](../explanation/gates.md).
+
+`verification.mode: scoped` derives selectors from the feature's changed test paths. A scoped PASS
+includes its command template and resolved selector set in the fingerprint, so either change makes
+the evidence stale. An empty scoped selection deliberately runs the aggregate command and records
+that basis in evidence and the existing verification event. `drift_budget` is cumulative from the
+attested PASS: a declared within-budget change preserves that PASS; every other mismatch re-runs the
+aggregate or scoped command as configured.
 
 ## llm_provider
 
@@ -663,6 +646,34 @@ Not schema-validated — the key is allow-listed only. An unknown name makes `re
 `PluginNotFoundError` (`src/conductor/src/engine/plugin-registry.ts:37-46`), which is the opposite of
 `memory_provider`'s soft fallback.
 
+## visualizers
+
+Names of `kind: visualizer` plugins to start for this run. Optional array of strings, unset by
+default (`src/conductor/src/types/config.ts:439`).
+
+Schema-validated: a non-array value, or an array containing a non-string, fails `validateConfig`
+with `visualizers must be an array of strings` / `visualizers must contain only strings`
+(`src/conductor/src/engine/config.ts:788-795`).
+
+Each name is resolved against the plugin registry by `selectVisualizers`
+(`src/conductor/src/index.ts:236-274`). Resolution is soft, unlike `ui_renderer`:
+
+| Input | Result |
+| --- | --- |
+| Unset or `[]` | No visualizer is selected from this key |
+| A registered visualizer name | Its factory is invoked with the run's start context and the result is started |
+| A name that is not registered | Warn once per name, naming the registered visualizers, and skip it |
+| `otel` | Warn once and skip — see below |
+
+Project-local plugins shadow global plugins of the same kind and name, so a project install of a
+name wins over the global one (`src/conductor/src/engine/plugin-loader.ts:144-167`).
+
+`otel` is **not** selected through this key. The OTel visualizer is a built-in configured by its own
+[`otel`](#otel) block and is attempted independently of `visualizers` for interactive runs and for
+each daemon-dispatched feature (`src/conductor/src/engine/otel/wire.ts`). Listing `otel` here warns
+`visualizer "otel" is configured through the "otel:" block; remove it from "visualizers".` and is
+otherwise ignored (`src/conductor/src/index.ts:243-248`).
+
 ## memory_provider
 
 Plugin name for the memory store. Optional string, default `local`. Resolved by `resolveMemoryProvider`
@@ -680,7 +691,85 @@ Not schema-validated.
 
 OpenTelemetry export. Allow-listed at the top level but **not validated by `validateConfig`** — all
 handling lives in `resolveOtelConfig` (`src/conductor/src/engine/otel/otel-config.ts:26-70`), which never
-throws.
+throws. When enabled, it exports interactive runs and each daemon-dispatched feature independently;
+the trace Resource identifies the feature, project, durable dispatch run id, branch, executing
+engine version, and released harness version. The release is exported as the standard
+`service.version` Resource attribute, so OTel backends can group traces from different engine builds
+of the same harness release. For daemon dispatches, the branch is the dispatched feature worktree's
+branch rather than the primary checkout's branch. Branch, engine-version, and harness-version identity use a non-empty resolved value;
+an explicitly attempted but unavailable value is `unresolved`, while a caller that did not supply the
+property is `not-supplied`. The metric Resource uses daemon-stable identity: `service.name`,
+`service.instance.id` (`<project>/<worker>`), `conductor.project`, `conductor.worker`, and
+`host.name`. It has no feature, branch, run-id, or engine-version attributes. Metric data points
+carry `project` and `worker`; feature-scoped instruments also carry `feature`. A new dispatch
+therefore does not create a new metric Resource series for the same daemon worker.
+
+Event coverage is checked separately for the shared metrics listener and the trace visualizer.
+The sink registry's `otel` flag drives the metrics listener's complete handler table; an
+`otelTrace: false` declaration marks a metrics-only event and excludes it from the visualizer.
+Other OTel-enabled events require a visualizer handler at compile time. Daemon backlog, dispatch,
+and shipment events, `memory_setup`, `feature_usage_total`, and `feature_cost_snapshot` are metrics-only. `provider_attempt` is also excluded from tracing; its
+metrics projection records the authoritative invoked dispatch. `unattributed_progress` is excluded
+from both OTel consumers. Missing visualizer handlers at runtime report the event type through its warning callback.
+Production visualizers continue exporting traces with their per-run meter disabled.
+
+The `conductor.step.duration` and `conductor.pipeline.closeout.duration` histograms use explicit
+duration buckets through 8 hours; quantiles saturate above that largest finite bucket boundary.
+
+Daemon exports include backlog count and oldest state-residence age by `state`, busy and free slots,
+in-flight features, liveness, active dispatch blockers, discovery duration, and build stalls by
+`reason`. `conductor.daemon.inflight` is the only `conductor.daemon.*` instrument with a `feature`
+attribute. The other daemon instruments—including `conductor.daemon.stalls`—carry only daemon-stable
+`project` and `worker` identity plus their instrument-specific attributes. Parked features contribute
+to both `conductor.daemon.backlog{state=parked}` and its oldest-age series.
+
+When a run opens a `conductor.run` root span, its terminal export carries
+`conductor.run.outcome`: `complete` after `feature_complete`, `halted` after `loop_halt`, or
+`terminated` when the visualizer force-closes without either terminal event. Halted roots also carry
+`conductor.run.halt.reason` and, when supplied, `conductor.run.halt.step` and
+`conductor.run.halt.class`. An in-progress root span is not exported until it reaches one of those
+terminal paths.
+
+The `conductor.run.outcomes` counter increments once when an opened root run reaches one of those
+terminal paths. Its `outcome` attribute uses the same `complete`, `halted`, and `terminated` taxonomy,
+so dashboards can chart terminal runs without deriving counts from trace-query metrics.
+
+Dispatch metrics use the same projection as the shipped-record cost rollup. Every invoked
+`provider_attempt` contributes one `conductor.step.dispatches` point, including failed attempts; an
+unavailable provider that was never invoked does not. A successful attempt suppresses its matching
+`step_completed` compatibility record, while an unmatched completion remains a legacy fallback only
+when it carries token usage, provider attribution, or a model. Provider-free completions do not count
+as dispatches. This keeps OTel dispatch counts, token totals, and costs aligned with `## Cost` in the
+shipped record.
+
+Step duration and retry points carry `model`, `effort`, `provider`, and `tier` when each is resolved;
+undefined dimensions are omitted. Every authoritative dispatch emits `conductor.step.dispatches`
+with `step`, `metering` (`fully-metered`, `cost-unmetered`, or `unmetered`), and the same resolved
+dimensions. Dispatches also carry `fallback=true` or `false` when both the preferred and invoked
+providers are known; duration and retry points never carry `fallback`. A terminal step also emits a
+non-persisted `feature_cost_snapshot` from the feature's durable event ledger. The snapshot records
+the cumulative `conductor.feature.cost` USD gauge, plus `conductor.feature.step.cost` by `step`,
+`model` when known, and `source` when known (`provider` or `rate-card`), and
+`conductor.feature.step.tokens` by `step`, `model` when known, and token `kind` (`input`, `output`,
+`cacheRead`, or `cacheCreation`). A missing, malformed, or incomplete ledger emits no snapshot, so
+dashboards do not treat a partial total as authoritative.
+
+`feature_usage_total` at feature closeout also records `conductor.feature.cost`; it agrees with the
+last successful snapshot for the same ledger. Its `cost_complete` attribute is false when any dispatch
+lacks token evidence or finite cost evidence. These are cumulative gauges, not counters: use a
+last-value query (or `max_over_time` where a range query is required), never `increase()` or `rate()`.
+Prometheus commonly normalizes the instruments to `conductor_feature_cost_usd`,
+`conductor_feature_step_cost_usd`, and `conductor_feature_step_tokens`. For example:
+
+```promql
+max by (feature) (
+  last_over_time(conductor_feature_cost_usd{project=~"$project"}[$__range])
+)
+```
+
+To measure spend over an interval, subtract each cost series' last value at the interval start from
+its last value at the interval end, then sum the differences. Do not sum repeated snapshot samples:
+each sample already represents the whole feature total at that moment.
 
 | Key | Type | Required | Allowed | Default |
 | --- | --- | --- | --- | --- |
@@ -689,10 +778,67 @@ throws.
 | `otel.endpoint` | string | Yes, when `exporter: otlp` | any URL | — |
 | `otel.file` | string | No | any path | `<pipelineDir>/otel.jsonl` |
 | `otel.protocol` | string | No | `http/protobuf`, `grpc` per the type | passed through unchecked; omitted when falsy |
+| `otel.headers` | mapping | No; non-empty mappings only with `exporter: otlp` and HTTP/protobuf | header name to `{ env: <non-empty variable name> }` | absent; no headers are sent |
+| `otel.project_name` | string | No | any non-blank name | project root basename |
+| `otel.worker_name` | string | No | any non-blank name | OS hostname |
+| `otel.attributes` | mapping | No | At most 16 namespaced keys with non-empty literal string values; keys beginning `service.`, `conductor.`, or `host.` are reserved | absent; no custom attributes |
 
 The failure mode is silent-disable-with-an-error-string, not a halt. An unknown exporter yields
 `{ enabled: false, error: "Unknown otel exporter '<x>'. Valid options: otlp, file." }`; `otlp` without an
 endpoint yields `{ enabled: false, error: "otel exporter='otlp' requires an 'endpoint' URL …" }`.
+
+`otel.headers` supplies HTTP OTLP credentials by reference, never by value. Its only supported
+credential source in this slice is the process environment, using this shape:
+
+```yaml
+otel:
+  exporter: otlp
+  endpoint: https://collector.example.test
+  headers:
+    authorization:
+      env: OTEL_EXPORT_TOKEN
+```
+
+At configuration load, the resolver reads the non-empty `OTEL_EXPORT_TOKEN` environment variable and
+uses its value for the `authorization` HTTP header. The configuration remains a header-name and
+variable-name reference; it does not contain the credential. A literal string is refused rather than
+treated as a credential in configuration.
+
+The same silent-disable result names these header failures: a non-mapping `headers` value; an empty
+or control-character header name; a literal credential; a reference other than exactly
+`{ env: <non-empty variable name> }`; and an unset or empty referenced environment variable. Header
+entries are also refused for gRPC and the file exporter with an error that names the configured header
+and, when the reference contains a string `env` field, its environment-variable name; it never includes
+the environment variable's value.
+
+Other credential sources are excluded from this slice. Headers are carried only by the HTTP/protobuf
+OTLP exporters: this configuration does not provide gRPC credential or metadata carriage. It also
+does not classify an unauthorized export response as an authentication-specific outcome; existing
+export-failure handling remains in effect.
+
+`otel.project_name` is trimmed before use. An absent, blank, or whitespace-only value falls back to
+the basename of the absolute project root for metric data-point identity; it does not affect
+`service.name` (`ai-conductor`) or the Resource `conductor.project` attribute. It is the project
+half of `service.instance.id` as well.
+
+`otel.worker_name` is trimmed before use. An absent or blank value falls back to the OS hostname,
+then `unknown` if hostname resolution fails. It is the worker half of metric `service.instance.id`.
+
+`otel.attributes` adds static attributes to every exported trace Resource, metric Resource, and
+metric data point. Each key and value is trimmed. Keys must contain a dot and must not begin with
+`service.`, `conductor.`, or `host.`; values must be literal, non-empty strings. Invalid entries
+and entries after the first 16 are dropped without disabling export, and OTel reports the dropped
+entries as one warning. Conductor-owned Resource and metric identity attributes always take
+precedence over a supplied attribute with the same name.
+
+```yaml
+otel:
+  exporter: otlp
+  endpoint: https://collector.example.test
+  attributes:
+    deployment.environment.name: staging
+    team.name: platform
+```
 
 > **Known limitation.** `otel.protocol` is passed through entirely unvalidated
 > (`otel-config.ts:60`) even though the type restricts it to `'http/protobuf' | 'grpc'`
@@ -775,6 +921,22 @@ Kill-switch for classifying a retry as a rerun versus a route to another step. V
 
 Consumed at `src/conductor/src/engine/conductor.ts:4149`.
 
+## gate_code_validity
+
+Kill-switch for reusing a previously passing gate verdict when its stamped code surface is unchanged,
+even if the verdict artifact's modification time is stale.
+
+| Key | Type | Validation | Default |
+| --- | --- | --- | --- |
+| `gate_code_validity.enabled` | boolean | Boolean, else hard error | `true` |
+
+`enabled` is the only allowed key; a non-object block or an unknown inner key is a hard error. Setting
+`enabled: false` restores pure modification-time freshness and prevents reuse through code stamps.
+
+The resolved value is consumed by the `build_review`, `prd_audit`,
+`architecture_review_as_built`, and `manual_test` completion predicates, by stale-review-artifact
+sweeping, and by step-runner gate preservation.
+
 ## harness_self_host
 
 Guardrails that apply when the build target is the harness checkout itself. Validated by
@@ -787,7 +949,6 @@ any omitted field, yields auto-detection with every gate enabled.
 | Key | Type | Allowed | Default | Effect |
 | --- | --- | --- | --- | --- |
 | `activation` | string | `auto`, `force_on`, `force_off` | `auto` | `auto` compares the build root's realpath against the harness root; `force_on` treats any repo as a self-build; `force_off` never self-hosts |
-| `skill_relink_preflight` | boolean | — | `true` | Intended to gate the pre-dispatch `bin/install --update` relink |
 | `sandbox_build_env` | boolean | — | `true` | Runs the self-build under a throwaway `CLAUDE_CONFIG_DIR` |
 | `live_containment` | boolean | — | `true` | Proves the live checkout is read-only to each self-host dispatch with `bwrap`. If `false`, skips containment and restores fail-closed live-boundary behavior. |
 | `version_approval_gate` | boolean | — | `true` | Halts for operator VERSION-bump approval before `finish` |
@@ -826,12 +987,7 @@ write a single file, so the dispatch burns its whole budget making no progress. 
 itself on such hosts with `containment unavailable: the wrap denies the provider its own nested
 sandbox namespace` rather than wrapping a dispatch that cannot work.
 
-> **Known limitation.** `skill_relink_preflight` is resolved into `skillRelinkPreflight`
-> (`resolved-config.ts:562`) but has no consumer outside `resolved-config.ts`. The relink runs
-> unconditionally inside the self-host bundle (`src/conductor/src/daemon-cli.ts:1295`, called at
-> `daemon-cli.ts:359` and `src/conductor/src/engine/daemon.ts:1159`). Setting it to `false` does not
-> disable the relink — and that relink also re-merges `~/.claude/settings.json` permissions and hooks.
-> Tracked in [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
+The skill relink preflight is always on.
 
 Operating this repo under these guardrails is covered in [self-hosting](../guides/self-hosting.md).
 
@@ -907,10 +1063,6 @@ Draft PRs are never dispatched for auto-resolution. A CONFLICTING draft is logge
 `skipping resolve for <url> (draft PR)` and left alone; its `mergeable` label handling is
 unchanged, and no attempt counter is burned.
 
-> **Known limitation.** `resolveMergeableAutoresolve` (`resolved-config.ts:597-604`) exists but has no
-> callers; the daemon reads the raw config directly. Nothing breaks, but the resolver is not the
-> authority the name implies. Tracked in
-> [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
 
 ## conflict_check
 
@@ -937,6 +1089,7 @@ block is normalized in place; the resolved value is written back (`config.ts:111
 | Key | Type | Default | Status |
 | --- | --- | --- | --- |
 | `build_review.enabled` | boolean | `true` | Works |
+| `build_review.adjudication.enabled` | boolean | `true` | Strict nested rollout switch for post-join remediation adjudication |
 | `build_review.scopeContainmentEnforced` | boolean | `false` | Works |
 | `build_review.maxParallel` | integer | `4` | Must be between 1 and 4 |
 | `build_review.rubrics` | object | `testQuality` off | Closed canonical map: `testQuality` only. Every other id ever accepted — `scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`, `wiring` — is retired: it warns and is silently ignored rather than rejecting the config |
@@ -947,6 +1100,8 @@ Normalization contract:
 | --- | --- |
 | Absent or `null` | `{ enabled: true }`, no warning |
 | Valid `enabled` and/or `scopeContainmentEnforced` keys | Preserved; omitted `enabled` defaults to `true` |
+| Absent `adjudication` or `adjudication.enabled` | `{ enabled: true }`, no warning |
+| Non-object `adjudication`, non-boolean `adjudication.enabled`, or an unknown `adjudication` key | Hard validation error naming the exact `build_review.adjudication.*` path |
 | Non-object | `{ enabled: true }` plus one warning |
 | Unknown or invalid inner key | That key is omitted and warned by name; valid sibling keys are preserved |
 | `perTaskFloor` (any value) | Retired and ignored; a `config_deprecated_key` event is emitted naming `build_review.perTaskFloor` |
@@ -960,15 +1115,30 @@ config key is the only off switch. When disabled, the step is marked `skipped` a
 is emitted (`src/conductor/src/engine/conductor.ts:6259, 6270-6276`), resolved once per pass.
 
 `testQuality` accepts `enabled`, `llm_provider`, `model`, `effort`, `model_fallback_ladder`,
-`max_retries`, and `escalate`. It is off by default; a feature with no acceptance-criteria change has an
-empty judged scope and the rubric passes without judging even when enabled. Any unknown or retired rubric
+`max_retries`, `escalate`, and `min_confidence`. `min_confidence` is an integer from 0 through 100 and
+defaults to `0`; scored findings below it are reported as suppressed rather than failing the gate or
+remaining actionable through `build-review findings` / `build-review accept`. Unscored findings are
+never suppressed. `testQuality` is off by default. When enabled, the engine derives a frozen,
+feature-local typed scope from the graded diff, the active plan and stories, and established `Covers`
+bindings; it does not admit every declaration in a marked file. A production-only refactor, move, or
+rename with neither an established target nor a concrete candidate is a valid empty-scope PASS and
+dispatches neither the reviewer nor counterfactual execution. Missing markers, absent plan test paths, and
+an abstract possibility of an unknown dependency do not turn that empty scope into a coverage failure.
+Any unknown or retired rubric
 id under `build_review.rubrics` — `scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`,
 `wiring` — is accepted as a no-op with a one-time notice naming the retired setting; it never fails
 configuration loading or halts a run
 (`adr-2026-08-22-build-review-opt-in-rubric-container`).
 
+An ambiguous changed marker association or identified changed setup/helper that affects an opted-in test
+is a concrete candidate, not an automatically in-scope test. The existing test-quality reviewer resolves
+each candidate from pinned source in its normal review call as `resolved`, `out-of-scope`, or
+`indeterminate`. Candidate file selectors may be used for conservative counterfactual execution without
+authorizing unchanged siblings as review targets. An `indeterminate` result preserves any valid findings
+but yields the derived `scope-incomplete` coverage fault; see [the stalled-feature runbook](../runbooks/stalled-or-stuck-feature.md#build_review-has-a-scope-incomplete-candidate) for recovery and the bounded reduced-coverage path.
+
 `scopeContainmentEnforced` is resolved through the same block and read by the real
-`conduct-ts scope-check` command. It defaults to `false`, so verified violations are reported while
+`ai-conductor scope-check` command. It defaults to `false`, so verified violations are reported while
 the commit proceeds. Set it to `true` to make a verified violation return exit `2`; the generated
 `commit-msg` hook converts that result to Git exit `1` and refuses the commit without changing the
 working tree or index.
@@ -1006,6 +1176,8 @@ one of `APPROVED`, `PLAN_GAP`, or `BLOCKED`.
 | Key | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `architecture_review_as_built.checks.<name>.tiers` | array of `S`\|`M`\|`L` | see below | Restricts the named check to the listed complexity tiers; an explicit list always overrides the artifact-presence default |
+| `architecture_review_as_built.remediation.enabled` | boolean | `true` | Enables daemon-mode bounded remediation for an all-`REMEDIABLE` `BLOCKED` report; `false` keeps that report on the needs-human halt path |
+| `architecture_review_as_built.max_remediation_laps` | positive integer | `1` | Caps as-built remediation laps for the feature; exhaustion halts before another plan append |
 
 `<name>` is one of `reachability`, `planGap`, `adrCompliance`, `diagramDrift`. Without an explicit
 `tiers` override:
@@ -1017,9 +1189,13 @@ one of `APPROVED`, `PLAN_GAP`, or `BLOCKED`.
 | `adrCompliance` | Approved ADRs exist under `.docs/decisions/` |
 | `diagramDrift` | Architecture diagrams exist |
 
-`PLAN_GAP` means the code faithfully implements the approved design and the design itself is the limit;
-it is recorded in the verdict and the shipped record and ships when acceptance criteria still pass, and
-halts when a stated outcome is not delivered.
+`PLAN_GAP` means the code faithfully implements the approved design and the design itself is the limit.
+The outcome is judged against the sealed story criteria under `.docs/stories/`, never against superseded
+`.docs/intake/` capture: the gap is recorded in the verdict and the shipped record and ships when those
+criteria are satisfied, and halts only when a sealed story criterion is unmet.
+
+`remediation` accepts only the `enabled` boolean. `max_remediation_laps` must be an integer greater
+than zero; unknown keys and invalid values are configuration errors.
 
 ## ci_watch
 
@@ -1047,10 +1223,17 @@ Remediation waits for terminal CI. A rollup counts as `failed` as soon as one ch
 while sibling checks are still queued or running, so the eligibility gate defers any PR that still
 has a non-terminal check — reason `checks-not-terminal`
 (`src/conductor/src/engine/ci-fix.ts#nonTerminalCheckNames`). A check is terminal once it reports a
-conclusion (`SUCCESS`, `FAILURE`, `CANCELLED`, `TIMED_OUT`, `SKIPPED`, …); `QUEUED`, `IN_PROGRESS`,
-`PENDING`, `WAITING`, `REQUESTED`, `EXPECTED`, and a missing conclusion are not. A deferral burns no
-attempt — the next sweep tick re-reads the PR and dispatches once every check has finished. When the
-PR state carries no check-rollup detail at all, the gate does not block.
+conclusion (`SUCCESS`, `FAILURE`, `CANCELLED`, `TIMED_OUT`, `SKIPPED`, …). Legacy commit-status
+entries are terminal when they report a completed `state` such as `SUCCESS`, `FAILURE`, or `ERROR`;
+`QUEUED`, `IN_PROGRESS`, `PENDING`, `WAITING`, `REQUESTED`, `EXPECTED`, and entries with neither a
+conclusion nor a state are not. A deferral burns no attempt — the next sweep tick re-reads the PR and
+dispatches once every check has finished. When the PR state carries no check-rollup detail at all, the
+gate does not block.
+
+CI repair agents diagnose from the supplied logs and commit fixes without running tests or pushing.
+The daemon runs the configured `test_suite` verifier in the repair worktree, including its working
+directory, timeout, and evidence policy, before publishing with lease protection. Missing or invalid
+verification configuration blocks publication; CI repair does not use `mergeable_autoresolve.suiteCommand`.
 
 Draft PRs are never dispatched to the CI fix loop. The sweep may still reconcile their `mergeable`
 label, but logs `skipping ci-fix for <url> (draft PR)` instead of collecting them as candidates — a
@@ -1080,8 +1263,9 @@ that tree-hash witness and reverts to re-kicking until the cap. It does not disa
 per-gate cap, which still bounds unchanged cross-dispatch loops; the `planRemediation` guard is
 also not gated by this flag (`src/conductor/src/types/config.ts:302-308`).
 
-The flag applies to active build kickbacks only. `wiring_check` is a deprecated compatibility no-op
-and never produces a kickback. See [`.pipeline/build-outcome.json`](artifacts.md#core-state).
+The flag applies to active build kickbacks only. A leftover configuration entry using the removed
+step name is rejected as an ordinary unknown custom step (it lacks the required `after:` field).
+See [`.pipeline/build-outcome.json`](artifacts.md#core-state).
 
 ## cumulative_kickback_bound
 
@@ -1126,7 +1310,7 @@ dashboard. Optional boolean; a non-boolean is a hard error (`config.ts:607-609`)
 resolves to `true` at validation time (unlike `daemon_verbose`, the default is written back into
 `obj.reconcile_parked_auto_cleanup`, not just applied at the wiring site).
 
-Set to `false` to require an explicit `conduct-ts daemon reconcile-parked <slug>` (or manual
+Set to `false` to require an explicit `ai-conductor daemon reconcile-parked <slug>` (or manual
 cleanup) for every parked feature, even once it is merged and recorded — see
 [park a feature before you touch its git state](../guides/running-the-daemon.md#park-a-feature-before-you-touch-its-git-state).
 
@@ -1158,11 +1342,25 @@ finite bound. It does not share the auth timeout contract: `harness_self_host.au
 0` requests an immediate authentication halt, while `teardown_timeout_seconds: 0` cannot opt out of
 the bound.
 
-The daemon passes this bound to post-ship reaping, `conduct-ts daemon reclaim-worktree <slug>`, and
+The daemon passes this bound to post-ship reaping, `ai-conductor daemon reclaim-worktree <slug>`, and
 parked-feature reconciliation. A missing `bin/teardown` is silent. A timeout, non-zero exit, or an
 unrunnable script is logged and contained; removal continues once its normal safety proof has
 authorized it. See [running the daemon](../guides/running-the-daemon.md#project-teardown-hook) for
 the hook contract and [worktree recovery](../runbooks/worktree-and-evidence-recovery.md) for recovery.
+
+## dispatch_start_timeout_seconds
+
+Maximum time, in seconds, for a project's optional `bin/dispatch-start` hook at the start of every
+daemon dispatch. Absent values resolve to `120`; a finite positive value, including a fractional
+number, replaces that bound.
+
+```yaml
+dispatch_start_timeout_seconds: 120
+```
+
+This timeout is deliberately non-disableable. `0`, negative, non-numeric, non-finite, and `null`
+values produce one warning at resolution and fall back to `120`. A missing hook is silent; a timeout,
+non-zero exit, or unrunnable script is logged and contained, so the dispatch continues.
 
 ## step_heartbeat_stall_minutes
 
@@ -1245,11 +1443,42 @@ A non-number is a hard error (`config.ts:748-752`). Zero, negative, and `NaN` pa
 
 Consumed at `src/conductor/src/engine/conductor.ts:1263`, then clamped to the branch count at `:6357`.
 
+## daemon_concurrency
+
+Sets the daemon feature-executor pool width. It is optional and defaults to `1`, which preserves the
+serial daemon behavior. Set it to a positive integer to allow that many eligible features to run at
+once:
+
+```yaml
+daemon_concurrency: 3
+```
+
+Only integers in `[1, ∞)` are valid. Zero, negative, fractional, non-finite, and non-numeric values
+make configuration loading fail before the daemon dispatches work; they are not silently clamped.
+
+> **Warning: anything above `1` is a different operating mode.** Every executor shares one
+> repository and one `.git`, so the daemon prints a `WARNING: daemon concurrency N` line at startup
+> whenever the effective width exceeds `1`. Expect more rebase kickbacks (a sibling feature landing on
+> `main` invalidates downstream gates for everyone still in flight), busier worktree lifecycle
+> operations, and provider spend that scales with the pool width. Start at `2`, watch the daemon log
+> for `@rebase` halts, and drop back to `1` if the kickback churn outweighs the throughput.
+
+For a daemon invocation, an explicit `--concurrency <n>` flag takes precedence over this setting;
+otherwise this setting takes precedence over the default of `1`. This pool width is independent of
+[`validation_concurrency`](#validation_concurrency), which bounds validation-phase branch fan-out
+within one feature.
+
+The legacy compatibility dispatch used when no `ProviderExecutionContext` is available mutates the
+process-global provider environment. To avoid concurrent environment mutation, it refuses an
+effective daemon concurrency above `1` before build dispatch and reports
+`LEGACY_NO_PROVIDER_EXECUTION_CONCURRENCY_REFUSAL`. That compatibility-path refusal is not a clamp
+on the daemon's normal worker pool.
+
 ## stale_claim_window_hours
 
 Controls how long a `claimed` engineer-intake ledger entry may remain unfinished before it is
 treated as stranded. It governs claim-time auto-heal and the default window for
-`conduct-ts engineer requeue --stale`; `--older-than` overrides it for one invocation.
+`ai-conductor compose requeue --stale`; `--older-than` overrides it for one invocation.
 
 The default is `24` hours. Non-positive and non-numeric values fall back to that default.
 
@@ -1264,35 +1493,6 @@ explicit cleanup, or expiry.
 The default is `14` days. Set a whole number from `1` through `90`. Other values are hard validation
 errors. Logical retirement is recorded before physical removal, and failed removal remains retryable
 cleanup debt rather than making the path available again.
-
-## Keys the type declares but the loader rejects
-
-These fields exist in `src/conductor/src/types/config.ts` with documented semantics and, in some cases,
-live consumers — but they are absent from the loader's allow-lists, so writing them into a config file
-fails the load.
-
-| Key | Declared at | Rejected with |
-| --- | --- | --- |
-| `gate_code_validity` | `types/config.ts:322-325, 466-468` | `Unknown top-level key: "gate_code_validity"` |
-| `auth_park_timeout_minutes` (top level) | `types/config.ts:546-553` | `Unknown top-level key: "auth_park_timeout_minutes"` |
-| `steps.<custom>.gate` | `types/config.ts:134-140` | `Unknown key in steps.<n>: "gate"` |
-| `steps.<custom>.kickback_target` | `types/config.ts:141-146` | `Unknown key in steps.<n>: "kickback_target"` |
-
-> **Known limitation.** `gate_code_validity` is a fully wired kill-switch: `resolveGateCodeValidityConfig`
-> (`config.ts:1911-1919`) is called from six sites — `src/conductor/src/engine/artifacts.ts:365, 1587,
-> 1753, 1847, 1955` and `src/conductor/src/engine/step-runners.ts:1687` — and the absent block resolves
-> to `{ enabled: true }`. Because the key is not in `knownTopLevelKeys` (`config.ts:213-269`), it can
-> never be set from a config file, so the gate is permanently on. There is no workaround.
-> Tracked in [#1001](https://github.com/jstoup111/ai-conductor/issues/1001).
-
-> **Known limitation.** Top-level `auth_park_timeout_minutes` is declared and has a resolver,
-> `resolveAuthParkTimeoutMinutes` (`resolved-config.ts:463-480`), which throws on non-numeric or
-> non-finite input — and has no callers anywhere in `src/`. The key is also rejected at load. Use the
-> nested [`harness_self_host.auth_park_timeout_minutes`](#harness_self_host) instead; note its bad-value
-> contract differs, silently falling back to 60 rather than throwing. The two declarations also disagree
-> on what `0` means: `types/config.ts:551` says it polls indefinitely, while `types/config.ts:374` and
-> `resolved-config.ts:446-447` say it halts immediately. The nested key's behavior is the immediate halt.
-> Tracked in [#1025](https://github.com/jstoup111/ai-conductor/issues/1025).
 
 ## Full example
 
@@ -1321,6 +1521,11 @@ test_suite:
   timeout_seconds: 1800
   environment:
     - CI
+  verification:
+    mode: aggregate
+    drift_budget:
+      source: 5
+      tests: 10
 
 markdown_viewer:
   preset: glow
@@ -1329,8 +1534,8 @@ markdown_viewer:
   mode: inline
 ```
 
-`templates/project-config.yml.template` is the project seed used by `conduct-ts create` and
-`conduct-ts config init`. `templates/ai-conductor-config.yml.template` remains the user-level
+`templates/project-config.yml.template` is the project seed used by `ai-conductor create` and
+`ai-conductor config init`. `templates/ai-conductor-config.yml.template` remains the user-level
 reference. The remaining allow-listed keys are documented only here.
 
 ## See also

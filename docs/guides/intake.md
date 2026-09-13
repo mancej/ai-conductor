@@ -1,7 +1,7 @@
 ---
 title: Filing intake issues
 parent: Guides
-nav_order: 3
+nav_order: 5
 ---
 
 # Filing intake issues
@@ -20,7 +20,7 @@ to DECIDE.
 | `gh` authenticated for the target repo | `gh auth status` |
 | A harness checkout containing `bin/intake-file` | `<harness-checkout>/bin/intake-file` (prints usage, exit 1) |
 
-`bin/install` symlinks only `conduct-ts` (and the legacy `conduct`) into `~/.local/bin`, so
+`bin/install` symlinks only `ai-conductor` (and the legacy `conduct`) into `~/.local/bin`, so
 `intake-file` is never on `PATH`. Run it from the harness checkout, or call it by absolute path
 from anywhere. It always executes inside the harness's own engine directory, so a bare invocation
 files into the harness repo — pass `--repo <owner>/<repo>` to target any other repo, including the
@@ -41,6 +41,10 @@ contradictory bands.
 ## The shape
 
 Four sections. Three are required.
+
+Use `## Desired outcome` as the canonical heading. The intake reader also accepts
+`## Desired outcomes`; both forms preserve the section's bullets, while staged and committed
+intake markers use the canonical singular heading.
 
 | Section | Required | Contents |
 | --- | --- | --- |
@@ -271,11 +275,14 @@ scrubbing would gut the evidence.
 
 An intake issue does not reach the daemon by itself. The path is:
 
-1. **Poll.** `conduct-ts engineer poll`, or the intake loop, sweeps GitHub issues into the durable
-   inbox. The ledger dedups, so a repeat poll enqueues nothing new.
-2. **Claim.** `conduct-ts engineer claim` dequeues the oldest unblocked idea and persists a claim
+1. **Poll.** `ai-conductor compose poll`, or the intake loop, sweeps GitHub issues into the durable
+   inbox. Tracker title and body text is treated as untrusted: directive-shaped prose is replaced
+   with a neutralization marker before it reaches the inbox, while fenced, indented, and quoted
+   evidence remains unchanged. The resulting text is enclosed in a source-bound, digested inbound
+   envelope. The ledger dedups, so a repeat poll enqueues nothing new.
+2. **Claim.** `ai-conductor compose claim` dequeues the oldest unblocked idea and persists a claim
    record carrying the Desired-outcome bullets.
-3. **DECIDE.** The [engineer loop](engineer-loop.md) authors the full spec artifact set in a per-idea
+3. **DECIDE.** The [composer loop](engineer-loop.md) authors the full spec artifact set in a per-idea
    worktree and lands them on a `spec/<slug>` branch.
 4. **Merge.** You merge the spec PR. Only then do the artifacts exist on the default branch.
 5. **Build.** The daemon reads `.docs/plans` from the committed default-branch tree and dispatches
@@ -288,7 +295,8 @@ An issue that is blocked by another open issue is held back at step 2 — `claim
 
 When a spec lands, the engineer commits `.docs/intake/<slug>.md` alongside it. This is how the
 originating issue and the spec's owner travel with the spec onto the default branch, where the daemon
-can read them — the daemon never sees the intake ledger.
+can read them — the daemon never sees the intake ledger. For a tracker-sourced idea, its Desired
+outcome section remains inside the sanitized inbound envelope rather than copying raw issue text.
 
 ```markdown
 # Intake origin: <slug>
@@ -298,8 +306,15 @@ Owner: <owner-id>
 
 ## Desired outcome
 
-- <bullets carried verbatim from the claim record>
+<<< INBOUND sourceRef=<owner/repo#N> digest=<sha256> >>>
+- <sanitized outcome bullets from the claim record>
+<<< END INBOUND >>>
 ```
+
+The coherence gate compares an outcome-coverage row's quote with the staged sanitized bullet. It
+rejects a raw-tracker quote or any other mismatch, so tracker prose cannot be copied into committed
+coherence artifacts through that field. See the [artifacts reference](../reference/artifacts.md) for
+the exact comparison rule.
 
 | Line | Written when | Read by |
 | --- | --- | --- |

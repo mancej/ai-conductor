@@ -17,12 +17,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
+import { resolveCanonicalLauncher, shellQuote } from './canonical-launcher.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants — only place that encodes the session prefix and foreground command.
 // ─────────────────────────────────────────────────────────────────────────────
 export const SESSION_PREFIX = 'cc-daemon-';
-export const DAEMON_FOREGROUND_COMMAND = 'conduct-ts daemon --continuous';
+export const DAEMON_FOREGROUND_COMMAND =
+  `${shellQuote(resolveCanonicalLauncher())} daemon --continuous`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TmuxRunner — injectable execution boundary (allows deterministic unit tests).
@@ -52,11 +54,11 @@ export class TmuxNotInstalledError extends Error {
 
 export const defaultTmuxRunner: TmuxRunner = (args, opts) => {
   // Kill-switch (#377): under AI_CONDUCTOR_NO_REAL_EXEC=1, refuse any tmux
-  // verb that would put a live process into a real `cc-daemon-*` session —
+  // verb that would put a live process into a real session —
   // both fresh creation (new-session) and re-launching a command in an
   // existing pane (respawn-pane). This guard is deliberately runner-level,
   // not operation-level: the injectable-runner seam is HOW the unit tests
-  // drive newDetachedSession/respawnPane with cc-daemon names and fake
+  // drive newDetachedSession/respawnPane with fake
   // runners under the suite-wide kill-switch, so only the runner that
   // actually reaches real tmux may refuse. In-process guards cannot catch a
   // child process spawned without the env — the suite-level teardown
@@ -72,11 +74,14 @@ export const defaultTmuxRunner: TmuxRunner = (args, opts) => {
     const rawTarget = tIndex >= 0 ? args[tIndex + 1] : undefined;
     // respawn-pane targets look like `=<session>:`; normalize to the session name.
     const sessionName = rawTarget?.replace(/^=/, '').replace(/:.*$/, '');
-    if (sessionName && sessionName.startsWith(SESSION_PREFIX)) {
+    if (sessionName) {
       throw new Error(
         `Refusing to ${args[0]} real tmux session "${sessionName}": AI_CONDUCTOR_NO_REAL_EXEC=1 kill-switch is set.`
       );
     }
+    throw new Error(
+      `AI_CONDUCTOR_NO_REAL_EXEC=1 kill-switch refuses ${args[0]}: target was unresolved.`
+    );
   }
   const result = spawnSync('tmux', args, {
     stdio: opts.inherit ? 'inherit' : ['ignore', 'pipe', 'pipe'],
@@ -555,7 +560,7 @@ export function makeTmuxSupervisor(run: TmuxRunner = defaultTmuxRunner): Supervi
       const name = sessionNameForRepo(repo);
       if (!(await hasSession(name, run))) {
         throw new Error(
-          `No daemon session found for "${repo}". Run 'conduct-ts daemon start' first.`,
+          `No daemon session found for "${repo}". Run 'ai-conductor daemon start' first.`,
         );
       }
       await attachSession(name, opts, run);

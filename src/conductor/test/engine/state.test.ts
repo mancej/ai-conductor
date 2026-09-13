@@ -1,3 +1,4 @@
+// Covers: task:1
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, writeFile, readFile } from 'fs/promises';
 import { join } from 'path';
@@ -25,6 +26,7 @@ import {
   savePrUrl,
   markFeatureComplete,
   markDownstreamStale,
+  filterRestageChanges,
 } from '../../src/engine/state.js';
 
 class RecordingConductStateStore implements ConductStateStore<ConductState> {
@@ -114,6 +116,17 @@ describe('engine/state', () => {
       if (!result.ok) {
         expect(result.error.type).toBe('corrupted');
       }
+    });
+
+    it('rejects a stale retro step status by its unknown name', async () => {
+      await writeFile(statePath, JSON.stringify({ retro: 'done' }));
+
+      const result = await readState(statePath);
+
+      expect(result).toEqual({
+        ok: false,
+        error: { type: 'corrupted', message: 'Unknown step: retro' },
+      });
     });
   });
 
@@ -473,14 +486,13 @@ describe('engine/state', () => {
       acceptance_specs: 'done',
       build: 'done',
       manual_test: 'done',
-      retro: 'done',
       finish: 'done',
     };
 
     const stepNames = [
       'worktree', 'memory', 'explore', 'complexity', 'stories',
       'conflict_check', 'plan', 'architecture_diagram', 'architecture_review',
-      'acceptance_specs', 'build', 'manual_test', 'retro', 'finish',
+      'acceptance_specs', 'build', 'manual_test', 'finish',
     ] as const;
 
     it('marks all done steps after target as stale', () => {
@@ -498,7 +510,6 @@ describe('engine/state', () => {
       expect(result.acceptance_specs).toBe('stale');
       expect(result.build).toBe('stale');
       expect(result.manual_test).toBe('stale');
-      expect(result.retro).toBe('stale');
       expect(result.finish).toBe('stale');
     });
 
@@ -530,6 +541,40 @@ describe('engine/state', () => {
       expect(result.explore).toBe('done');
       expect(result.complexity).toBe('done');
       expect(result.stories).toBe('done');
+    });
+  });
+
+  // --- filterRestageChanges ---
+
+  describe('filterRestageChanges', () => {
+    it('drops skipped fields while retaining restages for other states', () => {
+      expect(filterRestageChanges(
+        {
+          manual_test: 'skipped',
+          build: 'done',
+          build_review: 'failed',
+          rebase: 'stale',
+        },
+        {
+          manual_test: 'stale',
+          build: 'stale',
+          build_review: 'stale',
+          rebase: 'stale',
+          finish: 'stale',
+        },
+      )).toEqual({
+        build: 'stale',
+        build_review: 'stale',
+        rebase: 'stale',
+        finish: 'stale',
+      });
+    });
+
+    it('returns an empty record when every requested restage is skipped', () => {
+      expect(filterRestageChanges(
+        { manual_test: 'skipped', prd_audit: 'skipped' },
+        { manual_test: 'stale', prd_audit: 'stale' },
+      )).toEqual({});
     });
   });
 

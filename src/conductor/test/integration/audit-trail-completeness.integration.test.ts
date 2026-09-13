@@ -1,7 +1,8 @@
+// Covers: task:1, task:4, task:6
 // ─────────────────────────────────────────────────────────────────────────────
 // RED acceptance specs for "Every executed step leaves positive evidence —
 // including non-verdict steps" (Story 3,
-// .docs/stories/audit-trail-write-completeness-for-retro-under-fre.md).
+// .docs/stories/audit-trail-write-completeness.md).
 //
 // `src/conductor/src/engine/audit-trail.ts` (`AuditTrailWriter`) does not exist
 // yet — every test below dynamically imports it so a missing module RREDs only
@@ -70,6 +71,16 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   engineer_run_failed: 'not-audited-by-design',
   engineer_run_settled: 'not-audited-by-design',
   engineer_worktree_retired: 'not-audited-by-design',
+  daemon_backlog_snapshot: 'not-audited-by-design',
+  feature_dispatch_started: 'not-audited-by-design',
+  feature_dispatch_ended: 'not-audited-by-design',
+  feature_shipped: 'not-audited-by-design',
+  intake_inbound_sanitized: 'not-audited-by-design',
+  project_setup: 'not-audited-by-design',
+  memory_setup: 'not-audited-by-design',
+  setup_repair: 'not-audited-by-design',
+  coverage_binding_judged: 'not-audited-by-design',
+  coverage_binding_disabled: 'not-audited-by-design',
   config_deprecated_key: 'not-audited-by-design',
   contained_live_checkout_drift: 'not-audited-by-design',
   self_host_containment_verdict: 'not-audited-by-design',
@@ -78,22 +89,34 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   build_review_rubric_result: 'not-audited-by-design',
   build_review_rubric_skipped: 'not-audited-by-design',
   build_review_cache_hit: 'not-audited-by-design',
+  build_review_scope_summary: 'not-audited-by-design',
+  build_review_cache_discarded: 'friction-mapped',
   build_review_rubric_infrastructure_failure: 'not-audited-by-design',
+  build_review_scope_incomplete: 'not-audited-by-design',
   build_review_mechanical_allowance_exhausted: 'not-audited-by-design',
   build_review_disposition_accepted: 'not-audited-by-design',
   build_review_reduced_coverage_accepted: 'not-audited-by-design',
   build_review_disposition_refused: 'not-audited-by-design',
   build_review_disposition_version_invalidated: 'friction-mapped',
   build_review_outer_verdict: 'not-audited-by-design',
+  remediation_adjudication_started: 'not-audited-by-design',
+  remediation_adjudication_completed: 'not-audited-by-design',
+  remediation_adjudication_failed: 'not-audited-by-design',
+  remediation_case_reconciled: 'not-audited-by-design',
+  remediation_case_refuted: 'friction-mapped',
+  remediation_effect_reserved: 'not-audited-by-design',
+  remediation_effect_applied: 'not-audited-by-design',
+  remediation_effect_failed: 'not-audited-by-design',
+  remediation_semantic_repeat_halt: 'not-audited-by-design',
   build_review_stale_aggregate: 'not-audited-by-design',
   step_started: 'not-audited-by-design',
-  deprecated_step: 'not-audited-by-design',
   step_completed: 'friction-mapped', // positive evidence (gate_pass) when no verdict already recorded
   step_failed: 'not-audited-by-design', // superseded by step_retry / gate_verdict on the same step
   // adr-2026-08-24 D3 declares the refusal audited at introduction, and its
   // sink registry entry carries `audit: true` — the declaration and the writer
   // must agree.
   step_refused: 'friction-mapped',
+  step_status_write_refused: 'friction-mapped',
   provider_attempt: 'not-audited-by-design',
   provider_stream_progress: 'not-audited-by-design',
   scratch_cleanup_reclaimed: 'not-audited-by-design',
@@ -102,6 +125,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   // Whole-feature cost telemetry: durable in events.jsonl, but it describes no
   // friction — it is a summation of dispatches already mapped elsewhere.
   feature_usage_total: 'not-audited-by-design',
+  feature_cost_snapshot: 'not-audited-by-design',
   provider_fallback: 'not-audited-by-design',
   session_policy: 'not-audited-by-design',
   step_retry: 'friction-mapped',
@@ -115,7 +139,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   rate_limit: 'not-audited-by-design',
   session_reset: 'not-audited-by-design',
   credentials_park: 'not-audited-by-design',
-  // Durable event-log telemetry, but deliberately outside the retro friction schema.
+  // Durable event-log telemetry, deliberately outside the tested event schema.
   credentials_park_progress: 'not-audited-by-design',
   finish_publication_transition: 'not-audited-by-design',
   finish_publication_blocked: 'not-audited-by-design',
@@ -129,6 +153,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   protected_artifact_reseal_refused: 'friction-mapped',
   auto_heal: 'not-audited-by-design',
   remediation_sealed_artifact_redirect: 'not-audited-by-design',
+  remediation_disposition_rejected: 'friction-mapped',
   verdict_freshness: 'friction-mapped',
   build_review_base: 'not-audited-by-design',
   build_review_stale_mirage_regrade: 'not-audited-by-design',
@@ -138,6 +163,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   build_progress: 'not-audited-by-design',
   build_no_progress: 'not-audited-by-design',
   pipeline_closeout: 'not-audited-by-design',
+  pipeline_tail_diagnostic: 'not-audited-by-design',
   renderer_error: 'not-audited-by-design',
   when_skip: 'not-audited-by-design', // skipped steps must have zero records
   parallel_started: 'not-audited-by-design',
@@ -155,6 +181,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   halt_record_written: 'friction-mapped',
   halt_record_write_failed: 'friction-mapped',
   halt_record_push_failed: 'friction-mapped',
+  shipment_evidence_refused: 'friction-mapped',
   loop_converged: 'not-audited-by-design',
   rebase_noop: 'not-audited-by-design',
   rebase_mergeable_skip: 'not-audited-by-design',
@@ -177,6 +204,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   // friction-mapped via `step_retry`, so it writes no record of its own.
   unattributed_progress: 'not-audited-by-design',
   halt_cleared: 'friction-mapped',
+  kickback_budget_adjustment_authorized: 'friction-mapped',
   operator_rewind: 'friction-mapped',
   plan_growth: 'not-audited-by-design',
   ci_failed: 'not-audited-by-design',
@@ -263,6 +291,39 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     reason: 'spec_merged',
     retainedCommit: 'a'.repeat(40),
   },
+  daemon_backlog_snapshot: {
+    type: 'daemon_backlog_snapshot',
+    counts: { eligible: 0, waiting: 0, blocked: 0, gated: 0, parked: 0 },
+    oldestAgeSeconds: {},
+    slots: { busy: 0, free: 1 },
+    inFlight: [],
+    blocked: { paused: false, build_auth_missing: false, gh_version: false, episode_active: false },
+    pollDurationMs: 1,
+  },
+  feature_dispatch_started: { type: 'feature_dispatch_started', slug: 'feature', kind: 'initial' },
+  feature_dispatch_ended: { type: 'feature_dispatch_ended', slug: 'feature', outcome: 'complete' },
+  feature_shipped: { type: 'feature_shipped', slug: 'feature', active: { state: 'unavailable' } },
+  intake_inbound_sanitized: {
+    type: 'intake_inbound_sanitized',
+    sourceRef: 'owner/repo#12',
+    neutralizations: [{ category: 'agent-directive', count: 1 }],
+    digest: 'a'.repeat(64),
+  },
+  project_setup: { type: 'project_setup', ran: false, reason: 'marker-valid' },
+  memory_setup: { type: 'memory_setup', before: 'absent', canonical: true },
+  setup_repair: {
+    type: 'setup_repair',
+    disposition: 'engine-committed',
+    preservedPaths: [],
+  },
+  coverage_binding_judged: {
+    type: 'coverage_binding_judged',
+    step: 'coverage_binding',
+    verdict: 'asserts',
+    digest: 'sha256:claim',
+    taskIds: ['1'],
+  },
+  coverage_binding_disabled: { type: 'coverage_binding_disabled', step: 'coverage_binding' },
   config_deprecated_key: {
     type: 'config_deprecated_key',
     key: 'build_review.rubrics.scope',
@@ -290,20 +351,27 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
   build_review_rubric_result: { type: 'build_review_rubric_result', rubric: 'scope', lapId: 'lap-1', verdict: 'FAIL' },
   build_review_rubric_skipped: { type: 'build_review_rubric_skipped', rubric: 'scope', lapId: 'lap-1', reason: 'disabled' },
   build_review_cache_hit: { type: 'build_review_cache_hit', rubric: 'scope', lapId: 'lap-1' },
+  build_review_scope_summary: { type: 'build_review_scope_summary', rubric: 'testQuality', lapId: 'lap-1', establishedTargetCount: 2, candidateCount: 1, unresolvedReasons: ['uncertain-association'] },
+  build_review_cache_discarded: { type: 'build_review_cache_discarded', rubric: 'testQuality', lapId: 'lap-1', reason: 'engine-version-mismatch', cachedEngineStamp: 'aaaaaaaaaaaa', currentEngineStamp: 'bbbbbbbbbbbb' },
   build_review_rubric_infrastructure_failure: { type: 'build_review_rubric_infrastructure_failure', rubric: 'scope', lapId: 'lap-1', reason: 'provider-error' },
+  build_review_scope_incomplete: { type: 'build_review_scope_incomplete', rubric: 'testQuality', lapId: 'lap-1', candidates: [{ candidateId: 'candidate:fixture', sourceRegion: { path: 'test/fixture.test.ts', startLine: 1, endLine: 1, contentHash: 'sha256:fixture', display: 'fixture' }, obligationReferences: ['story:S6.1'], missingEvidenceReason: 'association is ambiguous' }] },
   build_review_mechanical_allowance_exhausted: { type: 'build_review_mechanical_allowance_exhausted', lapId: 'lap-1', rubric: 'scope', reason: 'provider-error', consumed: 3, allowance: 3 },
   build_review_disposition_accepted: { type: 'build_review_disposition_accepted', feature: 'feature', lapId: 'lap-1', findingId: 'sha256:x', operator: 'operator' },
   build_review_reduced_coverage_accepted: { type: 'build_review_reduced_coverage_accepted', feature: 'feature', lapId: 'lap-1', rubric: 'scope', reason: 'provider-error', operator: 'operator' },
   build_review_disposition_refused: { type: 'build_review_disposition_refused', feature: 'feature', reason: 'non-tty' },
   build_review_disposition_version_invalidated: { type: 'build_review_disposition_version_invalidated', feature: 'feature', findingId: 'sha256:x', rubric: 'scope', contractVersion: 'v1' },
   build_review_outer_verdict: { type: 'build_review_outer_verdict', lapId: 'lap-1', rawVerdict: 'FAIL', effectiveVerdict: 'PASS' },
+  remediation_adjudication_started: { type: 'remediation_adjudication_started', domain: 'build_review', lapId: 'lap-1' },
+  remediation_adjudication_completed: { type: 'remediation_adjudication_completed', domain: 'build_review', lapId: 'lap-1', caseIds: ['case-1'], effectIds: ['effect-1'] },
+  remediation_adjudication_failed: { type: 'remediation_adjudication_failed', domain: 'build_review', lapId: 'lap-1', reason: 'invalid-result' },
+  remediation_case_reconciled: { type: 'remediation_case_reconciled', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', resolution: 'open' },
+  remediation_case_refuted: { type: 'remediation_case_refuted', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1' },
+  remediation_effect_reserved: { type: 'remediation_effect_reserved', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', effectKind: 'action' },
+  remediation_effect_applied: { type: 'remediation_effect_applied', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', effectKind: 'action' },
+  remediation_effect_failed: { type: 'remediation_effect_failed', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', effectKind: 'action', reason: 'intake-unavailable' },
+  remediation_semantic_repeat_halt: { type: 'remediation_semantic_repeat_halt', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', reason: 'already-attempted' },
   build_review_stale_aggregate: { type: 'build_review_stale_aggregate', storedLapId: 'lap-old', currentLapId: 'lap-new' },
   step_started: { type: 'step_started', step: 'build', index: 0 },
-  deprecated_step: {
-    type: 'deprecated_step',
-    step: 'wiring_check',
-    adr: 'adr-2026-08-11-wiring-judged-in-build-review',
-  },
   step_completed: { type: 'step_completed', step: 'build', status: 'done' },
   step_failed: { type: 'step_failed', step: 'build', error: 'boom', retryCount: 1 },
   step_refused: {
@@ -311,6 +379,13 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     step: 'build',
     kind: 'needs-human',
     reason: 'operator judgement required',
+  },
+  step_status_write_refused: {
+    type: 'step_status_write_refused',
+    field: 'manual_test',
+    expected: 'skipped',
+    requested: 'stale',
+    intent: 'restage ship tail after build kickback',
   },
   provider_attempt: {
     type: 'provider_attempt',
@@ -364,6 +439,13 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     costUsd: 1.5,
     inputTokens: 100,
     outputTokens: 20,
+  },
+  feature_cost_snapshot: {
+    type: 'feature_cost_snapshot',
+    costUsd: 1.5,
+    costComplete: true,
+    byDimension: [{ step: 'build', costUsd: 1.5 }],
+    tokensByDimension: [{ step: 'build', tokens: { input: 100, output: 20 } }],
   },
   provider_fallback: {
     type: 'provider_fallback',
@@ -446,6 +528,12 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     gapId: 'gap-1',
     artifact: '.docs/stories/another-feature.md',
   },
+  remediation_disposition_rejected: {
+    type: 'remediation_disposition_rejected',
+    gapId: 'gap-2',
+    disposition: 'unknown-disposition',
+    accepted: ['build'],
+  },
   verdict_freshness: {
     type: 'verdict_freshness',
     step: 'build_review',
@@ -488,12 +576,32 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     endedAt: 140,
     ts: 140,
   },
+  pipeline_tail_diagnostic: {
+    type: 'pipeline_tail_diagnostic',
+    reason: 'malformed-line',
+    path: '.pipeline/pipeline-events.jsonl',
+    byteOffset: 12,
+  },
   renderer_error: { type: 'renderer_error', rendererName: 'console', error: 'oops' },
   when_skip: { type: 'when_skip', step: 'build', expression: '${foo}' },
   parallel_started: { type: 'parallel_started', step: 'build', branches: ['a', 'b'] },
   parallel_completed: { type: 'parallel_completed', step: 'build', branches: ['a', 'b'] },
   parallel_failure: { type: 'parallel_failure', step: 'build', branch: 'a', error: 'boom' },
   group_member_step: { type: 'group_member_step', member: 'a', skill: 'build', phase: 'dispatch' },
+  kickback_budget_adjustment_authorized: {
+    type: 'kickback_budget_adjustment_authorized',
+    adjustmentId: 'adjustment-1',
+    gate: 'build_review',
+    kind: 'raise',
+    feature: 'budgeted-feature',
+    operator: 'operator',
+    rationale: 'Approved after reviewing the cap halt.',
+    beforeConsumed: 5,
+    afterConsumed: 5,
+    beforeLimit: 5,
+    afterLimit: 6,
+    ts: '2026-09-05T12:00:00.000Z',
+  },
   gate_verdict: { type: 'gate_verdict', step: 'build', satisfied: true },
   test_suite_verification: { type: 'test_suite_verification', freshness: { status: 'CURRENT' } },
   build_member_evidence_reused: {
@@ -504,7 +612,7 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
   },
   build_member_evidence_recomputed: {
     type: 'build_member_evidence_recomputed',
-    member: 'wiring_check',
+    member: 'test_suite',
     decision: 'recompute',
     basis: 'recorded-head-versus-current-head',
   },
@@ -536,6 +644,14 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     type: 'halt_record_push_failed',
     path: '.docs/halted/my-feature.md',
     reason: 'no remote configured',
+  },
+  shipment_evidence_refused: {
+    type: 'shipment_evidence_refused',
+    slug: 'my-feature',
+    pr: 'https://github.com/acme/conductor/pull/2004',
+    code: 'shipment-candidate-not-on-implementation-head',
+    expected: '0'.repeat(40),
+    observed: '1'.repeat(40),
   },
   loop_converged: { type: 'loop_converged' },
   rebase_noop: { type: 'rebase_noop' },
@@ -654,10 +770,6 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
     writer.subscribe(events);
 
     const stepsRun: StepName[] = [];
-    const deprecatedSteps: Array<Extract<ConductorEvent, { type: 'deprecated_step' }>> = [];
-    events.on('deprecated_step', (event) => {
-      if (event.type === 'deprecated_step') deprecatedSteps.push(event);
-    });
     const runner: StepRunner = {
       run: async (step: StepName): Promise<StepRunResult> => {
         stepsRun.push(step);
@@ -673,19 +785,10 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
 
     await conductor.run();
 
-    expect(deprecatedSteps).toEqual([
-      {
-        type: 'deprecated_step',
-        step: 'wiring_check',
-        adr: 'adr-2026-08-11-wiring-judged-in-build-review',
-      },
-    ]);
-
     expect(stepsRun).not.toContain('conflict_check');
     expect(stepsRun).not.toContain('architecture_diagram');
 
     const records = await readRecords(dir);
-    expect(records.some((record) => record.event === 'deprecated_step')).toBe(false);
     const recordedSteps = new Set(records.map((r) => r.origin));
 
     // executed ⊆ recorded
@@ -739,6 +842,28 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
     ).toBe(true);
   });
 
+  it('records a rejected remediation category using the rejected field name', async () => {
+    const mod = await loadWriter();
+    const AuditTrailWriter = mod.AuditTrailWriter as new (root: string) => {
+      subscribe(emitter: ConductorEventEmitter): void;
+    };
+    new AuditTrailWriter(dir).subscribe(events);
+
+    await events.emit({
+      type: 'remediation_disposition_rejected',
+      gapId: 'gap-category',
+      disposition: 'unknown-category',
+      accepted: ['build', 'plan'],
+      field: 'category',
+    });
+
+    expect((await readRecords(dir)).at(-1)).toMatchObject({
+      origin: 'build',
+      event: 'remediation_disposition_rejected',
+      reason: 'gap-category: category "unknown-category" not in [build, plan]',
+    });
+  });
+
   it('drift guard: every audit-owned event type is classified, and the writer honors that classification', async () => {
     // Enumeration-driven (writing-system-tests §3): EVENT_TYPE_CLASSIFICATION
     // above is a `Record` keyed by the audit-writer-owned event union —
@@ -767,6 +892,18 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
           after,
           `expected event type "${type}" (classified friction-mapped) to append a record — the writer's allowlist no longer matches this test's classification`,
         ).toBeGreaterThan(before);
+
+        if (type === 'step_status_write_refused') {
+          expect(
+            (await readRecords(dir)).at(-1),
+            'the skipped-to-stale refusal must preserve its operator-actionable audit fields',
+          ).toMatchObject({
+            origin: 'build',
+            event: 'step_status_write_refused',
+            reason: 'manual_test: expected skipped, requested stale',
+            cause: 'restage ship tail after build kickback',
+          });
+        }
       } else {
         expect(
           after,
@@ -780,18 +917,28 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
     // rubric events stay durable; externally-owned disposition events do not
     // re-enter events.jsonl when the closeout tail re-emits them.
     const buildReviewSinkExpectations = {
-      build_review_rubric_started: { render: false, persist: true, audit: false },
-      build_review_rubric_result: { render: false, persist: true, audit: false },
-      build_review_rubric_skipped: { render: false, persist: true, audit: false },
-      build_review_cache_hit: { render: false, persist: true, audit: false },
-      build_review_rubric_infrastructure_failure: { render: false, persist: true, audit: false },
-      build_review_mechanical_allowance_exhausted: { render: false, persist: true, audit: false },
-      build_review_disposition_accepted: { render: false, persist: false, audit: false },
-      build_review_reduced_coverage_accepted: { render: false, persist: false, audit: false },
-      build_review_disposition_refused: { render: false, persist: false, audit: false },
-      build_review_disposition_version_invalidated: { render: false, persist: true, audit: true },
-      build_review_outer_verdict: { render: false, persist: true, audit: false },
-    } satisfies Partial<Record<ConductorEvent['type'], { render: boolean; persist: boolean; audit: boolean }>>;
+      build_review_rubric_started: { render: true, persist: true, audit: false, otel: false },
+      build_review_rubric_result: { render: true, persist: true, audit: false, otel: false },
+      build_review_rubric_skipped: { render: true, persist: true, audit: false, otel: false },
+      build_review_cache_hit: { render: true, persist: true, audit: false, otel: false },
+      build_review_scope_summary: { render: false, persist: true, audit: false, otel: false },
+      build_review_rubric_infrastructure_failure: { render: true, persist: true, audit: false, otel: false },
+      build_review_scope_incomplete: { render: true, persist: true, audit: false, otel: false },
+      build_review_mechanical_allowance_exhausted: { render: false, persist: true, audit: false, otel: false },
+      build_review_disposition_accepted: { render: false, persist: false, audit: false, otel: false },
+      build_review_reduced_coverage_accepted: { render: false, persist: false, audit: false, otel: false },
+      build_review_disposition_refused: { render: false, persist: false, audit: false, otel: false },
+      build_review_disposition_version_invalidated: { render: false, persist: true, audit: true, otel: false },
+      build_review_outer_verdict: { render: true, persist: true, audit: false, otel: false },
+      remediation_adjudication_started: { render: false, persist: true, audit: false, otel: false },
+      remediation_adjudication_completed: { render: true, persist: true, audit: false, otel: false },
+      remediation_adjudication_failed: { render: false, persist: true, audit: false, otel: false },
+      remediation_case_reconciled: { render: false, persist: true, audit: false, otel: false },
+      remediation_effect_reserved: { render: false, persist: true, audit: false, otel: false },
+      remediation_effect_applied: { render: false, persist: true, audit: false, otel: false },
+      remediation_effect_failed: { render: false, persist: true, audit: false, otel: false },
+      remediation_semantic_repeat_halt: { render: false, persist: true, audit: false, otel: false },
+    } satisfies Partial<Record<ConductorEvent['type'], { render: boolean; persist: boolean; audit: boolean; otel: boolean }>>;
     expect(Object.fromEntries(Object.keys(buildReviewSinkExpectations).map((type) => [
       type,
       EVENT_SINKS[type as ConductorEvent['type']],
@@ -801,9 +948,19 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
       'build_review_rubric_result',
       'build_review_rubric_skipped',
       'build_review_cache_hit',
+      'build_review_scope_summary',
       'build_review_rubric_infrastructure_failure',
+      'build_review_scope_incomplete',
       'build_review_mechanical_allowance_exhausted',
       'build_review_outer_verdict',
+      'remediation_adjudication_started',
+      'remediation_adjudication_completed',
+      'remediation_adjudication_failed',
+      'remediation_case_reconciled',
+      'remediation_effect_reserved',
+      'remediation_effect_applied',
+      'remediation_effect_failed',
+      'remediation_semantic_repeat_halt',
     ]));
     expect(persistedEventTypes()).not.toEqual(expect.arrayContaining([
       'build_review_disposition_accepted',

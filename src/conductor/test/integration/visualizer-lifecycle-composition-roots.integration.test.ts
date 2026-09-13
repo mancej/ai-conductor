@@ -59,7 +59,7 @@ function namedFunction(
 }
 
 function awaitedNamedCall(
-  owner: NamedFunction | undefined,
+  owner: Pick<NamedFunction, 'body'> | undefined,
   calleeName: string,
 ): ts.CallExpression | undefined {
   const ownerBody = owner?.body;
@@ -90,7 +90,7 @@ function awaitedNamedCall(
 }
 
 function namedCallWithin(
-  owner: NamedFunction | undefined,
+  owner: Pick<NamedFunction, 'body'> | undefined,
   calleeName: string,
 ): ts.CallExpression | undefined {
   const ownerBody = owner?.body;
@@ -181,9 +181,9 @@ function isNamedCall(
 }
 
 function directlyAwaitsConductorRun(
-  callback: ts.ArrowFunction | ts.FunctionExpression | undefined,
+  callback: Pick<NamedFunction, 'body'> | undefined,
 ): boolean {
-  if (callback === undefined) return false;
+  if (callback?.body === undefined) return false;
   if (!ts.isBlock(callback.body)) {
     return ts.isAwaitExpression(callback.body)
       && isNamedCall(callback.body.expression, 'conductor', 'run');
@@ -271,9 +271,18 @@ describe('visualizer lifecycle composition roots', () => {
       ts.ScriptTarget.Latest,
       true,
     );
-    const inlineRootCall = awaitedNamedCall(
-      namedFunction(inlineSource, 'main'),
-      'runInlineVisualizerLifecycle',
+    const inlineMain = namedFunction(inlineSource, 'main');
+    const inlineRootCall = namedCallWithin(inlineMain, 'buildInteractiveVisualizers');
+    // Upstream owns inline teardown directly around Conductor.run(). Keep
+    // checking that real entrypoint, independently of the legacy public seam.
+    const inlineRunScope = inlineMain?.body && ts.isBlock(inlineMain.body)
+      ? inlineMain.body.statements.find((statement): statement is ts.TryStatement =>
+        ts.isTryStatement(statement)
+        && directlyAwaitsConductorRun({ body: statement.tryBlock }))
+      : undefined;
+    const inlineStopCall = awaitedNamedCall(
+      { body: inlineRunScope?.finallyBlock },
+      'stopVisualizers',
     );
     const daemonRootCall = awaitedNamedCall(
       namedFunction(daemonSource, 'runDaemonMode'),
@@ -295,8 +304,14 @@ describe('visualizer lifecycle composition roots', () => {
       daemonSeamOwner,
       'withRegisteredVisualizers',
     );
-    const inlineCallback = lifecycleCallback(inlineRootCall);
     const daemonCallback = lifecycleCallback(daemonRootCall);
+    const daemonContext = daemonRootCall?.arguments[3];
+    const daemonContextFields = daemonContext && ts.isObjectLiteralExpression(daemonContext)
+      ? Object.fromEntries(daemonContext.properties.flatMap((property) =>
+        ts.isPropertyAssignment(property)
+          ? [[property.name.getText(daemonSource), property.initializer.getText(daemonSource)]]
+          : []))
+      : {};
     const tempDir = await mkdtemp(join(tmpdir(), 'visualizer-entrypoints-'));
     const globalPlugins = join(tempDir, 'global');
     const projectPlugins = join(tempDir, 'project');
@@ -514,14 +529,15 @@ export default {
 
       expect({
         inlineImportsHelper: importsLifecycleHelper(inlineSource),
-        inlineRootAwaitsSeam: inlineRootCall !== undefined,
+        inlineRootStartsConfiguredVisualizers: inlineRootCall !== undefined,
         inlineRootArguments: hasExactArguments(
           inlineRootCall,
           inlineSource,
-          ['registry', 'events', inlineCallback?.getText(inlineSource) ?? '', 'builtInVisualizers'],
+          ['registry', 'visualizerContext.config', 'visualizerContext'],
         ),
         inlineRootAwaitsConductorRun:
-          directlyAwaitsConductorRun(inlineCallback),
+          directlyAwaitsConductorRun({ body: inlineRunScope?.tryBlock }),
+        inlineRootAwaitsTeardown: hasExactArguments(inlineStopCall, inlineSource, ['visualizerList']),
         inlineSeamExported: exportsNamedFunction(
           inlineSource,
           'runInlineVisualizerLifecycle',
@@ -529,15 +545,16 @@ export default {
         inlineSeamDelegatesShared: hasExactArguments(
           inlineDelegation,
           inlineSource,
-          ['registry', 'emitter', 'run', 'builtIns'],
+          ['registry', 'emitter', 'run', 'builtIns', 'context'],
         ),
         daemonImportsHelper: importsLifecycleHelper(daemonSource),
         daemonRootAwaitsSeam: daemonRootCall !== undefined,
         daemonRootArguments: hasExactArguments(
           daemonRootCall,
           daemonSource,
-          ['registry', 'events', daemonCallback?.getText(daemonSource) ?? ''],
+          ['registry', 'events', daemonCallback?.getText(daemonSource) ?? '', daemonContext?.getText(daemonSource) ?? ''],
         ),
+        daemonContextFields,
         daemonRootReturnsOrAwaitsRunDaemon:
           directlyReturnsOrAwaitsRunDaemon(daemonCallback),
         daemonSeamExported: exportsNamedFunction(
@@ -547,7 +564,7 @@ export default {
         daemonSeamDelegatesShared: hasExactArguments(
           daemonDelegation,
           daemonSource,
-          ['pluginRegistry', 'emitter', 'run'],
+          ['pluginRegistry', 'emitter', 'run', '[]', 'context'],
         ),
         inlineSeamAvailable: inlineLifecycle !== undefined,
         daemonSeamAvailable: daemonLifecycle !== undefined,
@@ -561,14 +578,21 @@ export default {
         failureOutcomes,
       }).toEqual({
         inlineImportsHelper: true,
-        inlineRootAwaitsSeam: true,
+        inlineRootStartsConfiguredVisualizers: true,
         inlineRootArguments: true,
         inlineRootAwaitsConductorRun: true,
+        inlineRootAwaitsTeardown: true,
         inlineSeamExported: true,
         inlineSeamDelegatesShared: true,
         daemonImportsHelper: true,
         daemonRootAwaitsSeam: true,
         daemonRootArguments: true,
+        daemonContextFields: {
+          config: 'config ?? {}',
+          pipelineDir: "join(projectRoot, '.pipeline')",
+          emitter: 'events',
+          startContext: "{ project: projectRoot, pipelineDir: join(projectRoot, '.pipeline'), metrics: false }",
+        },
         daemonRootReturnsOrAwaitsRunDaemon: true,
         daemonSeamExported: true,
         daemonSeamDelegatesShared: true,

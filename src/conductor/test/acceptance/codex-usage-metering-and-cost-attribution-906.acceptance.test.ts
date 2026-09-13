@@ -369,7 +369,7 @@ describe('acceptance: Codex usage metering and cost attribution (#906)', () => {
           actualProvider: 'codex',
           tokenUsage: { input: 600, output: 60, cacheRead: 5, cacheCreation: 7 },
         },
-        // A non-LLM step: no usage at all → plain unmetered (today's meaning).
+        // A provider-free completion carries no dispatch evidence and is excluded.
         { type: 'step_completed', step: 'worktree', status: 'done' },
       ]);
       expect(await shipRecord()).toBe(0);
@@ -411,15 +411,15 @@ describe('acceptance: Codex usage metering and cost attribution (#906)', () => {
       expect(codex).toMatch(/cost_unmetered:\s*(?:count:\s*)?1\b/);
     });
 
-    it('NP-1: a step with no tokenUsage keeps today\'s meaning — unmetered, NOT cost_unmetered', async () => {
+    it('NP-1: a provider-free step with no tokenUsage is excluded from both metering counts', async () => {
       await writeEventsLedger([
-        // Only the non-LLM step: no usage at all.
+        // Only the provider-free completion: no provider or usage evidence.
         { type: 'step_completed', step: 'worktree', status: 'done' },
       ]);
       expect(await shipRecord()).toBe(0);
 
       const block = await committedCostBlock();
-      expect(block).toMatch(/^unmetered: count: 1, duration_ms: 0$/m);
+      expect(block).toMatch(/^unmetered: count: 0, duration_ms: 0$/m);
       expect(block).toMatch(/^cost_unmetered:\s*(?:count:\s*)?0\b/m);
     });
 
@@ -809,7 +809,7 @@ describe('acceptance: Codex usage metering and cost attribution (#906)', () => {
       }
     });
 
-    it('Story 6 HP-2: documentation names halt consumers without promising --report halt or kickback tables', async () => {
+    it('Story 6 HP-2: documentation names halt consumers and distinguishes report kickback tables', async () => {
       const artifacts = await readFile(join(REPO_ROOT, 'docs/reference/artifacts.md'), 'utf-8');
       const stalledRunbook = await readFile(join(REPO_ROOT, 'docs/runbooks/stalled-or-stuck-feature.md'), 'utf-8');
 
@@ -824,13 +824,13 @@ describe('acceptance: Codex usage metering and cost attribution (#906)', () => {
       for (const consumer of [
         'cost-rollup.halts',
         "shipped records' `## Cost` blocks",
-        '`conduct-ts kpi`',
+        '`ai-conductor kpi`',
         'engineer-loop signal assembler',
       ]) {
         expect(artifacts).toContain(consumer);
       }
-      expect(artifacts).toContain('renders neither halt nor kickback tables');
-      expect(stalledRunbook).toContain('renders neither halt nor kickback tables');
+      expect(artifacts).toContain('kickback tables but not halt tables');
+      expect(stalledRunbook).toContain('does not render halt tables');
       expect(artifacts).not.toMatch(/`aggregateHalts` always returns/);
       expect(artifacts).not.toMatch(/kickback table do reflect real/);
     });

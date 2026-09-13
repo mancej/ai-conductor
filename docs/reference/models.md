@@ -7,7 +7,7 @@ nav_order: 5
 # Model and effort resolution
 
 How the engine picks a model, a reasoning effort, a retry budget, and a review mode for every step, and
-how those values stay in sync with the table in `HARNESS.md`. Source-ordered: engine steps follow
+how those values stay in sync with the table in `ARCHITECTURE.md`. Source-ordered: engine steps follow
 `StepName` declaration order, not alphabetical order.
 
 ## Precedence chain
@@ -73,12 +73,10 @@ not a tuning knob.
 | `acceptance_specs` | opus | gpt-5.6-sol | medium | 3 | auto |
 | `build` | sonnet | gpt-5.6-terra | medium | 3 | auto |
 | `build_review` | opus | gpt-5.6-sol | high | 3 | conditional |
-| `wiring_check` | — | — | — | 1 | auto |
 | `test_suite` | sonnet | gpt-5.6-terra | low | 1 | auto |
 | `manual_test` | sonnet | gpt-5.6-terra | medium | 3 | auto |
 | `prd_audit` | opus | gpt-5.6-sol | high | 3 | conditional |
 | `architecture_review_as_built` | opus | gpt-5.6-sol | high | 3 | conditional |
-| `retro` | sonnet | gpt-5.6-terra | medium | 3 | manual |
 | `rebase` | opus | gpt-5.6-terra | high | 1 | auto |
 | `finish` | sonnet | gpt-5.6-terra | medium | 6 | auto |
 | `remediate` | opus | gpt-5.6-sol | medium | 3 | auto |
@@ -103,8 +101,7 @@ escalations. The floor is 3, not 2, because the model-bump rung lives at attempt
 | `manual` | The operator reviews before the run proceeds |
 | `conditional` | Auto-approved **unless** the skill wrote `.pipeline/review-required-<step>` (`src/conductor/src/types/config.ts:14-21`) |
 
-`wiring_check` reads `auto` because it is a compatibility no-op. `test_suite` reads `auto` because
-it produces deterministic evidence with no generative verdict to review. See
+`test_suite` reads `auto` because it produces deterministic evidence with no generative verdict to review. See
 [artifacts](artifacts.md).
 
 ## Tier overrides
@@ -306,9 +303,9 @@ Change one thing — add `defaults: { model: sonnet }` — and step 3 stops at l
 step runs on `sonnet` (a Claude name, on a Codex provider) and the L-tier promotion never applies. Model
 names are not enum-checked at any point.
 
-## Keeping HARNESS.md in sync
+## Keeping ARCHITECTURE.md in sync
 
-The model-selection table in `HARNESS.md` is generated, not hand-written. Regenerate it with:
+The model-selection table in `ARCHITECTURE.md` is generated, not hand-written. Regenerate it with:
 
 ```bash
 bin/generate-model-table
@@ -328,7 +325,7 @@ Exit codes (`generate-model-table.ts:396-398`): `0` ok, `1` drift (check mode on
 marker error.
 
 The region is delimited by `<!-- BEGIN GENERATED: model-selection-table -->` and
-`<!-- END GENERATED: model-selection-table -->`, each alone on its line (`HARNESS.md:147` and `:198`). A
+`<!-- END GENERATED: model-selection-table -->`, each alone on its line (in `ARCHITECTURE.md`). A
 missing, duplicated, or out-of-order marker throws a `MarkerError` and leaves the document untouched
 (`generate-model-table.ts:49-89`).
 

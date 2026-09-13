@@ -39,7 +39,12 @@ mkdir -p "$CHECKOUT"
 cp -r "$HARNESS_DIR/bin" "$CHECKOUT/bin"
 cp -r "$HARNESS_DIR/skills" "$CHECKOUT/skills"
 cp -r "$HARNESS_DIR/hooks" "$CHECKOUT/hooks"
-cp "$HARNESS_DIR/HARNESS.md" "$HARNESS_DIR/VERSION" "$CHECKOUT/"
+cp "$HARNESS_DIR/HARNESS.md" "$HARNESS_DIR/ARCHITECTURE.md" "$HARNESS_DIR/VERSION" "$CHECKOUT/"
+# The installer now requires an existing conductor bundle before it reports
+# completion. This catalog test stubs that unrelated build boundary so every
+# scenario observes real skill-link reconciliation only.
+mkdir -p "$CHECKOUT/src/conductor/dist"
+: > "$CHECKOUT/src/conductor/dist/index.js"
 
 STUBS="$TMP_ROOT/stubs"
 mkdir -p "$STUBS"
@@ -80,6 +85,19 @@ owned_catalog_is_current() {
   [ "$found" -eq "$expected" ] \
     && [ -L "$fake_home/.agents/skills/HARNESS.md" ] \
     && [ "$(readlink -f "$fake_home/.agents/skills/HARNESS.md")" = "$CHECKOUT/HARNESS.md" ]
+}
+
+canonical_composer_and_engineer_resolve_for_both_hosts() {
+  local fake_home=$1
+  local host_dir skill
+
+  for host_dir in "$fake_home/.claude/skills" "$fake_home/.agents/skills"; do
+    for skill in composer engineer; do
+      [ -L "$host_dir/$skill" ] || return 1
+      [ "$(readlink -f "$host_dir/$skill")" = "$CHECKOUT/skills/$skill" ] || return 1
+      [ -r "$host_dir/$skill/SKILL.md" ] || return 1
+    done
+  done
 }
 
 snapshot_current_catalog() {
@@ -139,15 +157,17 @@ legacy_catalog_has_no_owned_entries() {
 }
 
 # ST-904-1/ST-904-2: normal built-in installation exposes the whole canonical
-# catalog and linked resources through Codex's documented user scope.
+# catalog and linked resources through each host's documented user scope.
 FRESH_HOME="$TMP_ROOT/home-fresh"
-if run_install "$FRESH_HOME" --providers codex >"$TMP_ROOT/fresh.out" 2>&1; then
-  pass 'normal Codex installation completes without plugin or prompt setup'
+if run_install "$FRESH_HOME" --providers claude,codex >"$TMP_ROOT/fresh.out" 2>&1; then
+  pass 'normal both-host installation completes without plugin or prompt setup'
 else
-  fail 'normal Codex installation completes without plugin or prompt setup'
+  fail 'normal both-host installation completes without plugin or prompt setup'
 fi
 check 'every canonical skill is readable exactly once from ~/.agents/skills' \
   owned_catalog_is_current "$FRESH_HOME"
+check 'both hosts resolve canonical composer and the compatibility engineer delegate' \
+  canonical_composer_and_engineer_resolve_for_both_hosts "$FRESH_HOME"
 check 'a linked skill resource is readable from the installed Codex view' \
   test -r "$FRESH_HOME/.agents/skills/tdd/references/red.md"
 check 'normal installation creates no Codex plugin dependency' \
@@ -155,13 +175,38 @@ check 'normal installation creates no Codex plugin dependency' \
 check 'normal installation leaves no harness-owned duplicate catalog in the legacy scope' \
   legacy_catalog_has_no_owned_entries "$FRESH_HOME"
 
+# The generic catalog check must identify a compatibility delegate that has
+# disappeared or become unreadable in either supported host's installed view.
+BROKEN_DELEGATE_HOME="$TMP_ROOT/home-broken-engineer"
+run_install "$BROKEN_DELEGATE_HOME" --providers claude,codex \
+  >"$TMP_ROOT/broken-delegate-install.out" 2>&1
+rm -f "$BROKEN_DELEGATE_HOME/.claude/skills/engineer" \
+  "$BROKEN_DELEGATE_HOME/.agents/skills/engineer"
+ln -s "$TMP_ROOT/missing-claude-engineer" \
+  "$BROKEN_DELEGATE_HOME/.claude/skills/engineer"
+ln -s "$TMP_ROOT/missing-codex-engineer" \
+  "$BROKEN_DELEGATE_HOME/.agents/skills/engineer"
+set +e
+run_install "$BROKEN_DELEGATE_HOME" --check --providers claude,codex \
+  >"$TMP_ROOT/broken-delegate-check.out" 2>&1
+BROKEN_DELEGATE_CHECK_CODE=$?
+if [ "$BROKEN_DELEGATE_CHECK_CODE" -ne 0 ] \
+  && grep -qiE 'Claude skill: engineer.*broken symlink' \
+    "$TMP_ROOT/broken-delegate-check.out" \
+  && grep -qiE 'Codex active skill: engineer.*broken symlink' \
+    "$TMP_ROOT/broken-delegate-check.out"; then
+  pass 'check fails with both host diagnostics for a broken engineer delegate'
+else
+  fail 'check fails with both host diagnostics for a broken engineer delegate'
+fi
+
 # ST-904-3/ST-904-4: update replaces an older harness-owned target, removes
 # legacy duplication, and converges when repeated.
 UPDATE_HOME="$TMP_ROOT/home-update"
 OLD_CHECKOUT="$TMP_ROOT/old-checkout"
 mkdir -p "$UPDATE_HOME/.agents/skills" "$UPDATE_HOME/.codex/skills" "$OLD_CHECKOUT"
 cp -r "$CHECKOUT/skills" "$OLD_CHECKOUT/skills"
-cp "$CHECKOUT/HARNESS.md" "$CHECKOUT/VERSION" "$OLD_CHECKOUT/"
+cp "$CHECKOUT/HARNESS.md" "$CHECKOUT/ARCHITECTURE.md" "$CHECKOUT/VERSION" "$OLD_CHECKOUT/"
 printf '%s\n' 'old workflow revision' > "$OLD_CHECKOUT/skills/tdd/SKILL.md"
 mkdir -p "$OLD_CHECKOUT/skills/retired-workflow"
 printf '%s\n' 'retired workflow revision' > "$OLD_CHECKOUT/skills/retired-workflow/SKILL.md"
@@ -172,6 +217,7 @@ ln -s "$OLD_CHECKOUT/skills/tdd" "$UPDATE_HOME/.agents/skills/tdd"
 ln -s "$OLD_CHECKOUT/skills/retired-workflow" "$UPDATE_HOME/.agents/skills/retired-workflow"
 ln -s "$CHECKOUT/skills/tdd" "$UPDATE_HOME/.codex/skills/tdd"
 ln -s "$CHECKOUT/HARNESS.md" "$UPDATE_HOME/.codex/skills/HARNESS.md"
+ln -s "$CHECKOUT/ARCHITECTURE.md" "$UPDATE_HOME/.codex/skills/ARCHITECTURE.md"
 
 run_install "$UPDATE_HOME" --update --providers codex >"$TMP_ROOT/update-1.out" 2>&1
 check 'update refreshes a stale current-scope harness skill to this checkout' \
@@ -180,6 +226,8 @@ check 'update removes a recognized harness-owned legacy duplicate' \
   test ! -e "$UPDATE_HOME/.codex/skills/tdd"
 check 'update removes recognized harness-owned legacy instructions' \
   test ! -e "$UPDATE_HOME/.codex/skills/HARNESS.md"
+check "UPDATE_HOME removes its owned legacy architecture reference" \
+  test ! -L "$UPDATE_HOME/.codex/skills/ARCHITECTURE.md"
 check 'updated catalog matches the complete current source catalog' \
   owned_catalog_is_current "$UPDATE_HOME"
 check 'update removes an obsolete current-scope skill owned by the prior harness checkout' \
@@ -257,12 +305,15 @@ OLD_LEGACY_UPDATE_HOME="$TMP_ROOT/home-old-legacy-update"
 mkdir -p "$OLD_LEGACY_UPDATE_HOME/.codex/skills"
 ln -s "$OLD_CHECKOUT/skills/tdd" "$OLD_LEGACY_UPDATE_HOME/.codex/skills/tdd"
 ln -s "$OLD_CHECKOUT/HARNESS.md" "$OLD_LEGACY_UPDATE_HOME/.codex/skills/HARNESS.md"
+ln -s "$OLD_CHECKOUT/ARCHITECTURE.md" "$OLD_LEGACY_UPDATE_HOME/.codex/skills/ARCHITECTURE.md"
 run_install "$OLD_LEGACY_UPDATE_HOME" --update --providers codex \
   >"$TMP_ROOT/old-legacy-update.out" 2>&1
 check 'update converges a complete prior-harness legacy skill link' \
   test ! -e "$OLD_LEGACY_UPDATE_HOME/.codex/skills/tdd"
 check 'update converges complete prior-harness legacy instructions' \
   test ! -e "$OLD_LEGACY_UPDATE_HOME/.codex/skills/HARNESS.md"
+check "OLD_LEGACY_UPDATE_HOME removes its owned legacy architecture reference" \
+  test ! -L "$OLD_LEGACY_UPDATE_HOME/.codex/skills/ARCHITECTURE.md"
 
 SAME_CHECKOUT_HOME="$TMP_ROOT/home-update-same-checkout"
 mkdir -p "$SAME_CHECKOUT_HOME/.agents/skills"
@@ -300,7 +351,7 @@ done
 
 catalog_reinstall_is_idempotent() {
   local source skill
-  local expected_count=2
+  local expected_count=3
   local unrelated_hash
 
   unrelated_hash=$(printf '%s\n' 'operator-owned current-scope content' | sha256sum | awk '{print $1}')
@@ -484,22 +535,28 @@ OWNED_LEGACY_HOME="$TMP_ROOT/home-owned-legacy"
 mkdir -p "$OWNED_LEGACY_HOME/.codex/skills"
 ln -s "$CHECKOUT/skills/stories" "$OWNED_LEGACY_HOME/.codex/skills/stories"
 ln -s "$CHECKOUT/HARNESS.md" "$OWNED_LEGACY_HOME/.codex/skills/HARNESS.md"
+ln -s "$CHECKOUT/ARCHITECTURE.md" "$OWNED_LEGACY_HOME/.codex/skills/ARCHITECTURE.md"
 run_install "$OWNED_LEGACY_HOME" --uninstall >"$TMP_ROOT/owned-legacy-uninstall.out" 2>&1
 check 'uninstall removes legacy harness-owned catalog entries' \
   test ! -e "$OWNED_LEGACY_HOME/.codex/skills/stories"
 check 'uninstall removes legacy harness-owned instructions' \
   test ! -e "$OWNED_LEGACY_HOME/.codex/skills/HARNESS.md"
+check "OWNED_LEGACY_HOME removes its owned legacy architecture reference" \
+  test ! -L "$OWNED_LEGACY_HOME/.codex/skills/ARCHITECTURE.md"
 
 OLD_LEGACY_UNINSTALL_HOME="$TMP_ROOT/home-old-legacy-uninstall"
 mkdir -p "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills"
 ln -s "$OLD_CHECKOUT/skills/tdd" "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills/tdd"
 ln -s "$OLD_CHECKOUT/HARNESS.md" "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills/HARNESS.md"
+ln -s "$OLD_CHECKOUT/ARCHITECTURE.md" "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills/ARCHITECTURE.md"
 run_install "$OLD_LEGACY_UNINSTALL_HOME" --uninstall \
   >"$TMP_ROOT/old-legacy-uninstall.out" 2>&1
 check 'uninstall removes a complete prior-harness legacy skill link' \
   test ! -e "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills/tdd"
 check 'uninstall removes complete prior-harness legacy instructions' \
   test ! -e "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills/HARNESS.md"
+check "OLD_LEGACY_UNINSTALL_HOME removes its owned legacy architecture reference" \
+  test ! -L "$OLD_LEGACY_UNINSTALL_HOME/.codex/skills/ARCHITECTURE.md"
 
 CODEX_UNRELEASED=$(awk '
   /^## \[Unreleased\]$/ { in_unreleased=1; next }

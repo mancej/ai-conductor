@@ -1,4 +1,5 @@
 import type { StepName, StepStatus, ComplexityTier } from './steps.js';
+import type { EffortLevel } from './config.js';
 import type { BootstrapMode } from './state.js';
 import type {
   AuthenticationReadinessState,
@@ -12,6 +13,32 @@ import type { ObservedInterval } from '../execution/observed-interval.js';
 import type { SchedulingUnitRef } from './scheduling-unit.js';
 
 export type RecoveryOption = 'retry' | 'interactive' | 'back' | 'skip' | 'quit';
+
+/** Daemon-lifetime backlog dimensions. Kept closed so metric cardinality is bounded. */
+export type BacklogState = 'eligible' | 'waiting' | 'blocked' | 'gated' | 'parked';
+export type DispatchKind = 'initial' | 'resume' | 'rekick';
+export type DispatchBlockReason = 'paused' | 'build_auth_missing' | 'gh_version' | 'episode_active';
+export type FeatureDispatchOutcome = 'complete' | 'halted' | 'terminated';
+
+/** Closed outcomes for the daemon's bounded setup repair session. */
+export type SetupRepairDisposition =
+  | 'engine-committed'
+  | 'accepted-existing-commit'
+  | 'verified-no-tree-change'
+  | 'rejected';
+
+/** Fail-closed reasons for a rejected setup repair attempt. */
+export type SetupRepairRejectionReason =
+  | 'provider-failure'
+  | 'history-rewritten'
+  | 'mixed-commit-and-residue'
+  | 'setup-still-failing'
+  | 'setup-drift'
+  | 'snapshot-failed'
+  | 'repair-commit-failed'
+  | 'repair-postcondition-failed'
+  | 'preservation-failed'
+  | 'restoration-failed';
 
 /** Identity is deliberately explicit when a retention decision has no readable lease. */
 type ScratchCleanupIdentityValue = string | 'unknown';
@@ -154,7 +181,10 @@ export interface ProviderAttemptEvent {
   outcome: 'success' | 'failure' | 'unavailable';
   /** False when a cached run-wide unavailability avoided process dispatch. */
   invoked: boolean;
+  preferredProvider?: string;
   model?: string;
+  effort?: EffortLevel;
+  tier?: ComplexityTier;
   tokenUsage?: TokenUsage;
   observedIntervals?: readonly ObservedInterval[];
   reason?: string;
@@ -303,7 +333,54 @@ export type EngineerLifecycleEvent = EngineerEventBase & (
 
 export type ConductorEvent =
   | EngineerLifecycleEvent
+  | {
+      type: 'daemon_backlog_snapshot';
+      counts: Record<BacklogState, number>;
+      oldestAgeSeconds: Partial<Record<BacklogState, number>>;
+      slots: { busy: number; free: number };
+      inFlight: string[];
+      blocked: Record<DispatchBlockReason, boolean>;
+      pollDurationMs: number;
+    }
+  | { type: 'feature_dispatch_started'; slug: string; kind: DispatchKind }
+  | {
+      type: 'feature_dispatch_ended';
+      slug: string;
+      outcome: FeatureDispatchOutcome;
+      haltClass?: import('../engine/halt-marker.js').HaltDisposition;
+      step?: string;
+    }
+  | {
+      type: 'feature_shipped';
+      slug: string;
+      runStartedAt?: number;
+      active: { state: 'exact' | 'partial' | 'unavailable'; activeMs?: number };
+    }
+  | { type: 'intake_inbound_sanitized'; sourceRef: string; neutralizations: import('../engine/engineer/intake/sanitize-inbound.js').InboundNeutralization[]; digest: string }
   | { type: 'operator_rewind'; operator: string; target: string; demoted: string[] }
+  | {
+      type: 'setup_repair';
+      disposition: Exclude<SetupRepairDisposition, 'rejected'>;
+      preservedPaths: string[];
+    }
+  | {
+      type: 'setup_repair';
+      disposition: 'rejected';
+      reason: SetupRepairRejectionReason;
+      quarantineRef?: string;
+      preservedPaths: string[];
+    }
+  | { type: 'project_setup'; ran: boolean; reason: 'marker-valid' | 'no-marker' | 'no-script' | 'script-changed' | 'base-moved' | 'marker-invalid' | 'forced' }
+  | {
+      /** The memory-path state observed before daemon setup ran. */
+      type: 'memory_setup';
+      /** Whether `.memory` was absent, a real directory, or a symlink. */
+      before: 'absent' | 'directory' | 'symlink';
+      /** Whether `.memory` points to the canonical store after setup. */
+      canonical: boolean;
+      /** Sanitized setup failure or non-canonical outcome, when available. */
+      reason?: string;
+    }
   | {
       /** Durable plan-task growth accounting after a remediation append. */
       type: 'plan_growth';
@@ -311,6 +388,19 @@ export type ConductorEvent =
       added: number;
       byGate: Record<string, number>;
       remaining: number;
+    }
+  | {
+      /** One terminal judgement of a criterion-to-Done-when binding claim. */
+      type: 'coverage_binding_judged';
+      step: 'coverage_binding';
+      verdict: 'asserts' | 'does-not-assert' | 'not-applicable';
+      digest: string;
+      taskIds: string[];
+    }
+  | {
+      /** The default-off coverage-binding judge completed without dispatching. */
+      type: 'coverage_binding_disabled';
+      step: 'coverage_binding';
     }
   | {
       /** A retired configuration key was accepted as a compatibility no-op. */
@@ -343,7 +433,30 @@ export type ConductorEvent =
   | { type: 'build_review_rubric_result'; rubric: string; lapId: string; verdict: 'PASS' | 'FAIL' }
   | { type: 'build_review_rubric_skipped'; rubric: string; lapId: string; reason: string }
   | { type: 'build_review_cache_hit'; rubric: string; lapId: string }
+  /** Frozen scope assessment for one rubric lap; routine detail stays in the shared ledger. */
+  | {
+      type: 'build_review_scope_summary';
+      rubric: string;
+      lapId: string;
+      establishedTargetCount: number;
+      candidateCount: number;
+      unresolvedReasons: readonly string[];
+    }
+  /** adr-2026-08-21 D5: a cached judgement discarded because the judging engine or rubric skill text changed. */
+  | { type: 'build_review_cache_discarded'; rubric: string; lapId: string; reason: 'engine-version-mismatch' | 'skill-digest-mismatch'; cachedEngineStamp?: string; currentEngineStamp: string }
   | { type: 'build_review_rubric_infrastructure_failure'; rubric: string; lapId: string; reason: string; excerpt?: string }
+  /** Valid scope judgment could not resolve a concrete candidate; not a malformed provider result. */
+  | {
+      type: 'build_review_scope_incomplete';
+      rubric: string;
+      lapId: string;
+      candidates: readonly {
+        candidateId: string;
+        sourceRegion: { path: string; startLine: number; endLine: number; contentHash: string; display: string };
+        obligationReferences: readonly string[];
+        missingEvidenceReason: string;
+      }[];
+    }
   | {
       /** The shared retry allowance was exhausted for a mechanical rubric failure. */
       type: 'build_review_mechanical_allowance_exhausted';
@@ -374,6 +487,82 @@ export type ConductorEvent =
       reason?: string;
       /** Unbound Covers declarations seen in the frozen test-quality scope. */
       unresolvedMarkers?: readonly { selector: string; reference: string }[];
+      /** Findings below the configured per-rubric confidence floor. */
+      suppressedFindings?: readonly { findingId: string; rubric: string; confidence: number; floor: number }[];
+    }
+  | {
+      /** A post-join remediation judgement is about to run for one build-review lap. */
+      type: 'remediation_adjudication_started';
+      domain: 'build_review';
+      lapId: string;
+    }
+  | {
+      /** A valid remediation judgement was fully reconciled for one build-review lap. */
+      type: 'remediation_adjudication_completed';
+      domain: 'build_review';
+      lapId: string;
+      caseIds: readonly string[];
+      effectIds: readonly string[];
+    }
+  | {
+      /** A remediation judgement could not be completed and remains fail-closed. */
+      type: 'remediation_adjudication_failed';
+      domain: 'build_review';
+      lapId: string;
+      reason: string;
+    }
+  | {
+      /** One canonical remediation case was reconciled against the current lap. */
+      type: 'remediation_case_reconciled';
+      domain: 'build_review';
+      lapId: string;
+      caseId: string;
+      resolution: 'open' | 'resolved';
+    }
+  | {
+      /** One attempted remediation case was refuted against the current lap. */
+      type: 'remediation_case_refuted';
+      domain: 'build_review';
+      lapId: string;
+      caseId: string;
+      residualEffectId?: string;
+    }
+  | {
+      /** One idempotent remediation effect was reserved before execution. */
+      type: 'remediation_effect_reserved';
+      domain: 'build_review';
+      lapId: string;
+      caseId: string;
+      effectId: string;
+      effectKind: 'action' | 'deferral';
+    }
+  | {
+      /** One reserved remediation effect completed successfully. */
+      type: 'remediation_effect_applied';
+      domain: 'build_review';
+      lapId: string;
+      caseId: string;
+      effectId: string;
+      effectKind: 'action' | 'deferral';
+    }
+  | {
+      /** One reserved remediation effect failed and remains blocking. */
+      type: 'remediation_effect_failed';
+      domain: 'build_review';
+      lapId: string;
+      caseId: string;
+      effectId: string;
+      effectKind: 'action' | 'deferral';
+      reason: string;
+    }
+  | {
+      /** A previously attempted or resolved case reappeared and halted routing. */
+      type: 'remediation_semantic_repeat_halt';
+      domain: 'build_review';
+      lapId: string;
+      caseId: string;
+      effectId?: string;
+      reason: 'already-attempted' | 'regressed';
     }
   | { type: 'build_review_stale_aggregate'; storedLapId: string; currentLapId: string }
   | { type: 'step_started'; step: StepName; index: number }
@@ -394,18 +583,14 @@ export type ConductorEvent =
       ts: number;
     }
   | {
-      /** A retained compatibility step ran as a deprecated no-op. */
-      type: 'deprecated_step';
-      step: StepName;
-      adr: string;
-    }
-  | {
       type: 'step_completed';
       step: StepName;
       status: StepStatus;
       tail?: string[];
       tokenUsage?: TokenUsage;
       model?: string;
+      effort?: EffortLevel;
+      tier?: ComplexityTier;
       unmetered?: boolean;
       /** Preferred provider resolved for this step, when provider routing is active. */
       preferredProvider?: string;
@@ -421,6 +606,8 @@ export type ConductorEvent =
       step: StepName;
       error: string;
       retryCount: number;
+      effort?: EffortLevel;
+      tier?: ComplexityTier;
       observedIntervals?: readonly ObservedInterval[];
     }
   | {
@@ -429,6 +616,14 @@ export type ConductorEvent =
       step: StepName;
       kind: 'seal' | 'needs-human' | 'validation-verdict';
       reason: string;
+    }
+  | {
+      /** A domain rule refused a conductor-owned step status write. */
+      type: 'step_status_write_refused';
+      field: string;
+      expected: 'skipped';
+      requested: 'stale';
+      intent: string;
     }
   | ProviderAttemptEvent
   | ProviderStreamProgressEvent
@@ -492,6 +687,29 @@ export type ConductorEvent =
       costUnmeteredDispatches?: number;
     }
   | {
+      /**
+       * Non-persisted projection of the ledger emitted after each step close.
+       *
+       * Its dimensions are cumulative ledger totals, so OTel can record the
+       * current feature-wide cost without treating a step terminal as a new
+       * cost occurrence.
+       */
+      type: 'feature_cost_snapshot';
+      costUsd: number;
+      costComplete: boolean;
+      byDimension: Array<{
+        step: string;
+        model?: string;
+        source?: 'provider' | 'rate-card';
+        costUsd: number;
+      }>;
+      tokensByDimension: Array<{
+        step: string;
+        model?: string;
+        tokens: { input?: number; output?: number; cacheRead?: number; cacheCreation?: number };
+      }>;
+    }
+  | {
       /** A visible transition from an unavailable provider to the next candidate. */
       type: 'provider_fallback';
       step: StepName;
@@ -512,6 +730,11 @@ export type ConductorEvent =
       attempt: number; // 1-based: "attempt 2 of 3"
       maxAttempts: number;
       reason: string;
+      /** Dimensions of the failed attempt, distinct from upcoming escalation fields below. */
+      model?: string;
+      effort?: EffortLevel;
+      provider?: string;
+      tier?: ComplexityTier;
       resolvedBefore?: number;
       resolvedAfter?: number;
       /**
@@ -532,7 +755,7 @@ export type ConductorEvent =
       step: StepName;
       attempt: number;
       decision: 'rerun' | 'route';
-      signal?: 'named-route' | 'identical-repeat' | 'unretryable-inputs';
+      signal?: 'named-route' | 'identical-repeat' | 'unretryable-inputs' | 'stale-run-identity' | 'terminal-refusal';
       unchangedInput?: string;
     }
   | { type: 'checkpoint_reached'; step: StepName }
@@ -576,12 +799,17 @@ export type ConductorEvent =
         | 'head-unresolvable'
         | 'base-tip-unresolved'
         | 'workspace-differs-from-head'
-        | 'head-differs-from-base';
+        | 'head-differs-from-base'
+        | 'engine-append-unvouched';
       path?: string;
       /** Merge-base used to classify a named path, when provenance resolved far enough to obtain one. */
       mergeBase?: string;
       /** Whether HEAD changed the named path since `mergeBase`; degraded probes stay explicit. */
       headTouchedPath?: boolean | 'indeterminate';
+      /** Why the operator-reseal exit could not approve this named path. */
+      operatorResealExit?: 'not-resealed' | 'sealed-content-mismatch';
+      /** Why the engine-remediation-append exit could not approve this named path. */
+      engineAppendExit?: 'not-present' | 'unvouched';
     }
   | {
       /** An interactive operator resealed the enumerated protected artifacts. */
@@ -611,6 +839,18 @@ export type ConductorEvent =
       type: 'remediation_sealed_artifact_redirect';
       gapId: string;
       artifact: string;
+      /** The planner prose clause that directed the sealed-artifact edit. */
+      directingClause?: string;
+      /** Which remediation input supplied the directing clause. */
+      directingSource?: 'task title' | 'rationale';
+    }
+  | {
+      /** A remediation planner disposition was not recognized by the engine. */
+      type: 'remediation_disposition_rejected';
+      gapId: string;
+      disposition: string;
+      accepted: string[];
+      field?: 'disposition' | 'category';
     }
   | ({
       /**
@@ -623,7 +863,7 @@ export type ConductorEvent =
       type: 'verdict_freshness';
       step: StepName;
       artifact: string;
-      floorSource: 'attempt' | 'session';
+      floorSource: 'attempt' | 'session' | 'run-identity';
       mtimeMs?: number;
       floorMs?: number;
     } & VerdictFreshnessClassification)
@@ -642,6 +882,10 @@ export type ConductorEvent =
       trackingRefSha: string | null;
       remoteHeadSha: string | null;
       fresh: boolean;
+      /** Advisory commit records Git found patch-equivalent to the review base. */
+      filteredCommits?: readonly { readonly sha: string; readonly subject: string }[];
+      /** Advisory paths excluded from the graded diff by those commit records. */
+      excludedPaths?: readonly string[];
     }
   | {
       /**
@@ -697,6 +941,8 @@ export type ConductorEvent =
       featureSlug?: string;
       tickReason?: 'task-delta' | 'head-moved' | 'heartbeat';
       headMoved?: boolean;
+      /** Epoch ms of the last observed commit, if tracked. */
+      lastCommitAt?: number;
     }
   | {
       /**
@@ -723,7 +969,6 @@ export type ConductorEvent =
         | 'evaluator'
         | 'simplify'
         | 'architecture-diagram'
-        | 'micro-retro'
         | 'memory'
         | 'summary';
       /** Epoch milliseconds when the obligation began. */
@@ -732,6 +977,15 @@ export type ConductorEvent =
       endedAt: number;
       /** Epoch milliseconds when the pipeline recorded this event. */
       ts: number;
+    }
+  | {
+      /** A malformed complete record observed in the pipeline closeout ledger. */
+      type: 'pipeline_tail_diagnostic';
+      reason: 'malformed-line' | 'poll-failed';
+      /** Relative path to the tailed pipeline-owned ledger. */
+      path: string;
+      /** Byte offset of a malformed line, when a line was skipped. */
+      byteOffset?: number;
     }
   | {
       type: 'renderer_error';
@@ -803,6 +1057,23 @@ export type ConductorEvent =
         status: 'CURRENT' | 'STALE';
         reason?: string;
       };
+      /** Optional to preserve parsing of events emitted before verification modes existed. */
+      mode?: 'aggregate' | 'scoped';
+      /** Present only when the inspection made a drift-budget verdict. */
+      budgetVerdict?:
+        | {
+            outcome: 'preserved_within_budget';
+            categories: Record<string, number>;
+          }
+        | {
+            outcome: 'rerun_required';
+            reason: 'drift_budget_exceeded' | 'unbudgetable_drift';
+            category: string;
+            count: number;
+            bound: 'none' | number;
+          };
+      /** Records the non-silent aggregate fallback for a scoped empty selector set. */
+      executionBasis?: 'scoped-empty-selection-aggregate';
     }
   | {
       /**
@@ -811,9 +1082,11 @@ export type ConductorEvent =
        * that declares the member satisfied for the round.
        */
       type: 'build_member_evidence_reused';
-      member: 'wiring_check' | 'test_suite';
+      member: 'test_suite';
       decision: 'reuse';
       basis: 'fingerprint-match';
+      /** Optional to preserve parsing of events emitted before verification modes existed. */
+      mode?: 'aggregate' | 'scoped';
     }
   | {
       /**
@@ -822,7 +1095,7 @@ export type ConductorEvent =
        * evidence, command output, credentials, or host paths.
        */
       type: 'build_member_evidence_recomputed';
-      member: 'wiring_check' | 'test_suite';
+      member: 'test_suite';
       decision: 'recompute';
       basis:
         | 'recorded-head-versus-current-head'
@@ -904,6 +1177,24 @@ export type ConductorEvent =
       reason: string;
     }
   | {
+      /**
+       * The post-FINISH shipment audit refused a candidate ship. Carries the
+       * two commits the durable-evidence evaluator compared, so an operator
+       * can tell WHICH heads disagreed instead of re-deriving them from the
+       * refusal code alone.
+       */
+      type: 'shipment_evidence_refused';
+      slug: string;
+      /** The implementation PR the audit bound the candidate to. */
+      pr: string;
+      /** The evaluator's typed refusal code. */
+      code: string;
+      /** What the evaluator required — the implementation head for a reachability refusal. */
+      expected: string;
+      /** What it observed — the audited candidate commit for a reachability refusal. */
+      observed: string | null;
+    }
+  | {
       /** The gate loop reached a fully-satisfied state (.pipeline/DONE). */
       type: 'loop_converged';
     }
@@ -945,6 +1236,8 @@ export type ConductorEvent =
       gate: StepName;
       surface: string[];
       deltaConsidered: string[];
+      /** A bounded test-suite drift evaluation retained its existing PASS. */
+      basis?: 'test_suite_drift_budget';
     }
   | {
       /**
@@ -1060,7 +1353,22 @@ export type ConductorEvent =
       /** A halt (operator park or daemon HALT) was cleared, resuming the feature. */
       type: 'halt_cleared';
       step?: StepName;
-      cause: 'operator' | 'rekick';
+      cause: 'operator' | 'rekick' | 'kickback-budget';
+    }
+  | {
+      /** Operator authorized a bounded recovery for one halted kickback gate. */
+      type: 'kickback_budget_adjustment_authorized';
+      adjustmentId: string;
+      gate: string;
+      kind: 'raise' | 'reset';
+      feature: string;
+      operator: string;
+      rationale: string;
+      beforeConsumed: number;
+      afterConsumed: number;
+      beforeLimit: number;
+      afterLimit: number;
+      ts: string;
     }
   // ── Ship→CI feedback loop (Task 5): CI failure events ──
   | {

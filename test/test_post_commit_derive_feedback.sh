@@ -49,6 +49,31 @@ assert_output_contains() {
   fi
 }
 
+make_test_repo() {
+  local path=$1
+  mkdir -p "$path"
+  git -C "$path" init -q
+  git -C "$path" config user.email "test@example.com"
+  git -C "$path" config user.name "Test User"
+  printf 'initial\n' > "$path/file.txt"
+  git -C "$path" add file.txt
+  git -C "$path" commit -q -m "Initial commit"
+  printf 'change\n' > "$path/file.txt"
+  git -C "$path" add file.txt
+  git -C "$path" commit -q -m "Add feature"
+}
+
+make_recording_engine() {
+  local path=$1
+  cat > "$path" <<'STUB'
+#!/bin/bash
+echo "$@" >> "$STUB_CALL_LOG"
+echo '{"evidenced":false,"reason":"none"}'
+exit 1
+STUB
+  chmod +x "$path"
+}
+
 # Cleanup function
 cleanup() {
   rm -rf "$TMPDIR_ROOT"
@@ -85,7 +110,7 @@ echo "change" > file.txt
 git add file.txt
 output=$(cd "$test_repo" && git -C "$test_repo" commit -q -m "Add feature
 
-Task: 28" 2>&1 && "$HOOK" 2>&1 || echo "")
+Task: 28" 2>&1 && "$HOOK" </dev/null 2>&1 || echo "")
 [ -z "$output" ] || [ "$(echo "$output" | wc -l)" -eq 0 ] || output=""
 assert_output_contains "No warning on Task: trailer commit" "$output" ""
 
@@ -110,7 +135,7 @@ git add file.txt
 git commit -q -m "Add feature"
 
 # Run the hook and capture output
-output=$("$HOOK" 2>&1 || true)
+output=$("$HOOK" </dev/null 2>&1 || true)
 
 # Check that it warns with commit sha
 commit_sha=$(git -C "$test_repo2" rev-parse HEAD 2>/dev/null || echo "")
@@ -139,7 +164,7 @@ git add file.txt
 git commit -q -m "Add feature"
 
 # Run the hook and check exit code
-if "$HOOK" >/dev/null 2>&1; then
+if "$HOOK" </dev/null >/dev/null 2>&1; then
   exit_code=0
 else
   exit_code=$?
@@ -166,7 +191,7 @@ git add file.txt
 git commit -q -m "Add feature"
 
 # Run the hook
-"$HOOK" >/dev/null 2>&1 || true
+"$HOOK" </dev/null >/dev/null 2>&1 || true
 
 # Check that no task-status.json was created
 [ ! -f "$test_repo4/.pipeline/task-status.json" ]
@@ -193,7 +218,7 @@ git commit -q -m "Add feature
 
 Task: rem-fr10-1"
 
-output=$("$HOOK" 2>&1 || true)
+output=$("$HOOK" </dev/null 2>&1 || true)
 [ -z "$output" ]
 assert "No warning on non-numeric H9 id (rem-fr10-1)" $?
 
@@ -217,19 +242,57 @@ git commit -q -m "Add feature
 
 Task: rem-adr-engine-owned-task-status-1"
 
-output=$("$HOOK" 2>&1 || true)
+output=$("$HOOK" </dev/null 2>&1 || true)
 [ -z "$output" ]
 assert "No warning on non-numeric H9 id (rem-adr-engine-owned-task-status-1)" $?
+
+# Test 8: Without an override, the hook uses the canonical repo-local
+# ai-conductor launcher, never the deprecated conduct-ts alias or operator PATH.
+echo ""
+echo "Test 8: Hook defaults to the canonical repo-local ai-conductor launcher"
+test_repo7="$TMPDIR_ROOT/test_default_engine_launcher"
+default_harness="$TMPDIR_ROOT/default-engine-harness"
+mkdir -p "$test_repo7" "$default_harness/hooks/claude" "$default_harness/bin"
+cp "$HOOK" "$default_harness/hooks/claude/post-commit-derive-feedback.sh"
+chmod +x "$default_harness/hooks/claude/post-commit-derive-feedback.sh"
+DEFAULT_HOOK="$default_harness/hooks/claude/post-commit-derive-feedback.sh"
+
+cd "$test_repo7"
+git init -q
+git config user.email "test@example.com"
+git config user.name "Test User"
+
+echo "test" > file.txt
+git add file.txt
+git commit -q -m "Initial commit" || true
+
+echo "change" > file.txt
+git add file.txt
+git commit -q -m "Add feature"
+
+DEFAULT_STUB_LOG="$TMPDIR_ROOT/default-engine.calls"
+cat > "$default_harness/bin/ai-conductor" <<'STUB'
+#!/bin/bash
+echo "$@" >> "$DEFAULT_STUB_LOG"
+echo '{"evidenced":false,"reason":"none"}'
+exit 1
+STUB
+chmod +x "$default_harness/bin/ai-conductor"
+
+DEFAULT_STUB_LOG="$DEFAULT_STUB_LOG" "$DEFAULT_HOOK" </dev/null >/dev/null 2>&1 || true
+
+[ -f "$DEFAULT_STUB_LOG" ] && grep -q "derive-feedback" "$DEFAULT_STUB_LOG"
+assert "Hook defaults to bin/ai-conductor for derive-feedback" $?
 
 # Test 8: Hook invokes the engine derive path (AI_CONDUCTOR_ENGINE_BIN honored)
 # — point the hook at a stub "engine" binary that records its invocation
 # and asserts the sha/subcommand contract, so this test fails if the hook
 # regresses back to being pure bash regex with no engine call at all.
 echo ""
-echo "Test 8: Hook invokes the engine derive path (honors AI_CONDUCTOR_ENGINE_BIN)"
-test_repo7="$TMPDIR_ROOT/test_engine_invoke"
-mkdir -p "$test_repo7"
-cd "$test_repo7"
+echo "Test 9: Hook invokes the engine derive path (honors AI_CONDUCTOR_ENGINE_BIN)"
+test_repo8="$TMPDIR_ROOT/test_engine_invoke"
+mkdir -p "$test_repo8"
+cd "$test_repo8"
 git init -q
 git config user.email "test@example.com"
 git config user.name "Test User"
@@ -252,17 +315,17 @@ exit 1
 STUB
 chmod +x "$STUB_BIN"
 
-AI_CONDUCTOR_ENGINE_BIN="$STUB_BIN" STUB_CALL_LOG="$STUB_CALL_LOG" "$HOOK" >/dev/null 2>&1 || true
+AI_CONDUCTOR_ENGINE_BIN="$STUB_BIN" STUB_CALL_LOG="$STUB_CALL_LOG" "$HOOK" </dev/null >/dev/null 2>&1 || true
 
 [ -f "$STUB_CALL_LOG" ] && grep -q "derive-feedback" "$STUB_CALL_LOG"
 assert "Hook shells out to the engine derive-feedback subcommand" $?
 
-# Test 9: Engine binary missing/broken → hook still exits 0 and falls back
+# Test 10: Engine binary missing/broken → hook still exits 0 and falls back
 echo ""
-echo "Test 9: Engine binary missing → hook falls back and still exits 0"
-test_repo8="$TMPDIR_ROOT/test_engine_missing"
-mkdir -p "$test_repo8"
-cd "$test_repo8"
+echo "Test 10: Engine binary missing → hook falls back and still exits 0"
+test_repo9="$TMPDIR_ROOT/test_engine_missing"
+mkdir -p "$test_repo9"
+cd "$test_repo9"
 git init -q
 git config user.email "test@example.com"
 git config user.name "Test User"
@@ -275,26 +338,26 @@ echo "change" > file.txt
 git add file.txt
 git commit -q -m "Add feature"
 
-if AI_CONDUCTOR_ENGINE_BIN="/nonexistent/engine-binary" "$HOOK" >/dev/null 2>&1; then
+if AI_CONDUCTOR_ENGINE_BIN="/nonexistent/engine-binary" "$HOOK" </dev/null >/dev/null 2>&1; then
   exit_code=0
 else
   exit_code=$?
 fi
 assert "Hook exits 0 when engine binary is missing" $((exit_code == 0 ? 0 : 1))
 
-commit_sha8=$(git -C "$test_repo8" rev-parse HEAD 2>/dev/null || echo "")
-output=$(AI_CONDUCTOR_ENGINE_BIN="/nonexistent/engine-binary" "$HOOK" 2>&1 || true)
+commit_sha8=$(git -C "$test_repo9" rev-parse HEAD 2>/dev/null || echo "")
+output=$(AI_CONDUCTOR_ENGINE_BIN="/nonexistent/engine-binary" "$HOOK" </dev/null 2>&1 || true)
 assert_output_contains "Falls back to bash check and still warns with sha" "$output" "$commit_sha8"
 
-# Test 10: Engine path-fallback (mentioned in the script's own header): a
+# Test 11: Engine path-fallback (mentioned in the script's own header): a
 # stub engine reports "evidenced via path-fallback" and the hook stays
 # silent, proving the hook trusts the path-fallback verdict from the engine
 # path (not just the bare trailer regex).
 echo ""
-echo "Test 10: Engine path-fallback verdict (evidenced:true, reason:path-fallback) → no warning"
-test_repo9="$TMPDIR_ROOT/test_path_fallback"
-mkdir -p "$test_repo9"
-cd "$test_repo9"
+echo "Test 11: Engine path-fallback verdict (evidenced:true, reason:path-fallback) → no warning"
+test_repo10="$TMPDIR_ROOT/test_path_fallback"
+mkdir -p "$test_repo10"
+cd "$test_repo10"
 git init -q
 git config user.email "test@example.com"
 git config user.name "Test User"
@@ -315,9 +378,122 @@ exit 0
 STUB
 chmod +x "$STUB_BIN2"
 
-output=$(AI_CONDUCTOR_ENGINE_BIN="$STUB_BIN2" "$HOOK" 2>&1 || true)
+output=$(AI_CONDUCTOR_ENGINE_BIN="$STUB_BIN2" "$HOOK" </dev/null 2>&1 || true)
 [ -z "$output" ]
 assert "No warning when engine reports path-fallback evidence" $?
+
+# Tests 12–18 exercise the post-Bash gate against the real hook in isolated
+# repositories. The engine is a local recording fake: no test invokes a real
+# engine, LLM, or network service.
+GATE_STUB="$TMPDIR_ROOT/gate-engine.sh"
+make_recording_engine "$GATE_STUB"
+
+echo ""
+echo "Test 12: Non-commit Bash command stays silent without invoking the engine"
+gate_repo="$TMPDIR_ROOT/gate_non_commit"
+make_test_repo "$gate_repo"
+gate_log="$TMPDIR_ROOT/gate-non-commit.calls"
+output=$(cd "$gate_repo" && { printf '%s' '{"tool_input":{"command":"ls -la"}}' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -z "$output" ] && [ ! -e "$gate_log" ]
+assert "Non-commit payload is silent and does not invoke derive-feedback" $?
+
+echo ""
+echo "Test 13: Commit-creating Bash command invokes the engine for fresh HEAD"
+gate_repo="$TMPDIR_ROOT/gate_commit"
+make_test_repo "$gate_repo"
+gate_log="$TMPDIR_ROOT/gate-commit.calls"
+gate_sha=$(git -C "$gate_repo" rev-parse HEAD)
+output=$(cd "$gate_repo" && { printf '%s' '{"tool_input":{"command":"git -C . commit -m update"}}' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -f "$gate_log" ] && grep -q "derive-feedback --sha $gate_sha" "$gate_log" && echo "$output" | grep -q "$gate_sha"
+assert "Commit payload invokes derive-feedback and preserves warning output" $?
+
+echo ""
+echo "Test 14: Quoted commit text is not a commit invocation"
+gate_repo="$TMPDIR_ROOT/gate_quoted"
+make_test_repo "$gate_repo"
+gate_log="$TMPDIR_ROOT/gate-quoted.calls"
+output=$(cd "$gate_repo" && { printf '%s' '{"tool_input":{"command":"echo '\''git commit -m update'\''"}}' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -z "$output" ] && [ ! -e "$gate_log" ]
+assert "Quoted commit text is silent and does not invoke derive-feedback" $?
+
+echo ""
+echo "Test 15: An old HEAD does not invoke the engine"
+gate_repo="$TMPDIR_ROOT/gate_stale"
+mkdir -p "$gate_repo"
+git -C "$gate_repo" init -q
+git -C "$gate_repo" config user.email "test@example.com"
+git -C "$gate_repo" config user.name "Test User"
+printf 'old\n' > "$gate_repo/file.txt"
+git -C "$gate_repo" add file.txt
+GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' git -C "$gate_repo" commit -q -m "Old commit"
+gate_log="$TMPDIR_ROOT/gate-stale.calls"
+output=$(cd "$gate_repo" && { printf '%s' '{"tool_input":{"command":"git commit -m update"}}' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -z "$output" ] && [ ! -e "$gate_log" ]
+assert "Commit payload against old HEAD is silent and does not invoke derive-feedback" $?
+
+echo ""
+echo "Test 16: A repository with no commits stays silent"
+gate_repo="$TMPDIR_ROOT/gate_empty"
+mkdir -p "$gate_repo"
+git -C "$gate_repo" init -q
+gate_log="$TMPDIR_ROOT/gate-empty.calls"
+output=$(cd "$gate_repo" && { printf '%s' '{"tool_input":{"command":"git commit -m update"}}' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -z "$output" ] && [ ! -e "$gate_log" ]
+assert "Commit payload in empty repository is silent and does not invoke derive-feedback" $?
+
+echo ""
+echo "Test 17: Malformed payload retains advisory behavior"
+gate_repo="$TMPDIR_ROOT/gate_malformed"
+make_test_repo "$gate_repo"
+gate_log="$TMPDIR_ROOT/gate-malformed.calls"
+gate_sha=$(git -C "$gate_repo" rev-parse HEAD)
+output=$(cd "$gate_repo" && { printf '%s' 'not json' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -f "$gate_log" ] && grep -q "derive-feedback --sha $gate_sha" "$gate_log" && echo "$output" | grep -q "$gate_sha"
+assert "Malformed payload falls through to the existing advisory check" $?
+
+echo ""
+echo "Test 18: Payload without a command retains advisory behavior"
+gate_repo="$TMPDIR_ROOT/gate_missing_command"
+make_test_repo "$gate_repo"
+gate_log="$TMPDIR_ROOT/gate-missing-command.calls"
+gate_sha=$(git -C "$gate_repo" rev-parse HEAD)
+output=$(cd "$gate_repo" && { printf '%s' '{"tool_input":{}}' | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+[ -f "$gate_log" ] && grep -q "derive-feedback --sha $gate_sha" "$gate_log" && echo "$output" | grep -q "$gate_sha"
+assert "Payload without a command falls through to the existing advisory check" $?
+
+# Regressions: only the actual Git subcommand controls the gate. Reuse a
+# fresh HEAD so a mistaken classification is observable at the fake engine.
+echo ""
+echo "Test 19: Git operands and excluded pull commands stay silent"
+gate_repo="$TMPDIR_ROOT/gate_subcommand"
+make_test_repo "$gate_repo"
+case_number=0
+for command_text in 'git branch commit' 'git log merge' 'git -C commit branch' 'git pull' 'git pull origin rebase'; do
+  case_number=$((case_number + 1))
+  gate_log="$TMPDIR_ROOT/gate-subcommand-$case_number.calls"
+  gate_payload=$(python3 -c 'import json,sys; print(json.dumps({"tool_input":{"command":sys.argv[1]}}))' "$command_text")
+  output=$(cd "$gate_repo" && { printf '%s' "$gate_payload" | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+  if [ -z "$output" ] && [ ! -e "$gate_log" ]; then
+    assert "Silent for $command_text" 0
+  else
+    assert "Silent for $command_text" 1
+  fi
+done
+
+echo ""
+echo "Test 20: Git global options preserve real commit detection"
+gate_sha=$(git -C "$gate_repo" rev-parse HEAD)
+for command_text in 'git -C "." commit -m update' 'git -c core.quotePath=false commit -m update' 'git --git-dir=.git commit -m update' 'git branch commit; git commit -m update'; do
+  case_number=$((case_number + 1))
+  gate_log="$TMPDIR_ROOT/gate-subcommand-$case_number.calls"
+  gate_payload=$(python3 -c 'import json,sys; print(json.dumps({"tool_input":{"command":sys.argv[1]}}))' "$command_text")
+  output=$(cd "$gate_repo" && { printf '%s' "$gate_payload" | AI_CONDUCTOR_ENGINE_BIN="$GATE_STUB" STUB_CALL_LOG="$gate_log" "$HOOK"; } 2>&1 || true)
+  if [ -f "$gate_log" ] && grep -q "derive-feedback --sha $gate_sha" "$gate_log" && echo "$output" | grep -q "$gate_sha"; then
+    assert "Checks fresh HEAD for $command_text" 0
+  else
+    assert "Checks fresh HEAD for $command_text" 1
+  fi
+done
 
 # Summary
 echo ""

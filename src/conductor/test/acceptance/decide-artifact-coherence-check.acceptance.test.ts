@@ -1,3 +1,4 @@
+// Covers: task:1, task:3, task:4
 // Acceptance specs for the DECIDE artifact coherence check
 // (jstoup111/ai-conductor#539, .docs/stories/decide-artifact-coherence-check.md,
 // PRD .docs/specs/2026-07-22-decide-artifact-coherence-check.md FR-1..14).
@@ -45,7 +46,7 @@ import { join } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { landSpec } from '../../src/engine/engineer/land-spec.js';
-import { slugify } from '../../src/engine/engineer/authoring.js';
+import { slugify } from '../../src/engine/engineer/spec-branch.js';
 import { createEngineerWorktree } from '../../src/engine/engineer/worktree-authoring.js';
 import type { GhRunner } from '../../src/engine/owner-gate/identity.js';
 
@@ -115,8 +116,8 @@ const PLAN = [
   'implement outcome one and reject an unmapped outcome',
   '',
   '**Done when:**',
-  '- A staged outcome is committed to the intake marker.',
-  '- An unmapped outcome is rejected at land.',
+  '- Given a mapped outcome, when land validates, then it passes.',
+  '- Given an unmapped outcome, when land validates, then it is rejected.',
   '',
   '### Task 2: implement story two',
   '**Story:** Story 2 (happy path — stories map)',
@@ -126,8 +127,8 @@ const PLAN = [
   'implement story two and reject an uncovered story',
   '',
   '**Done when:**',
-  '- A covered story maps to its plan task.',
-  '- An uncovered story is rejected at land.',
+  '- Given a covered story, when land validates, then it passes.',
+  '- Given an uncovered story, when land validates, then it is rejected.',
   '',
   '## Task Dependency Graph',
   '```',
@@ -140,6 +141,16 @@ const PLAN = [
   '|---|---|',
   '| 1 | 1 |',
   '| 2 | 2 |',
+  '| Story 1 happy: Given a mapped outcome, when land validates, then it passes. | 1 | Given a mapped outcome, when land validates, then it passes. | diff-local |',
+  '| Story 1 negative: Given an unmapped outcome, when land validates, then it is rejected. | 1 | Given an unmapped outcome, when land validates, then it is rejected. | diff-local |',
+  '| Story 2 happy: Given a covered story, when land validates, then it passes. | 2 | Given a covered story, when land validates, then it passes. | diff-local |',
+  '| Story 2 negative: Given an uncovered story, when land validates, then it is rejected. | 2 | Given an uncovered story, when land validates, then it is rejected. | diff-local |',
+  '',
+  '## Architecture Obligation Coverage',
+  '',
+  '| Decision | Disposition | Task(s) | Evidence |',
+  '| --- | --- | --- | --- |',
+  '| adr-2026-09-08-coherence#D1 | task | task-1 | Given an unmapped outcome, when land validates, then it is rejected. |',
   '',
 ].join('\n');
 
@@ -153,23 +164,32 @@ const COHERENCE = [
   '',
   '| class   | id        | maps-to  | verdict | evidence                     |',
   '|---------|-----------|----------|---------|-------------------------------|',
-  '| outcome | outcome-1 | story-1  | covered | "outcome 1 maps to story 1"  |',
-  '| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |',
+  '| outcome | outcome-1 | story-1  | covered | "The duplicate-spec class dies at land." |',
+  '| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |',
   '| fr      | FR-1      | story-1  | covered | "FR-1 maps to story 1"       |',
   '| fr      | FR-2      | story-2  | covered | "FR-2 maps to story 2"       |',
   '| story   | story-1   | task-1   | covered | "story 1 maps to task 1"     |',
   '| story   | story-2   | task-2   | covered | "story 2 maps to task 2"     |',
   '| task    | task-1    | story-1  | covered | "task 1 maps to story 1"     |',
   '| task    | task-2    | story-2  | covered | "task 2 maps to story 2"     |',
-  '| adr     | adr-coherence | story-1 | covered | "ADR is adjudicated by story 1" |',
-  '| criterion | Story 1 happy: Given a mapped outcome, when land validates, then it passes. | task-1 | covered | "implement outcome one" | diff-local |',
-  '| criterion | Story 1 negative: Given an unmapped outcome, when land validates, then it is rejected. | task-1 | covered | "reject an unmapped outcome" | diff-local |',
-  '| criterion | Story 2 happy: Given a covered story, when land validates, then it passes. | task-2 | covered | "implement story two" | diff-local |',
-  '| criterion | Story 2 negative: Given an uncovered story, when land validates, then it is rejected. | task-2 | covered | "reject an uncovered story" | diff-local |',
+  '| adr     | adr-2026-09-08-coherence | story-1 | covered | "ADR is adjudicated by story 1" |',
+  '| criterion | Story 1 happy: Given a mapped outcome, when land validates, then it passes. | task-1 | covered | "Given a mapped outcome, when land validates, then it passes." | diff-local |',
+  '| criterion | Story 1 negative: Given an unmapped outcome, when land validates, then it is rejected. | task-1 | covered | "Given an unmapped outcome, when land validates, then it is rejected." | diff-local |',
+  '| criterion | Story 2 happy: Given a covered story, when land validates, then it passes. | task-2 | covered | "Given a covered story, when land validates, then it passes." | diff-local |',
+  '| criterion | Story 2 negative: Given an uncovered story, when land validates, then it is rejected. | task-2 | covered | "Given an uncovered story, when land validates, then it is rejected." | diff-local |',
   '',
 ].join('\n');
 
-const APPROVED_ADR = ['# ADR: coherence placement', '', '**Status:** APPROVED', '', 'Body.', ''].join('\n');
+const APPROVED_ADR = [
+  '# ADR: coherence placement',
+  '',
+  '**Status:** APPROVED',
+  '',
+  '## Decision',
+  '',
+  '1. **Keep coherence validation at land time.**',
+  '',
+].join('\n');
 
 let repoPath: string;
 
@@ -247,10 +267,8 @@ async function seedWorktree(idea: string, overrides: SeedOverrides = {}): Promis
     await mkdir(join(dir, '.docs', 'architecture'), { recursive: true });
     await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
     await w(`conflicts/${stem}.md`, '# Conflicts\n\nClean.\n');
-    // Plain markdown, NO ```mermaid block, so the render gate resolves to
-    // no-diagrams and never needs mmdc.
-    await w('architecture/coherence-demo.md', '# Architecture\n\nComponents A and B.\n');
-    await w('decisions/adr-coherence.md', APPROVED_ADR);
+    await w('architecture/coherence-demo.md', '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n');
+    await w('decisions/adr-2026-09-08-coherence.md', APPROVED_ADR);
   }
 
   // NOTE: the `.docs/coherence/.gitkeep` signal used to be hand-planted here.
@@ -287,7 +305,19 @@ async function seedWorktree(idea: string, overrides: SeedOverrides = {}): Promis
 }
 
 function landOpts() {
-  return { ownerConfig: {}, gh: resolvingGh };
+  // The architecture fixture carries a Mermaid fence to satisfy the land-time
+  // presence gate. Keep this coherence fixture at its intended land boundary:
+  // renderer behavior has its own tests, and the real mmdc process can launch
+  // Chromium once for every coherence case.
+  return {
+    ownerConfig: {},
+    gh: resolvingGh,
+    renderDeps: {
+      hasTool: async () => true,
+      writeTemp: async () => '/tmp/coherence-architecture.mmd',
+      runMmdc: async () => ({ ok: true }),
+    },
+  };
 }
 
 beforeEach(async () => {
@@ -341,6 +371,14 @@ describe('Story 2 / FR-1 — mapping artifact authored + cross-checked at land',
     await expect(landSpec(target(), 'coherence demo', wt, SOURCE_REF, landOpts())).resolves.toBeDefined();
   });
 
+  it('negative: a changed ADR decision without plan-level obligation coverage is refused', async () => {
+    const plan = PLAN.replace(/\n## Architecture Obligation Coverage[\s\S]*$/, '\n');
+    const wt = await seedWorktree('coherence demo', { plan });
+    await expect(
+      landSpec(target(), 'coherence demo', wt, SOURCE_REF, landOpts()),
+    ).rejects.toThrow(/adr-2026-09-08-coherence#D1 \(missing\)/i);
+  });
+
   it('negative: a mapping row citing a nonexistent story id is refused (fabricated citation)', async () => {
     const badCoherence = COHERENCE.replace(
       '| task    | task-1    | story-1  | covered | "task 1 maps to story 1"     |',
@@ -364,7 +402,7 @@ describe('Story 2 / FR-1 — mapping artifact authored + cross-checked at land',
 describe('Story 3 / FR-2 — outcome coverage (outcome-<n>)', () => {
   it('negative: an outcome bullet with no mapping row is refused with an outcome gap id', async () => {
     // Drop the row covering the second outcome bullet.
-    const gapped = COHERENCE.replace('| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |\n', '');
+    const gapped = COHERENCE.replace('| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |\n', '');
     const wt = await seedWorktree('coherence demo', { coherence: gapped });
     await expect(
       landSpec(target(), 'coherence demo', wt, SOURCE_REF, landOpts()),
@@ -374,8 +412,8 @@ describe('Story 3 / FR-2 — outcome coverage (outcome-<n>)', () => {
   it('negative: an outcome row with an affirmative verdict but a blank Cited-Ids cell is refused with an outcome gap id', async () => {
     // outcome-2's row keeps its "covered" verdict but cites zero stories.
     const blankCited = COHERENCE.replace(
-      '| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |\n',
-      '| outcome | outcome-2 |          | covered | "outcome 2 maps to story 1"  |\n',
+      '| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |\n',
+      '| outcome | outcome-2 |          | covered | "An unmapped outcome blocks the spec." |\n',
     );
     const wt = await seedWorktree('coherence demo', { coherence: blankCited });
     await expect(
@@ -412,12 +450,12 @@ describe('Story 3 / FR-2 — outcome coverage (outcome-<n>)', () => {
     await w('complexity/coherence-demo.md', '# Complexity\n\nTier: M\n');
     await w('track/coherence-demo.md', '# Track\n\nTrack: product\n');
     await w('conflicts/coherence-demo.md', '# Conflicts\n\nClean.\n');
-    await w('architecture/coherence-demo.md', '# Architecture\n\nComponents A and B.\n');
-    await w('decisions/adr-coherence.md', APPROVED_ADR);
+    await w('architecture/coherence-demo.md', '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n');
+    await w('decisions/adr-2026-09-08-coherence.md', APPROVED_ADR);
 
     // Drop the row covering the second outcome bullet — an unmapped outcome.
     const gapped = COHERENCE.replace(
-      '| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |\n',
+      '| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |\n',
       '',
     );
     await w('coherence/coherence-demo.md', gapped);
@@ -457,6 +495,15 @@ describe('Story 4 / FR-3 — FR coverage, product track (fr-<N>)', () => {
 
 // ── Story 5 (FR-4): every story maps to at least one plan task ─────────────────
 describe('Story 5 / FR-4 — story coverage (story-<id>)', () => {
+  it('happy: task references written as story-N bind at land without orphan or coverage gaps', async () => {
+    const plan = PLAN
+      .replace('**Story:** Story 1 (happy path — outcomes travel)', '**Story:** story-1 (happy path — outcomes travel)')
+      .replace('**Story:** Story 2 (happy path — stories map)', '**Story:** Story-2 (happy path — stories map)');
+    const wt = await seedWorktree('coherence demo', { plan });
+
+    await expect(landSpec(target(), 'coherence demo', wt, SOURCE_REF, landOpts())).resolves.toBeDefined();
+  });
+
   it('negative: a story cited by no task is refused with a story gap id', async () => {
     // Remove Task 2 (the only task citing Story 2).
     const plan = PLAN.replace(/### Task 2:[\s\S]*?\n\n/, '');
@@ -561,8 +608,8 @@ describe('Story 6 / FR-5 — orphan-task detection (task-<id>)', () => {
       .replace('| fr      | FR-2      | story-2  | covered | "FR-2 maps to story 2"       |\n', '')
       .replace('| story   | story-2   | task-2   | covered | "story 2 maps to task 2"     |\n', '')
       .replace('| task    | task-2    | story-2  | covered | "task 2 maps to story 2"     |\n', '')
-      .replace('| criterion | Story 2 happy: Given a covered story, when land validates, then it passes. | task-2 | covered | "implement story two" | diff-local |\n', '')
-      .replace('| criterion | Story 2 negative: Given an uncovered story, when land validates, then it is rejected. | task-2 | covered | "reject an uncovered story" | diff-local |\n', '');
+      .replace('| criterion | Story 2 happy: Given a covered story, when land validates, then it passes. | task-2 | covered | "Given a covered story, when land validates, then it passes." | diff-local |\n', '')
+      .replace('| criterion | Story 2 negative: Given an uncovered story, when land validates, then it is rejected. | task-2 | covered | "Given an uncovered story, when land validates, then it is rejected." | diff-local |\n', '');
     const wt = await seedWorktree('coherence demo', { plan, stories, prd, coherence });
     await expect(landSpec(target(), 'coherence demo', wt, SOURCE_REF, landOpts())).resolves.toBeDefined();
   });
@@ -633,7 +680,7 @@ describe('Story 8 / FR-7 — duplicate intake claim (duplicate:<ref>)', () => {
 // ── Story 9 (FR-8): waivers name gaps, are fresh, never cover silently ─────────
 describe('Story 9 / FR-8 — coherence waiver', () => {
   // Introduce a real gap (unmapped outcome-2) that the waiver must name.
-  const gappedCoherence = COHERENCE.replace('| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |\n', '');
+  const gappedCoherence = COHERENCE.replace('| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |\n', '');
 
   it('happy: a fresh-in-diff waiver naming the gap with a non-empty rationale lets the land proceed', async () => {
     const waiver = 'Waives: outcome-2\n\nRationale: outcome-2 is a deferred follow-up, tracked in #540.\n';
@@ -683,7 +730,7 @@ describe('Story 10 / FR-9 — precise, aggregated gap reporting', () => {
     // outcome-2 unmapped + Story 2 uncovered (Task 2 removed) + phantom coverage claim.
     const plan = PLAN.replace(/### Task 2:[\s\S]*?\n\n/, '').replace('| 2 | 2 |', '| 2 | T9 |');
     const coherence = COHERENCE
-      .replace('| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |\n', '')
+      .replace('| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |\n', '')
       .replace('| task    | task-2    | story-2  | covered | "task 2 maps to story 2"     |\n', '')
       .replace('| story   | story-2   | task-2   | covered | "story 2 maps to task 2"     |\n', '| story   | story-2   |          | covered | "story 2 not yet covered"    |\n');
     const wt = await seedWorktree('coherence demo', { plan, coherence });
@@ -721,7 +768,7 @@ describe('Story 11 / FR-10 — technical-track behavior', () => {
     const coherence = COHERENCE
       .replace('| fr      | FR-1      | story-1  | covered | "FR-1 maps to story 1"       |\n', '')
       .replace('| fr      | FR-2      | story-2  | covered | "FR-2 maps to story 2"       |\n', '')
-      .replace('| outcome | outcome-2 | story-1  | covered | "outcome 2 maps to story 1"  |\n', '');
+      .replace('| outcome | outcome-2 | story-1  | covered | "An unmapped outcome blocks the spec." |\n', '');
     const wt = await seedWorktree('coherence demo', { prd: null, track: 'technical', stories, coherence });
     await expect(
       landSpec(target(), 'coherence demo', wt, SOURCE_REF, landOpts()),

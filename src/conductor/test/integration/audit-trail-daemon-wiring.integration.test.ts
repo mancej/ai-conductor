@@ -1,12 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // RED acceptance specs for "The writer is wired in BOTH entry points — inline
 // conduct and the daemon" (Story 6,
-// .docs/stories/audit-trail-write-completeness-for-retro-under-fre.md).
+// .docs/stories/audit-trail-write-completeness.md).
 //
 // `src/conductor/src/engine/audit-trail.ts` does not exist yet; every test
 // dynamically imports it so a missing module RREDs only that test (§6).
 //
-// Per writing-system-tests §3b (replacement/wiring class): retro's primary
+// Per writing-system-tests §3b (replacement/wiring class): the event spine's primary
 // habitat is the DAEMON, not inline `conduct` — a unit test on the writer in
 // isolation would pass even if daemon-cli.ts never constructs or subscribes
 // it. `runConductorInWorktree` (daemon-cli.ts:561-641) and the inline wiring
@@ -120,7 +120,7 @@ describe('Acceptance: audit-trail dual-mode wiring — inline and daemon entry p
     await conductor.run();
 
     expect(stepsRun).not.toContain('coherence_check');
-    expect(stepsRun[0]).toBe('acceptance_specs');
+    expect(stepsRun[0]).toBe('coverage_binding');
     expect(stepsRun).not.toContain('explore'); // front-half never re-executed
 
     const records = await readRecords(dir);

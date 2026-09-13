@@ -163,10 +163,40 @@ consumer project has that bus, yet scope-check's general-benefit reading returne
 and the rule was landed in `HARNESS.md` and the shipped `skills/` catalog over a correct contrary
 steer.)
 
+### Skill Deletions Ship as Two Features
+
+A change whose deliverable includes **deleting a skill directory** — or any directory of
+production files — MUST be split into two features, landed in order:
+
+1. **Mechanical cleanup.** Remove every reference to the skill: callers, tests, config keys,
+   contract entries, model-table rows, symlink targets, and documentation mentions. The skill
+   directory itself stays on disk and unreferenced. This feature's diff edits files; it deletes
+   no directory.
+2. **Removal.** Delete the now-unreferenced directory, and nothing else.
+
+Do NOT combine them, and do not treat "the deletion is only a few files" as grounds to skip the
+split — the split is about what the diff does, not how large it is.
+
+**Why.** `build_review`'s testQuality preflight materializes a counterfactual checkout of HEAD and
+restores merge-base content for every changed production file, to prove the changed tests actually
+fail against pre-change code. When one diff both deletes a directory and rewrites the tests that
+referenced it, that restore writes into a directory that does not exist at HEAD, the preflight dies
+as `materialization-failed`, and the feature burns its entire three-fault mechanical allowance and
+halts `needs-human`. The only recovery the halt documents is a permanent testQuality coverage
+waiver. Splitting the work keeps every diff materializable, and keeps the deletion reviewable on
+its own. (First hit by `remove-retrospectives-full-and-micro-from-feature-`, which deleted
+`skills/retro/`; engine defect tracked as #1961.)
+
+The `code-removal` skill governs how each of those features is executed. This rule governs how the
+work is divided before that skill is reached.
+
+Per this repo's Design Principle the durable fix is machinery — the preflight should create the
+parent directory it is restoring into — so this rule is the interim guard, not the endpoint.
+
 ## Validation Rules (This Repo)
 
-**Every change to this harness repo MUST be validated before committing.** This is not optional.
-Run the full validation suite and fix any failures before `git commit`.
+**Every change to this harness repo MUST be validated.** Run the full validation suite
+and fix any failures before declaring the work complete.
 
 ### Test Authoring Rules
 
@@ -174,6 +204,20 @@ The active host agent adding, changing, reviewing, or debugging tests in this re
 read and follow [`.agents/skills/write-tests/SKILL.md`](.agents/skills/write-tests/SKILL.md). This is
 repository-local test-design guidance; it complements the provider-neutral `tdd` skill, which
 controls implementation order.
+
+### Test Process Isolation
+
+Tests of process guards MUST remain safe when the guard is absent or restored to its
+pre-change implementation by test-quality review. Mock the process boundary and verify
+that the production adapter reaches the mock before exercising destructive arguments;
+assert that refused calls never reach that boundary. A configured mock alone is not
+proof of isolation: imports cached by test setup can retain the real implementation.
+
+New or changed real-tmux fixtures MUST use a fixture-owned private socket for every
+command, including discovery and teardown. Never rely on session names, the ambient
+`TMUX` environment, or a production kill-switch to isolate a test from operator sessions.
+Use a mocked adapter until private-socket isolation is available. This is repository-local
+test-authoring policy; consumer projects do not inherit this repository's fixture machinery.
 
 ### Validation Suite
 
@@ -187,11 +231,11 @@ fail, and how to fix it — is [`docs/contributing/validation.md`](docs/contribu
    `test/lint_shell.sh`. Catches shell bugs that parse cleanly but misbehave at runtime.
 2. **SKILL.md frontmatter** — Every `skills/*/SKILL.md` has YAML frontmatter with required
    fields: `name`, `description`, `enforcement`, `phase`.
-3. **Agent references** — Every `agents/*.md` referenced in skills or HARNESS.md exists on disk.
+3. **Agent references** — Every `agents/*.md` referenced in skills, HARNESS.md, or ARCHITECTURE.md exists on disk.
 4. **Cross-skill references** — Every `/skill-name` reference in SKILL.md files points to an
    existing `skills/` directory.
-5. **HARNESS.md model table** — Every skill directory has an entry in the model selection table.
-5a. **Table content drift** — The generated HARNESS.md model-selection-table section matches
+5. **ARCHITECTURE.md model table** — Every skill directory has an entry in the model selection table.
+5a. **Table content drift** — The generated ARCHITECTURE.md model-selection-table section matches
     the output of `bin/generate-model-table` (source: `model-table-metadata.ts` +
     `resolved-config.ts`); regenerate and commit if it drifts.
 5b. **SKILL.md pin agreement** — Every skill marked opus-tier in the model table pins
@@ -201,36 +245,19 @@ fail, and how to fix it — is [`docs/contributing/validation.md`](docs/contribu
 
 ### When to Validate
 
-- **Before every commit** in this repo
 - After editing any SKILL.md, agent, HARNESS.md, or bin/ script
 - The active host agent MUST run validation automatically — do not ask, do not skip
 
 ### Failure Handling
 
-If validation fails, fix the issue before committing. Do not commit with known validation
-failures. If a check is failing due to a legitimate structural change (e.g., renaming a skill),
-fix all references before committing.
+If validation fails, fix the issue before declaring the work complete. If a check is failing
+due to a legitimate structural change (e.g., renaming a skill), fix all references.
 
-## Documentation Upkeep
+## Worktree Policy
 
-Docs track features. Every change that adds or alters user-facing behavior MUST
-update the relevant documentation in the **same** PR:
-
-- New `conduct-ts` flags → update `docs/reference/cli.md`; new config keys → `docs/reference/configuration.md`.
-- New daemon options or operational behavior → update `docs/guides/running-the-daemon.md`, and the
-  affected runbook under `docs/runbooks/` if it changes recovery.
-- New skill → `docs/reference/skills.md`; new step → `docs/reference/steps.md`; new gate →
-  `docs/explanation/gates.md`; new hook → `docs/reference/settings-and-hooks.md`; new HARNESS.md rule →
-  the affected page in `docs/` (see `README.md`'s Documentation index).
-- Ordinary reader-visible changes update the canonical affected documentation. Leave README unchanged unless the README landing-page contract changes.
-- The README rule is a repository-local landing-page refinement of the global harness documentation convention.
-
-A PR is not complete while its affected canonical documentation is stale. For consumer projects without this custom-step configuration, the global harness documentation convention remains unchanged.
-
-## Branch Policy
-
-All work MUST happen on a feature branch — never commit directly to main.
-Create a branch before making changes, and open a PR to merge.
+All work MUST happen in an isolated git worktree on a feature branch. Create the worktree
+and branch before making changes; switching branches in the primary checkout is not sufficient.
+Never commit directly to main. Open a PR to merge.
 
 ## Release & Update Gates
 
@@ -311,6 +338,7 @@ for the full mechanism.
 
 HARNESS.md is the single source of truth for behavioral rules consumed by projects using this harness.
 
-- All behavioral changes (communication protocol, model selection, conventions) go in HARNESS.md
+- Execution rules (communication protocol, model selection obligations, conventions) go in HARNESS.md
+- Architecture, generated model-policy tables, and operator reference material go in ARCHITECTURE.md; it is not a mandatory session-start read
 - This shared instruction file describes the harness repo itself; HARNESS.md describes rules for projects
 - `hooks/claude/session-start-context.sh` detects when a consumer CLAUDE.md is missing the HARNESS.md reference and prints the required block; consumers must add it manually (not auto-applied)

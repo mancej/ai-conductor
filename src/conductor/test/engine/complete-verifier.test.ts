@@ -1,3 +1,4 @@
+// Covers: task:8
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
@@ -62,18 +63,16 @@ describe('engine/complete-verifier', () => {
     });
   }
 
-  it('reports ok when all SHIP-phase artifacts are present and consistent', async () => {
+  it('reports ok when all surviving SHIP-gating artifacts are present and consistent', async () => {
     await writeState({
       feature_status: 'complete',
       feature_desc: 'add foo',
       pr_url: 'https://github.com/x/y/pull/1',
     });
-    await mkdir(join(dir, '.docs/retros'), { recursive: true });
     await writeFile(
       join(dir, '.pipeline/manual-test-results.md'),
       '| Story | Result |\n|---|---|\n| foo | PASS |\n',
     );
-    await writeFile(join(dir, '.docs/retros/2026-05-01-add-foo.md'), '# Retro\n');
     await writeFile(join(dir, '.pipeline/finish-choice'), 'keep');
 
     const result = await verifyWithCurrentSuite();
@@ -86,12 +85,10 @@ describe('engine/complete-verifier', () => {
       feature_desc: 'add-foo',
       pr_url: 'https://github.com/x/y/pull/1',
     });
-    await mkdir(join(dir, '.docs/retros'), { recursive: true });
     await writeFile(
       join(dir, '.pipeline/manual-test-results.md'),
       '| Story | Result |\n|---|---|\n| foo | PASS |\n',
     );
-    await writeFile(join(dir, '.docs/retros/2026-05-01-add-foo.md'), '# Retro\n');
     await writeFile(join(dir, '.pipeline/finish-choice'), 'pr');
 
     evaluateShipmentEvidenceSpy.mockResolvedValueOnce({
@@ -106,7 +103,7 @@ describe('engine/complete-verifier', () => {
     expect(result).toMatchObject({ ok: false, failedSteps: ['finish'] });
   });
 
-  it('reports gaps when manual_test, retro, and finish artifacts are all missing', async () => {
+  it('reports gaps when surviving manual_test and finish artifacts are missing', async () => {
     await writeState({
       feature_status: 'complete',
       feature_desc: 'add foo',
@@ -115,12 +112,30 @@ describe('engine/complete-verifier', () => {
     const result = await verifyWithCurrentSuite();
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.failedSteps).toEqual(['manual_test', 'retro', 'finish']);
-      expect(result.reasons).toHaveLength(3);
+      expect(result.failedSteps).toEqual(['manual_test', 'finish']);
+      expect(result.reasons).toHaveLength(2);
       expect(result.reasons[0]).toMatch(/manual-test-results\.md/);
-      expect(result.reasons[1]).toMatch(/retros/);
-      expect(result.reasons[2]).toMatch(/finish-choice/);
+      expect(result.reasons[1]).toMatch(/finish-choice/);
     }
+  });
+
+  it('omits skipped steps but retains a done step with missing evidence as a gap', async () => {
+    await writeState({
+      feature_status: 'complete',
+      feature_desc: 'add foo',
+      manual_test: 'skipped',
+      finish: 'done',
+    });
+    await mkdir(join(dir, '.docs/retros'), { recursive: true });
+    await writeFile(join(dir, '.docs/retros/2026-05-01-add-foo.md'), '# Retro\n');
+
+    const result = await verifyWithCurrentSuite();
+
+    expect(result).toEqual({
+      ok: false,
+      failedSteps: ['finish'],
+      reasons: ['.pipeline/finish-choice is missing — the finish skill must record the chosen outcome (pr | merge-local | keep | discard)'],
+    });
   });
 
   it('reports test_suite as stale-complete when its PASS is no longer current', async () => {
@@ -129,12 +144,10 @@ describe('engine/complete-verifier', () => {
       feature_desc: 'add foo',
       pr_url: 'https://github.com/x/y/pull/1',
     });
-    await mkdir(join(dir, '.docs/retros'), { recursive: true });
     await writeFile(
       join(dir, '.pipeline/manual-test-results.md'),
       '| Story | Result |\n|---|---|\n| foo | PASS |\n',
     );
-    await writeFile(join(dir, '.docs/retros/2026-05-01-add-foo.md'), '# Retro\n');
     await writeFile(join(dir, '.pipeline/finish-choice'), 'pr');
 
     const result = await verifyCompleteState(dir, {
@@ -154,12 +167,10 @@ describe('engine/complete-verifier', () => {
       feature_desc: 'add foo',
       pr_url: 'https://github.com/x/y/pull/1',
     });
-    await mkdir(join(dir, '.docs/retros'), { recursive: true });
     await writeFile(
       join(dir, '.pipeline/manual-test-results.md'),
       '| Story | Result |\n|---|---|\n| foo | FAIL |\n',
     );
-    await writeFile(join(dir, '.docs/retros/2026-05-01-add-foo.md'), '# Retro\n');
     await writeFile(join(dir, '.pipeline/finish-choice'), 'pr');
 
     const result = await verifyWithCurrentSuite();
@@ -175,12 +186,10 @@ describe('engine/complete-verifier', () => {
       feature_status: 'complete',
       feature_desc: 'add foo',
     });
-    await mkdir(join(dir, '.docs/retros'), { recursive: true });
     await writeFile(
       join(dir, '.pipeline/manual-test-results.md'),
       '| Story | Result |\n|---|---|\n| foo | PASS |\n',
     );
-    await writeFile(join(dir, '.docs/retros/2026-05-01-add-foo.md'), '# Retro\n');
     await writeFile(join(dir, '.pipeline/finish-choice'), 'pr');
 
     const result = await verifyWithCurrentSuite();

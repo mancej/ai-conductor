@@ -18,7 +18,7 @@ import type { LLMProvider } from '../../src/execution/llm-provider.js';
 import type { HarnessConfig } from '../../src/types/config.js';
 import { DefaultStepRunner } from '../../src/engine/step-runners.js';
 import { coordinateBuildReviewRubrics } from '../../src/engine/build-review-coordinator.js';
-import { MAX_MECHANICAL_FAULTS_BUILD_REVIEW, writeKickbackLedger } from '../../src/engine/kickback-ledger.js';
+import { MAX_MECHANICAL_FAULTS_BUILD_REVIEW } from '../../src/engine/kickback-ledger.js';
 
 vi.mock('../../src/engine/build-review-coordinator.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/engine/build-review-coordinator.js')>(),
@@ -35,13 +35,6 @@ const TASK_STATUS_SENTINEL = 'TASK_STATUS_SENTINEL_12345';
 const TRANSCRIPT_SENTINEL = 'TRANSCRIPT_SENTINEL_12345';
 const MAKER_SUMMARY_SENTINEL = 'MAKER_SUMMARY_SENTINEL_12345';
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
-const BROAD_FALLBACK_TRIGGERS = [
-  'A shared/core module has 3+ production importers.',
-  'The diff touches config, migrations, dependency manifests, or test infrastructure.',
-  'The scoped/affected set is empty.',
-  'Module-to-test mapping is low-confidence and cannot be made confidently.',
-] as const;
-
 const execFileAsync = promisify(execFile);
 const CURRENT_PROOF = {
   status: 'CURRENT',
@@ -90,6 +83,8 @@ describe('build_review input isolation', () => {
     await mainGit('worktree', 'add', '-b', 'feature/foo', dir);
     planPath = join(dir, 'plan.md');
     await writeFile(planPath, '# Plan body\n\nDo the isolated thing.\n', 'utf-8');
+    await git('add', 'plan.md');
+    await git('commit', '-m', 'add frozen plan');
 
     // Commit an unrelated feature change — this is what should actually
     // appear in the graded diff.
@@ -160,24 +155,6 @@ describe('build_review input isolation', () => {
     >>;
     const assembleSignature: _AssembleSignature = true;
     expect(assembleSignature).toBe(true);
-  });
-
-  it('keeps scoped verification agent-owned and preserves the broad-fallback contract', async () => {
-    const [pipeline, tdd, harness] = await Promise.all([
-      readFile(join(REPOSITORY_ROOT, 'skills/pipeline/SKILL.md'), 'utf8'),
-      readFile(join(REPOSITORY_ROOT, 'skills/tdd/SKILL.md'), 'utf8'),
-      readFile(join(REPOSITORY_ROOT, 'HARNESS.md'), 'utf8'),
-    ]);
-
-    for (const policy of [pipeline, tdd, harness]) {
-      expect(policy).toContain('conduct-ts scoped-run <selectors...>');
-      expect(policy).toMatch(/agent derives the selectors/i);
-    }
-
-    for (const trigger of BROAD_FALLBACK_TRIGGERS) {
-      expect(harness).toContain(trigger);
-      expect(pipeline).toContain(trigger);
-    }
   });
 
   it('routes an infrastructure result with arbitrary detail through the mechanical lane', async () => {
@@ -298,3 +275,5 @@ describe('build_review input isolation', () => {
     );
   });
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

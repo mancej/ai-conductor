@@ -39,6 +39,9 @@ publication *mechanics* are the coordinator's.
 
 ### 1. Fresh Verification
 
+The FINISH provider session never runs tests or launches full-suite or aggregate verification.
+It consumes the coordinator's evidence; missing or stale suite proof belongs to `test_suite`.
+
 Before any provider receives FINISH work, the coordinator uses the engine's
 configured aggregate verifier for current completion evidence. It reuses a
 current passing result; when evidence is missing or stale, the verifier obtains
@@ -118,14 +121,20 @@ unstructured substitute. The provider-facing verdict vocabulary is:
   when the retained prose contains halt text.
 - `{"kind":"revision_required","reason":"structurally_incomplete","detail":"optional concrete observation"}`
   when the retained prose is missing required reader-facing structure.
+- `{"kind":"timed_out"}` when the bounded judgment could not complete before its deadline.
+- `{"kind":"provider_unavailable"}` when no provider is available to make the bounded judgment.
 - `{"kind":"refused","detail":"optional concrete blocker"}` when the provider cannot make
   the bounded judgment.
 
-`detail` is optional for `revision_required` and `refused`. When supplied, it
-must be a non-blank string describing the concrete observation or blocker. The
-coordinator trims it and bounds it to 1,000 characters; overlong detail is
-truncated with a visible marker. The coordinator, not the provider, owns all
-routing and publication transitions.
+Every `revision_required` verdict is a deficient-prose objection: it routes the
+retained PR to a separate authoring pass, then a fresh bounded judgment pass.
+It should include a concrete `detail` naming what is deficient so that authoring
+can address the objection. `detail` remains optional for compatibility on
+`revision_required` and `refused`; when supplied, it must be a non-blank string
+describing the concrete observation or blocker. The coordinator trims it and
+bounds it to 1,000 characters; overlong detail is truncated with a visible
+marker. The coordinator, not the provider, owns all routing and publication
+transitions.
 
 Accepted prose authorizes the coordinator to continue with its deterministic
 transitions. It does not itself authorize any publication effect.

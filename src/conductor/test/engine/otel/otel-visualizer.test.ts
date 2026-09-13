@@ -1,450 +1,139 @@
-/**
- * T9: OtelVisualizer — provider/processor setup (off hot path).
- * T17: hot-path guard — emit() resolves promptly even when the transport blocks.
- * FR-5/FR-8 infra; R1.
- *
- * Verifies that constructing the visualizer assembles a TracerProvider with a
- * BatchSpanProcessor and a MeterProvider with a PeriodicExportingMetricReader
- * over the injected exporters and the Task-7 resource.
- */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { SpanExporter, ReadableSpan } from '@opentelemetry/sdk-trace-base';
-import { mkdtemp, rm } from 'fs/promises';
-import { join } from 'path';
-import { tmpdir } from 'os';
+// Covers: task:6
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { AggregationTemporality, InMemoryMetricExporter } from '@opentelemetry/sdk-metrics';
 import { ConductorEventEmitter } from '../../../src/ui/events.js';
+import { otelTracedEventTypes } from '../../../src/engine/event-sinks.js';
 import { resolveOtelConfig } from '../../../src/engine/otel/otel-config.js';
 import { OtelVisualizer } from '../../../src/engine/otel/otel-visualizer.js';
-import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
-import { InMemoryMetricExporter, AggregationTemporality } from '@opentelemetry/sdk-metrics';
+import { CapturingSpanExporter } from '../../fixtures/capturing-span-exporter.js';
 
-describe('OtelVisualizer — T9: provider/processor setup', () => {
+describe('OtelVisualizer', () => {
   let tempDir: string;
   let pipelineDir: string;
-  let spanExporter: InMemorySpanExporter;
-  let metricExporter: InMemoryMetricExporter;
   let emitter: ConductorEventEmitter;
+  let spanExporter: CapturingSpanExporter;
+  let metricExporter: InMemoryMetricExporter;
 
   beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), 'otel-vis-t9-'));
+    tempDir = await mkdtemp(join(tmpdir(), 'otel-visualizer-'));
     pipelineDir = join(tempDir, '.pipeline');
-    spanExporter = new InMemorySpanExporter();
-    metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
     emitter = new ConductorEventEmitter();
+    spanExporter = new CapturingSpanExporter();
+    metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
   });
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it('constructs without throwing given a valid enabled config with injected exporters', () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      pipelineDir,
+  function makeVisualizer(): OtelVisualizer {
+    return new OtelVisualizer(
+      resolveOtelConfig({ otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } }, pipelineDir),
+      { spanExporter, metricExporter },
     );
-    expect(
-      () =>
-        new OtelVisualizer(resolved, {
-          runId: 'test-run-1',
-          feature: 'test-feature',
-          project: 'test-project',
-          spanExporter,
-          metricExporter,
-        }),
-    ).not.toThrow();
-  });
-
-  it('has name property "otel" (VisualizerPlugin contract)', () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      pipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-run-name',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter,
-      metricExporter,
-    });
-    expect(vis.name).toBe('otel');
-  });
-
-  it('start() attaches to emitter (does not throw)', () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      pipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-run-start',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter,
-      metricExporter,
-    });
-    expect(() => vis.start(emitter)).not.toThrow();
-    // cleanup
-    return vis.stop();
-  });
-
-  it('stop() resolves — BatchSpanProcessor + PeriodicMetricReader flush and shut down', async () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      pipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-run-stop',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter,
-      metricExporter,
-    });
-    vis.start(emitter);
-    await expect(vis.stop()).resolves.toBeUndefined();
-  });
-
-  it('stop() without start() still resolves (no-op flush on no emitter)', async () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      pipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-run-nostop',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter,
-      metricExporter,
-    });
-    // Never called start — stop should still work
-    await expect(vis.stop()).resolves.toBeUndefined();
-  });
-
-  it('exporter receives spans after stop() flushes the BatchSpanProcessor', async () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      pipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-run-flush',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter,
-      metricExporter,
-    });
-    vis.start(emitter);
-    await emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
-    await emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
-    await emitter.emit({ type: 'feature_complete', featureDesc: 'test' });
-    // Before stop: BatchSpanProcessor may not have exported yet
-    await vis.stop();
-    // After stop + forceFlush: spans must be in the exporter
-    expect(spanExporter.getFinishedSpans().length).toBeGreaterThan(0);
-  });
-});
-
-// ── T17: hot-path guard — emit() resolves promptly (R1 non-blocking) ──────────
-
-describe('T17: hot-path guard — emit() does not await the transport', () => {
-  /**
-   * Regression guard for R1: handlers must be synchronous (O(1)) and must NOT
-   * await the exporter. If a handler awaited the exporter, emit() would block
-   * for the full duration of the export call, stalling the event bus.
-   *
-   * We inject a span exporter whose export() method blocks indefinitely (never
-   * calls the callback). If emit() awaited the export, it would never resolve.
-   * The test asserts that emit() resolves within a short deadline.
-   */
-  let t17TempDir: string;
-  let t17PipelineDir: string;
-  let t17MetricExporter: InMemoryMetricExporter;
-  let t17Emitter: ConductorEventEmitter;
-
-  beforeEach(async () => {
-    t17TempDir = await mkdtemp(join(tmpdir(), 'otel-vis-t17-'));
-    t17PipelineDir = join(t17TempDir, '.pipeline');
-    t17MetricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
-    t17Emitter = new ConductorEventEmitter();
-  });
-
-  afterEach(async () => {
-    await rm(t17TempDir, { recursive: true, force: true });
-  });
-
-  it('emitter.emit() resolves promptly even when the transport export blocks indefinitely', async () => {
-    // A span exporter that blocks forever — never calls the result callback.
-    const blockingExporter: SpanExporter = {
-      export(_spans: ReadableSpan[], _resultCallback: (result: { code: number }) => void): void {
-        // Intentionally never calls _resultCallback — simulates a hung transport.
-      },
-      async shutdown(): Promise<void> {},
-    };
-
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      t17PipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-hotpath',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter: blockingExporter,
-      metricExporter: t17MetricExporter,
-    });
-    vis.start(t17Emitter);
-
-    // emit() must resolve in ≪1 second even though the exporter never calls back.
-    const DEADLINE_MS = 500;
-    const start = Date.now();
-    await t17Emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
-    await t17Emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
-    await t17Emitter.emit({ type: 'feature_complete', featureDesc: 'test' });
-    const elapsed = Date.now() - start;
-
-    expect(elapsed).toBeLessThan(DEADLINE_MS);
-
-    // stop() may hang (blocked export) — don't await it in this test. The test
-    // only verifies that the *emit* path is non-blocking (R1 guard).
-    // Suppress unused import warning: vi is used for type checking context.
-    vi.stubGlobal('__t17_vis_ref', vis); // keep vis alive for GC; not awaited
-  });
-});
-
-// ── T19: bounded export timeout ────────────────────────────────────────────────
-
-describe('T19: bounded export timeout — stop() resolves within exportTimeoutMillis', () => {
-  /**
-   * Verifies that an export that never calls its resultCallback is abandoned
-   * after exportTimeoutMillis and stop() resolves rather than hanging forever.
-   *
-   * We inject a "hanging" span exporter (export() never calls the callback)
-   * and a very short exportTimeoutMillis so the test stays fast.
-   */
-  let t19TempDir: string;
-  let t19PipelineDir: string;
-  let t19MetricExporter: InMemoryMetricExporter;
-  let t19Emitter: ConductorEventEmitter;
-
-  beforeEach(async () => {
-    t19TempDir = await mkdtemp(join(tmpdir(), 'otel-vis-t19-'));
-    t19PipelineDir = join(t19TempDir, '.pipeline');
-    t19MetricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
-    t19Emitter = new ConductorEventEmitter();
-  });
-
-  afterEach(async () => {
-    await rm(t19TempDir, { recursive: true, force: true });
-  });
-
-  it('stop() resolves within the export timeout even when the transport never responds', async () => {
-    // Span exporter that blocks forever — never calls the result callback.
-    const hangingExporter: SpanExporter = {
-      export(_spans: ReadableSpan[], _cb: (r: { code: number }) => void): void {
-        // Never calls _cb.
-      },
-      async shutdown(): Promise<void> {},
-    };
-
-    const TIMEOUT_MS = 200; // short bound for test speed
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      t19PipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-t19',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter: hangingExporter,
-      metricExporter: t19MetricExporter,
-      exportTimeoutMillis: TIMEOUT_MS,
-    });
-    vis.start(t19Emitter);
-    await t19Emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
-    await t19Emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
-    await t19Emitter.emit({ type: 'feature_complete', featureDesc: 'test' });
-
-    // stop() must abandon the hung export and resolve within a reasonable multiple
-    // of TIMEOUT_MS (allowing for scheduling jitter).
-    const DEADLINE_MS = TIMEOUT_MS * 5;
-    const start = Date.now();
-    await expect(vis.stop()).resolves.toBeUndefined();
-    const elapsed = Date.now() - start;
-
-    expect(elapsed).toBeLessThan(DEADLINE_MS);
-  }, 10_000 /* test timeout: must complete well before 10 s */);
-});
-
-// ── Task 19: pipeline closeout live-bus export ──────────────────────────────
-
-describe('Task 19: pipeline_closeout export', () => {
-  let closeoutTempDir: string;
-  let closeoutPipelineDir: string;
-  let closeoutSpanExporter: InMemorySpanExporter;
-  let closeoutMetricExporter: InMemoryMetricExporter;
-  let closeoutEmitter: ConductorEventEmitter;
-
-  beforeEach(async () => {
-    closeoutTempDir = await mkdtemp(join(tmpdir(), 'otel-vis-closeout-'));
-    closeoutPipelineDir = join(closeoutTempDir, '.pipeline');
-    closeoutSpanExporter = new InMemorySpanExporter();
-    closeoutMetricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
-    closeoutEmitter = new ConductorEventEmitter();
-  });
-
-  afterEach(async () => {
-    await rm(closeoutTempDir, { recursive: true, force: true });
-  });
-
-  it('subscribes synchronously and adds obligation timing to the active build span', async () => {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      closeoutPipelineDir,
-    );
-    const vis = new OtelVisualizer(resolved, {
-      runId: 'test-closeout-span',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter: closeoutSpanExporter,
-      metricExporter: closeoutMetricExporter,
-    });
-    const onSpy = vi.spyOn(closeoutEmitter, 'on');
-    vis.start(closeoutEmitter);
-
-    await closeoutEmitter.emit({ type: 'step_started', step: 'build', index: 0 });
-    const closeoutEvent = {
-      type: 'pipeline_closeout',
-      obligation: 'evaluator',
-      startedAt: 100,
-      endedAt: 140,
-      ts: 150,
-    } as const;
-    const closeoutHandler = onSpy.mock.calls.find(([type]) => type === 'pipeline_closeout')?.[1];
-    expect(closeoutHandler).toBeDefined();
-    expect(closeoutHandler!({ ...closeoutEvent, obligation: 'summary' })).toBeUndefined();
-    await closeoutEmitter.emit(closeoutEvent);
-    await closeoutEmitter.emit({ type: 'step_completed', step: 'build', status: 'done' });
-    await closeoutEmitter.emit({ type: 'feature_complete' });
-    await vis.stop();
-
-    const buildSpan = closeoutSpanExporter.getFinishedSpans().find((span) => span.name === 'build')!;
-    const closeout = buildSpan.events.find(
-      (event) => event.name === 'pipeline_closeout' && event.attributes?.['obligation'] === 'evaluator',
-    );
-    expect(closeout?.attributes).toMatchObject({
-      obligation: 'evaluator',
-      startedAt: 100,
-      endedAt: 140,
-      durationMs: 40,
-    });
-  });
-});
-
-// ── T21: flush on exit — SIGINT/SIGTERM handlers ──────────────────────────────
-
-describe('T21: flush on exit — idempotent stop() and signal handlers', () => {
-  let t21TempDir: string;
-  let t21PipelineDir: string;
-  let t21SpanExporter: InMemorySpanExporter;
-  let t21MetricExporter: InMemoryMetricExporter;
-  let t21Emitter: ConductorEventEmitter;
-
-  beforeEach(async () => {
-    t21TempDir = await mkdtemp(join(tmpdir(), 'otel-vis-t21-'));
-    t21PipelineDir = join(t21TempDir, '.pipeline');
-    t21SpanExporter = new InMemorySpanExporter();
-    t21MetricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
-    t21Emitter = new ConductorEventEmitter();
-  });
-
-  afterEach(async () => {
-    await rm(t21TempDir, { recursive: true, force: true });
-  });
-
-  function makeVis(): OtelVisualizer {
-    const resolved = resolveOtelConfig(
-      { otel: { exporter: 'otlp', endpoint: 'http://localhost:4318' } },
-      t21PipelineDir,
-    );
-    return new OtelVisualizer(resolved, {
-      runId: 'test-t21',
-      feature: 'test-feature',
-      project: 'test-project',
-      spanExporter: t21SpanExporter,
-      metricExporter: t21MetricExporter,
-    });
   }
 
-  it('calling stop() twice returns the same promise (no double-flush)', async () => {
-    const vis = makeVis();
-    vis.start(t21Emitter);
-    await t21Emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
-    await t21Emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
-    await t21Emitter.emit({ type: 'feature_complete', featureDesc: 'test' });
+  it('subscribes via the visualizer emitter seam and exports enriched spans', async () => {
+    const visualizer = makeVisualizer();
+    const on = vi.spyOn(emitter, 'on');
+    visualizer.start(emitter, { runId: 'run-1', feature: 'feature', project: 'project' });
 
-    const p1 = vis.stop();
-    const p2 = vis.stop();
-    // Both must be the same promise object (idempotent).
-    expect(p1).toBe(p2);
-    await p1;
-    // Spans must appear exactly once (no duplicate flush).
-    const roots = t21SpanExporter.getFinishedSpans().filter((s) => !s.parentSpanContext);
-    expect(roots).toHaveLength(1);
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'claude', preferredProvider: 'codex',
+      model: 'sonnet', fallbackReason: 'codex unavailable', invoked: true, outcome: 'success',
+    });
+    await emitter.emit({
+      type: 'step_completed', step: 'build', status: 'done', actualProvider: 'claude', effort: 'high', tier: 'M',
+    });
+    await emitter.emit({ type: 'feature_complete' });
+    await visualizer.stop();
+
+    expect(new Set(on.mock.calls.map(([type]) => type))).toEqual(new Set(otelTracedEventTypes()));
+    expect(spanExporter.getFinishedSpans().find((span) => span.name === 'build')?.attributes).toMatchObject({
+      'conductor.model': 'sonnet',
+      'conductor.effort': 'high',
+      'conductor.complexity_tier': 'M',
+      'conductor.provider': 'claude',
+      'conductor.provider.preferred': 'codex',
+      'conductor.fallback': true,
+      'conductor.fallback.reason': 'codex unavailable',
+    });
   });
 
-  it('SIGINT triggers stop() and spans are flushed', async () => {
-    const vis = makeVis();
-    const processOn = vi.spyOn(process, 'on');
-    vis.start(t21Emitter);
-    await t21Emitter.emit({ type: 'step_started', step: 'bootstrap', index: 0 });
-    await t21Emitter.emit({ type: 'step_completed', step: 'bootstrap', status: 'done' });
-    await t21Emitter.emit({ type: 'feature_complete', featureDesc: 'test' });
+  it('keeps the visualizer spans-only even when given a metric exporter', async () => {
+    const visualizer = makeVisualizer();
+    visualizer.start(emitter, { runId: 'run-1', feature: 'feature', project: 'project' });
 
-    // Invoke only this visualizer's handler. Broadcasting a real process-wide
-    // SIGINT also invokes Vitest's signal handler in a reused fork, which can
-    // terminate the worker after the test has passed.
-    const sigintHandler = processOn.mock.calls.find(([signal]) => signal === 'SIGINT')?.[1];
-    expect(sigintHandler).toBeTypeOf('function');
-    (sigintHandler as () => void)();
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({ type: 'step_completed', step: 'build', status: 'done' });
+    await emitter.emit({ type: 'feature_complete' });
+    await visualizer.stop();
 
-    // Wait for the flush to complete by awaiting stop() directly.
-    // stop() is idempotent: calling it again after SIGINT triggered it returns
-    // the same promise that is already resolving.
-    await vis.stop();
-
-    expect(t21SpanExporter.getFinishedSpans().length).toBeGreaterThan(0);
+    expect(spanExporter.getFinishedSpans().map((span) => span.name)).toEqual(['build', 'conductor.run']);
+    expect(metricExporter.getMetrics()).toEqual([]);
   });
 
-  it('SIGTERM triggers stop() and spans are flushed', async () => {
-    const vis = makeVis();
-    const processOn = vi.spyOn(process, 'on');
-    vis.start(t21Emitter);
-    await t21Emitter.emit({ type: 'step_started', step: 'plan', index: 2 });
-    await t21Emitter.emit({ type: 'step_completed', step: 'plan', status: 'done' });
-    await t21Emitter.emit({ type: 'feature_complete', featureDesc: 'test' });
+  it('reads resolved attributes once for its trace Resource and reports dropped keys through one warning callback', async () => {
+    const onWarning = vi.fn();
+    const visualizer = new OtelVisualizer(
+      resolveOtelConfig({
+        otel: {
+          exporter: 'otlp',
+          endpoint: 'http://localhost:4318',
+          attributes: {
+            'deployment.environment.name': ' staging ',
+            invalid: 'dropped',
+          },
+        },
+      }, pipelineDir),
+      { spanExporter, metricExporter, onWarning },
+    );
+    visualizer.start(emitter, { runId: 'run-1', feature: 'feature', project: 'project' });
 
-    // Invoke only this visualizer's handler. Broadcasting a real process-wide
-    // SIGTERM also invokes unrelated handlers retained by other test fixtures
-    // in a reused Vitest fork, some of which legitimately terminate the process.
-    const sigtermHandler = processOn.mock.calls.find(([signal]) => signal === 'SIGTERM')?.[1];
-    expect(sigtermHandler).toBeTypeOf('function');
-    (sigtermHandler as () => void)();
-    await vis.stop();
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({ type: 'feature_complete' });
+    await visualizer.stop();
 
-    expect(t21SpanExporter.getFinishedSpans().length).toBeGreaterThan(0);
+    const traceResource = spanExporter.getFinishedSpans().find((span) => span.name === 'conductor.run')?.resource.attributes;
+    expect({
+      traceResource,
+      invalidPresent: Object.hasOwn(traceResource ?? {}, 'invalid'),
+      warnings: { count: onWarning.mock.calls.length, message: onWarning.mock.calls[0]?.[0] },
+      metricBatches: metricExporter.getMetrics(),
+    }).toMatchObject({
+      traceResource: { 'deployment.environment.name': 'staging' },
+      invalidPresent: false,
+      warnings: { count: 1, message: expect.stringContaining('invalid') },
+      metricBatches: [],
+    });
   });
 
-  it('signal handler is removed after stop() — no listener leak', async () => {
-    const vis = makeVis();
-    vis.start(t21Emitter);
+  it('ignores lifecycle-only provider attempts without overwriting an invoked attempt on the step span', async () => {
+    const visualizer = makeVisualizer();
+    visualizer.start(emitter, { runId: 'run-1', feature: 'feature', project: 'project' });
 
-    const sigintCountBefore = process.listenerCount('SIGINT');
-    await vis.stop();
-    // After stop, our handler must have been unregistered.
-    const sigintCountAfter = process.listenerCount('SIGINT');
-    expect(sigintCountAfter).toBe(sigintCountBefore - 1);
-  });
+    await emitter.emit({ type: 'step_started', step: 'build', index: 0 });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'claude', preferredProvider: 'codex',
+      invoked: true, outcome: 'success',
+    });
+    await emitter.emit({
+      type: 'provider_attempt', step: 'build', provider: 'provider-lifecycle', invoked: false,
+      outcome: 'success', lifecycle: { phase: 'settled', attemptId: 'attempt-1', recoveryCount: 0 },
+    });
+    await emitter.emit({ type: 'step_failed', step: 'build', error: 'failed', retryCount: 0 });
+    await emitter.emit({ type: 'feature_complete' });
+    await visualizer.stop();
 
-  it('stop() without prior start() still resolves (no-op flush on empty state)', async () => {
-    const vis = makeVis();
-    // Never call start() — stop() should still resolve cleanly.
-    await expect(vis.stop()).resolves.toBeUndefined();
+    expect(spanExporter.getFinishedSpans().find((span) => span.name === 'build')?.attributes)
+      .toMatchObject({
+        'conductor.provider': 'claude',
+        'conductor.provider.preferred': 'codex',
+        'conductor.fallback': true,
+      });
   });
 });

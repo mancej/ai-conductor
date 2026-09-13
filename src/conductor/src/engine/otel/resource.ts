@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import { resourceFromAttributes, type Resource } from '@opentelemetry/resources';
@@ -6,18 +7,39 @@ import { resourceFromAttributes, type Resource } from '@opentelemetry/resources'
 const SERVICE_NAME = 'ai-conductor';
 
 export interface ResourceContext {
+  attributes?: Record<string, string>;
   /** Absolute path to the .pipeline directory. Used to read conduct-session-id. */
   pipelineDir: string;
   /** Feature name / description. Defaults to 'unknown'. */
   feature?: string;
   /** Project name. Defaults to 'unknown'. */
   project?: string;
+  /** Resolved project identity for service.instance.id. Defaults to 'unknown'. */
+  projectName?: string;
+  /** Worker identity; metrics are stable per project/worker instead of feature. */
+  workerName?: string;
+  /** Git branch: a non-empty string resolves; own empty/undefined is unresolved; omission is not supplied. */
+  branch?: string;
+  /** Engine version: a non-empty string resolves; own empty/undefined is unresolved; omission is not supplied. */
+  engineVersion?: string;
+  /** Released harness version: a non-empty string resolves; own empty/undefined is unresolved; omission is not supplied. */
+  harnessVersion?: string;
   /**
    * Override the run id. When supplied, the session-id file and generated id
    * are both bypassed. Used by tests that need deterministic run ids.
    */
   runId?: string;
 }
+
+/**
+ * Which signal a Resource is being built for. Metric backends fold the whole
+ * resource attribute set into `target_info`'s label set, so a run-varying
+ * attribute on the metric Resource mints a series per run exactly as a
+ * data-point attribute would. Traces carry no such cost — each trace is unique
+ * already — so the run id and the engine version ride the trace scope only.
+ * See adr-014's 2026-08-28 amendment.
+ */
+export type ResourceSignal = 'metrics' | 'traces';
 
 /**
  * Build an OTel Resource with conductor-specific attributes (FR-6).
@@ -30,17 +52,57 @@ export interface ResourceContext {
  * This function is synchronous and NEVER throws — missing session-id file results
  * in a generated id.
  */
-export function buildResource(ctx: ResourceContext): Resource {
-  const runId = ctx.runId ?? resolveRunId(ctx.pipelineDir);
+export function buildResource(ctx: ResourceContext, signal: ResourceSignal = 'traces'): Resource {
   const feature = ctx.feature ?? 'unknown';
   const project = ctx.project ?? 'unknown';
+  const projectName = ctx.projectName ?? 'unknown';
+  const workerName = ctx.workerName ?? 'unknown';
+  const branch = normalizeIdentity(ctx, 'branch');
 
-  return resourceFromAttributes({
+  const traceStable = {
     'service.name': SERVICE_NAME,
-    'conductor.run.id': runId,
+    // Trace identity intentionally remains feature scoped.  Metrics use the
+    // stable project/worker identity below.
+    'service.instance.id': `${projectName}/${feature}`,
     'conductor.feature': feature,
     'conductor.project': project,
+    'conductor.branch': branch,
+  };
+  // Every value above is fixed for a feature's lifetime, so `target_info` holds
+  // one row per feature rather than one per run. Resolving the run id is also
+  // skipped here: it writes the session-id file as a side effect, and the
+  // metric scope has no use for the value.
+  if (signal === 'metrics') return resourceFromAttributes({
+    ...ctx.attributes,
+    'service.name': SERVICE_NAME,
+    'service.instance.id': `${projectName}/${workerName}`,
+    'conductor.project': project,
+    'conductor.worker': workerName,
+    'host.name': resolveHostName(),
   });
+
+  return resourceFromAttributes({
+    ...ctx.attributes,
+    ...traceStable,
+    'conductor.run.id': ctx.runId ?? resolveRunId(ctx.pipelineDir),
+    'conductor.engine.version': normalizeIdentity(ctx, 'engineVersion'),
+    'service.version': normalizeIdentity(ctx, 'harnessVersion'),
+  });
+}
+
+function resolveHostName(): string {
+  try {
+    return hostname() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function normalizeIdentity(ctx: ResourceContext, key: 'branch' | 'engineVersion' | 'harnessVersion'): string {
+  if (!Object.prototype.hasOwnProperty.call(ctx, key)) return 'not-supplied';
+
+  const value = ctx[key];
+  return typeof value === 'string' && value.length > 0 ? value : 'unresolved';
 }
 
 function resolveRunId(pipelineDir: string): string {

@@ -9,24 +9,23 @@ export type StepName =
   | 'conflict_check'
   | 'plan'
   | 'coherence_check'
+  | 'coverage_binding'
   | 'architecture_diagram'
   | 'architecture_review'
   | 'worktree'
   | 'acceptance_specs'
   | 'build'
   | 'build_review'
-  | 'wiring_check'
   | 'test_suite'
   | 'manual_test'
   | 'prd_audit'
   | 'architecture_review_as_built'
-  | 'retro'
   | 'rebase'
   | 'finish'
   // Conditional SHIP sub-routine — dispatched by the conductor when a blocking
   // prd_audit / as-built review needs gap remediation. NOT part of the
   // sequential ALL_STEPS; it routes each gap to the right step or HALTs
-  // (architectural-clarity / product-scope only).
+  // (architectural-clarity / product-scope / unanswerable only).
   | 'remediate'
   // Semantic attribution verification step — out-of-band verification gate
   // (like remediate) that validates task attribution metadata in commits.
@@ -73,7 +72,7 @@ export interface StepDefinition {
    * objective verdict is recomputed after it runs and the selector may route
    * to/over it. The conductor derives the loop region and the front/loop
    * boundary from this flag, so a custom config step inserted among the loop
-   * steps joins the loop. Built-ins: build, manual_test, retro, finish.
+   * steps joins the loop. Built-ins: build, manual_test, rebase, finish.
    */
   loopGate?: boolean;
   /**
@@ -101,11 +100,6 @@ export interface StepDefinition {
    * — they can never be disabled. Built-ins: manual_test.
    */
   configDisableAllowed?: boolean;
-  /**
-   * Retained compatibility step that performs no work. The conductor emits a
-   * spine notice whenever it executes so operators can see the deprecation.
-   */
-  deprecated?: { adr: string };
 }
 
 /**

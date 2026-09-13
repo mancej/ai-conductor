@@ -53,7 +53,7 @@ vi.mock('execa', async (importOriginal) => {
 // gate-loop.test.ts. We start the loop at `build` with complexity tier 'M' so
 // the gate-driven tail runs manual_test (S-tier now legitimately skips
 // manual_test per D5 — see steps.ts skippableForTiers):  build → manual_test →
-// retro → [rebase, once implemented] → finish.
+// validation group → rebase → finish.
 //
 // The `rebase` loopGate step is NOT yet implemented, so the tail today is
 // build → manual_test → finish with no rebase. Every assertion below encodes a
@@ -79,6 +79,7 @@ const FRONT_DONE: ConductState = {
   conflict_check: 'skipped',
   plan: 'done',
   coherence_check: 'done',
+  coverage_binding: 'done',
   architecture_diagram: 'skipped',
   architecture_review: 'skipped',
   acceptance_specs: 'skipped',
@@ -102,6 +103,7 @@ const FRONT_DONE_M: ConductState = {
   conflict_check: 'skipped',
   plan: 'done',
   coherence_check: 'done',
+  coverage_binding: 'done',
   architecture_diagram: 'skipped',
   architecture_review: 'done',
   acceptance_specs: 'skipped',
@@ -203,6 +205,12 @@ describe('integration/rebase-loop', () => {
     await mkdir(join(dir, '.pipeline'), { recursive: true });
     await mkdir(join(dir, '.docs/specs'), { recursive: true });
     await mkdir(join(dir, '.docs/stories'), { recursive: true });
+    await mkdir(join(dir, '.docs/plans'), { recursive: true });
+    // The prd_audit fixture below cites Plan task 1; the plan declares it.
+    await writeFile(
+      join(dir, '.docs/plans/add-foo.md'),
+      '### Task 1: add foo\n\n**Files:** foo.ts\n',
+    );
     await writeFile(
       join(dir, '.docs/specs/add-foo.md'),
       '## Functional Requirements\n\nFR-1\n',
@@ -230,7 +238,7 @@ describe('integration/rebase-loop', () => {
     prospectiveMergeFixture.forceIndeterminate = true;
   }
 
-  function conductorWith(runner: StepRunner, fromStep: 'build' | 'retro' = 'build'): Conductor {
+  function conductorWith(runner: StepRunner, fromStep: 'build' | 'rebase' = 'build'): Conductor {
     const fakeGit: GitRunner = async (args) =>
       args.includes('--symbolic-full-name')
         ? { stdout: 'refs/remotes/origin/feature/x\n' }
@@ -263,7 +271,7 @@ describe('integration/rebase-loop', () => {
       const done = await access(join(dir, '.pipeline/DONE')).then(() => true).catch(() => false);
       const halted = await access(join(dir, '.pipeline/HALT')).then(() => true).catch(() => false);
       if (done || halted) return;
-      await conductorWith(runner, 'retro').run();
+      await conductorWith(runner, 'rebase').run();
     }
   }
 
@@ -276,6 +284,9 @@ describe('integration/rebase-loop', () => {
         join(dir, '.pipeline/task-status.json'),
         JSON.stringify({ tasks: [{ id: 't1', status: 'completed' }] }),
       );
+    } else if (step === 'coverage_binding') {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(join(dir, '.pipeline/coverage-binding.json'), JSON.stringify({ version: 1, slug: 'add-foo', runId: 'test-run', status: 'disabled', entries: [] }));
     } else if (step === 'build_review') {
       // The build_review judgement gate's completion predicate requires a
       // fresh, valid PASS verdict at .pipeline/build-review.json (see
@@ -302,7 +313,10 @@ describe('integration/rebase-loop', () => {
           '## Verdict Table',
           '| Criterion | Grade | Plan task | Evidence |',
           '|---|---|---|---|',
-          '| S1.1 | PASS | 1 | foo.ts:1 |',
+          // The fixture story's heading id is `1-1`, so its sole criterion is
+          // `S1-1.1` — the criterion id carries the whole heading id, not just
+          // its first digit run.
+          '| S1-1.1 | PASS | 1 | foo.ts:1 |',
           '',
           '| FR | Verdict | Evidence |',
           '|---|---|---|',
@@ -1427,8 +1441,9 @@ describe('integration/rebase-loop', () => {
           }).toEqual({
             kickedBack: [
               'build',
-              'test_suite',
+              'coverage_binding',
               'build_review',
+              'test_suite',
               ...manualTarget,
               'prd_audit',
               'architecture_review_as_built',
@@ -1474,8 +1489,9 @@ describe('integration/rebase-loop', () => {
         // Full legacy invalidation set (fail-closed fallback), no preservations.
         expect(result.kickedBack).toEqual([
           'build',
-          'test_suite',
+          'coverage_binding',
           'build_review',
+          'test_suite',
           'manual_test',
           'prd_audit',
           'architecture_review_as_built',

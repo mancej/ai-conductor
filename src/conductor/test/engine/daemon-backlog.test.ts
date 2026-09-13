@@ -1,9 +1,12 @@
+// Covers: task:5, task:4
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, readFile as fsReadFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
+import { execa as execaCommand } from 'execa';
+import type { GitBlobBatchRunner } from '../../src/engine/git-blob-batch.js';
 import {
   discoverBacklog,
   fastForwardRoot,
@@ -13,6 +16,11 @@ import {
 } from '../../src/engine/daemon-backlog.js';
 import { makeGitRunner } from '../../src/engine/rebase.js';
 import { parseComplexityTier } from '../../src/engine/artifacts.js';
+import { parseCoherenceArtifact } from '../../src/engine/coherence-parse.js';
+import {
+  coherenceRegressionCorpus,
+  retiredHasCoherenceTableDataRow,
+} from './coherence-corpus.js';
 import {
   renderShippedRecord,
   parseShippedRecord,
@@ -394,17 +402,28 @@ describe('engine/daemon-backlog — discoverBacklog (eligibility vetting)', () =
     );
   });
 
-  it('blocks missing coherence while preserving the existing warning', async () => {
+  // Covers: task:7 — discovery keeps non-S coherence failures fail-closed
+  // through the shared parser, while S remains exempt.
+  it('blocks a merged non-S spec with no coherence file and warns once per slug', async () => {
     await writeFile(
       join(dir, '.docs/plans/missing-coherence.md'),
       planWithDeps('.docs/stories/missing-coherence.md'),
     );
     await writeFile(join(dir, '.docs/stories/missing-coherence.md'), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+    await writeFile(join(dir, '.docs/complexity/missing-coherence.md'), '# Complexity\n\nTier: M\n');
     const logs: string[] = [];
-
-    const result = await discoverBacklog(dir, undefined, (message) => logs.push(message), {
+    const warned = new Set<string>();
+    const opts = {
       treeSource: fsTreeSource(dir),
-    });
+      hasWarned: async (slug: string) => warned.has(slug),
+      markWarned: async (slug: string) => {
+        warned.add(slug);
+      },
+    };
+
+    const result = await discoverBacklog(dir, undefined, (message) => logs.push(message), opts);
+    await discoverBacklog(dir, undefined, (message) => logs.push(message), opts);
 
     expect(result.blocked).toEqual([
       {
@@ -414,15 +433,279 @@ describe('engine/daemon-backlog — discoverBacklog (eligibility vetting)', () =
       },
     ]);
     expect(logs).toContain(
-      'skip missing-coherence: merged spec cannot build — missing or unparseable coherence artifact (.docs/coherence/missing-coherence.md) required for tier unresolved. Author it on the default branch; logged once.',
+      'skip missing-coherence: merged spec cannot build — missing or unparseable coherence artifact (.docs/coherence/missing-coherence.md) required for tier M. Author it on the default branch; logged once.',
+    );
+    expect(logs.filter((message) => message.startsWith('skip missing-coherence:'))).toHaveLength(1);
+  });
+
+  it('blocks an empty coherence artifact for a merged non-S spec and warns once per slug', async () => {
+    const slug = 'empty-coherence';
+    await writeFile(join(dir, `.docs/plans/${slug}.md`), planWithDeps(`.docs/stories/${slug}.md`));
+    await writeFile(join(dir, `.docs/stories/${slug}.md`), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await writeFile(join(dir, `.docs/coherence/${slug}.md`), '   \n');
+    await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+    await writeFile(join(dir, `.docs/complexity/${slug}.md`), '# Complexity\n\nTier: L\n');
+    const logs: string[] = [];
+    const warned = new Set<string>();
+    const opts = {
+      treeSource: fsTreeSource(dir),
+      hasWarned: async (warnedSlug: string) => warned.has(warnedSlug),
+      markWarned: async (warnedSlug: string) => {
+        warned.add(warnedSlug);
+      },
+    };
+
+    const first = await discoverBacklog(dir, undefined, (message) => logs.push(message), opts);
+    await discoverBacklog(dir, undefined, (message) => logs.push(message), opts);
+
+    expect(first.blocked).toMatchObject([{ slug, reason: 'missing-coherence' }]);
+    expect(logs.filter((message) => message.startsWith(`skip ${slug}:`))).toHaveLength(1);
+  });
+
+  it('blocks prose without a coherence table for a merged non-S spec and warns once per slug', async () => {
+    const slug = 'table-less-coherence';
+    await writeFile(join(dir, `.docs/plans/${slug}.md`), planWithDeps(`.docs/stories/${slug}.md`));
+    await writeFile(join(dir, `.docs/stories/${slug}.md`), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await writeFile(join(dir, `.docs/coherence/${slug}.md`), '# Coherence\n\nThis is prose, not a table.\n');
+    await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+    await writeFile(join(dir, `.docs/complexity/${slug}.md`), '# Complexity\n\nTier: M\n');
+    const logs: string[] = [];
+    const warned = new Set<string>();
+    const opts = {
+      treeSource: fsTreeSource(dir),
+      hasWarned: async (warnedSlug: string) => warned.has(warnedSlug),
+      markWarned: async (warnedSlug: string) => {
+        warned.add(warnedSlug);
+      },
+    };
+
+    const first = await discoverBacklog(dir, undefined, (message) => logs.push(message), opts);
+    await discoverBacklog(dir, undefined, (message) => logs.push(message), opts);
+
+    expect(first.blocked).toMatchObject([{ slug, reason: 'missing-coherence' }]);
+    expect(logs.filter((message) => message.startsWith(`skip ${slug}:`))).toHaveLength(1);
+  });
+
+  it('keeps a merged S-tier spec with no plan-carried criterion rows eligible at discovery', async () => {
+    const slug = 's-tier-without-coherence';
+    await writeFile(join(dir, `.docs/plans/${slug}.md`), planWithDeps(`.docs/stories/${slug}.md`));
+    await writeFile(join(dir, `.docs/stories/${slug}.md`), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+    await writeFile(join(dir, `.docs/complexity/${slug}.md`), '# Complexity\n\nTier: S\n');
+
+    const result = await discoverBacklog(dir, undefined, undefined, {
+      treeSource: fsTreeSource(dir),
+    });
+
+    expect(result.blocked).toEqual([]);
+    expect(result.items.map((item) => item.slug)).toEqual([slug]);
+  });
+
+  it('dispatches a parser-only criterion table whose header and separator widths differ', async () => {
+    // The retired discovery predicate rejected this because its five-cell
+    // header and six-cell separator differ. The shared parser deliberately
+    // ignores header width and accepts the typed six-cell criterion row.
+    const parserOnlyCriterionTable =
+      '| Row class | Criterion | Cited task ids | Verdict | Quote |\n' +
+      '|---|---|---|---|---|---|\n' +
+      '| criterion | Story 1 happy | Task 1 | covered | fixture | diff-local |\n';
+    await writeFile(join(dir, '.docs/plans/parser-only-criterion.md'), planWithDeps('.docs/stories/parser-only-criterion.md'));
+    await writeFile(join(dir, '.docs/stories/parser-only-criterion.md'), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await writeFile(join(dir, '.docs/coherence/parser-only-criterion.md'), parserOnlyCriterionTable);
+
+    const result = await discoverBacklog(dir, undefined, undefined, {
+      treeSource: fsTreeSource(dir),
+    });
+
+    expect(result.blocked).toEqual([]);
+    expect(result.items.map((item) => item.slug)).toEqual(['parser-only-criterion']);
+  });
+
+  it('dispatches a merged non-S spec whose coherence artifact has a seven-cell fail criterion row', async () => {
+    const sevenCellFixture = coherenceRegressionCorpus.find(
+      ({ sevenCellFailCriterionTable }) => sevenCellFailCriterionTable !== undefined,
+    )?.sevenCellFailCriterionTable;
+    if (sevenCellFixture === undefined) throw new Error('missing seven-cell coherence corpus fixture');
+
+    const slug = 'seven-cell-fail-criterion';
+    await writeFile(join(dir, `.docs/plans/${slug}.md`), planWithDeps(`.docs/stories/${slug}.md`));
+    await writeFile(join(dir, `.docs/stories/${slug}.md`), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await writeFile(join(dir, `.docs/coherence/${slug}.md`), sevenCellFixture);
+    await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+    await writeFile(join(dir, `.docs/complexity/${slug}.md`), '# Complexity\n\nTier: M\n');
+
+    const result = await discoverBacklog(dir, undefined, undefined, {
+      treeSource: fsTreeSource(dir),
+    });
+
+    expect(result.blocked).toEqual([]);
+    expect(result.items.map((item) => item.slug)).toEqual([slug]);
+  });
+
+  it('dispatches a parser-only legacy table whose header and separator widths differ', async () => {
+    // This is the inverse arity mismatch: the retired predicate also rejected
+    // it before inspecting the valid five-cell legacy row.
+    const parserOnlyLegacyTable =
+      '| Row class | Cited id(s) | Counterpart id(s) | Verdict | Notes | Disposition |\n' +
+      '|---|---|---|---|---|\n' +
+      '| story | S1 | Task 1 | covered | fixture |\n';
+    await writeFile(join(dir, '.docs/plans/parser-only-legacy.md'), planWithDeps('.docs/stories/parser-only-legacy.md'));
+    await writeFile(join(dir, '.docs/stories/parser-only-legacy.md'), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await writeFile(join(dir, '.docs/coherence/parser-only-legacy.md'), parserOnlyLegacyTable);
+
+    const result = await discoverBacklog(dir, undefined, undefined, {
+      treeSource: fsTreeSource(dir),
+    });
+
+    expect(result.blocked).toEqual([]);
+    expect(result.items.map((item) => item.slug)).toEqual(['parser-only-legacy']);
+  });
+
+  it('blocks malformed coherence with the parser line detail in its remedy and warning', async () => {
+    const malformedTable =
+      '| Row class | Cited id(s) | Counterpart id(s) | Verdict | Notes | Disposition |\n' +
+      '|---|---|---|---|---|---|\n' +
+      '| criterion | Story 1 happy | Task 1 | covered | fixture |\n';
+    await writeFile(join(dir, '.docs/plans/malformed-coherence.md'), planWithDeps('.docs/stories/malformed-coherence.md'));
+    await writeFile(join(dir, '.docs/stories/malformed-coherence.md'), APPROVED_STORIES);
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await writeFile(join(dir, '.docs/coherence/malformed-coherence.md'), malformedTable);
+    const logs: string[] = [];
+
+    const result = await discoverBacklog(dir, undefined, (message) => logs.push(message), {
+      treeSource: fsTreeSource(dir),
+    });
+
+    expect(result.blocked).toEqual([
+      {
+        slug: 'malformed-coherence',
+        reason: 'missing-coherence',
+        remedy:
+          'Author a valid coherence table in .docs/coherence/malformed-coherence.md on the default branch. ' +
+          'Detail: line 3: criterion row expected 6 or 7 and actual 5 cells.',
+      },
+    ]);
+    expect(logs).toContain(
+      'skip malformed-coherence: merged spec cannot build — missing or unparseable coherence artifact ' +
+        '(.docs/coherence/malformed-coherence.md) required for tier unresolved. ' +
+        'Author it on the default branch; logged once. Detail: line 3: criterion row expected 6 or 7 and actual 5 cells.',
     );
   });
 
-  // Plan Task 19 — a legacy coherence artifact (all five legacy row classes,
-  // zero criterion rows) still satisfies discovery. This fails if the
-  // criterion layer is ever wired into `hasCoherenceTableDataRow` or the
-  // discovery-side coherence branch.
-  it('keeps a criterion-free legacy coherence artifact eligible at discovery (plan Task 19)', async () => {
+  // Covers: task:4, task:6 — the retired acceptance corpus is exercised through
+  // discovery as well as directly through the shared parser.
+  it('makes every retired-predicate acceptance visible through un-deduped discovery', async () => {
+    await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+    await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+    for (const fixture of coherenceRegressionCorpus) {
+      await writeFile(join(dir, `.docs/plans/${fixture.slug}.md`), planWithDeps(`.docs/stories/${fixture.slug}.md`));
+      await writeFile(join(dir, `.docs/stories/${fixture.slug}.md`), APPROVED_STORIES);
+      await writeFile(join(dir, `.docs/complexity/${fixture.slug}.md`), '# Complexity\n\nTier: M\n');
+      if (fixture.content !== null) {
+        await writeFile(join(dir, `.docs/coherence/${fixture.slug}.md`), fixture.content);
+      }
+    }
+
+    // This explicitly disables processed dedup: the second-table fixture must
+    // reach the shared parser, rather than disappearing before its diagnostic
+    // can be surfaced to an operator.
+    const isProcessed = vi.fn(async () => false);
+    const result = await discoverBacklog(
+      dir,
+      isProcessed,
+      undefined,
+      { treeSource: fsTreeSource(dir) },
+    );
+    const observations = coherenceRegressionCorpus.map((fixture) => ({
+      ...fixture,
+      oracleAccepted: retiredHasCoherenceTableDataRow(fixture.content),
+      parserAccepted: parseCoherenceArtifact(fixture.content).ok,
+    }));
+
+    expect(observations).toEqual(coherenceRegressionCorpus);
+    expect(isProcessed).toHaveBeenCalledWith('decide-artifact-coherence-check');
+    expect(observations
+      .filter(({ oracleAccepted, parserAccepted }) => !oracleAccepted && parserAccepted)
+      .map(({ name }) => name),
+    ).toEqual([
+      'five-wide header over six-wide separator and criterion row',
+      'six-wide header over five-wide separator and legacy row',
+    ]);
+    expect(observations.filter(({ parserAccepted }) => parserAccepted).map(({ name }) => name)).toEqual([
+      'minimal valid table',
+      'ragged mixed legacy and criterion rows',
+      'five-wide header over six-wide separator and criterion row',
+      'six-wide header over five-wide separator and legacy row',
+      'zero-criterion legacy artifact',
+      'shipped second-table artifact',
+      'two mapping tables',
+    ]);
+    expect(observations.filter(({ parserAccepted }) => !parserAccepted).map(({ name }) => name)).toContain(
+      'stranded mapping row in prose table',
+    );
+    expect(observations.filter(({ oracleAccepted, parserAccepted }) => oracleAccepted && !parserAccepted)).toEqual([]);
+    const shippedSecondTable = coherenceRegressionCorpus.find(
+      ({ slug }) => slug === 'decide-artifact-coherence-check',
+    );
+    if (shippedSecondTable?.content === undefined || shippedSecondTable.content === null) {
+      throw new Error('missing shipped second-table corpus fixture');
+    }
+    expect(parseCoherenceArtifact(shippedSecondTable.content)).toMatchObject({ ok: true });
+    const visibility = observations
+      .filter(({ oracleAccepted }) => oracleAccepted)
+      .map(({ slug, parserAccepted }) => {
+        const blocked = result.blocked.find((item) => item.slug === slug);
+        return {
+          slug,
+          disposition: result.items.some((item) => item.slug === slug)
+            ? 'eligible'
+            : blocked?.reason === 'missing-coherence'
+              ? 'blocked-missing-coherence'
+              : 'silently-lost',
+          remedy: blocked?.remedy,
+          parserAccepted,
+        };
+      });
+
+    expect(visibility.map(({ slug, disposition, parserAccepted }) => ({ slug, disposition, parserAccepted }))).toEqual([
+      { slug: 'minimal-valid-table', disposition: 'eligible', parserAccepted: true },
+      { slug: 'ragged-mixed-rows', disposition: 'eligible', parserAccepted: true },
+      { slug: 'zero-criterion-legacy', disposition: 'eligible', parserAccepted: true },
+      { slug: 'decide-artifact-coherence-check', disposition: 'eligible', parserAccepted: true },
+      { slug: 'two-mapping-tables', disposition: 'eligible', parserAccepted: true },
+    ]);
+
+    for (const fixture of observations.filter(({ parserAccepted, content }) => !parserAccepted && content !== null)) {
+      const parsed = parseCoherenceArtifact(fixture.content);
+      expect(parsed.ok).toBe(false);
+      // Empty and table-less artifacts are intentionally parser refusals
+      // without structural details. Every structural refusal, including the
+      // stranded mapping row, must surface its precise diagnostic in discovery.
+      if (parsed.ok || parsed.detail === undefined) continue;
+      const blocked = result.blocked.find((item) => item.slug === fixture.slug);
+      expect(blocked?.reason).toBe('missing-coherence');
+      expect(blocked?.remedy).toContain(`line ${parsed.detail.line}`);
+      expect(blocked?.remedy).toContain(parsed.detail.message);
+    }
+
+    for (const fixture of observations.filter(({ oracleAccepted, parserAccepted }) => oracleAccepted && !parserAccepted)) {
+      const parsed = parseCoherenceArtifact(fixture.content);
+      if (parsed.ok || parsed.detail === undefined) throw new Error(`missing parser detail for ${fixture.slug}`);
+      const blocked = visibility.find(({ slug }) => slug === fixture.slug);
+      expect(blocked?.remedy).toContain(`line ${parsed.detail.line}`);
+      expect(blocked?.remedy).toContain(parsed.detail.message);
+    }
+  });
+
+  // Plan Task 19 / Covers: task:6 — a legacy coherence artifact (all five
+  // legacy row classes, zero criterion rows) stays eligible through the shared
+  // parser that discovery consumes.
+  it('keeps a shared-parser-accepted criterion-free legacy coherence artifact eligible at discovery (plan Task 19)', async () => {
     const legacyOnlyTable =
       '| Row class | Cited id(s) | Counterpart id(s) | Verdict | Notes |\n' +
       '|---|---|---|---|---|\n' +
@@ -431,6 +714,7 @@ describe('engine/daemon-backlog — discoverBacklog (eligibility vetting)', () =
       '| story | S1 | Task 1 | covered | fixture |\n' +
       '| task | Task 1 | S1 | covered | fixture |\n' +
       '| adr | adr-2026-01-01-x | Task 1 | covered | fixture |\n';
+    expect(parseCoherenceArtifact(legacyOnlyTable)).toMatchObject({ ok: true });
     await writeFile(join(dir, '.docs/plans/legacy-coherence.md'), planWithDeps('.docs/stories/legacy-coherence.md'));
     await writeFile(join(dir, '.docs/stories/legacy-coherence.md'), APPROVED_STORIES);
     await mkdir(join(dir, '.docs/coherence'), { recursive: true });
@@ -955,9 +1239,13 @@ describe('engine/daemon-backlog — discoverBacklog (eligibility vetting)', () =
 
     const backlog = await discover();
     expect(backlog).toHaveLength(1);
-    // The item carries only the slug — the vetted plan+stories live on the
-    // (fast-forwarded) default branch the worktree is cut from, so no paths travel.
-    expect(backlog[0]).toEqual({ slug: 'feature-a' });
+    // The item preserves the source identity and carries the already-vetted
+    // document refs across the dispatcher-to-executor boundary.
+    expect(backlog[0]).toMatchObject({ slug: 'feature-a' });
+    expect(backlog[0]).toMatchObject({
+      storiesPath: '.docs/stories/feature-a.md',
+      planPath: '.docs/plans/feature-a.md',
+    });
   });
 
   it('includes a feature whose Stories reference is a relative Markdown link', async () => {
@@ -1075,7 +1363,11 @@ describe('engine/daemon-backlog — discoverBacklog (eligibility vetting)', () =
     await writeFile(join(dir, '.docs/complexity/big.md'), '# Complexity\n\nTier: L\n');
 
     const backlog = await discover();
-    expect(backlog).toEqual([{ slug: 'big', tier: 'L' }]);
+    expect(backlog).toMatchObject([{ slug: 'big', tier: 'L' }]);
+    expect(backlog[0]).toMatchObject({
+      storiesPath: '.docs/stories/big.md',
+      planPath: '.docs/plans/big.md',
+    });
   });
 
   it('leaves tier undefined when no complexity marker is present', async () => {
@@ -1472,6 +1764,11 @@ describe('engine/daemon-backlog — FR-24 merge is the build-ready trigger (git)
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'daemon-backlog-fr24-'));
     await execFile('git', ['init', '-b', 'main', '-q'], { cwd: dir });
+    // These tests remove the repository immediately after each case. Disable
+    // Git's automatic background maintenance so it cannot recreate
+    // `.git/objects/pack` while teardown is removing that exact fixture.
+    await execFile('git', ['config', 'maintenance.auto', 'false'], { cwd: dir });
+    await execFile('git', ['config', 'gc.auto', '0'], { cwd: dir });
     await execFile('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
     await execFile('git', ['config', 'user.name', 'Test'], { cwd: dir });
     await writeFile(join(dir, 'README.md'), 'init\n');
@@ -1576,6 +1873,196 @@ describe('engine/daemon-backlog — FR-24 merge is the build-ready trigger (git)
       baseBranch,
     });
     expect(backlog).toEqual([]);
+  });
+});
+
+describe('engine/daemon-backlog — committed-tree prefetch (Task 3)', () => {
+  let dir: string;
+  const baseBranch = 'main';
+  const gitInvocations: (readonly string[])[] = [];
+
+  const git = async (args: string[]) => {
+    const { stdout } = await execFile('git', args, { cwd: dir });
+    return stdout.trim();
+  };
+
+  const legacyTreeSource = (): BacklogTreeSource => ({
+    async listPlanFiles() {
+      const { stdout } = await execFile('git', ['ls-tree', '--name-only', `${baseBranch}:.docs/plans`], { cwd: dir });
+      return stdout.split('\n').filter((path) => path.endsWith('.md'));
+    },
+    async listShippedFiles() {
+      try {
+        const { stdout } = await execFile('git', ['ls-tree', '--name-only', `${baseBranch}:.docs/shipped`], { cwd: dir });
+        return stdout.split('\n').filter((path) => path.endsWith('.md'));
+      } catch {
+        return [];
+      }
+    },
+    async listAdrFiles() {
+      const { stdout } = await execFile('git', ['ls-tree', '--name-only', `${baseBranch}:.docs/decisions`], { cwd: dir });
+      return stdout.split('\n').filter((path) => /^adr-.*\.md$/i.test(path));
+    },
+    async readFile(path) {
+      try {
+        const { stdout } = await execFile('git', ['show', `${baseBranch}:${path}`], { cwd: dir });
+        return stdout;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  const recordingGitRunner = async (args: string[]) => {
+    gitInvocations.push(args);
+    return execFile('git', args, { cwd: dir });
+  };
+
+  const writeCorpus = async (count: number, includeCoherence = true) => {
+    for (let index = 0; index < count; index += 1) {
+      const slug = `2026-09-06-prefetch-${index}`;
+      await mkdir(join(dir, '.docs/plans'), { recursive: true });
+      await mkdir(join(dir, '.docs/stories'), { recursive: true });
+      await mkdir(join(dir, '.docs/complexity'), { recursive: true });
+      await mkdir(join(dir, '.docs/track'), { recursive: true });
+      if (includeCoherence) await mkdir(join(dir, '.docs/coherence'), { recursive: true });
+      await writeFile(join(dir, `.docs/plans/${slug}.md`), `# Plan\n**Stories:** .docs/stories/${slug}.md\n### Task 1\n**Dependencies:** none\n`);
+      await writeFile(join(dir, `.docs/stories/${slug}.md`), '# Stories\n**Status:** Accepted\n');
+      await writeFile(join(dir, `.docs/complexity/${slug}.md`), 'Tier: S\n');
+      await writeFile(join(dir, `.docs/track/${slug}.md`), 'Track: technical\n');
+      if (includeCoherence) {
+        await writeFile(join(dir, `.docs/coherence/${slug}.md`), '| Row class | Cited id(s) | Counterpart id(s) | Verdict | Notes |\n|---|---|---|---|---|\n| story | S1 | Task 1 | covered | fixture |\n');
+      }
+    }
+    await mkdir(join(dir, '.docs/decisions'), { recursive: true });
+    for (let index = 0; index < count; index += 1) {
+      await writeFile(join(dir, `.docs/decisions/adr-prefetch-${index}.md`), '# ADR\n**Status:** APPROVED\n');
+    }
+    await git(['add', '.docs']);
+    await git(['commit', '-q', '-m', `commit corpus (${count})`]);
+  };
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'daemon-backlog-prefetch-'));
+    await execFile('git', ['init', '-b', baseBranch, '-q'], { cwd: dir });
+    await execFile('git', ['config', 'user.email', 'test@test.com'], { cwd: dir });
+    await execFile('git', ['config', 'user.name', 'Test'], { cwd: dir });
+    await writeFile(join(dir, 'README.md'), 'init\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-q', '-m', 'init']);
+    gitInvocations.length = 0;
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('preserves discovery output from the previous per-file tree reader for a committed corpus', async () => {
+    await writeCorpus(12);
+
+    const expected = await discoverBacklog(dir, undefined, undefined, { treeSource: legacyTreeSource() });
+    const actual = await discoverBacklog(dir, undefined, undefined, { baseBranch });
+
+    expect(actual).toEqual(expected);
+  });
+
+  it('uses a bounded number of batched blob reads as the committed corpus grows', async () => {
+    await writeCorpus(4);
+    const invocations: (readonly string[])[] = [];
+    const runner: GitBlobBatchRunner = async (file, args, options) => {
+      if (file === 'git') {
+        invocations.push(args);
+        gitInvocations.push(args);
+      }
+      return execaCommand(file, args, options);
+    };
+    gitInvocations.length = 0;
+
+    await discoverBacklog(dir, undefined, undefined, {
+      treeSource: gitTreeSource(dir, baseBranch, { blobRunner: runner, gitRunner: recordingGitRunner }),
+    });
+    const smallCorpusCalls = invocations.length;
+
+    await writeCorpus(300);
+    invocations.length = 0;
+    gitInvocations.length = 0;
+    await discoverBacklog(dir, undefined, undefined, {
+      treeSource: gitTreeSource(dir, baseBranch, { blobRunner: runner, gitRunner: recordingGitRunner }),
+    });
+
+    expect([smallCorpusCalls, invocations.length]).toEqual([1, 1]);
+    expect(gitInvocations.filter(([command]) => command === 'show')).toEqual([]);
+  });
+
+  it('reports absent in-subtree coherence and intake artifacts from the prefetched memo', async () => {
+    await writeCorpus(3, false);
+    const invocations: (readonly string[])[] = [];
+    const runner: GitBlobBatchRunner = async (file, args, options) => {
+      if (file === 'git') {
+        invocations.push(args);
+        gitInvocations.push(args);
+      }
+      return execaCommand(file, args, options);
+    };
+    gitInvocations.length = 0;
+
+    const result = await discoverBacklog(dir, undefined, undefined, {
+      treeSource: gitTreeSource(dir, baseBranch, { blobRunner: runner, gitRunner: recordingGitRunner }),
+    });
+
+    expect([result.items.length, invocations.length]).toEqual([3, 1]);
+    expect(gitInvocations.filter(([command]) => command === 'show')).toEqual([]);
+  });
+
+  it('reads committed out-of-corpus files and rejects uncommitted ones', async () => {
+    await mkdir(join(dir, 'notes'), { recursive: true });
+    await writeFile(join(dir, 'notes/linked-stories.md'), '# External stories\n');
+    await git(['add', 'notes/linked-stories.md']);
+    await git(['commit', '-q', '-m', 'add external stories']);
+
+    const tree = gitTreeSource(dir, baseBranch);
+
+    await expect(
+      Promise.all([tree.readFile('notes/linked-stories.md'), tree.readFile('notes/not-committed.md')]),
+    ).resolves.toEqual(['# External stories\n', null]);
+  });
+
+  it('returns an empty backlog when the base branch has no documentation subtree', async () => {
+    await expect(discoverBacklog(dir, undefined, undefined, { baseBranch })).resolves.toEqual({
+      items: [],
+      waiting: [],
+      blocked: [],
+      gated: [],
+    });
+  });
+
+  it('treats a failed recursive documentation enumeration as an absent documentation tree', async () => {
+    await writeCorpus(3);
+    const blobInvocations: (readonly string[])[] = [];
+    const runner: GitBlobBatchRunner = async (file, args, options) => {
+      if (file === 'git') blobInvocations.push(args);
+      return execaCommand(file, args, options);
+    };
+    const recursiveDocsEnumeration = ['ls-tree', '-r', '-z', '--name-only', baseBranch, '--', '.docs'];
+    const enumerationAttempts: string[][] = [];
+    gitInvocations.length = 0;
+
+    const result = await discoverBacklog(dir, undefined, undefined, {
+      treeSource: gitTreeSource(dir, baseBranch, {
+        blobRunner: runner,
+        gitRunner: async (args) => {
+          if (args.every((arg, index) => arg === recursiveDocsEnumeration[index]) && args.length === recursiveDocsEnumeration.length) {
+            enumerationAttempts.push(args);
+            throw new Error('recursive documentation enumeration failed');
+          }
+          return recordingGitRunner(args);
+        },
+      }),
+    });
+
+    expect(result).toEqual({ items: [], waiting: [], blocked: [], gated: [] });
+    expect(enumerationAttempts).toEqual([recursiveDocsEnumeration]);
+    expect(blobInvocations).toEqual([]);
+    expect(gitInvocations.filter(([command, target]) => command === 'show' && target.startsWith(`${baseBranch}:.docs/`))).toEqual([]);
   });
 });
 
@@ -2212,19 +2699,27 @@ describe('engine/daemon-backlog — shipped-record dedup (Story 3/Task 4)', () =
     expect(logs.join('\n')).toMatch(/already-shipped.*shipped dedup/i);
   });
 
-  it('a candidate already marked processed locally is skipped WITHOUT consulting shipped records', async () => {
+  it('a processed candidate with a malformed legacy coherence row is skipped before discovery parses it', async () => {
     await writeSpec('cache-hit');
+    await writeFile(
+      join(dir, '.docs/coherence/cache-hit.md'),
+      `| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| widget | task:6 | story:2 | covered | fixture |
+`,
+    );
     // Deliberately do NOT write a shipped record — if the dedup path were
     // consulted first it would find nothing; the point is that isProcessed
     // short-circuits BEFORE shipped-record lookup even happens.
     let repairCalls = 0;
-    const { items: backlog } = await discoverBacklog(dir, async () => true, undefined, {
+    const { items: backlog, blocked } = await discoverBacklog(dir, async () => true, undefined, {
       treeSource: fsSource(dir),
       repairProcessed: async () => {
         repairCalls += 1;
       },
     });
     expect(backlog).toEqual([]);
+    expect(blocked).toEqual([]);
     expect(repairCalls).toBe(0);
   });
 
@@ -2887,6 +3382,47 @@ describe('engine/daemon-backlog — fastForwardRoot heal integration (Task 7)', 
     // Verify: HEAD advanced (fast-forward succeeded)
     const currentBranch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
     expect(currentBranch).toBe(baseBranch);
+  });
+
+  it('multiple in-flight candidates explaining different dirty entries → refuses all-or-nothing heal loudly without partial mutation (Task 13)', async () => {
+    // feat/daemon-x already supplies src/file.ts. Give the second in-flight
+    // candidate its own dirty entry, so no one candidate can explain both.
+    await execFile('git', ['checkout', '-q', '-b', 'feat/daemon-y'], { cwd: dir });
+    await writeFile(join(dir, 'src/other.ts'), 'const y = 2;\n');
+    await execFile('git', ['add', 'src/other.ts'], { cwd: dir });
+    await execFile('git', ['commit', '-q', '-m', 'feat: modify other file'], { cwd: dir });
+    await execFile('git', ['push', '-q', '-u', 'origin', 'feat/daemon-y'], { cwd: dir });
+    await execFile('git', ['checkout', '-q', baseBranch], { cwd: dir });
+
+    await writeFile(join(dir, 'src/file.ts'), 'const x = 1;\n');
+    await writeFile(join(dir, 'src/other.ts'), 'const y = 2;\n');
+    const beforeStatus = await git(['status', '--porcelain']);
+    expect(beforeStatus).toContain('src/file.ts');
+    expect(beforeStatus).toContain('src/other.ts');
+
+    const logs: string[] = [];
+    let restoreCount = 0;
+    const trackingGit = async (args: string[]) => {
+      if (args[0] === 'restore') restoreCount += 1;
+      return makeGitRunner(dir)(args);
+    };
+
+    const outcome = await fastForwardRoot(dir, (message) => logs.push(message), trackingGit);
+
+    expect(outcome).toMatchObject({ status: 'skipped', cause: 'dirty' });
+    expect(restoreCount).toBe(0);
+    expect(await git(['status', '--porcelain'])).toBe(beforeStatus);
+    expect(await fsReadFile(join(dir, 'src/file.ts'), 'utf-8')).toBe('const x = 1;\n');
+    expect(await fsReadFile(join(dir, 'src/other.ts'), 'utf-8')).toBe('const y = 2;\n');
+
+    const refusalLogs = logs.filter((message) =>
+      message.includes('FAST_FORWARD_REFUSED_MULTI_BRANCH_LEAK'),
+    );
+    expect(refusalLogs).toHaveLength(1);
+    expect(refusalLogs[0]).toContain('src/file.ts');
+    expect(refusalLogs[0]).toContain('src/other.ts');
+    expect(refusalLogs[0]).toContain('feat/daemon-x');
+    expect(refusalLogs[0]).toContain('feat/daemon-y');
   });
 
   it('partial-explanation veto: 5 explained + 1 unexplained → no restore, no delete, FF skipped (Task 8 / TR-2 negative)', async () => {

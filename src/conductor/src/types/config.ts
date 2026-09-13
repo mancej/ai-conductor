@@ -57,24 +57,6 @@ export interface ParallelBranch {
 }
 
 /**
- * Advisory model selection for one TDD generator phase. The build agent reads
- * this configuration and passes the native model to its RED or GREEN child
- * dispatch; it does not create a separate conductor step.
- */
-export interface TddPhaseConfig {
-  model?: string;
-}
-
-/**
- * Optional model overrides for the RED and GREEN generator phases inside the
- * structural build step.
- */
-export interface TddConfig {
-  red?: TddPhaseConfig;
-  green?: TddPhaseConfig;
-}
-
-/**
  * Configuration for a single step. Every key is optional — unset values fall
  * back through phases > defaults > hardcoded baselines.
  *
@@ -116,9 +98,6 @@ export interface StepConfig {
 
   /** Tier-specific overrides applied when state.complexity_tier matches. */
   by_tier?: Partial<Record<ComplexityTier, TierOverride>>;
-
-  /** Advisory child-agent model overrides. Valid only for `steps.build`. */
-  tdd?: TddConfig;
 
   // --- Custom-step-only fields -----------------------------------------------
 
@@ -244,6 +223,11 @@ export interface AssessConfig {
   stale_after_commits?: number;
 }
 
+/** Environment-variable reference for an OTLP HTTP header value. */
+export interface OtelHeaderEnvironmentReference {
+  env: string;
+}
+
 /**
  * OpenTelemetry exporter configuration. When present in HarnessConfig, the
  * OTel visualizer plugin is constructed and attached to the event bus.
@@ -258,6 +242,14 @@ export interface OtelConfig {
   file?: string;
   /** OTLP wire protocol. Defaults to 'http/protobuf' (port 4318). */
   protocol?: 'http/protobuf' | 'grpc';
+  /** OTLP HTTP headers whose values are read from the process environment. */
+  headers?: Record<string, OtelHeaderEnvironmentReference>;
+  /** Optional metric project identity. Defaults to the project root basename. */
+  project_name?: string;
+  /** Stable worker identity for daemon-scoped metric Resources. */
+  worker_name?: string;
+  /** Static attributes carried on every exported telemetry signal. */
+  attributes?: Record<string, string>;
 }
 
 /**
@@ -351,6 +343,16 @@ export interface RetryRoutingConfig {
 }
 
 /**
+ * Opt-in pre-BUILD judge that confirms each criterion claim is asserted by
+ * the cited task's Done when checks. The shipped default is disabled.
+ */
+export interface CoverageBindingConfig {
+  judge?: {
+    enabled?: boolean;
+  };
+}
+
+/**
  * How harness self-host mode is decided (adr-2026-06-30-self-host-detection-seam):
  *   - 'auto'      → path-based auto-detection (build repo root == harness root)
  *   - 'force_on'  → treat ANY repo as the harness self-build (testing)
@@ -367,8 +369,6 @@ export type SelfHostActivation = 'auto' | 'force_on' | 'force_off';
 export interface HarnessSelfHostConfig {
   /** Activation strategy. Omitted → 'auto'. */
   activation?: SelfHostActivation;
-  /** Relink harness skills before dispatch (TR-4). Omitted → true. */
-  skill_relink_preflight?: boolean;
   /** Run the self-build under a throwaway CLAUDE_CONFIG_DIR (TR-5/6). Omitted → true. */
   sandbox_build_env?: boolean;
   /** Contain the dispatch from the live checkout with bubblewrap. Omitted → true. */
@@ -405,6 +405,28 @@ export interface HarnessSelfHostConfig {
   };
 }
 
+export type TestSuiteVerificationMode = 'aggregate' | 'scoped';
+
+/** Closed vocabulary shared by full-suite fingerprints and drift budgets. */
+export type TestSuiteDriftCategory =
+  | 'additional_inputs'
+  | 'dependencies'
+  | 'environment'
+  | 'migrations'
+  | 'project_config'
+  | 'source'
+  | 'test_infrastructure'
+  | 'tests';
+
+/** A declared per-category tolerance for drift since an attested PASS. */
+export type TestSuiteDriftBudgetBound = 'none' | 'unlimited' | number;
+
+/** Fully resolved verification settings with a bound for every drift category. */
+export interface TestSuiteVerificationConfig {
+  mode: TestSuiteVerificationMode;
+  drift_budget: Record<TestSuiteDriftCategory, TestSuiteDriftBudgetBound>;
+}
+
 /** Project-owned aggregate test operation used by full-suite verification. */
 export interface TestSuiteConfig {
   command?: string;
@@ -413,6 +435,7 @@ export interface TestSuiteConfig {
   timeout_seconds?: number;
   inputs?: string[];
   environment?: string[];
+  verification?: TestSuiteVerificationConfig;
 }
 
 export type AggregateTestSuiteConfig = TestSuiteConfig & { command: string };
@@ -426,9 +449,7 @@ export interface HarnessConfig {
    * and custom steps (new entries with `after` + `skill`).
    */
   steps?: Record<string, StepConfig>;
-  complexity?: {
-    default_tier?: ComplexityTier;
-  };
+  complexity?: Record<string, never>;
   /** User-level global state — loaded from ~/.ai-conductor/config.yml. */
   conductor?: ConductorConfig;
   /** Preferred markdown viewer — user-level default, project can override. */
@@ -457,6 +478,8 @@ export interface HarnessConfig {
   llm_provider?: ProviderSelection;
   /** Plugin selection: which UI renderer to use (defaults to 'terminal'). */
   ui_renderer?: string;
+  /** Names of visualizer plugins to start for this run. */
+  visualizers?: string[];
   /**
    * Plugin selection: which memory provider to use (defaults to 'local').
    * Set in `.ai-conductor/config.yml`; resolved once at run start so every
@@ -498,6 +521,8 @@ export interface HarnessConfig {
    * runtime resolution (not this type). See `RetryRoutingConfig`.
    */
   retry_routing?: RetryRoutingConfig;
+  /** Pre-BUILD criterion-to-Done-when binding judge. Absent → disabled. */
+  coverage_binding?: CoverageBindingConfig;
   /**
    * Owner-gate (adr-2026-06-30-owner-gate-identity-resolution / FR-1): the
    * configured operator identity the daemon builds specs for. Wins over the
@@ -559,6 +584,12 @@ export interface HarnessConfig {
    */
   validation_concurrency?: number;
   /**
+   * Maximum number of feature executors the daemon may run concurrently.
+   * Absent → one executor. Values must be positive integers; validation rejects
+   * invalid values rather than silently clamping them.
+   */
+  daemon_concurrency?: number;
+  /**
    * Harness self-host guardrails (adr-2026-06-30-self-host-detection-seam):
    * activation override + per-gate toggles. Absent → auto-detect, all gates on
    * (the safe default). Scoped to harness self-builds; no effect on other repos.
@@ -570,14 +601,6 @@ export interface HarnessConfig {
    * array → no fallback. Each entry must be a non-empty string.
    */
   model_fallback_ladder?: string[];
-  /**
-   * Timeout in minutes for OAuth token park-and-poll recovery (TR-5).
-   * Default: 60 (one hour). When the daemon detects an expired operator
-   * OAuth token, it parks the build and polls for token refresh until this
-   * timeout elapses. 0 disables the timeout (polls indefinitely). Negative or
-   * non-numeric values fall back to 60.
-   */
-  auth_park_timeout_minutes?: number;
   /**
    * Deprecated legacy compatibility key. It is accepted so older configs
    * continue to load, but it has no termination or lifecycle authority and is
@@ -596,6 +619,12 @@ export interface HarnessConfig {
    * engine default.
    */
   teardown_timeout_seconds?: number;
+  /**
+   * Maximum seconds a project-supplied `bin/dispatch-start` hook may run at
+   * the start of each daemon dispatch. Omitted or invalid values use the
+   * bounded engine default.
+   */
+  dispatch_start_timeout_seconds?: number;
   /**
    * When true, the daemon automatically restarts when the engine becomes stale.
    * When false or absent, manual restart is required. Invalid values resolve to
@@ -663,12 +692,19 @@ export interface BuildReviewRubricConfig {
   model_fallback_ladder?: string[];
   max_retries?: number;
   escalate?: boolean;
+  min_confidence?: number;
 }
 
 /** Per-rubric settings keyed by the closed {@link BuildReviewRubricId} set. */
 export type BuildReviewRubricsConfig = Partial<
   Record<BuildReviewRubricId, BuildReviewRubricConfig>
 >;
+
+/** Default-on compatibility switch for post-join remediation adjudication. */
+export interface BuildReviewAdjudicationConfig {
+  /** Run one post-join remediation judgement for unresolved content findings. Default: true. */
+  enabled?: boolean;
+}
 
 /**
  * Configuration for the default-on `build_review` judgement gate. Legacy
@@ -685,6 +721,8 @@ export interface BuildReviewConfig {
   scopeContainmentEnforced?: boolean;
   /** Maximum concurrently-dispatched enabled rubric branches. Default: 5. */
   maxParallel?: number;
+  /** Default-on post-join remediation adjudication. */
+  adjudication?: BuildReviewAdjudicationConfig;
   /** Closed per-rubric enablement and execution-policy overrides. */
   rubrics?: BuildReviewRubricsConfig;
 }

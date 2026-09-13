@@ -54,7 +54,7 @@ tasks and route back to BUILD so that the feature converges without an operator.
 ### Acceptance Criteria
 
 #### Happy Path
-- Given a blocked-remediable outcome within allowance, when the conductor handles the gate, then each finding is admitted as a remediation gap and appended to the plan through the existing remediation-append primitive with a task id prefixed for the as-built gate source, each task carrying its governing clause and a Done when block
+- Given a blocked-remediable outcome within allowance, when the conductor handles the gate, then each finding is admitted as a remediation gap, and each finding whose disposition appends is appended to the plan through the existing remediation-append primitive with a task id prefixed for the as-built gate source, each task carrying its governing clause and a Done when block (an existing-task-dispositioned finding is admitted without an append and charges no plan growth, per adr-2026-08-25 decision 9)
 - Given tasks were appended, when routing completes, then execution navigates back to BUILD, the as-built gate is restaged stale, and after the rebuild the gate re-runs against a fresh report
 - Given the re-run report is APPROVED, when the gate re-evaluates, then the SHIP tail proceeds and no halt is written
 
@@ -81,7 +81,7 @@ instead of looping.
 #### Negative Paths
 - Given one as-built lap already recorded, when the gate returns any BLOCKED outcome again, then no tasks are appended and the feature halts with class kickback-cap, the halt body listing every finding with its class and clause
 - Given the requested task count exceeds the remaining shared growth allowance, when admission runs, then no tasks are appended and the feature halts with class kickback-cap naming the allowance and the findings
-- Given a remediation lap whose rebuild produced no tree movement, when the no-op escalation check runs for the as-built gate, then the lap escalates to a halt instead of re-dispatching
+- Given a remediation lap whose rebuild produced no tree movement or net resolved-task progress and whose effective review still fails unchanged, when the no-op escalation check runs for the as-built gate, then the lap escalates to a halt instead of re-dispatching; a passing effective review ends the cycle even without tree movement
 - Given an as-built lap is recorded, when the ledger is inspected, then build_review's cumulative counter and prd_audit's lap counter are unchanged (isolation test)
 
 ### Done When

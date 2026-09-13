@@ -1,8 +1,6 @@
 // engineer-cli-launch-intake.test.ts — intake wired into the LIVE launch path.
 //
-// Regression coverage for the bug where bare `conduct-ts engineer` dropped straight
-// into `claude /engineer` and never ran intake (poll-on-launch lived only in the
-// test-only runEngineerMode). This pins the three idea sources — github intake,
+// Regression coverage for the live launch pre-poll. This pins the three idea sources — github intake,
 // CLI idea arg, and direct chat — plus the `claim` dequeue seam and the
 // `--source-ref` write-back on land/handoff. gh is injected; no network.
 
@@ -195,16 +193,16 @@ describe('detectEngineerCommand: idea sources, claim, --source-ref', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('engineerLaunchArgs: idea passthrough', () => {
-  it('no idea → exactly /engineer (backward compatible)', () => {
-    expect(engineerLaunchArgs({})).toEqual(['--permission-mode', 'default', '/engineer']);
+  it('no idea → exactly /composer', () => {
+    expect(engineerLaunchArgs({})).toEqual(['--permission-mode', 'default', '/composer']);
   });
-  it('idea → appended to the /engineer prompt', () => {
+  it('idea → appended to the /composer prompt', () => {
     expect(engineerLaunchArgs({}, 'add a /metrics endpoint')).toEqual([
-      '--permission-mode', 'default', '/engineer add a /metrics endpoint',
+      '--permission-mode', 'default', '/composer add a /metrics endpoint',
     ]);
   });
   it('blank idea is treated as no idea', () => {
-    expect(engineerLaunchArgs({}, '   ')).toEqual(['--permission-mode', 'default', '/engineer']);
+    expect(engineerLaunchArgs({}, '   ')).toEqual(['--permission-mode', 'default', '/composer']);
   });
 });
 

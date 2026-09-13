@@ -1,3 +1,4 @@
+// Covers: S1.1, S1.2, S1.3, task:1, task:2, task:3, task:6, task:10
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, utimes, readFile, readdir, symlink } from 'fs/promises';
 import { join, dirname, relative } from 'path';
@@ -60,6 +61,7 @@ import {
   STEP_ARTIFACT_CONTRACTS,
   STEP_ARTIFACT_GLOBS,
   validateFeatureArtifactStems,
+  featureArtifactPatternsAreRecursive,
   buildArtifactResolutionContext,
   resolveArtifactFiles,
   findArtifactFiles,
@@ -81,11 +83,19 @@ import {
   MANUAL_TEST_SKIP_SENTINEL,
   MANUAL_TEST_WARN_SENTINEL,
   readManualTestFailRows,
+  stampGateRunIdentity,
   stampCode,
   BUILD_REVIEW_VERDICT,
+  MANUAL_TEST_CODE_STAMP,
+  PRD_AUDIT_CODE_STAMP,
   removeBuildReviewVerdict,
   PR_BODY_REGEN_ATTEMPT_MARKER,
   uncommittedPathsOrNull,
+  isNoOwnerKey,
+  isCanonicalAdrFilename,
+  parseAdrDecisions,
+  parsePrdAuditReport,
+  readRemediationPlanResult,
 } from '../../src/engine/artifacts.js';
 import type {
   CompletionResult,
@@ -96,6 +106,7 @@ import type { StepName } from '../../src/types/index.js';
 import type { HarnessConfig } from '../../src/types/config.js';
 import { joinBuildReviewRubricOutcomes } from '../../src/engine/build-review-aggregate.js';
 import { parseBuildReviewLapId } from '../../src/engine/build-review-domain.js';
+import { verdictProducedByRun } from '../../src/engine/gate-code-validity.js';
 
 describe('engine/artifacts', () => {
   let dir: string;
@@ -113,12 +124,519 @@ describe('engine/artifacts', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('keeps a no-mode remediation artifact on the legacy parser path', async () => {
+    await mkdir(join(dir, '.pipeline'), { recursive: true });
+    await writeFile(
+      join(dir, '.pipeline/remediation.json'),
+      JSON.stringify({
+        dispositions: [{
+          id: 'build_review:legacy',
+          disposition: 'build',
+          category: null,
+          rationale: 'The existing direct remediation route remains unchanged.',
+          tasks: [{ id: 'rem-legacy-1', title: 'src/widget.ts:20 — preserve legacy routing.' }],
+        }],
+      }),
+      'utf8',
+    );
+
+    await expect(readRemediationPlanResult(dir, Date.now() - 60_000)).resolves.toEqual({
+      plan: {
+        gaps: [{
+          id: 'build_review:legacy',
+          disposition: 'build',
+          category: null,
+          rationale: 'The existing direct remediation route remains unchanged.',
+          tasks: [{ id: 'rem-legacy-1', title: 'src/widget.ts:20 — preserve legacy routing.' }],
+        }],
+        rejected: [],
+        invalidTasklessBuild: false,
+      },
+    });
+  });
+
+  // Covers: task:1
+  describe('gate code-stamp marker contract', () => {
+    it('round-trips an engine-stamped run identity through the manual-test sidecar', async () => {
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+      await writeFile(
+        join(dir, MANUAL_TEST_CODE_STAMP),
+        '{\n  "codeStamp": "abc123"\n}\n',
+      );
+
+      await stampGateRunIdentity(dir, 'manual_test', 'run-123');
+
+      expect(MANUAL_TEST_CODE_STAMP).toBe('.pipeline/manual-test-code-stamp.json');
+      await expect(readFile(join(dir, MANUAL_TEST_CODE_STAMP), 'utf8')).resolves.toBe(
+        '{\n  "codeStamp": "abc123",\n  "runId": "run-123"\n}\n',
+      );
+    });
+  });
+
   async function createFile(relativePath: string, content = 'test') {
     const fullPath = join(dir, relativePath);
     const dirPath = fullPath.substring(0, fullPath.lastIndexOf('/'));
     await mkdir(dirPath, { recursive: true });
     await writeFile(fullPath, content);
   }
+
+  it.each([
+    ['disabled', true],
+    ['done', true],
+    ['failed', false],
+    ['refused', false],
+  ] as const)('accepts coverage-binding completion evidence only when status is %s', async (status, done) => {
+    await createFile('.pipeline/coverage-binding.json', JSON.stringify({
+      version: 1,
+      slug: 'coverage-feature',
+      runId: 'coverage-run',
+      status,
+      entries: [],
+    }));
+
+    expect(await checkStepCompletion(dir, 'coverage_binding')).toMatchObject({ done });
+  });
+
+  describe('parsePrdAuditReport', () => {
+    // The plan is the parser's citation authority: a Verdict Table row naming
+    // a `Plan task` is resolved against the ids THIS text declares, never
+    // against the citation itself (adr-2026-08-30 D1).
+    const activePlan = [
+      '### Task 3: Existing work',
+      '',
+      '### Task 4: Existing work',
+    ].join('\n');
+
+    it('salvages valid criterion rows while diagnosing invented criterion keys', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** present
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | FR-1 | First valid row |
+| OS.1 | PASS | — | FR-1 | Invented key |
+| S1.2 | PLAN_GAP | — | FR-2 | Second valid row |
+| OS.2 | OVER_SCOPE | — | FR-3 | Another invented key |
+| S1.3 | FIXABLE | 3 | FR-3 | Third valid row |
+`, activePlan);
+
+      expect(parsed).toMatchObject({
+        ok: true,
+        value: {
+          findings: [
+            { criterion: 'S1.1', grade: 'PASS' },
+            { criterion: 'S1.2', grade: 'PLAN_GAP' },
+            { criterion: 'S1.3', grade: 'FIXABLE', planTask: '3' },
+          ],
+          rejectedRows: [
+            { key: 'OS.1', reason: expect.stringContaining('accepted key forms') },
+            { key: 'OS.2', reason: expect.stringContaining('accepted key forms') },
+          ],
+        },
+      });
+      if (parsed.ok) {
+        expect(parsed.value.findings).toHaveLength(3);
+        expect(parsed.value.rejectedRows).toHaveLength(2);
+        expect(parsed.value.rejectedRows.map(({ rowText }) => rowText)).toEqual([
+          '| OS.1 | PASS | — | FR-1 | Invented key |',
+          '| OS.2 | OVER_SCOPE | — | FR-3 | Another invented key |',
+        ]);
+      }
+    });
+
+    // Story heading ids are `[A-Za-z0-9.-]` (skills/stories/SKILL.md), so a
+    // criterion owned by `## Story 5a:` is keyed `S5a.1`. Keying it anything
+    // else would break the story link, so the gate must accept the whole
+    // story-id alphabet — while still rejecting keys that name no story.
+    it('accepts criterion keys whose story id is alphanumeric or nested', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** present
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | FR-1 | Numeric story id |
+| S5a.1 | PASS | — | FR-1 | Alphanumeric story id |
+| S2.1.3 | PLAN_GAP | — | FR-2 | Nested story id |
+| OS.1 | PASS | — | FR-1 | Does not name a story |
+| S1 | PASS | — | FR-1 | Missing criterion number |
+| S1.a | PASS | — | FR-1 | Non-numeric criterion number |
+| S.1 | PASS | — | FR-1 | Empty story id |
+| NC.1 | PASS | — | FR-1 | Findings form, not a criterion |
+`, activePlan);
+
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.value.findings.map(({ criterion }) => criterion)).toEqual([
+          'S1.1',
+          // Canonicalized to upper case at parse time; the expected set derived
+          // from the stories file is upper-cased to match.
+          'S5A.1',
+          'S2.1.3',
+        ]);
+        expect(parsed.value.rejectedRows.map(({ key }) => key)).toEqual([
+          'OS.1',
+          'S1',
+          'S1.a',
+          'S.1',
+          'NC.1',
+        ]);
+      }
+    });
+
+    it('rejects only invalid rows while retaining their valid siblings', () => {
+      const activePlan = '### Task 3: existing task\n';
+      const parsed = parsePrdAuditReport(`
+**PRD:** present
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | FR-1 | Valid sibling |
+| S1.2 | UNKNOWN | — | FR-1 | Invalid grade |
+| S1.3 | FIXABLE | no | FR-1 | Invalid task |
+| S1.4 | FIXABLE | — | FR-1 | Missing task |
+| S1.5 | FIXABLE | 99 | FR-1 | Absent task |
+| NC.1 | OVER_SCOPE | — | none | Wrong section |
+
+## Findings without an owning criterion
+
+| Finding | Grade | Evidence |
+| --- | --- | --- |
+| NC.1 | PASS | Wrong grade |
+| NC.2 | OVER_SCOPE | Valid no-owner sibling |
+`, activePlan);
+
+      expect(parsed).toMatchObject({
+        ok: true,
+        value: {
+          findings: [
+            { criterion: 'S1.1', grade: 'PASS' },
+            { criterion: 'NC.2', grade: 'OVER_SCOPE' },
+          ],
+          rejectedRows: [
+            { key: 'S1.2', reason: expect.stringContaining('invalid Grade') },
+            { key: 'S1.3', reason: expect.stringContaining('absent from the active plan') },
+            { key: 'S1.4', reason: expect.stringContaining('no Plan task') },
+            { key: 'S1.5', reason: expect.stringContaining('absent from the active plan') },
+            { key: 'NC.1', reason: expect.stringContaining('Verdict Table') },
+            { key: 'NC.1', reason: expect.stringContaining('only OVER_SCOPE') },
+          ],
+        },
+      });
+    });
+
+    it('keeps missing report-level structure as a mechanical fault', () => {
+      expect(parsePrdAuditReport('## Verdict Table')).toMatchObject({
+        ok: false,
+        class: 'mechanical-fault',
+      });
+      expect(parsePrdAuditReport('**PRD:** present')).toMatchObject({
+        ok: false,
+        class: 'mechanical-fault',
+      });
+    });
+
+    it('parses no-owner OVER_SCOPE findings alongside Verdict Table findings', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** present
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Intent relation | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | FR-1 | — | Existing criterion evidence |
+
+## Findings without an owning criterion
+
+| Finding | Grade | Intent relation | Evidence |
+| --- | --- | --- | --- |
+| nc.1 | OVER_SCOPE | outside-visible | src/engine/no-owner.ts:10 — visible unplanned behavior |
+| NC.2 | OVER_SCOPE | within | src/engine/no-owner.ts:20 — harmless implementation detail |
+`);
+
+      expect(parsed).toEqual({
+        ok: true,
+        value: {
+          prd: 'present',
+          rejectedRows: [],
+          findings: [
+            {
+              criterion: 'S1.1',
+              grade: 'PASS',
+              prdIds: ['FR-1'],
+              evidence: 'Existing criterion evidence',
+            },
+            {
+              criterion: 'NC.1',
+              grade: 'OVER_SCOPE',
+              prdIds: [],
+              evidence: 'src/engine/no-owner.ts:10 — visible unplanned behavior',
+            },
+            {
+              criterion: 'NC.2',
+              grade: 'OVER_SCOPE',
+              prdIds: [],
+              evidence: 'src/engine/no-owner.ts:20 — harmless implementation detail',
+            },
+          ],
+        },
+      });
+    });
+
+    it('parses the prd-audit skill no-owner report example without rejected rows', async () => {
+      const skill = await readFile(join(REPOSITORY_ROOT, 'skills/prd-audit/SKILL.md'), 'utf8');
+      const reportExample = skill.match(/```markdown\n(# PRD Audit:[\s\S]*?)```/)?.[1];
+      const noOwnerSection = reportExample?.match(/## Findings without an owning criterion[\s\S]*/)?.[0];
+
+      expect(noOwnerSection).toBeDefined();
+      expect(reportExample).toBeDefined();
+
+      const parsed = parsePrdAuditReport(reportExample ?? '', activePlan);
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.value.findings).toContainEqual(
+          expect.objectContaining({ criterion: 'NC.1', grade: 'OVER_SCOPE' }),
+        );
+        expect(parsed.value.rejectedRows).toEqual([]);
+      }
+    });
+
+    it('rejects an old no-owner row without an NC key per-row', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** none
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | none | Valid criterion sibling |
+
+## Findings without an owning criterion
+
+| Finding | Grade | Evidence |
+| --- | --- | --- |
+| Unplanned user-visible behavior | OVER_SCOPE | src/engine/no-owner.ts:10 |
+`);
+
+      expect(parsed).toMatchObject({
+        ok: true,
+        value: {
+          findings: [{ criterion: 'S1.1', grade: 'PASS' }],
+          rejectedRows: [{
+            key: 'Unplanned user-visible behavior',
+            reason: expect.stringContaining('NC.<number>'),
+          }],
+        },
+      });
+    });
+
+    it('rejects every duplicate Verdict Table finding while retaining unique siblings', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** present
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | FR-1 | Unique sibling |
+| S1.3 | PASS | — | FR-1 | First S1.3 carrier |
+| S1.3 | OVER_SCOPE | — | FR-1 | Second S1.3 carrier |
+| S4.1 | PASS | — | FR-4 | First S4.1 carrier |
+| S4.1 | OVER_SCOPE | — | FR-4 | Second S4.1 carrier |
+| S4.2 | PASS | — | FR-4 | Other unique sibling |
+`);
+
+      expect(parsed).toMatchObject({
+        ok: true,
+        value: {
+          findings: [
+            { criterion: 'S1.1', grade: 'PASS' },
+            { criterion: 'S4.2', grade: 'PASS' },
+          ],
+          rejectedRows: [
+            { key: 'S1.3', reason: expect.stringContaining('duplicate') },
+            { key: 'S1.3', reason: expect.stringContaining('duplicate') },
+            { key: 'S4.1', reason: expect.stringContaining('duplicate') },
+            { key: 'S4.1', reason: expect.stringContaining('duplicate') },
+          ],
+        },
+      });
+      if (parsed.ok) {
+        expect(parsed.value.rejectedRows.map(({ key }) => key)).toEqual([
+          'S1.3', 'S1.3', 'S4.1', 'S4.1',
+        ]);
+        expect(parsed.value.rejectedRows.map(({ reason }) => reason).join(' ')).toContain('S1.3');
+        expect(parsed.value.rejectedRows.map(({ reason }) => reason).join(' ')).toContain('S4.1');
+      }
+    });
+
+    it('rejects duplicate no-owner findings but does not diagnose unique keys', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** none
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | none | Unique criterion sibling |
+
+## Findings without an owning criterion
+
+| Finding | Grade | Evidence |
+| --- | --- | --- |
+| NC.1 | OVER_SCOPE | First NC.1 carrier |
+| NC.1 | OVER_SCOPE | Second NC.1 carrier |
+| NC.2 | OVER_SCOPE | Unique no-owner sibling |
+`);
+
+      expect(parsed).toMatchObject({
+        ok: true,
+        value: {
+          findings: [
+            { criterion: 'S1.1', grade: 'PASS' },
+            { criterion: 'NC.2', grade: 'OVER_SCOPE' },
+          ],
+          rejectedRows: [
+            { key: 'NC.1', reason: expect.stringContaining('duplicate') },
+            { key: 'NC.1', reason: expect.stringContaining('duplicate') },
+          ],
+        },
+      });
+    });
+
+    it('never returns two findings with the same normalized key', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** present
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| s1.1 | PASS | — | FR-1 | First carrier |
+| S1.1 | OVER_SCOPE | — | FR-1 | Second carrier |
+| S1.2 | PASS | — | FR-1 | Unique sibling |
+`);
+
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.value.findings).toEqual([
+          expect.objectContaining({ criterion: 'S1.2', grade: 'PASS' }),
+        ]);
+        expect(parsed.value.rejectedRows).toEqual([
+          expect.objectContaining({ key: 'S1.1', reason: expect.stringContaining('duplicate') }),
+          expect.objectContaining({ key: 'S1.1', reason: expect.stringContaining('duplicate') }),
+        ]);
+      }
+    });
+
+    it('leaves all-unique keys free of duplicate diagnostics', () => {
+      const parsed = parsePrdAuditReport(`
+**PRD:** none
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Evidence |
+| --- | --- | --- | --- | --- |
+| S1.1 | PASS | — | none | First unique criterion |
+| S1.2 | OVER_SCOPE | — | none | Second unique criterion |
+
+## Findings without an owning criterion
+
+| Finding | Grade | Evidence |
+| --- | --- | --- |
+| NC.1 | OVER_SCOPE | Unique no-owner finding |
+`);
+
+      expect(parsed).toMatchObject({
+        ok: true,
+        value: {
+          findings: [
+            { criterion: 'S1.1' },
+            { criterion: 'S1.2' },
+            { criterion: 'NC.1' },
+          ],
+          rejectedRows: [],
+        },
+      });
+    });
+
+    it('keeps the sectionless report result shape unchanged', () => {
+      expect(parsePrdAuditReport(`
+**PRD:** none
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Intent relation | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| S2.1 | FIXABLE | 3 | none | — | Missing guard |
+`, activePlan)).toEqual({
+        ok: true,
+        value: {
+          prd: 'none',
+          rejectedRows: [],
+          findings: [
+            {
+              criterion: 'S2.1',
+              grade: 'FIXABLE',
+              planTask: '3',
+              prdIds: [],
+              evidence: 'Missing guard',
+            },
+          ],
+        },
+      });
+    });
+
+    it('accepts a PASS row whose evidence spans several plan tasks', () => {
+      // The rejected rows that halted bin-setup-quarantines were all PASS,
+      // citing `12, 13` and `1, 2, 14`. Nothing had failed the audit; four
+      // passing criteria were discarded on cell shape.
+      const result = parsePrdAuditReport(`
+**PRD:** none
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Intent relation | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| S4.1 | PASS | 3, 4 | none | — | one latch guards both emit sites |
+`, activePlan);
+
+      if (!result.ok) throw new Error(result.error);
+      expect(result.value.rejectedRows).toEqual([]);
+      expect(result.value.findings[0]).toMatchObject({ criterion: 'S4.1', grade: 'PASS' });
+      // Every cited id was validated against the plan, but no single parent is
+      // claimed when the row names several — nothing downstream binds to a
+      // multi-task citation.
+      expect(result.value.findings[0]).not.toHaveProperty('planTask');
+    });
+
+    it('rejects a FIXABLE row citing several plan tasks, naming the choice', () => {
+      // A repair is appended under ONE parent task, so the parser must not pick
+      // among the cited tasks on the auditor's behalf.
+      const result = parsePrdAuditReport(`
+**PRD:** none
+
+## Verdict Table
+
+| Criterion | Grade | Plan task | PRD: | Intent relation | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| S2.1 | FIXABLE | 3, 4 | none | — | Missing guard |
+`, activePlan);
+
+      if (!result.ok) throw new Error(result.error);
+      expect(result.value.findings).toEqual([]);
+      expect(result.value.rejectedRows[0]?.reason).toContain('must cite exactly one parent task');
+    });
+
+    it('identifies no-owner keys without accepting story criteria', () => {
+      expect([isNoOwnerKey('NC.1'), isNoOwnerKey('S1.2')]).toEqual([true, false]);
+    });
+  });
 
   describe('STEP_ARTIFACT_GLOBS', () => {
     it('derives the complete ordered compatibility map while retaining per-pattern scope', async () => {
@@ -139,6 +657,7 @@ describe('engine/artifacts', () => {
           '.docs/decisions/adr-*.md',
         ],
         worktree: [],
+        coverage_binding: ['.pipeline/coverage-binding.json'],
         acceptance_specs: [
           'spec/acceptance/**/*',
           'spec/requests/**/*',
@@ -158,12 +677,10 @@ describe('engine/artifacts', () => {
         ],
         build: ['.pipeline/task-status.json'],
         build_review: ['.pipeline/build-review.json'],
-        wiring_check: [],
-        test_suite: ['.pipeline/test-suite-evidence.json'],
+         test_suite: ['.pipeline/test-suite-evidence.json'],
         manual_test: ['.pipeline/manual-test-results.md'],
         prd_audit: ['.pipeline/prd-audit.md'],
         architecture_review_as_built: ['.pipeline/architecture-review-as-built.md'],
-        retro: ['.docs/retros/*.md'],
         rebase: [],
         finish: [],
         remediate: [],
@@ -187,6 +704,12 @@ describe('engine/artifacts', () => {
         ],
         derivedProjection: true,
       });
+    });
+
+    it('declares coverage_binding as run-scoped completion evidence', () => {
+      expect(STEP_ARTIFACT_CONTRACTS.coverage_binding).toEqual([
+        { pattern: '.pipeline/coverage-binding.json', scope: 'run' },
+      ]);
     });
 
     it('declares lifecycle scope and feature identity for every built-in artifact pattern', () => {
@@ -314,6 +837,25 @@ describe('engine/artifacts', () => {
         ),
       ).toEqual([]);
     });
+
+    it('ignores unrelated plan-family paths for a custom step', () => {
+      expect(
+        validateFeatureArtifactStems(
+          [{ step: 'release-disposition' as StepName, paths: ['.docs/plans/unrelated.md'] }],
+          'my-feature',
+        ),
+      ).toEqual([]);
+    });
+  });
+
+  describe('featureArtifactPatternsAreRecursive', () => {
+    it('returns false for a custom step', () => {
+      expect(featureArtifactPatternsAreRecursive('release-disposition' as StepName)).toBe(false);
+    });
+
+    it('returns true for the built-in recursive stories family', () => {
+      expect(featureArtifactPatternsAreRecursive('stories')).toBe(true);
+    });
   });
 
   describe('buildArtifactResolutionContext', () => {
@@ -409,6 +951,64 @@ describe('engine/artifacts', () => {
   });
 
   describe('resolveArtifactFiles', () => {
+    it('resolves an absent contract entry to no files without a diagnostic', async () => {
+      await createFile('.docs/plans/unrelated-feature.md');
+      await createFile('.pipeline/maintain-documentation-pass');
+
+      await expect(
+        resolveArtifactFiles(dir, 'maintain-documentation' as StepName, {
+          featureIdentities: [],
+          changedPaths: new Set<string>(),
+        }),
+      ).resolves.toEqual({ files: [] });
+    });
+
+    it('still resolves extra globs for a step absent from the contract table', async () => {
+      await createFile('.pipeline/maintain-documentation-pass');
+
+      await expect(
+        resolveArtifactFiles(
+          dir,
+          'maintain-documentation' as StepName,
+          { featureIdentities: [], changedPaths: new Set<string>() },
+          ['.pipeline/*-pass'],
+        ),
+      ).resolves.toEqual({ files: [join(dir, '.pipeline/maintain-documentation-pass')] });
+    });
+
+    it('resolves complexity identically to an absent contract entry', async () => {
+      await createFile('.docs/plans/unrelated-feature.md');
+      await createFile('.pipeline/maintain-documentation-pass');
+      const context = { featureIdentities: [], changedPaths: new Set<string>() };
+      const absentContractResult = await resolveArtifactFiles(
+        dir,
+        'maintain-documentation' as StepName,
+        context,
+      );
+      const complexityResult = await resolveArtifactFiles(dir, 'complexity', context);
+
+      expect(complexityResult).toEqual(absentContractResult);
+    });
+
+    it('preserves the plan ambiguous diagnostic for unrelated plan candidates', async () => {
+      await createFile('.docs/plans/another-feature.md');
+      await createFile('.docs/plans/yet-another-feature.md');
+
+      await expect(
+        resolveArtifactFiles(dir, 'plan', {
+          featureIdentities: ['active-feature'],
+          changedPaths: new Set<string>(),
+        }),
+      ).resolves.toEqual({
+        files: [],
+        diagnostic: {
+          code: 'ambiguous',
+          reason:
+            'plan has 2 artifact candidates and none can be associated with active feature "active-feature". Naming rule: plan-stem; expected stem "active-feature"; example expected filename ".docs/plans/active-feature.md".',
+        },
+      });
+    });
+
     it('selects associated feature files while preserving broad and raw corpora', async () => {
       await createFile('.docs/specs/feature-a.md');
       await createFile('.docs/specs/2026-07-28-feature-b.md');
@@ -416,7 +1016,6 @@ describe('engine/artifacts', () => {
       await createFile('.docs/plans/feature-b.md');
       await createFile('.docs/conflicts/foreign-conflict.md');
       await createFile('.docs/conflicts/unconventional-current.md');
-      await createFile('.docs/retros/legacy-singleton.md');
       await createFile('.docs/decisions/technical-assessment-one.md');
       await createFile('.docs/decisions/technical-assessment-two.md');
       await createFile('.pipeline/task-status.json', '{}');
@@ -436,16 +1035,10 @@ describe('engine/artifacts', () => {
         featureIdentities: ['unknown-feature'],
         changedPaths: new Set<string>(),
       };
-      const legacyContext = {
-        featureIdentities: [],
-        changedPaths: new Set<string>(),
-      };
-
-      const [prd, plan, changed, singleton, repository, run, raw] = await Promise.all([
+      const [prd, plan, changed, repository, run, raw] = await Promise.all([
         resolveArtifactFiles(dir, 'prd', featureB),
         resolveArtifactFiles(dir, 'plan', featureB),
         resolveArtifactFiles(dir, 'conflict_check', changedFeature),
-        resolveArtifactFiles(dir, 'retro', legacyContext),
         resolveArtifactFiles(dir, 'assess', unknownFeature),
         resolveArtifactFiles(dir, 'build', unknownFeature),
         findArtifactFiles(dir, 'prd'),
@@ -458,7 +1051,6 @@ describe('engine/artifacts', () => {
         prd: relativeFiles(prd.files),
         plan: relativeFiles(plan.files),
         changed: relativeFiles(changed.files),
-        singleton: relativeFiles(singleton.files),
         repository: relativeFiles(repository.files),
         run: relativeFiles(run.files),
         raw: relativeFiles(raw),
@@ -466,26 +1058,12 @@ describe('engine/artifacts', () => {
         prd: ['.docs/specs/2026-07-28-feature-b.md'],
         plan: ['.docs/plans/feature-b.md'],
         changed: ['.docs/conflicts/unconventional-current.md'],
-        singleton: ['.docs/retros/legacy-singleton.md'],
         repository: [
           '.docs/decisions/technical-assessment-one.md',
           '.docs/decisions/technical-assessment-two.md',
         ],
         run: ['.pipeline/task-status.json'],
         raw: ['.docs/specs/2026-07-28-feature-b.md', '.docs/specs/feature-a.md'],
-      });
-    });
-
-    it('selects one unrecognizable legacy feature artifact for an identified active feature', async () => {
-      await createFile('.docs/retros/legacy-singleton.md');
-
-      const result = await resolveArtifactFiles(dir, 'retro', {
-        featureIdentities: ['active-feature'],
-        changedPaths: new Set<string>(),
-      });
-
-      expect(result).toEqual({
-        files: [join(dir, '.docs/retros/legacy-singleton.md')],
       });
     });
 
@@ -505,21 +1083,6 @@ describe('engine/artifacts', () => {
           code: 'ambiguous',
           reason:
             'stories has 2 artifact candidates and none can be associated with active feature "feature-b". Naming rule: normalized-stem (date prefix stripped); expected stem "feature-b"; example expected filename ".docs/stories/feature-b.md".',
-        },
-      });
-    });
-
-    it('keeps the empty-candidate missing diagnostic byte-identical', async () => {
-      const result = await resolveArtifactFiles(dir, 'retro', {
-        featureIdentities: ['feature-b'],
-        changedPaths: new Set<string>(),
-      });
-
-      expect(result).toEqual({
-        files: [],
-        diagnostic: {
-          code: 'missing',
-          reason: 'retro has no artifact candidates for active feature "feature-b"',
         },
       });
     });
@@ -569,6 +1132,22 @@ describe('engine/artifacts', () => {
   });
 
   describe('checkStepCompletion: test_suite current-PASS predicate', () => {
+    it('accepts evidence preserved within the declared drift budget', async () => {
+      const inspect = vi.fn(async () => ({
+        status: 'PRESERVED_WITHIN_BUDGET' as const,
+        evidence: {} as import('../../src/engine/full-suite-evidence.js').FullSuitePassEvidence,
+      }));
+
+      const result = await checkStepCompletion(dir, 'test_suite', {
+        fullSuiteInspect: inspect,
+      });
+
+      expect({ result, inspectCalls: inspect.mock.calls.length }).toEqual({
+        result: { done: true },
+        inspectCalls: 1,
+      });
+    });
+
     it('rejects stale evidence through inspection without launching verification', async () => {
       await createFile('.pipeline/test-suite-evidence.json', JSON.stringify({ outcome: 'PASS' }));
       const inspect = vi.fn(async () => ({ status: 'STALE', reason: 'fingerprint_mismatch' } as const));
@@ -3428,6 +4007,60 @@ describe('engine/artifacts', () => {
       expect(result.done).toBe(true);
     });
 
+    it('honors an accepted NC finding only when its normalized evidence summary still matches', async () => {
+      const summary = '  Visible behavior outside the approved plan.  ';
+      await createFile(
+        '.pipeline/prd-audit.md',
+        '# PRD Audit\n\n**PRD:** none\n\n' + table +
+          '| S3.1 | PASS | — | none | within | Covered behavior |\n\n' +
+          '## Findings without an owning criterion\n' +
+          '| Finding | Grade | Intent relation | Evidence |\n' +
+          '| --- | --- | --- | --- |\n' +
+          `| NC.1 | OVER_SCOPE | outside-visible | ${summary} |\n`,
+      );
+      await createFile(
+        '.pipeline/accepted-widenings.json',
+        JSON.stringify({
+          version: 1,
+          decisions: [{
+            criterion: 'NC.1',
+            summary: summary.trim(),
+            decision: 'accept',
+            rationale: 'Approved for this feature.',
+            operator: 'test',
+            decidedAt: '2026-08-26T00:00:00.000Z',
+          }],
+        }),
+      );
+
+      expect((await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 })).done).toBe(true);
+
+      await createFile(
+        '.pipeline/prd-audit.md',
+        '# PRD Audit\n\n**PRD:** none\n\n' + table +
+          '| S3.1 | PASS | — | none | within | Covered behavior |\n\n' +
+          '## Findings without an owning criterion\n' +
+          '| Finding | Grade | Intent relation | Evidence |\n' +
+          '| --- | --- | --- | --- |\n' +
+          '| NC.1 | OVER_SCOPE | outside-visible | Changed visible behavior outside the approved plan. |\n',
+      );
+      // A reworded rendering of the same finding stays accepted (#2145).
+      expect((await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 })).done).toBe(true);
+
+      await createFile(
+        '.pipeline/prd-audit.md',
+        '# PRD Audit\n\n**PRD:** none\n\n' + table +
+          '| S3.1 | PASS | — | none | within | Covered behavior |\n\n' +
+          '## Findings without an owning criterion\n' +
+          '| Finding | Grade | Intent relation | Evidence |\n' +
+          '| --- | --- | --- | --- |\n' +
+          '| NC.1 | OVER_SCOPE | outside-visible | Removed the daemon retry backoff and its config key entirely. |\n',
+      );
+      const mismatched = await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 });
+      expect(mismatched.done).toBe(false);
+      expect(mismatched.reason).toContain('NC.1 (OVER_SCOPE)');
+    });
+
     it('the same finding still blocks when the operator has NOT accepted it', async () => {
       await writeReport('| S3.1 | OVER_SCOPE | — | none | outside-visible | conductor.ts:8163 |\n');
       const result = await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 });
@@ -3449,6 +4082,18 @@ describe('engine/artifacts', () => {
       expect(result.reason).toContain('S5.7 (PLAN_GAP)');
     });
 
+    it('blocks an otherwise all-PASS report when it contains rejected rows, naming every rejected key and reason', async () => {
+      await writeReport(
+        '| S3.1 | PASS | — | none | within | conductor.ts:8163 |\n' +
+          '| S3.2 | MAYBE | — | none | within | conductor.ts:8164 |\n',
+      );
+
+      const result = await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 });
+
+      expect(result.done).toBe(false);
+      expect(result.reason).toContain('rejected rows: S3.2 (PRD audit finding S3.2 has an invalid Grade.)');
+    });
+
     it('accepting one finding does not clear an unaccepted sibling', async () => {
       await writeReport(
         '| S3.1 | OVER_SCOPE | — | none | outside-visible | conductor.ts:8163 |\n' +
@@ -3459,6 +4104,138 @@ describe('engine/artifacts', () => {
       expect(result.done).toBe(false);
       expect(result.reason).toContain('S4.2 (OVER_SCOPE)');
       expect(result.reason).not.toContain('S3.1');
+    });
+
+    it('completes an all-PASS report with a within-intent NC finding without treating it as an unknown story criterion', async () => {
+      await createFile(
+        '.docs/stories/feature.md',
+        [
+          '# Stories',
+          '',
+          '## Story 1: audited behavior',
+          '',
+          '#### Happy Path',
+          '- Given input, when exercised, then the expected behavior occurs.',
+        ].join('\n'),
+      );
+      await createFile(
+        '.pipeline/prd-audit.md',
+        [
+          '# PRD Audit',
+          '',
+          '**PRD:** none',
+          '',
+          table.trimEnd(),
+          '| S1.1 | PASS | — | none | within | Covered behavior |',
+          '',
+          '## Findings without an owning criterion',
+          '| Finding | Grade | Intent relation | Evidence |',
+          '| --- | --- | --- | --- |',
+          '| NC.1 | OVER_SCOPE | within | Internal implementation detail |',
+        ].join('\n'),
+      );
+
+      const result = await checkStepCompletion(dir, 'prd_audit', {
+        featureDesc: 'feature',
+        sessionStartedAt: 0,
+      });
+
+      expect(result).toEqual({ done: true, verdictFreshness: expect.any(Object) });
+      const withinReport = await readFile(join(dir, '.pipeline/prd-audit.md'), 'utf8');
+      expect(parsePrdAuditReport(withinReport)).toMatchObject({
+        ok: true,
+        value: {
+          findings: [
+            { criterion: 'S1.1', grade: 'PASS' },
+            { criterion: 'NC.1', grade: 'OVER_SCOPE', evidence: 'Internal implementation detail' },
+          ],
+          rejectedRows: [],
+        },
+      });
+
+      await createFile(
+        '.pipeline/prd-audit.md',
+        withinReport.replace('| NC.1 | OVER_SCOPE | within |', '| NC.1 | OVER_SCOPE | outside-visible |'),
+      );
+      const outsideVisible = await checkStepCompletion(dir, 'prd_audit', {
+        featureDesc: 'feature',
+        sessionStartedAt: 0,
+      });
+      expect(outsideVisible.done).toBe(false);
+      expect(outsideVisible.reason).toContain('NC.1 (OVER_SCOPE)');
+    });
+  });
+
+
+  // adr-2026-08-30-shared-plan-task-reference-resolver decision 1 requires a
+  // cited reference to be resolved against the id set of the artifact that
+  // DEFINES it. The gate scorer used to call the parser with no active plan,
+  // and the parser then built its lookup set out of the citation under
+  // judgement — so every grammar-valid id resolved against itself and the gate
+  // scored a report the remediation path (which does supply the plan) rejects.
+  describe('checkStepCompletion: prd_audit plan-task citation authority', () => {
+    const table =
+      '| Criterion | Grade | Plan task | Evidence |\n' +
+      '| --- | --- | --- | --- |\n';
+
+    async function writePlan(...taskIds: string[]): Promise<void> {
+      await createFile(
+        '.docs/plans/citation-authority.md',
+        taskIds
+          .map((id) => `### Task ${id}: Existing work\n\n**Files:** src/example.ts\n`)
+          .join('\n'),
+      );
+    }
+
+    async function writeReport(rows: string): Promise<void> {
+      await createFile('.pipeline/prd-audit.md', '# PRD Audit\n\n**PRD:** none\n\n' + table + rows);
+    }
+
+    it('refuses a citation naming a task the active plan does not declare', async () => {
+      await writePlan('1');
+      await writeReport('| S1.1 | PASS | rem-ab1-9 | Implemented |\n');
+
+      const result = await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 });
+
+      expect(result.done).toBe(false);
+      expect(result.reason).toContain('S1.1');
+      expect(result.reason).toContain('rem-ab1-9');
+    });
+
+    it('scores clean when every citation names a task the active plan declares', async () => {
+      await writePlan('1', 'rem-ab1-2');
+      // Story criteria make the story-coverage check authoritative too: it
+      // reads the parsed findings, so its own parse needs the plan or every
+      // citing row is rejected and its criterion reported missing.
+      await createFile(
+        '.docs/stories/citation-authority.md',
+        [
+          '# Stories',
+          '',
+          '## Story 1: behavior',
+          '',
+          '#### Happy Path',
+          '- Given input, when exercised, then the first behavior appears.',
+          '- Given input, when exercised, then the second behavior appears.',
+        ].join('\n'),
+      );
+      await writeReport(
+        '| S1.1 | PASS | 1 | Implemented |\n' +
+        '| S1.2 | PASS | rem-ab1-2 (landed) | Implemented |\n',
+      );
+
+      expect(await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 }))
+        .toMatchObject({ done: true });
+    });
+
+    it('refuses fail-closed when the feature plan cannot be resolved at all', async () => {
+      await writeReport('| S1.1 | PASS | 1 | Implemented |\n');
+
+      const result = await checkStepCompletion(dir, 'prd_audit', { sessionStartedAt: 0 });
+
+      expect(result.done).toBe(false);
+      expect(result.reason).toContain('S1.1');
+      expect(result.reason).toMatch(/active plan could not be resolved/);
     });
   });
 
@@ -3474,43 +4251,6 @@ describe('engine/artifacts', () => {
       expect(result.done).toBe(true);
       const marker = JSON.parse(await readFile(join(dir, SIDECAR), 'utf-8'));
       expect(marker.codeStamp).toBe('eee555');
-    });
-  });
-
-  describe('checkStepCompletion: retro predicate', () => {
-    it('fails when no retro files exist', async () => {
-      const result = await checkStepCompletion(dir, 'retro');
-      expect(result.done).toBe(false);
-      expect(result.reason).toMatch(/no \.docs\/retros/);
-    });
-
-    it('fails when only stale prior-feature retros exist', async () => {
-      await createFile('.docs/retros/2025-01-01-other-feature.md', '# Retro');
-      const past = new Date(Date.now() - 60_000);
-      await utimes(join(dir, '.docs/retros/2025-01-01-other-feature.md'), past, past);
-      const result = await checkStepCompletion(dir, 'retro', {
-        sessionStartedAt: Date.now(),
-        featureDesc: 'add foo',
-      });
-      expect(result.done).toBe(false);
-      expect(result.reason).toMatch(/no retro found for current feature|stale/);
-    });
-
-    it('passes when a fresh slug-matched retro exists', async () => {
-      await createFile('.docs/retros/2026-05-01-add-foo.md', '# Retro');
-      const result = await checkStepCompletion(dir, 'retro', {
-        sessionStartedAt: 0,
-        featureDesc: 'add foo',
-      });
-      expect(result).toEqual({ done: true });
-    });
-
-    it('passes when feature_desc is unavailable and any fresh retro file exists', async () => {
-      await createFile('.docs/retros/some-retro.md', '# Retro');
-      const result = await checkStepCompletion(dir, 'retro', {
-        sessionStartedAt: 0,
-      });
-      expect(result).toEqual({ done: true });
     });
   });
 
@@ -3689,12 +4429,181 @@ describe('engine/artifacts', () => {
     });
   });
 
+  describe('isCanonicalAdrFilename', () => {
+    it.each([
+      ['accepts a canonical single-word slug', 'adr-2026-09-08-canonical.md', true],
+      ['accepts a canonical multi-word slug', 'adr-2026-09-08-canonical-multi-word.md', true],
+      ['accepts leap day in a leap year', 'adr-2024-02-29-canonical.md', true],
+      ['rejects a sequential three-digit ADR number', 'adr-001-canonical.md', false],
+      ['rejects a sequential four-digit ADR number', 'adr-0001-canonical.md', false],
+      ['rejects month 13 despite its date shape', 'adr-2026-13-08-canonical.md', false],
+      ['rejects day 32 despite its date shape', 'adr-2026-09-32-canonical.md', false],
+      ['rejects leap day in a non-leap year', 'adr-2026-02-29-canonical.md', false],
+      ['rejects a blank slug', 'adr-2026-09-08-.md', false],
+      ['rejects an uppercase slug', 'adr-2026-09-08-Canonical.md', false],
+      ['rejects an underscore slug', 'adr-2026-09-08-canonical_slug.md', false],
+      ['rejects a doubled-hyphen slug', 'adr-2026-09-08-canonical--slug.md', false],
+      ['rejects a non-Markdown extension', 'adr-2026-09-08-canonical.txt', false],
+      ['rejects a name without the ADR prefix', '2026-09-08-canonical.md', false],
+    ])('%s', (_description, filename, expected) => {
+      expect(isCanonicalAdrFilename(filename)).toBe(expected);
+    });
+  });
+
+  describe('parseAdrDecisions', () => {
+    it('keeps the ADR template status vocabulary and guides authors to citable decisions', async () => {
+      const template = await readFile(join(REPOSITORY_ROOT, 'templates', 'adr.md.template'), 'utf8');
+      const statusLine = template.split(/\r?\n/).find((line) => line.startsWith('**Status:**'));
+      const statusVocabularyLines = template
+        .split(/\r?\n/)
+        .filter((line) => /\bstatus\b/i.test(line));
+
+      expect(statusLine).toBe('**Status:** APPROVED | SUPERSEDED by {{superseding-adr-slug}}');
+      expect(statusVocabularyLines).toEqual([
+        '**Status:** APPROVED | SUPERSEDED by {{superseding-adr-slug}}',
+      ]);
+      expect(template).toContain('Preferred form: a numbered list');
+
+      const parsed = parseAdrDecisions(
+        '# ADR: Template-conforming decision\n\n' +
+          '**Status:** APPROVED\n\n' +
+          '## Decision\n\n' +
+          '1. **Use a numbered decision list.** This creates a stable citation id.\n',
+      );
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toEqual(new Set(['1']));
+      }
+    });
+
+    it.each([
+      ['numbered decision item', '4. **Termination.**'],
+      // Seven APPROVED ADRs number this way — the bold wraps the number rather
+      // than following it — and every one of their decisions was uncitable.
+      ['bold-wrapped numbered item', '**4. Termination.** Prose follows.'],
+      ['bolded D-heading', '**D4 — Termination.**'],
+      ['ATX D-heading', '### D4 — Termination'],
+      ['emphasized ATX D-heading', '### **D4** — X'],
+      ['bare D-line', 'D4 bare'],
+      ['single-emphasis D-heading', '*D4 - Termination'],
+      ['ATX D-heading without space', '###D4 - Termination'],
+    ])('accepts the AB-R12 %s shape', (_description, decisionLine) => {
+      const parsed = parseAdrDecisions(`# ADR\n\n## Decision\n\n${decisionLine}\n`);
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toContain('4');
+      }
+    });
+
+    it('never lets a bold-wrapped number answer for a different decision id', () => {
+      const parsed = parseAdrDecisions('# ADR\n\n## Decision\n\n**12. Termination.** Prose follows.\n');
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toEqual(new Set(['12']));
+      }
+    });
+
+    it('excludes decision-looking lines inside fenced code blocks', () => {
+      const parsed = parseAdrDecisions(
+        '# ADR\n\n## Decision\n\n```markdown\n4. **Termination.**\n### D4 — Termination\n```\n',
+      );
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toEqual(new Set());
+      }
+    });
+
+    it('returns the missing-decision-heading diagnostic when the section is absent', () => {
+      expect(parseAdrDecisions('# ADR\n\n## Context\n\nNo decision section.\n')).toMatchObject({
+        kind: 'diagnostic',
+        reason: 'missing-decision-heading',
+      });
+    });
+
+    it('does not treat D10 as decision id 1', () => {
+      const parsed = parseAdrDecisions('# ADR\n\n## Decision\n\n### D10 — Tenth decision\n');
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toContain('10');
+        expect(parsed.ids).not.toContain('1');
+      }
+    });
+
+    it('distinguishes an empty Decision section from a missing heading', () => {
+      const parsed = parseAdrDecisions('# ADR\n\n## Decision\n\n   \n\t\n## Consequences\n');
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toEqual(new Set());
+      }
+    });
+
+    it('accepts decisions introduced by an additive amendment blockquote', () => {
+      const parsed = parseAdrDecisions(
+        '# ADR\n\n## Decision\n\n4. **Original decision.**\n\n> **Amended 2026-09-02 by #2054:**\n>\n> 8. **Amendment decision.**\n',
+      );
+
+      expect(parsed).toMatchObject({ kind: 'decisions' });
+      if (parsed.kind === 'decisions') {
+        expect(parsed.ids).toEqual(new Set(['4', '8']));
+      }
+    });
+  });
+
+  // Covers: task:8
   describe('classifyPrdAuditGaps', () => {
     const header = '| FR | Verdict | Gap-class | Evidence | Accepted? |\n|----|----|----|----|----|\n';
     async function writeAudit(body: string) {
       // sessionStartedAt=undefined below treats any mtime as fresh.
       await createFile('.pipeline/prd-audit.md', '# PRD Audit\n\n' + header + body);
     }
+
+    // The classifier parses the report twice — once for rejected rows, once
+    // inside findUnalignedFrRowsWithClass — and BOTH parses need the active
+    // plan. An unauthorized second parse drops every citing row from
+    // `findings`, so a blocking report routes as clean.
+    it('routes a blocking row that cites a task the active plan declares', async () => {
+      await createFile(
+        '.docs/plans/citation-authority.md',
+        '### Task 1: Existing work\n\n**Files:** src/example.ts\n',
+      );
+      await createFile(
+        '.pipeline/prd-audit.md',
+        '# PRD Audit\n\n**PRD:** none\n\n' +
+          '| Criterion | Grade | Plan task | PRD: | Evidence |\n' +
+          '| --- | --- | --- | --- | --- |\n' +
+          '| S1.1 | FIXABLE | 1 | FR-1 | Missing guard |\n',
+      );
+
+      const c = await classifyPrdAuditGaps(dir, undefined);
+
+      expect(c.kind).toBe('impl-only');
+      expect(c.summary).toContain('FR-1 (impl-gap)');
+    });
+
+    it('refuses to route a blocking row whose citation names an absent plan task', async () => {
+      await createFile(
+        '.docs/plans/citation-authority.md',
+        '### Task 1: Existing work\n\n**Files:** src/example.ts\n',
+      );
+      await createFile(
+        '.pipeline/prd-audit.md',
+        '# PRD Audit\n\n**PRD:** none\n\n' +
+          '| Criterion | Grade | Plan task | PRD: | Evidence |\n' +
+          '| --- | --- | --- | --- | --- |\n' +
+          '| S1.1 | FIXABLE | rem-ab1-9 | FR-1 | Missing guard |\n',
+      );
+
+      const c = await classifyPrdAuditGaps(dir, undefined);
+
+      expect(c.kind).toBe('needs-decide');
+      expect(c.summary).toContain('rem-ab1-9');
+    });
 
     it('an accepted OVER_SCOPE widening flips cleanliness on the next lap', async () => {
       // ADR D8 / Plan Task 12: the operator's recorded acceptance must reach
@@ -3824,6 +4733,37 @@ describe('engine/artifacts', () => {
       const c = await classifyPrdAuditGaps(dir, Date.now());
       expect(c.kind).toBe('clean');
     });
+
+    it('ignores blocking rows from an earlier run in the same session', async () => {
+      await writeAudit('| FR-17 | MISSING | impl-gap | stale evidence | no |\n');
+      await createFile(PRD_AUDIT_CODE_STAMP, JSON.stringify({ runId: 'earlier-run' }));
+
+      const c = await classifyPrdAuditGaps(dir, undefined, 'current-run');
+
+      expect(c).toEqual({ kind: 'clean', summary: 'no blocking FRs' });
+    });
+
+    it('keeps blocking rows from the current run', async () => {
+      await writeAudit('| FR-17 | MISSING | impl-gap | current evidence | no |\n');
+      await createFile(PRD_AUDIT_CODE_STAMP, JSON.stringify({ runId: 'current-run' }));
+
+      const c = await classifyPrdAuditGaps(dir, undefined, 'current-run');
+
+      expect(c.kind).toBe('impl-only');
+      expect(c.summary).toContain('FR-17 (impl-gap)');
+    });
+
+    it('uses pure mtime freshness when gate-code-validity is disabled', async () => {
+      await writeAudit('| FR-17 | MISSING | impl-gap | fresh evidence | no |\n');
+      await createFile(PRD_AUDIT_CODE_STAMP, JSON.stringify({ runId: 'earlier-run' }));
+
+      const c = await classifyPrdAuditGaps(dir, undefined, 'current-run', {
+        gate_code_validity: { enabled: false },
+      });
+
+      expect(c.kind).toBe('impl-only');
+      expect(c.summary).toContain('FR-17 (impl-gap)');
+    });
   });
 
   describe('classifyRetryDecision', () => {
@@ -3878,7 +4818,7 @@ describe('engine/artifacts', () => {
             expect(r).toEqual({ decision: 'rerun' });
           });
 
-          it('absent, attempt 2, same reason, inputsUnchanged → route identical-repeat', () => {
+          it('absent, attempt 2, same reason, inputsUnchanged → rerun', () => {
             const r = classifyRetryDecision({
               step,
               completion: completion('absent', 'same'),
@@ -3886,7 +4826,7 @@ describe('engine/artifacts', () => {
               priorReason: 'same',
               inputsUnchanged: true,
             });
-            expect(r).toEqual({ decision: 'route', signal: 'identical-repeat' });
+            expect(r).toEqual({ decision: 'rerun' });
           });
 
           it('absent, attempt 2, same reason, inputsUnchanged:false → rerun', () => {
@@ -3923,6 +4863,61 @@ describe('engine/artifacts', () => {
         inputsUnchanged: true,
       });
       expect(r).toEqual({ decision: 'rerun' });
+    });
+
+    // Covers: task:1
+    it('routes a needs-human terminal refusal before consulting retry signals', () => {
+      const r = classifyRetryDecision({
+        step: 'build',
+        completion: { done: false },
+        attempt: 1,
+        inputsUnchanged: false,
+        terminalRefusal: 'needs-human',
+      });
+
+      expect(r).toEqual({ decision: 'route', signal: 'terminal-refusal' });
+    });
+
+    // Covers: task:2
+    describe('terminal refusal kinds', () => {
+      it('leaves a seal refusal on the existing rerun path', () => {
+        const r = classifyRetryDecision({
+          step: 'build',
+          completion: { done: false },
+          attempt: 1,
+          inputsUnchanged: false,
+          terminalRefusal: 'seal',
+        });
+
+        expect(r).toEqual({ decision: 'rerun' });
+      });
+
+      it('routes a validation-verdict terminal refusal', () => {
+        const r = classifyRetryDecision({
+          step: 'build',
+          completion: { done: false },
+          attempt: 1,
+          inputsUnchanged: false,
+          terminalRefusal: 'validation-verdict',
+        });
+
+        expect(r).toEqual({ decision: 'route', signal: 'terminal-refusal' });
+      });
+
+      it('preserves the existing stale-run-identity result when terminalRefusal is absent', () => {
+        const r = classifyRetryDecision({
+          step: 'prd_audit',
+          completion: {
+            done: false,
+            routeClass: 'absent',
+            retrySignal: 'stale-run-identity',
+          },
+          attempt: 1,
+          inputsUnchanged: false,
+        });
+
+        expect(r).toEqual({ decision: 'rerun', signal: 'stale-run-identity' });
+      });
     });
 
     it('routes a typed unretryable input failure on attempt 1', () => {
@@ -3971,6 +4966,33 @@ describe('engine/artifacts', () => {
       expect(r).toEqual({ decision: 'rerun' });
     });
 
+    // Covers: task:10
+    it('reruns a typed absent verdict even when its diagnostic text repeats', () => {
+      const r = classifyRetryDecision({
+        step: 'prd_audit',
+        completion: completion(
+          'absent',
+          'report was produced by run prior-run, not the current run current-run',
+        ),
+        attempt: 2,
+        priorReason: 'report was produced by run prior-run, not the current run current-run',
+        inputsUnchanged: true,
+      });
+      expect(r).toEqual({ decision: 'rerun' });
+    });
+
+    // Covers: task:10
+    it('routes a matching-stamp adverse prd_audit verdict regardless of diagnostic wording', () => {
+      const r = classifyRetryDecision({
+        step: 'prd_audit',
+        completion: { done: false, reason: 'a reworded adverse verdict' },
+        attempt: 1,
+        inputsUnchanged: false,
+        prdAuditNonClean: true,
+      });
+      expect(r).toEqual({ decision: 'route', signal: 'named-route' });
+    });
+
     describe('identical-repeat requires all three conditions', () => {
       it('flips attempt < 2 → rerun', () => {
         const r = classifyRetryDecision({
@@ -4004,6 +5026,22 @@ describe('engine/artifacts', () => {
         });
         expect(r).toEqual({ decision: 'rerun' });
       });
+    });
+
+    // Covers: task:15
+    it('labels a stale run-identity absence without changing its rerun decision', () => {
+      const r = classifyRetryDecision({
+        step: 'prd_audit',
+        completion: {
+          done: false,
+          routeClass: 'absent',
+          retrySignal: 'stale-run-identity',
+        },
+        attempt: 1,
+        inputsUnchanged: false,
+      });
+
+      expect(r).toEqual({ decision: 'rerun', signal: 'stale-run-identity' });
     });
   });
 
@@ -4551,21 +5589,24 @@ Task 1 → Task 2
       const stale = new Date(Date.now() - 10_000);
       await utimes(verdictPath, stale, stale);
 
+      const effectiveResolver = vi.fn(async () => ({
+        ok: true as const,
+        feature: { version: 'v1' as const, repository: dir, feature: 'fixture' },
+        effective: {
+          rawVerdict: 'PASS' as const,
+          verdict: 'PASS' as const,
+          acceptedFindingIds: [],
+          unresolvedFindingIds: [],
+          suppressedFindingIds: [],
+          skippedRubrics: [],
+          infrastructureFailureRubrics: [],
+          uncoveredInfrastructureFailureRubrics: [],
+        },
+      }));
       const result = await checkStepCompletion(dir, 'build_review', {
         sessionStartedAt: Date.now(),
-        config: { gate_code_validity: { enabled: true } },
-        buildReviewEffectiveResolver: async () => ({
-          ok: true as const,
-          feature: { version: 'v1' as const, repository: dir, feature: 'fixture' },
-          effective: {
-            rawVerdict: 'PASS' as const,
-            verdict: 'PASS' as const,
-            acceptedFindingIds: [],
-            unresolvedFindingIds: [],
-            skippedRubrics: [],
-            infrastructureFailureRubrics: [],
-          },
-        }),
+        config: { gate_code_validity: { enabled: true }, build_review: { rubrics: { testQuality: { enabled: true, min_confidence: 70 } } } },
+        buildReviewEffectiveResolver: effectiveResolver,
         git: async (args) => {
           if (args[0] === 'symbolic-ref') return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
           if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return { exitCode: 0, stdout: '', stderr: '' };
@@ -4579,6 +5620,9 @@ Task 1 → Task 2
       expect(result).toMatchObject({
         done: true,
         verdictFreshness: { outcome: 'preserved_surface_miss' },
+      });
+      expect(effectiveResolver).toHaveBeenCalledWith(dir, expect.anything(), {
+        minConfidence: { testQuality: 70 },
       });
       expect(result.staleLap).toBeUndefined();
     });
@@ -4643,6 +5687,7 @@ Task 1 → Task 2
 
   describe('checkStepCompletion: prd_audit / architecture_review_as_built / manual_test code-validity on re-dispatch (Task 6, #817)', () => {
     const OLD_MTIME = new Date(2000, 0, 1);
+    const bareDirs: string[] = [];
 
     async function makeGitDir(): Promise<string> {
       const d = await mkdtemp(join(tmpdir(), 'artifacts-gate-validity-6-'));
@@ -4671,6 +5716,7 @@ Task 1 → Task 2
      * feature surface `F` in-fixture instead of failing open to `[]`. */
     async function wireOrigin(d: string): Promise<void> {
       const bare = await mkdtemp(join(tmpdir(), 'artifacts-gate-validity-6-origin-'));
+      bareDirs.push(bare);
       await execa('git', ['init', '-q', '--bare', '-b', 'main'], { cwd: bare });
       await execa('git', ['remote', 'add', 'origin', bare], { cwd: d });
       await execa('git', ['push', '-q', 'origin', 'main'], { cwd: d });
@@ -4691,6 +5737,7 @@ Task 1 → Task 2
     let gdir: string;
     afterEach(async () => {
       if (gdir) await rm(gdir, { recursive: true, force: true });
+      await Promise.all(bareDirs.splice(0).map((bare) => rm(bare, { recursive: true, force: true })));
     });
 
     describe('prd_audit', () => {
@@ -4704,20 +5751,224 @@ Task 1 → Task 2
         await utimes(p, OLD_MTIME, OLD_MTIME);
       }
 
-      async function writeSidecar(d: string, codeStamp: string | undefined): Promise<void> {
+      async function writeSidecar(
+        d: string,
+        codeStamp: string | undefined,
+        runId?: string,
+      ): Promise<void> {
         if (codeStamp === undefined) return;
-        await writeFile(join(d, SIDECAR), JSON.stringify({ codeStamp }, null, 2));
+        await writeFile(join(d, SIDECAR), JSON.stringify({ codeStamp, runId }, null, 2));
       }
 
+      // Covers: task:9
       it('preserves a stale-mtime report with a codeStamp sidecar when the surface since the stamp is unchanged', async () => {
         gdir = await makeGitDir();
         await wireOrigin(gdir);
         const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
         await writeReport(gdir);
+        await writeSidecar(gdir, baseline, 'current-run');
+
+        const result = await checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+        expect(result.done).toBe(true);
+      });
+
+      // The preserve short-circuit re-parses the report, so it needs the plan
+      // too: unauthorized, this legitimate citation is rejected, the report is
+      // no longer "still clean", and a stale-mtime PASS stops preserving.
+      it('preserves a stale-mtime report whose citation names a declared plan task', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        const baseline = await commitFile(
+          gdir,
+          '.docs/plans/citation.md',
+          '### Task 1: Existing work\n\n**Files:** featureA.ts\n',
+          'docs: add plan',
+        );
+        const p = join(gdir, PATH);
+        await writeFile(
+          p,
+          '**PRD:** none\n\n' +
+          '| Criterion | Grade | Plan task | Evidence |\n' +
+          '| --- | --- | --- | --- |\n' +
+          '| S1.1 | PASS | 1 | Implemented |\n',
+        );
+        await utimes(p, OLD_MTIME, OLD_MTIME);
         await writeSidecar(gdir, baseline);
 
         const result = await checkStepCompletion(gdir, 'prd_audit', ctxFor(gdir));
+
         expect(result.done).toBe(true);
+      });
+
+      // The preserve pre-check re-reads the report against present content, so
+      // its parse needs the active plan too: without it a citation naming an
+      // absent task resolves against itself and a stale PASS is preserved
+      // (adr-2026-08-30-shared-plan-task-reference-resolver decision 1).
+      it('never preserves a report whose citation names a task absent from the active plan', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        const baseline = await commitFile(
+          gdir,
+          '.docs/plans/citation.md',
+          '### Task 1: Existing work\n\n**Files:** featureA.ts\n',
+          'docs: add plan',
+        );
+        const p = join(gdir, PATH);
+        await writeFile(
+          p,
+          '**PRD:** none\n\n' +
+          '| Criterion | Grade | Plan task | Evidence |\n' +
+          '| --- | --- | --- | --- |\n' +
+          '| S1.1 | PASS | rem-ab1-9 | Implemented |\n',
+        );
+        await utimes(p, OLD_MTIME, OLD_MTIME);
+        await writeSidecar(gdir, baseline, 'current-run');
+
+        const result = await checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+
+        expect(result.done).toBe(false);
+        expect(result.reason).toContain('rem-ab1-9');
+      });
+
+      // Covers: task:9, task:10 — amended 2026-09-06 (adr-2026-08-25 D5): the
+      // code stamp decides first; a prior run identity condemns the report
+      // only when the stamp cannot vouch for the tree on disk.
+      it('preserves a code-valid report stamped for a prior run (unchanged surface)', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeReport(gdir);
+        await writeSidecar(gdir, baseline, 'prior-run');
+
+        const result = await checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+
+        expect(result).toMatchObject({ done: true });
+      });
+
+      it('scores a prior-run report absent when its surface changed since the stamp', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeReport(gdir);
+        await writeSidecar(gdir, baseline, 'prior-run');
+        await commitFile(gdir, 'featureA.ts', 'f2\n', 'feat: change featureA');
+
+        const result = await checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+
+        expect(result).toMatchObject({ done: false, routeClass: 'absent' });
+        expect(result.reason).toContain('.pipeline/prd-audit.md');
+        expect(result.reason).toContain('current-run');
+        expect(result.reason).toContain('prior-run');
+        expect(result.reason).not.toContain('FR-1');
+      });
+
+      // Covers: task:13
+      it('keeps unstamped reports on legacy mtime semantics', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeFile(join(gdir, PATH), ALIGNED);
+
+        await utimes(join(gdir, PATH), OLD_MTIME, OLD_MTIME);
+        await expect(checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({
+          done: false,
+          reason: expect.stringMatching(/not rewritten by this judging session/),
+        });
+
+        await writeFile(join(gdir, PATH), ALIGNED);
+        await expect(checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptStartedAt: 0,
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({ done: true });
+      });
+
+      // Covers: task:13
+      it('ignores a mismatched run stamp when gate-code-validity is disabled', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeFile(join(gdir, PATH), ALIGNED);
+        await writeFile(join(gdir, SIDECAR), JSON.stringify({ runId: 'prior-run' }));
+
+        await expect(checkStepCompletion(gdir, 'prd_audit', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptStartedAt: 0,
+          attemptRunId: 'current-run',
+          config: { gate_code_validity: { enabled: false } },
+        })).resolves.toMatchObject({ done: true });
+      });
+
+      it('preserves a stale report with a matching accepted NC finding', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        const summary = 'Visible behavior outside the approved plan.';
+        const report = [
+          '**PRD:** none',
+          '',
+          '## Verdict Table',
+          '| Criterion | Grade | Plan task | PRD: | Intent relation | Evidence |',
+          '| --- | --- | --- | --- | --- | --- |',
+          '| S3.1 | PASS | — | none | within | Covered behavior |',
+          '',
+          '## Findings without an owning criterion',
+          '| Finding | Grade | Intent relation | Evidence |',
+          '| --- | --- | --- | --- |',
+          `| NC.1 | OVER_SCOPE | outside-visible | ${summary} |`,
+        ].join('\n');
+        await writeFile(join(gdir, PATH), report);
+        await utimes(join(gdir, PATH), OLD_MTIME, OLD_MTIME);
+        await writeFile(join(gdir, '.pipeline/accepted-widenings.json'), JSON.stringify({
+          version: 1,
+          decisions: [{
+            criterion: 'NC.1', summary, decision: 'accept', rationale: 'Approved.', operator: 'test', decidedAt: '2026-08-26T00:00:00.000Z',
+          }],
+        }));
+        await writeSidecar(gdir, baseline);
+
+        const result = await checkStepCompletion(gdir, 'prd_audit', ctxFor(gdir));
+        expect(result).toMatchObject({ done: true, verdictFreshness: { outcome: 'preserved_surface_miss' } });
+      });
+
+      it('does not preserve a stale all-PASS report when the current report has rejected rows', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        const report = [
+          '**PRD:** none',
+          '',
+          '## Verdict Table',
+          '| Criterion | Grade | Plan task | Evidence |',
+          '| --- | --- | --- | --- |',
+          '| S1.1 | PASS | — | Valid row |',
+          '| S1.2 | MAYBE | — | Rejected row |',
+        ].join('\n');
+        await writeFile(join(gdir, PATH), report);
+        await utimes(join(gdir, PATH), OLD_MTIME, OLD_MTIME);
+        await writeSidecar(gdir, baseline);
+
+        const result = await checkStepCompletion(gdir, 'prd_audit', ctxFor(gdir));
+
+        expect(result.done).toBe(false);
+        expect(result.reason ?? '').toMatch(/not rewritten by this judging session/);
       });
 
       it('falls through to mtime rejection when the delta touches the feature\'s own runtime source', async () => {
@@ -4767,20 +6018,103 @@ Task 1 → Task 2
         await utimes(p, OLD_MTIME, OLD_MTIME);
       }
 
-      async function writeSidecar(d: string, codeStamp: string | undefined): Promise<void> {
+      async function writeSidecar(
+        d: string,
+        codeStamp: string | undefined,
+        runId?: string,
+      ): Promise<void> {
         if (codeStamp === undefined) return;
-        await writeFile(join(d, SIDECAR), JSON.stringify({ codeStamp }, null, 2));
+        await writeFile(join(d, SIDECAR), JSON.stringify({ codeStamp, runId }, null, 2));
       }
 
+      // Covers: task:9
       it('preserves a stale-mtime report with a codeStamp sidecar when the surface since the stamp is unchanged', async () => {
         gdir = await makeGitDir();
         await wireOrigin(gdir);
         const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
         await writeReport(gdir);
-        await writeSidecar(gdir, baseline);
+        await writeSidecar(gdir, baseline, 'current-run');
 
-        const result = await checkStepCompletion(gdir, 'architecture_review_as_built', ctxFor(gdir));
+        const result = await checkStepCompletion(gdir, 'architecture_review_as_built', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
         expect(result.done).toBe(true);
+      });
+
+      // Covers: task:9 — amended 2026-09-06 (adr-2026-08-25 D5): stamp first.
+      it('preserves a code-valid approval report stamped for a prior run (unchanged surface)', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeReport(gdir);
+        await writeSidecar(gdir, baseline, 'prior-run');
+
+        const result = await checkStepCompletion(gdir, 'architecture_review_as_built', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+
+        expect(result).toMatchObject({ done: true });
+      });
+
+      it('scores a prior-run approval report absent when its surface changed since the stamp', async () => {
+        gdir = await makeGitDir();
+        await wireOrigin(gdir);
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeReport(gdir);
+        await writeSidecar(gdir, baseline, 'prior-run');
+        await commitFile(gdir, 'featureA.ts', 'f2\n', 'feat: change featureA');
+
+        const result = await checkStepCompletion(gdir, 'architecture_review_as_built', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+
+        expect(result).toMatchObject({ done: false });
+        expect(result.reason).toContain('.pipeline/architecture-review-as-built.md');
+        expect(result.reason).toContain('current-run');
+        expect(result.reason).toContain('prior-run');
+      });
+
+      // Covers: task:13
+      it('keeps unstamped reports on legacy mtime semantics', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeFile(join(gdir, PATH), APPROVED);
+
+        await utimes(join(gdir, PATH), OLD_MTIME, OLD_MTIME);
+        await expect(checkStepCompletion(gdir, 'architecture_review_as_built', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({
+          done: false,
+          reason: expect.stringMatching(/not rewritten by this judging session/),
+        });
+
+        await writeFile(join(gdir, PATH), APPROVED);
+        await expect(checkStepCompletion(gdir, 'architecture_review_as_built', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptStartedAt: 0,
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({ done: true });
+      });
+
+      // Covers: task:13
+      it('ignores a mismatched run stamp when gate-code-validity is disabled', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeFile(join(gdir, PATH), APPROVED);
+        await writeFile(join(gdir, SIDECAR), JSON.stringify({ runId: 'prior-run' }));
+
+        await expect(checkStepCompletion(gdir, 'architecture_review_as_built', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptStartedAt: 0,
+          attemptRunId: 'current-run',
+          config: { gate_code_validity: { enabled: false } },
+        })).resolves.toMatchObject({ done: true });
       });
 
       it('falls through to mtime rejection when the delta touches the feature\'s own runtime source', async () => {
@@ -4809,7 +6143,13 @@ Task 1 → Task 2
       it('a fresh-mtime BLOCKED report still blocks regardless of the sidecar codeStamp', async () => {
         gdir = await makeGitDir();
         const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
-        await writeFile(join(gdir, PATH), '# As-Built Review\n\nVerdict: BLOCKED\n');
+        await writeFile(
+          join(gdir, PATH),
+          '# As-Built Review\n\nVerdict: BLOCKED\n\n## Blocking Findings\n\n' +
+            '| Finding | Class | Governing clause | Summary |\n' +
+            '|---|---|---|---|\n' +
+            '| ARCH-1 | DESIGN | Task 1 | A decision is required. |\n',
+        );
         await writeSidecar(gdir, baseline);
 
         const result = await checkStepCompletion(gdir, 'architecture_review_as_built', ctxFor(gdir));
@@ -4821,6 +6161,7 @@ Task 1 → Task 2
     describe('manual_test', () => {
       const RESULTS = '.pipeline/manual-test-results.md';
       const MARKER = '.pipeline/manual-test-fail-evidence.json';
+      const RUN_ID_SIDECAR = '.pipeline/manual-test-code-stamp.json';
       const PASS_FILE = '| Story | Result |\n|---|---|\n| Foo | PASS |\n';
 
       async function writeResults(d: string): Promise<void> {
@@ -4829,14 +6170,167 @@ Task 1 → Task 2
         await utimes(p, OLD_MTIME, OLD_MTIME);
       }
 
+      // Covers: task:9
       it('preserves a stale-mtime clean-PASS marker with a codeStamp when the surface since the stamp is unchanged', async () => {
         gdir = await makeGitDir();
         const baseline = await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
         await writeResults(gdir);
-        await writeFile(join(gdir, MARKER), JSON.stringify({ codeStamp: baseline }, null, 2));
+        await writeFile(
+          join(gdir, MARKER),
+          JSON.stringify({ codeStamp: baseline }, null, 2),
+        );
+        await writeFile(join(gdir, RUN_ID_SIDECAR), JSON.stringify({ runId: 'current-run' }, null, 2));
 
-        const result = await checkStepCompletion(gdir, 'manual_test', ctxFor(gdir));
+        const result = await checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
         expect(result.done).toBe(true);
+      });
+
+      // Covers: task:9
+      it('never preserves a clean PASS stamped for a prior run', async () => {
+        gdir = await makeGitDir();
+        const baseline = await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
+        await writeResults(gdir);
+        await writeFile(
+          join(gdir, MARKER),
+          JSON.stringify({ codeStamp: baseline }, null, 2),
+        );
+        await writeFile(join(gdir, RUN_ID_SIDECAR), JSON.stringify({ runId: 'prior-run' }, null, 2));
+
+        const result = await checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        });
+
+        expect(result).toMatchObject({ done: false });
+        expect(result.reason).toContain('.pipeline/manual-test-results.md');
+        expect(result.reason).toContain('current-run');
+        expect(result.reason).toContain('prior-run');
+      });
+
+      // Covers: task:14
+      it('keeps the FAIL→PASS head-movement guard ahead of a stale run identity', async () => {
+        gdir = await makeGitDir();
+        const baseline = await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
+        await writeFile(
+          join(gdir, RESULTS),
+          '## Attempt 1 — 2026-08-25T10:00:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | FAIL |\n\n' +
+            '## Attempt 2 — 2026-08-25T10:01:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | PASS |\n',
+        );
+        await writeFile(
+          join(gdir, MARKER),
+          JSON.stringify({ observedAt: Date.now(), headSha: baseline, failRows: ['| Bar | FAIL |'] }),
+        );
+        await writeFile(join(gdir, RUN_ID_SIDECAR), JSON.stringify({ runId: 'prior-run' }));
+
+        const result = await checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptRunId: 'current-run',
+        });
+
+        expect(result.done).toBe(false);
+        expect(result.reason ?? '').toMatch(/no new commits|whitewash/i);
+        expect(result.routeClass).toBeUndefined();
+      });
+
+      // Covers: task:14
+      it('keeps the FAIL→PASS head-movement guard with a matching run identity', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
+        await writeFile(join(gdir, RUN_ID_SIDECAR), JSON.stringify({ runId: 'current-run' }));
+        await writeFile(
+          join(gdir, RESULTS),
+          '## Attempt 1 — 2026-08-25T10:00:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | FAIL |\n',
+        );
+        await expect(checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({ done: false });
+
+        await writeFile(
+          join(gdir, RESULTS),
+          '## Attempt 1 — 2026-08-25T10:00:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | FAIL |\n\n' +
+            '## Attempt 2 — 2026-08-25T10:01:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | PASS |\n',
+        );
+        const result = await checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptRunId: 'current-run',
+        });
+
+        expect(result.done).toBe(false);
+        expect(result.reason ?? '').toMatch(/no new commits|whitewash/i);
+      });
+
+      // Covers: task:14
+      it('treats a mismatched stamp on the latest append attempt as no fresh verdict', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
+        await writeFile(
+          join(gdir, RESULTS),
+          '## Attempt 1 — 2026-08-25T10:00:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | FAIL |\n\n' +
+            '## Attempt 2 — 2026-08-25T10:01:00Z\n' +
+            '| Story | Result |\n|---|---|\n| Bar | PASS |\n',
+        );
+        await writeFile(join(gdir, RUN_ID_SIDECAR), JSON.stringify({ runId: 'prior-run' }));
+
+        const result = await checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptRunId: 'current-run',
+        });
+
+        expect(result).toMatchObject({ done: false, routeClass: 'absent' });
+        expect(result.reason ?? '').toMatch(/no fresh verdict/);
+        expect(result.reason ?? '').not.toMatch(/contains FAIL rows/);
+      });
+
+      // Covers: task:13
+      it('keeps unstamped results on legacy mtime semantics', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
+        await writeFile(join(gdir, RESULTS), PASS_FILE);
+
+        await utimes(join(gdir, RESULTS), OLD_MTIME, OLD_MTIME);
+        await expect(checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({
+          done: false,
+          reason: expect.stringMatching(/stale/),
+        });
+
+        await writeFile(join(gdir, RESULTS), PASS_FILE);
+        await expect(checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptRunId: 'current-run',
+        })).resolves.toMatchObject({ done: true });
+      });
+
+      // Covers: task:13
+      it('ignores a mismatched run stamp when gate-code-validity is disabled', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'src/a.ts', 'a\n', 'init');
+        await writeFile(join(gdir, RESULTS), PASS_FILE);
+        await writeFile(join(gdir, RUN_ID_SIDECAR), JSON.stringify({ runId: 'prior-run' }));
+
+        await expect(checkStepCompletion(gdir, 'manual_test', {
+          ...ctxFor(gdir),
+          sessionStartedAt: 0,
+          attemptRunId: 'current-run',
+          config: { gate_code_validity: { enabled: false } },
+        })).resolves.toMatchObject({ done: true });
       });
 
       it('falls through to mtime rejection when the delta touches a runtime path since the stamp', async () => {
@@ -4897,6 +6391,7 @@ Task 1 → Task 2
 
   describe('sweepStaleReviewArtifacts: code-validity preserve before delete (Task 7, #817)', () => {
     const OLD_MTIME = new Date(2000, 0, 1);
+    const bareDirs: string[] = [];
 
     async function makeGitDir(): Promise<string> {
       const d = await mkdtemp(join(tmpdir(), 'artifacts-gate-validity-7-'));
@@ -4925,6 +6420,7 @@ Task 1 → Task 2
      * feature surface `F` in-fixture instead of failing open to `[]`. */
     async function wireOrigin(d: string): Promise<void> {
       const bare = await mkdtemp(join(tmpdir(), 'artifacts-gate-validity-7-origin-'));
+      bareDirs.push(bare);
       await execa('git', ['init', '-q', '--bare', '-b', 'main'], { cwd: bare });
       await execa('git', ['remote', 'add', 'origin', bare], { cwd: d });
       await execa('git', ['push', '-q', 'origin', 'main'], { cwd: d });
@@ -4934,6 +6430,7 @@ Task 1 → Task 2
     let gdir: string;
     afterEach(async () => {
       if (gdir) await rm(gdir, { recursive: true, force: true });
+      await Promise.all(bareDirs.splice(0).map((bare) => rm(bare, { recursive: true, force: true })));
     });
 
     describe('prd_audit', () => {
@@ -4958,6 +6455,63 @@ Task 1 → Task 2
 
         expect(removed).toEqual([]);
         await expect(readFile(join(gdir, PATH), 'utf-8')).resolves.toBe(ALIGNED);
+      });
+
+      // The spare predicate re-reads the report it is about to preserve, and
+      // its parse carries the plan for the same reason the gate's does: a
+      // `Plan task` cell must be checked against the plan, not against itself.
+      it('spares a stale report whose citation names a declared plan task', async () => {
+        gdir = await makeGitDir();
+        await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        const baseline = await commitFile(
+          gdir,
+          '.docs/plans/citation.md',
+          '### Task 1: Existing work\n\n**Files:** featureA.ts\n',
+          'docs: add plan',
+        );
+        const citing =
+          '**PRD:** none\n\n' +
+          '| Criterion | Grade | Plan task | Evidence |\n' +
+          '| --- | --- | --- | --- |\n' +
+          '| S1.1 | PASS | 1 | Implemented |\n';
+        const p = join(gdir, PATH);
+        await writeFile(p, citing);
+        await utimes(p, OLD_MTIME, OLD_MTIME);
+        await writeFile(join(gdir, SIDECAR), JSON.stringify({ codeStamp: baseline }, null, 2));
+
+        const removed = await sweepStaleReviewArtifacts(gdir, 'prd_audit', Date.now());
+
+        expect(removed).toEqual([]);
+        await expect(readFile(join(gdir, PATH), 'utf-8')).resolves.toBe(citing);
+      });
+
+      // Covers: task:5
+      // Amended 2026-09-06 (adr-2026-08-25 D5): a code-valid report survives a
+      // prior run identity — the stamp, not the session, decides.
+      it('spares an otherwise code-valid report when the shared reader finds a prior run identity', async () => {
+        gdir = await makeGitDir();
+        const baseline = await commitFile(gdir, 'featureA.ts', 'f1\n', 'feat: add featureA');
+        await writeStaleReport(gdir);
+        await writeFile(
+          join(gdir, SIDECAR),
+          JSON.stringify({ codeStamp: baseline, runId: 'run-prior' }, null, 2),
+        );
+
+        await expect(verdictProducedByRun(gdir, 'prd_audit', 'run-current')).resolves.toEqual({
+          state: 'stale-run-identity',
+          expectedRunId: 'run-current',
+          foundRunId: 'run-prior',
+        });
+        const removed = await sweepStaleReviewArtifacts(
+          gdir,
+          'prd_audit',
+          Date.now(),
+          undefined,
+          undefined,
+          'run-current',
+        );
+
+        expect(removed).toEqual([]);
       });
 
       it('gate_code_validity.enabled: false restores pure mtime-freshness — deletes a stale report even when the codeStamp sidecar surface is unchanged (Task 8, #817)', async () => {
@@ -5100,14 +6654,14 @@ Task 1 → Task 2
   });
 
   // Task 13 (gate-step-completion-validates-against-code-state-, #817):
-  // characterization/regression coverage proving wiring_check, acceptance_specs,
+  // characterization/regression coverage proving test_suite, acceptance_specs,
   // and the build (task-status.json resume) predicate are byte-identical to
   // their pre-#817 behavior — the code-validity preserve mechanism
   // (gateVerdictStillValid / codeStamp sidecars) was scoped to build_review,
   // prd_audit, architecture_review_as_built, and manual_test ONLY (Tasks 1-9).
   // These tests would FAIL if a future change accidentally wired the preserve
   // mechanism into any of these three untouched gates.
-  describe('Task 13: wiring_check / acceptance_specs / build stay byte-identical (#817 out-of-scope gates)', () => {
+  describe('Task 13: test_suite / acceptance_specs / build stay byte-identical (#817 out-of-scope gates)', () => {
     describe('structural regression guard: predicate source never references the preserve mechanism', () => {
       let artifactsSource: string;
 
@@ -5137,8 +6691,8 @@ Task 1 → Task 2
         return artifactsSource.slice(start, i);
       }
 
-      it('wiring_check predicate body does not reference gateVerdictStillValid or codeStamp', () => {
-        const body = extractPredicateBody('wiring_check');
+      it('test_suite predicate body does not reference gateVerdictStillValid or codeStamp', () => {
+        const body = extractPredicateBody('test_suite');
         expect(body).not.toMatch(/gateVerdictStillValid/);
         expect(body).not.toMatch(/codeStamp/);
       });
@@ -5153,14 +6707,6 @@ Task 1 → Task 2
         const body = extractPredicateBody('build');
         expect(body).not.toMatch(/gateVerdictStillValid/);
         expect(body).not.toMatch(/codeStamp/);
-      });
-    });
-
-    describe('wiring_check: deprecated no-op', () => {
-      it('does not inspect obsolete evidence or current HEAD', async () => {
-        const ctx = { getHeadSha: async () => 'current-sha-222' };
-        const result = await checkStepCompletion(dir, 'wiring_check', ctx);
-        expect(result).toEqual({ done: true });
       });
     });
 

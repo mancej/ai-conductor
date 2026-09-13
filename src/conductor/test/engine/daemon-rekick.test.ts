@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+// Covers: task:12
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, readFile, access } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -6,6 +7,8 @@ import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import {
+  clearHaltForResume,
+  consumeResumeAuthorizations,
   rekickSweep,
   resumeRebaseFirst,
   hasRebaseInProgress,
@@ -18,6 +21,8 @@ import {
   HALT_CLEARED_MARKER,
   REKICK_SENTINEL,
 } from '../../src/engine/daemon-rekick.js';
+import type { HaltDisposition } from '../../src/engine/halt-marker.js';
+import { readKickbackLedger } from '../../src/engine/kickback-ledger.js';
 import { join as pjoin } from 'node:path';
 import { ConductorEventEmitter } from '../../src/ui/events.js';
 import { makeRunFeature, type FeatureRunnerDeps, type WorktreeOutcome } from '../../src/engine/daemon-runner.js';
@@ -28,10 +33,228 @@ import { checkAndAutoPark } from '../../src/engine/daemon-auto-park.js';
 import { isOperatorParked, __resetResolveCacheForTests, reconcileStrandedParkMarkers } from '../../src/engine/park-marker.js';
 import { initTestRepo } from '../fixtures/git-repo.js';
 import { createProtectedArtifactSeal } from '../../src/engine/protected-artifact-seal.js';
+import { FullSuiteVerifier } from '../../src/engine/full-suite-verifier.js';
+import type { ConductorEvent } from '../../src/types/events.js';
 
 const execFileAsync = promisify(execFileCb);
 const SHA_B = 'b'.repeat(40);
 const SHA_C = 'c'.repeat(40);
+
+describe('consumeResumeAuthorizations', () => {
+  const gateEntry = {
+    count: 1, cumulative: 5, treeHash: null, lastReason: 'cap', priorVerdict: false, resolvedBefore: 0,
+    capEvidence: { gate: 'build_review', consumed: 5, limit: 5, latestReason: 'cap', haltGeneration: 'g1' },
+    resumeAuthorization: { adjustmentId: 'a1', haltGeneration: 'g1', consumed: false },
+  };
+
+  async function seed(
+    entry: Record<string, unknown> = gateEntry,
+    gate = 'build_review',
+  ): Promise<{ root: string; worktree: string }> {
+    const root = await mkdtemp(join(tmpdir(), 'kickback-resume-'));
+    const worktree = join(root, 'feature');
+    await mkdir(join(worktree, '.pipeline'), { recursive: true });
+    await writeKickbackLedger(worktree, { version: 1, gates: { [gate]: entry } } as never);
+    return { root, worktree };
+  }
+
+  const base = (worktree: string, over: Record<string, unknown>) => ({
+    listHaltedWorktrees: async () => ['feature'],
+    worktreePath: () => worktree,
+    isOperatorParked: async () => false,
+    readLiveHaltClass: async () => 'needs-human',
+    readLiveHaltGeneration: async () => 'g1',
+    clearHalt: async () => 'confirmed' as const,
+    ...over,
+  });
+
+  it('clears the halt first and consumes the authorization only after a confirmed clear', async () => {
+    const { root, worktree } = await seed();
+    try {
+      const trace: string[] = [];
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        clearHalt: async () => {
+          const ledger = await readKickbackLedger(worktree);
+          // The authorization is still unconsumed while the clear is running:
+          // a `partial` clear must be able to leave it untouched.
+          expect(ledger.gates.build_review.resumeAuthorization?.consumed).toBe(false);
+          trace.push('clear');
+          return 'confirmed' as const;
+        },
+        emit: async () => { trace.push('event'); },
+      }) as never)).resolves.toEqual(['feature']);
+      expect(trace).toEqual(['clear', 'event']);
+      expect((await readKickbackLedger(worktree)).gates.build_review.resumeAuthorization?.consumed).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains the halt with an unconsumed authorization when the clear reports partial', async () => {
+    const { root, worktree } = await seed();
+    try {
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        clearHalt: async () => 'partial' as const,
+      }) as never)).resolves.toEqual([]);
+      expect((await readKickbackLedger(worktree)).gates.build_review.resumeAuthorization?.consumed).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains the halt when the live class is not the gate\'s recoverable cap halt', async () => {
+    const { root, worktree } = await seed();
+    try {
+      let cleared = false;
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        readLiveHaltClass: async () => 'kickback-cap',
+        clearHalt: async () => { cleared = true; return 'confirmed' as const; },
+      }) as never)).resolves.toEqual([]);
+      expect(cleared).toBe(false);
+      expect((await readKickbackLedger(worktree)).gates.build_review.resumeAuthorization?.consumed).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a remediation gate whose live halt class is kickback-cap', async () => {
+    const { root, worktree } = await seed({
+      ...gateEntry,
+      laps: 1,
+      capEvidence: { gate: 'prd_audit', consumed: 1, limit: 1, latestReason: 'lap cap', haltGeneration: 'g1' },
+    }, 'prd_audit');
+    try {
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        readLiveHaltClass: async () => 'kickback-cap\n',
+      }) as never)).resolves.toEqual(['feature']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves a processed (already shipped) feature\'s authorization unconsumed', async () => {
+    const { root, worktree } = await seed();
+    try {
+      let cleared = false;
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        isProcessed: async () => true,
+        clearHalt: async () => { cleared = true; return 'confirmed' as const; },
+      }) as never)).resolves.toEqual([]);
+      expect(cleared).toBe(false);
+      expect((await readKickbackLedger(worktree)).gates.build_review.resumeAuthorization?.consumed).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains an operator-parked feature before it reads the ledger', async () => {
+    const { root, worktree } = await seed();
+    try {
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        isOperatorParked: async () => true,
+      }) as never)).resolves.toEqual([]);
+      expect((await readKickbackLedger(worktree)).gates.build_review.resumeAuthorization?.consumed).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains a stale-generation authorization', async () => {
+    const { root, worktree } = await seed({
+      ...gateEntry,
+      resumeAuthorization: { adjustmentId: 'a1', haltGeneration: 'g0', consumed: false },
+    });
+    try {
+      await expect(consumeResumeAuthorizations(base(worktree, {})as never)).resolves.toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains an authorization when a newer same-class halt replaced its cap marker', async () => {
+    const { root, worktree } = await seed();
+    try {
+      await expect(consumeResumeAuthorizations(base(worktree, {
+        readLiveHaltGeneration: async () => 'g2',
+      }) as never)).resolves.toEqual([]);
+      expect((await readKickbackLedger(worktree)).gates.build_review.resumeAuthorization?.consumed).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let an authorization from one remediation gate clear another gate\'s cap halt', async () => {
+    const { root, worktree } = await seed({
+      ...gateEntry,
+      capEvidence: { gate: 'architecture_review_as_built', consumed: 1, limit: 1, latestReason: 'cap', haltGeneration: 'g1' },
+    }, 'prd_audit');
+    try {
+      await expect(consumeResumeAuthorizations(base(worktree, { readLiveHaltClass: async () => 'kickback-cap' }) as never)).resolves.toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('clearHaltForResume', () => {
+  it('repairs the presentation before removing the marker and supersedes the record', async () => {
+    const trace: string[] = [];
+    const result = await clearHaltForResume({
+      worktreePath: '/wt', slug: 'feature',
+      clearMarker: async () => { trace.push('marker'); },
+      resolvePrUrl: async () => 'https://example/pr/1',
+      cleanupPresentation: async () => { trace.push('presentation'); return 'confirmed'; },
+      resolveCommittedRecord: async () => { trace.push('record'); },
+    });
+    expect(result).toBe('confirmed');
+    expect(trace).toEqual(['presentation', 'record', 'marker']);
+  });
+
+  it('reports partial and leaves the marker in place when presentation repair fails', async () => {
+    const trace: string[] = [];
+    const result = await clearHaltForResume({
+      worktreePath: '/wt', slug: 'feature',
+      clearMarker: async () => { trace.push('marker'); },
+      resolvePrUrl: async () => 'https://example/pr/1',
+      cleanupPresentation: async () => 'partial',
+      resolveCommittedRecord: async () => { trace.push('record'); },
+    });
+    expect(result).toBe('partial');
+    expect(trace).toEqual([]);
+  });
+
+  it('confirms when the feature has no PR to repair', async () => {
+    const trace: string[] = [];
+    const result = await clearHaltForResume({
+      worktreePath: '/wt', slug: 'feature',
+      clearMarker: async () => { trace.push('marker'); },
+      resolvePrUrl: async () => undefined,
+      cleanupPresentation: async () => { trace.push('presentation'); return 'confirmed'; },
+    });
+    expect(result).toBe('confirmed');
+    expect(trace).toEqual(['marker']);
+  });
+
+  it('retains the marker when the committed record cannot be superseded', async () => {
+    const result = await clearHaltForResume({
+      worktreePath: '/wt', slug: 'feature',
+      clearMarker: async () => {},
+      resolveCommittedRecord: async () => { throw new Error('no record'); },
+    });
+    expect(result).toBe('partial');
+  });
+
+  it('retains the marker when committed-record supersession reports a typed failure', async () => {
+    const trace: string[] = [];
+    const result = await clearHaltForResume({
+      worktreePath: '/wt', slug: 'feature',
+      clearMarker: async () => { trace.push('marker'); },
+      resolveCommittedRecord: async () => ({ kind: 'failed' }),
+    });
+    expect(result).toBe('partial');
+    expect(trace).toEqual([]);
+  });
+});
 
 // ── Pure sweep core (injected primitives — no real git) ───────────────────────
 
@@ -49,9 +272,10 @@ function fakeDeps(opts: {
   isProcessed?: (slug: string) => Promise<boolean>;
   warned?: Set<string>;
   isOperatorParked?: (slug: string) => Promise<boolean>;
+  markRekicked?: (slug: string, sha: string) => Promise<void>;
   readHaltClass?: (
     slug: string,
-  ) => Promise<'needs-human' | 'mechanical' | 'legacy' | 'unclassified'>;
+  ) => Promise<HaltDisposition>;
 }): { deps: RekickSweepDeps; trace: Trace } {
   const trace: Trace = { events: [], cleared: new Set() };
   const warned = opts.warned ?? new Set<string>();
@@ -82,6 +306,7 @@ function fakeDeps(opts: {
         }
       : {}),
     ...(opts.isOperatorParked ? { isOperatorParked: opts.isOperatorParked } : {}),
+    ...(opts.markRekicked ? { markRekicked: opts.markRekicked } : {}),
     ...(opts.readHaltClass
       ? {
           readHaltClass: async (slug: string) => {
@@ -107,6 +332,52 @@ describe('engine/daemon-rekick — rekickSweep (FR-7/FR-9)', () => {
     expect([...trace.cleared].sort()).toEqual(['a', 'b', 'c']);
     expect(last.get('a')).toBe(SHA_B);
     expect(last.get('c')).toBe(SHA_B);
+  });
+
+  it('persists a cleared slug only after its marker clear resolves', async () => {
+    const trace: string[] = [];
+    const { deps } = fakeDeps({
+      halted: ['clear-me'],
+      markRekicked: async (slug, sha) => { trace.push(`record:${slug}:${sha}`); },
+    });
+    const originalClear = deps.clearMarker;
+    deps.clearMarker = async (slug) => {
+      await originalClear(slug);
+      trace.push(`clear:${slug}`);
+    };
+
+    await expect(rekickSweep(deps, SHA_B)).resolves.toEqual({ cleared: ['clear-me'], skipped: [] });
+    expect(trace).toEqual(['clear:clear-me', `record:clear-me:${SHA_B}`]);
+  });
+
+  it.each(['abort', 'clear'] as const)('does not persist a slug whose %s path fails', async (failure) => {
+    const recorded: string[] = [];
+    const { deps } = fakeDeps({
+      halted: ['broken'],
+      rebasing: failure === 'abort' ? new Set(['broken']) : undefined,
+      abortFails: failure === 'abort' ? new Set(['broken']) : undefined,
+      clearFails: failure === 'clear' ? new Set(['broken']) : undefined,
+      markRekicked: async (slug) => { recorded.push(slug); },
+    });
+
+    await expect(rekickSweep(deps, SHA_B)).resolves.toEqual({ cleared: [], skipped: ['broken'] });
+    expect(recorded).toEqual([]);
+  });
+
+  it('logs a failed durable write and continues sweeping siblings', async () => {
+    const { deps, trace } = fakeDeps({
+      halted: ['bad-record', 'good-record'],
+      markRekicked: async (slug) => {
+        if (slug === 'bad-record') throw new Error('disk full');
+      },
+    });
+
+    await expect(rekickSweep(deps, SHA_B)).resolves.toEqual({
+      cleared: ['bad-record', 'good-record'], skipped: [],
+    });
+    expect(deps.lastRekickSha.get('bad-record')).toBe(SHA_B);
+    expect(deps.lastRekickSha.get('good-record')).toBe(SHA_B);
+    expect(trace.events.some((event) => event.includes('bad-record') && event.includes('durable record anomaly'))).toBe(true);
   });
 
   it('aborts an in-progress rebase BEFORE clearing the marker', async () => {
@@ -157,7 +428,7 @@ describe('engine/daemon-rekick — rekickSweep (FR-7/FR-9)', () => {
     expect(last.get('x')).toBe(SHA_C);
   });
 
-  it.each(['needs-human', 'unclassified'] as const)(
+  it.each(['needs-human', 'plan-gap', 'protected-artifact', 'unclassified'] as const)(
     'a %s halt has no retry side effects across base advances',
     async (disposition) => {
       const last = new Map<string, string>();
@@ -178,10 +449,10 @@ describe('engine/daemon-rekick — rekickSweep (FR-7/FR-9)', () => {
       expect(trace.events.some((e) => e.startsWith('clear:'))).toBe(false);
       expect(trace.cleared).toEqual(new Set());
       expect(last.has('h')).toBe(false);
-      const logLine = trace.events.find(
+      const skipLogs = trace.events.filter(
         (e) => e.startsWith('log:') && e.includes('h') && e.includes(disposition),
       );
-      expect(logLine).toBeDefined();
+      expect(skipLogs).toHaveLength(2);
     },
   );
 
@@ -202,37 +473,63 @@ describe('engine/daemon-rekick — rekickSweep (FR-7/FR-9)', () => {
     expect(logLine).toBeDefined();
   });
 
-  it('applies the four-way halt disposition matrix and logs each slug with its disposition', async () => {
-    const dispositionBySlug = new Map<
-      string,
-      'needs-human' | 'mechanical' | 'legacy' | 'unclassified'
-    >([
-      ['mechanical', 'mechanical'],
-      ['legacy', 'legacy'],
-      ['needs-human', 'needs-human'],
-      ['unclassified', 'unclassified'],
-    ]);
+  it('applies the exhaustive halt disposition matrix through the real sweep', async () => {
+    const expectedActionByDisposition = {
+      'needs-human': 'retain',
+      'plan-gap': 'retain',
+      'protected-artifact': 'retain',
+      unclassified: 'retain',
+      mechanical: 'retry',
+      'kickback-cap': 'retain',
+      'over-scope': 'retain',
+      legacy: 'retry',
+    } satisfies Record<HaltDisposition, 'retain' | 'retry'>;
+
+    const matrix = Object.entries(expectedActionByDisposition);
+    const retryable = matrix
+      .filter(([, action]) => action === 'retry')
+      .map(([disposition]) => disposition);
+    const retained = matrix
+      .filter(([, action]) => action === 'retain')
+      .map(([disposition]) => disposition);
+    const isMatrixDisposition = (disposition: string): disposition is HaltDisposition =>
+      Object.hasOwn(expectedActionByDisposition, disposition);
+    const last = new Map<string, string>();
     const { deps, trace } = fakeDeps({
-      halted: [...dispositionBySlug.keys()],
-      readHaltClass: async (slug) => dispositionBySlug.get(slug)!,
+      halted: matrix.map(([disposition]) => disposition),
+      lastRekickSha: last,
+      readHaltClass: async (slug) => {
+        if (!isMatrixDisposition(slug)) throw new Error(`unexpected disposition: ${slug}`);
+        return slug;
+      },
     });
 
-    const res = await rekickSweep(deps, SHA_B);
+    const first = await rekickSweep(deps, SHA_B);
 
-    expect({
-      cleared: res.cleared,
-      skipped: res.skipped,
-      logged: [...dispositionBySlug].map(([slug, disposition]) =>
-        trace.events.some(
-          (event) =>
-            event.startsWith('log:') && event.includes(slug) && event.includes(disposition),
-        ),
-      ),
-    }).toEqual({
-      cleared: ['mechanical', 'legacy'],
-      skipped: ['needs-human', 'unclassified'],
-      logged: [true, true, true, true],
-    });
+    expect(first).toEqual({ cleared: retryable, skipped: retained });
+    expect([...trace.cleared]).toEqual(retryable);
+    expect(trace.events.filter((event) => event.startsWith('clear:'))).toEqual(
+      retryable.map((disposition) => `clear:${disposition}`),
+    );
+    for (const disposition of retryable) {
+      expect(last.get(disposition)).toBe(SHA_B);
+    }
+    for (const disposition of retained) {
+      expect(last.has(disposition)).toBe(false);
+    }
+
+    const second = await rekickSweep(deps, SHA_B);
+
+    expect(second).toEqual({ cleared: [], skipped: matrix.map(([disposition]) => disposition) });
+    expect(trace.events.filter((event) => event.startsWith('clear:'))).toEqual(
+      retryable.map((disposition) => `clear:${disposition}`),
+    );
+    for (const [disposition, action] of matrix) {
+      const dispositionLogs = trace.events.filter(
+        (event) => event.startsWith('log:') && event.includes(disposition),
+      );
+      expect(dispositionLogs).toHaveLength(action === 'retain' ? 2 : 1);
+    }
   });
 
   it('no readHaltClass dep at all still clears the slug normally (backward-compat)', async () => {
@@ -906,6 +1203,28 @@ describe('engine/daemon-rekick — resumeRebaseFirst (FR-12)', () => {
     expect(attempts).toBe(3); // exhausted the cap before parking
     expect(await fileExists(join(dir, HALT_MARKER))).toBe(true);
     expect(await fileExists(join(dir, REKICK_SENTINEL))).toBe(false);
+  });
+
+  it('completed rebase that drops feature content writes completed-rebase recovery at the re-kick halt site', async () => {
+    await initConflictRepo();
+    await writeSentinel();
+
+    const res = await resumeRebaseFirst({
+      worktreePath: dir,
+      localBase: 'main',
+      events,
+      ranManualTest: false,
+      resolveAttempts: 3,
+      resolveConflict: async () => {
+        await git('rebase', '--skip');
+        return { resolved: true };
+      },
+    });
+
+    const halt = await readFile(join(dir, HALT_MARKER), 'utf8');
+    expect(res).toBe('halted');
+    expect(halt).toContain('Review the completed rebase and restore any missing feature content.');
+    expect(halt).not.toContain('git rebase --continue');
   });
 
   // Task 12: Rekick call site ships capability-absent (fail-closed).
@@ -2079,6 +2398,100 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
     });
   });
 
+  it('emits every judged gate decision and mechanical re-verification on resume', async () => {
+    await initFeatureRepo(['1'], ['1']);
+    await advanceBaseWithCode();
+    const invalidated: Extract<ConductorEvent, { type: 'rebase_gate_invalidated' }>[] = [];
+    const preserved: Extract<ConductorEvent, { type: 'rebase_gate_preserved' }>[] = [];
+    const reverified: Extract<ConductorEvent, { type: 'rebase_gate_reverified' }>[] = [];
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') invalidated.push(event);
+    });
+    events.on('rebase_gate_preserved', (event) => {
+      if (event.type === 'rebase_gate_preserved') preserved.push(event);
+    });
+    events.on('rebase_gate_reverified', (event) => {
+      if (event.type === 'rebase_gate_reverified') reverified.push(event);
+    });
+
+    const res = await resumeRebaseFirst({
+      worktreePath: dir,
+      localBase: 'main',
+      events,
+      ranManualTest: true,
+      preVerify: async (step) => step === 'build' ? { done: true } : { done: false },
+    });
+
+    expect(res).toBe('rebased');
+    expect(invalidated).toEqual([
+      { type: 'rebase_gate_invalidated', gate: 'test_suite', matchedPaths: ['src/sibling.ts'] },
+      { type: 'rebase_gate_invalidated', gate: 'manual_test', matchedPaths: ['src/sibling.ts'] },
+    ]);
+    expect(preserved.map(({ gate, surface, deltaConsidered, basis }) => ({
+      gate, surface, deltaConsidered, basis,
+    }))).toEqual([
+      {
+        gate: 'coverage_binding',
+        surface: ['<all runtime source>'],
+        deltaConsidered: ['src/sibling.ts'],
+        basis: undefined,
+      },
+      { gate: 'build_review', surface: ['src/task-1.ts'], deltaConsidered: [], basis: undefined },
+      {
+        gate: 'prd_audit',
+        surface: ['<all runtime source>'],
+        deltaConsidered: ['src/sibling.ts'],
+        basis: undefined,
+      },
+      { gate: 'architecture_review_as_built', surface: ['src/task-1.ts'], deltaConsidered: [], basis: undefined },
+    ]);
+    expect(reverified).toEqual([
+      expect.objectContaining({ type: 'rebase_gate_reverified', step: 'build', skippedDispatch: true }),
+    ]);
+    const judgedGates = new Set([...invalidated, ...preserved].map(({ gate }) => gate));
+    expect(judgedGates.has('build')).toBe(false);
+    expect(judgedGates.size).toBe(invalidated.length + preserved.length);
+    expect(new Set(invalidated.map(({ gate }) => gate)).size).toBe(invalidated.length);
+    expect(new Set(preserved.map(({ gate }) => gate)).size).toBe(preserved.length);
+  });
+
+  it('inspects a budget-preserved test suite once and carries its basis into the preserved event', async () => {
+    await initFeatureRepo(['1', '2'], ['1', '2']);
+    await advanceBaseWithCode();
+    const inspect = vi.spyOn(FullSuiteVerifier.prototype, 'inspect').mockResolvedValue({
+      status: 'PRESERVED_WITHIN_BUDGET' as const,
+      evidence: {} as import('../../src/engine/full-suite-evidence.js').FullSuitePassEvidence,
+    });
+    const recordPreservation = vi.spyOn(FullSuiteVerifier.prototype, 'recordPreservation')
+      .mockResolvedValue(undefined);
+    const preserved: Array<{ gate: string; basis?: string }> = [];
+    events.on('rebase_gate_preserved', (event) => {
+      if (event.type !== 'rebase_gate_preserved') return;
+      preserved.push({ gate: event.gate, basis: event.basis });
+    });
+
+    try {
+      const res = await resumeRebaseFirst({
+        worktreePath: dir,
+        localBase: 'main',
+        events,
+        ranManualTest: false,
+      });
+
+      expect({ res, inspectCalls: inspect.mock.calls.length, recordCalls: recordPreservation.mock.calls.length, preserved }).toEqual({
+        res: 'rebased',
+        inspectCalls: 1,
+        recordCalls: 1,
+        preserved: expect.arrayContaining([
+          { gate: 'test_suite', basis: 'test_suite_drift_budget' },
+        ]),
+      });
+    } finally {
+      inspect.mockRestore();
+      recordPreservation.mockRestore();
+    }
+  });
+
   it('still invalidates the non-tree-attesting downstream gates on the same rebase', async () => {
     await initFeatureRepo(['1', '2'], ['1', '2']);
     await advanceBaseWithCode();
@@ -2089,11 +2502,6 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
       events,
       ranManualTest: false,
     });
-
-    // wiring_check is retained as a deprecated no-op, so rebasing no longer
-    // writes a verdict for it. Its stable step identity still lets existing
-    // state/config references resolve.
-    expect(await readVerdict(dir, 'wiring_check')).toBeNull();
 
     // build_review is 'feature-codetest': the base advance added src/sibling.ts,
     // which is outside the feature's surface and so cannot change the diff
@@ -2138,3 +2546,5 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
     expect(build?.kickback?.from).toBe('rebase');
   });
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

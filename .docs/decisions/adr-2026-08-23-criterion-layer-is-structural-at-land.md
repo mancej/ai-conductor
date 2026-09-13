@@ -87,9 +87,18 @@ Backwards compatibility at BUILD is a fixed requirement of this decision, not a 
 - `hasCoherenceTableDataRow` and the discovery-side coherence check are **not** modified. A merged
   spec carrying zero `criterion` rows remains a valid coherence artifact at discovery and continues
   to build.
+
+> **Amended 2026-08-26 by #1881:** the requirement's intent is behavioral — a merged spec valid at
+> discovery stays valid and keeps building — not the preservation of `hasCoherenceTableDataRow`
+> itself. `adr-2026-08-26-shared-coherence-parser-at-discovery` deletes that bespoke predicate and
+> routes discovery through the shared `parseCoherenceArtifact` (shape-only, change-set-free, no
+> layer strictness), because the two predicates' acceptance sets diverged and stranded a merged
+> spec (#1881). The zero-`criterion`-rows invariant is preserved and remains pinned by test.
 - No BUILD or SHIP consumer may require a `criterion` row. `prd_audit` already reads the mapping
   conditionally ("where a committed coherence mapping exists"), and that tolerance is preserved.
 - All added strictness lives inside `runCoherenceGate`, which runs only at `landSpec`.
+
+> **Amended 2026-08-31 by #2088:** strictness on the criterion layer's *shape and grounding* stays inside `runCoherenceGate` at `landSpec` exactly as ruled, and `runCoherenceGate` now also engages that single layer at tier S over the plan-carried criterion rows (`adr-2026-08-31-coverage-binding-judge-step` D3). One BUILD consumer is added by that ADR's D4: the config-gated, default-off `coverage_binding` step *reads* criterion claims where present and judges their binding. It requires nothing — a merged spec with zero `criterion` rows and an S plan with no table both pass it — so the zero-`criterion`-rows invariant and the "no BUILD or SHIP consumer may require a `criterion` row" rule are preserved.
 
 ## Consequences
 

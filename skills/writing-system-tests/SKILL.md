@@ -251,8 +251,8 @@ Use `acceptance-system-spec` only when this is a distinct multi-step externally 
 that cannot be proven below; otherwise assign a specific lower-layer behavioral test. The test
 must fail if the entry point is still wired to the OLD behavior.
 
-- Identify the real entry point from the story/plan ("when `runEngineerMode` processes an
-  idea…"), not the new symbol ("when `runAuthoring` is called…").
+- Identify the real entry point from the story/plan ("when `dispatchEngineer({ kind: 'land' })`
+  lands a spec…"), not the new helper symbol ("when `landSpec` is called…").
 - Assert the side effect, not the return value of the new unit.
 - Pair with the `/pipeline` batch gate that greps the superseded symbol for zero non-test
   callers: the acceptance test proves the new path runs; the grep proves the old one is gone.
@@ -409,7 +409,12 @@ verify outcome). Neither duplicates the other.
 - Every generated spec must declare feature coverage in a leading comment line. Where the active
   stories or plan are available, use resolvable `Covers: S<n>.<m>[, task:<id>]` markers (technical
   and product tracks alike); the marker must name a criterion in the active stories or a task in the
-  active plan. On the product track, also retain `Covers: FR-N[, FR-M]` for PRD coverage reporting.
+  active plan. Criterion ids are positional: `S<n>.<m>` is the m-th Given/When/Then bullet of Story n,
+  counting happy-path bullets first and then negative-path bullets — story files never carry literal
+  ids. On the product track, also retain `Covers: FR-N[, FR-M]` for PRD coverage reporting.
+  The generated marker must be introduced or updated in the active feature diff. An unchanged bare
+  marker inherited from the review base remains owned by the earlier feature and cannot authorize
+  an active-plan task or criterion merely because its ordinal collides.
   Do not use a test path as a substitute for a Covers marker.
 
 **Helpers:** Create shared request helpers (e.g. response-body parsing and auth-header
@@ -453,19 +458,10 @@ SUITE "Authentication" (driven through a real UI driver):
 
 ### 6. Run and Verify RED (Generated or Copied Acceptance/System Specs)
 
-Run the acceptance suite using the project's test runner against its acceptance directory.
-Examples (use whatever the project actually uses):
-
-```bash
-# Ruby + RSpec
-bundle exec rspec spec/integration/        # or spec/system/
-# Python + pytest
-pytest tests/integration/                  # or tests/e2e/
-# JS/TS
-npm test -- test/integration               # or test/e2e
-# Go
-go test ./... -run Integration
-```
+Run only the generated or copied specs needed to establish this feature's RED evidence through
+`ai-conductor scoped-run <selectors...>`. Select the specific spec files; do not run the whole
+acceptance directory or a full/aggregate suite. The `test_suite` step owns configured suite
+verification after implementation.
 
 Confirm tests fail for the **right reasons**. This is critical:
 
@@ -487,7 +483,7 @@ not a failing test. Two rules follow:
 
 - **Run the command that actually includes the new specs.** Never scope the RED run to a unit-only
   subset (e.g. `pytest tests/` when the specs live under `spec/integration/`, or `npm test -- test/unit`).
-  Run against the directory the specs were written to.
+  Select the generated or copied spec files themselves.
 - **Bring up the infrastructure the specs need** (containers, DB, Redis, services, env) so they
   execute and FAIL for the right reason. A spec that only runs in CI but is skipped locally/in the
   daemon is a gate hole: the build will be declared GREEN while the specs never ran, and CI (which

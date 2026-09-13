@@ -27,6 +27,14 @@ Documentation-only requests are delivered from `/explore`. Keep tests for machin
 only when they assert generated or runtime behavior (for example OpenAPI contracts or generated
 repository-harness functionality), never prose shape.
 
+### Suite-failure repair
+
+When BUILD returns after `test_suite` fails, read the engine's retry diagnostics and
+referenced `.pipeline/test-suite-evidence.json`, and include the relevant failure evidence
+in RED/GREEN dispatches. Repair and verify the affected tests through
+`ai-conductor scoped-run <selectors...>`, then commit. Leave aggregate re-verification to
+`test_suite`; a scoped PASS does not establish an aggregate PASS.
+
 ## Practices
 
 ### The Cycle
@@ -87,17 +95,10 @@ coverage, and need no RED of their own.
 **Agent:** Generator (test-files-only context).
 **Goal:** Write exactly one failing test that captures the next behavior.
 
-**Advisory model selection:** Before dispatching RED or GREEN, read
-`.ai-conductor/config.yml`. If `steps.build.tdd.red.model` or
-`steps.build.tdd.green.model` is configured, dispatch that phase's generator with the
-configured `model`. The config validator guarantees the model belongs to the selected
-`llm_provider`'s native family. If a phase is not configured, retain the build session's
-normal model. This is an orchestration instruction, not a separate conductor step.
-
 1. Choose the next acceptance criterion from the plan (or the most obvious next behavior)
 2. Write one test with one assertion
 3. The agent derives selectors, retains the test under change as an expected failing member,
-   and runs the scoped union of affected tests through `conduct-ts scoped-run <selectors...>`
+   and runs the scoped union of affected tests through `ai-conductor scoped-run <selectors...>`
 4. Confirm that the test under change fails for the expected reason and every
    other affected test passes
 5. Paste the expected failure output
@@ -105,8 +106,9 @@ normal model. This is an orchestration instruction, not a separate conductor ste
 Any unrelated scoped test failure blocks the current RED phase; fix that
 failure before proceeding to DOMAIN. If one of the repository's documented
 intermediate fallback triggers makes the affected set genuinely unsafe, name
-the exact trigger and reason and invoke the configured aggregate verifier.
-Never call a raw project aggregate command directly.
+the exact trigger and reason and defer aggregate proof to the engine's
+dedicated aggregate gate. Never run the full suite — or any aggregate
+command — inside this session.
 
 **Rules:**
 - One test, one behavior, one assertion
@@ -117,11 +119,15 @@ Never call a raw project aggregate command directly.
   changes carries a leading comment line binding it to the active feature, using the same marker
   contract as `/writing-system-tests`: a criterion in the active stories (`Covers: S<n>.<m>`), a
   task in the active plan (`Covers: task:<id>`), or — product track — a PRD requirement
-  (`Covers: FR-N`). Markers are resolvable only against the feature's own stories and plan; the
+  (`Covers: FR-N`). Criterion ids are positional — `S<n>.<m>` names the m-th Given/When/Then bullet
+  of Story n, happy-path bullets before negative-path ones; story files carry no literal ids.
+  Add or update the marker in the current feature diff; an unchanged marker inherited from the
+  review base belongs to its earlier feature and is not current-feature authority, even when its
+  bare ordinal happens to resolve in the active plan. Markers are resolvable only against the feature's own stories and plan; the
   build_review test-quality rubric scopes itself to changed tests with a resolvable `Covers:`
   binding, so a changed test without one is invisible to that review and the rubric passes
-  vacuously. A file-level marker listing every covered id is sufficient; keep it current when the
-  cycle extends an existing test file.
+  vacuously. A file-level marker listing every covered id is sufficient; update it in the same
+  feature when the cycle extends an existing test file so the diff establishes feature ownership.
 
 **If the test passes immediately:** The behavior already exists. Either the test is wrong
 (testing something already implemented) or the criterion is already met. Investigate — don't
@@ -144,8 +150,7 @@ production call site of any security/correctness derivation, with real adversari
 
 ### Phase 3: GREEN
 
-**Agent:** Generator (source-files-only context) — use
-`steps.build.tdd.green.model` when configured (see RED's advisory model selection rule).
+**Agent:** Generator (source-files-only context).
 **Goal:** Write the smallest behavior-complete code change that makes the failing test pass and
 conforms to the applicable recorded basis.
 
@@ -160,13 +165,14 @@ conforms to the applicable recorded basis.
    when no applicable basis exists, no pattern conformance is required.
 3. Write the smallest behavior-complete code change to pass the test
 4. Run the test — **watch it pass**
-5. The agent derives the selectors for the affected/scoped test set (the task's own tests + the files this change touches) and runs `conduct-ts scoped-run <selectors...>`. The dedicated pre-SHIP gate and CI own broad verification, not each TDD cycle.
+5. The agent derives the selectors for the affected/scoped test set (the task's own tests + the files this change touches) and runs `ai-conductor scoped-run <selectors...>`. The dedicated pre-SHIP gate and CI own broad verification, not each TDD cycle.
 
 A known failure in that scoped set blocks the current GREEN phase; fix it here
 rather than deferring it to a later gate. If one of the repository's documented
 intermediate fallback triggers makes the affected set genuinely unsafe, name
-the exact trigger and invoke the configured aggregate verifier. Never call a
-raw project aggregate command directly.
+the exact trigger and defer aggregate proof to the engine's dedicated
+aggregate gate. Never run the full suite — or any aggregate command —
+inside this session.
 
 **Rules:**
 - The smallest behavior-complete change must conform to an applicable recorded basis; a passing
@@ -255,7 +261,15 @@ inputs without failing open or closed). Has veto authority to send back to GREEN
    Refactor commits within the same task also carry the same Task: <id> so the task
    is atomically marked complete when the final commit lands.
 
-8. **Commit only to the current feature branch — never integrate upstream.** Do NOT run
+9. **Cross-boundary integration proved by its owning task.** When the current task owns a
+   cross-boundary integration check under `/plan` §3d, a test (new or existing) must exercise the
+   changed behavior through the appropriate project entry point named by that check—for example a
+   public API or route, CLI, job or worker, event consumer, framework hook, or application-service
+   boundary. A direct helper test alone cannot close that task. Tasks that do not own a changed
+   boundary remain at the lowest sufficient test layer; production-file count does not create
+   integration-test obligations.
+
+10. **Commit only to the current feature branch — never integrate upstream.** Do NOT run
    `git fetch`, `git pull`, `git rebase`, or switch branches during the cycle. Mid-build
    rebase onto a moved `origin/<default>` rewrites history under active work. The only
    sanctioned rebases are the daemon's finish-time rebase-onto-latest and the `/rebase`
@@ -306,7 +320,7 @@ Each empty commit carries `Task: <id>` (the task ID) plus `Evidence: satisfied-b
 `Evidence: skipped <reason>` (the evidence form). The conductor recognizes these commits and
 marks the task `completed` without requiring ordinary code changes. This enables honest tracking:
 a task that "completes" via verification is marked differently from one that completes via code
-delivery, supporting retro analysis and pipeline audits.
+delivery, supporting pipeline audits.
 
 ### Memory Checkpoint (Per-Cycle, Conditional)
 
@@ -370,7 +384,7 @@ focused and token-efficient. In Claude Code, this applies to Agent tool dispatch
 **Context budget rules:**
 - **Provide file paths and metadata, not full contents.** Give subagents file paths, line
   counts, and key method names/signatures. Subagents read files themselves — copying full
-  file contents into prompts wastes tokens (40-50K per feature observed in retros).
+  file contents into prompts wastes tokens (40-50K per feature observed in prior runs).
 - **For domain review: inline the diff only.** Paste the specific new/changed code (the diff)
   into the domain reviewer prompt — this is typically small (<50 lines). Do NOT inline entire files.
 - **Name domain types that exist** (e.g., "Domain types: Contact, Tag, ContactTag") so the
@@ -434,6 +448,8 @@ exact replication still follows its full delta cycle and required scoped verific
 - [ ] Linter passes before commit
 - [ ] Type-check passes before commit (typed stacks — run as the Phase 4 pre-check; skipped for stacks with no compile step)
 - [ ] Working tree clean at commit
+- [ ] Any cross-boundary integration check owned by this task is proven through the appropriate
+      project entry point, not only by a helper-level unit test
 - [ ] One behavior per cycle (not multiple changes lumped together)
 - [ ] Every new/changed test file carries a resolvable `Covers:` marker bound to the active
       feature's stories or plan (build_review test-quality scope)

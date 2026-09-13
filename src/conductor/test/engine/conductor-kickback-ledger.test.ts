@@ -13,8 +13,7 @@ import {
   KICKBACK_LEDGER_PATH,
   MAX_CUMULATIVE_KICKBACKS_BUILD_REVIEW,
   readKickbackLedger,
-  writeKickbackLedger,
-} from '../../src/engine/kickback-ledger.js';
+  } from '../../src/engine/kickback-ledger.js';
 import { RUBRIC_FAILURE_DETAIL_CAP_BYTES } from '../../src/engine/step-runners.js';
 import { HALT_MARKER, readHaltClass } from '../../src/engine/halt-marker.js';
 import { writeState } from '../../src/engine/state.js';
@@ -58,8 +57,8 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
       track: 'technical',
       worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
       conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
-      architecture_review: 'skipped', acceptance_specs: 'skipped', build: 'done',
-      wiring_check: 'skipped', test_suite: 'done',
+      architecture_review: 'skipped', acceptance_specs: 'skipped', coverage_binding: 'done', build: 'done',
+       test_suite: 'done',
     });
 
     const runner: StepRunner = {
@@ -112,9 +111,9 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
       architecture_diagram: 'skipped',
       architecture_review: 'skipped',
       acceptance_specs: 'skipped',
+      coverage_binding: 'done',
       build: 'done',
-      wiring_check: 'skipped',
-      test_suite: 'done',
+       test_suite: 'done',
     });
 
     const runner: StepRunner = {
@@ -322,7 +321,10 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
 
       await settleBuildReview('PASS');
 
-      expect((await readKickbackLedger(dir)).gates.build_review).toEqual(initialEntry);
+      expect((await readKickbackLedger(dir)).gates.build_review).toEqual({
+        ...initialEntry,
+        chargedEffectIds: [],
+      });
     });
   });
 
@@ -355,8 +357,8 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
       track: 'technical',
       worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
       conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
-      architecture_review: 'skipped', acceptance_specs: 'skipped',
-      wiring_check: 'skipped', test_suite: 'done',
+      architecture_review: 'skipped', acceptance_specs: 'skipped', coverage_binding: 'done',
+       test_suite: 'done',
     });
     const calls: string[] = [];
     const runner: StepRunner = {
@@ -403,8 +405,8 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
       track: 'technical',
       worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
       conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
-      architecture_review: 'skipped', acceptance_specs: 'skipped',
-      wiring_check: 'skipped', test_suite: 'done',
+      architecture_review: 'skipped', acceptance_specs: 'skipped', coverage_binding: 'done',
+       test_suite: 'done',
     });
     await writeKickbackLedger(dir, {
       version: 1,
@@ -487,8 +489,8 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
         track: 'technical',
         worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
         conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
-        architecture_review: 'skipped', acceptance_specs: 'skipped', build: 'done',
-        wiring_check: 'skipped', test_suite: 'done',
+        architecture_review: 'skipped', acceptance_specs: 'skipped', coverage_binding: 'done', build: 'done',
+         test_suite: 'done',
       });
       await writeKickbackLedger(dir, { version: 1, gates: { build_review: initialEntry } });
 
@@ -523,7 +525,7 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
     const failEntry = await runVerdict('FAIL');
 
     expect([passEntry, failEntry]).toEqual([
-      initialEntry,
+      { ...initialEntry, chargedEffectIds: [] },
       expect.objectContaining({ cumulative: initialEntry.cumulative + 1 }),
     ]);
   });
@@ -852,8 +854,8 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
         track: 'technical',
         worktree: 'done', memory: 'done', explore: 'done', prd: 'done', stories: 'done',
         conflict_check: 'skipped', plan: 'done', architecture_diagram: 'skipped',
-        architecture_review: 'skipped', acceptance_specs: 'skipped',
-        wiring_check: 'skipped', test_suite: 'done',
+        architecture_review: 'skipped', acceptance_specs: 'skipped', coverage_binding: 'done',
+         test_suite: 'done',
       });
       await writeFile(join(dir, '.pipeline/task-status.json'), JSON.stringify({
         tasks: Array.from({ length: lap }, (_, id) => ({ id: `t${id}`, status: 'completed' })),
@@ -900,3 +902,5 @@ describe('conductor kickback ledger lifecycle (Task 7, #984)', () => {
     expect(otherGateKickback.cumulativeCount).toBeUndefined();
   });
 });
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

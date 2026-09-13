@@ -66,10 +66,26 @@ a single set of Docker services. See Step 1c for the `.env` boundary pattern tha
 
 For every bootstrap mode, confirm the project is a git repository before continuing:
 `git rev-parse --is-inside-work-tree`. If it is not, initialize it with `git init -b main`
-as described in Step 1b. Then invoke the deterministic, idempotent project-config writer:
+as described in Step 1b. Then invoke the deterministic, idempotent project-config writer. In
+interactive mode, ask:
+
+1. "Which test-suite verification mode should this project use: `aggregate` (run the full suite) or
+   `scoped` (run the configured scoped command for selected tests)?" Pass the answer as
+   `--test-suite-mode <aggregate|scoped>`.
+2. "Which drift-budget preset should this project use: `strict` (no tolerated drift) or `tolerant`
+   (up to 20 source paths and unlimited additional inputs)?" Pass the answer as
+   `--test-suite-drift-budget <strict|tolerant>`.
+
+Use both answers when invoking the writer:
 
 ```bash
-conduct-ts config init
+ai-conductor config init --test-suite-mode <aggregate|scoped> --test-suite-drift-budget <strict|tolerant>
+```
+
+In auto mode, do not prompt; record the strict preset with aggregate verification:
+
+```bash
+ai-conductor config init --test-suite-mode aggregate --test-suite-drift-budget strict
 ```
 
 Never hand-author `.ai-conductor/config.yml` and never copy a config from the harness checkout.
@@ -159,7 +175,7 @@ sections for Node projects). If `.claudeignore` already exists, do NOT overwrite
 Copy `templates/pull_request_template.md` to `.github/pull_request_template.md`.
 Create `.github/` directory if it doesn't exist. If a PR template already exists, do NOT overwrite.
 The template contains `[feature_description]`, `[story_count]`, and `[branch]` placeholders
-that `conduct` fills in when creating the PR after retro.
+that `conduct` fills in when creating the PR.
 
 ### 3d. Generate Claude Code Settings
 
@@ -254,7 +270,8 @@ This step performs a **structural scan only** — file counts, directory layout,
 **Skip for new/fresh projects.** Build an inventory:
 
 - **Codebase:** models, controllers, services, jobs — count source and test files
-- **Test coverage:** run suite, identify files with NO specs
+- **Test coverage:** inspect test files and existing coverage reports; identify files with no specs
+  without executing tests. The `test_suite` step owns configured suite verification.
 - **Architecture:** routes, patterns (service objects, concerns), auth approach, existing docs
 - **In-flight work:** open PRs/issues (`gh pr list`, `gh issue list`), TODO comments
 - **Git history:** `git log --oneline -20`, `git shortlog -sn --no-merges`
@@ -294,7 +311,7 @@ background jobs, key architecture-shaping libraries.
 
 ### 5. Set Up Project Directories
 
-**`.memory/` is set up by the harness, not by this skill.** `conduct-ts memory setup <dir>`
+**`.memory/` is set up by the harness, not by this skill.** `ai-conductor memory setup <dir>`
 runs before any bootstrap sub-step. This creates a canonical
 per-project store at `~/.ai-conductor/memory/<key>/harness/` and makes `.memory/` a symlink to
 it (adr-2026-06-29-shared-memory-store-placement-and-durability). If `.memory/` already exists as a real directory (legacy), it is migrated via
@@ -302,7 +319,7 @@ copy-verify-swap before the symlink is created (adr-2026-06-29-safe-reversible-m
 yourself** — it will already be a symlink when this skill runs.
 
 Create if missing (idempotent): `.pipeline/` (audit-trail/), `.worktrees/`, `.docs/` (specs/,
-complexity/, stories/, conflicts/, architecture/, decisions/, plans/, retros/, intake/). These
+complexity/, stories/, conflicts/, architecture/, decisions/, plans/, intake/). These
 are the full set of `.docs/` subdirectories the conductor and daemon read/write across the SDLC
 — keep this list in parity with them.
 
@@ -480,7 +497,7 @@ a real failure and must be surfaced.
 ## Verification
 
 - [ ] Bootstrap mode correctly determined
-- [ ] Project config initialized via `conduct-ts config init` after git exists
+- [ ] Project config initialized via `ai-conductor config init` after git exists
 - [ ] Project type detected from file indicators
 - [ ] Tech-context loaded if matching stack found
 - [ ] Existing code analyzed with inventory presented (if existing project)

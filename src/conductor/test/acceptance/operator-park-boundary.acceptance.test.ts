@@ -1,3 +1,4 @@
+// Covers: task:3, task:4
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,17 +9,30 @@ import {
   type ConductorOptions,
   type StepRunner,
 } from '../../src/engine/conductor.js';
-import { runDaemon, type DaemonDeps, type FeatureOutcome } from '../../src/engine/daemon.js';
+import {
+  pickEligible,
+  runDaemon,
+  type DaemonDeps,
+  type FeatureOutcome,
+} from '../../src/engine/daemon.js';
+import { isHalted } from '../../src/engine/daemon-deps.js';
 import {
   makeRunFeature,
   type FeatureRunnerDeps,
 } from '../../src/engine/daemon-runner.js';
+import {
+  listHaltedWorktrees,
+  readHaltReason,
+  rekickSweep,
+} from '../../src/engine/daemon-rekick.js';
+import { readHaltClass, writeHaltMarker } from '../../src/engine/halt-marker.js';
 import { readState, writeState } from '../../src/engine/state.js';
 import { ALL_STEPS, STEP_GROUPS } from '../../src/engine/steps.js';
 import type { ConductState, StepName } from '../../src/types/index.js';
 import type { HarnessConfig } from '../../src/types/config.js';
 import { ConductorEventEmitter } from '../../src/ui/events.js';
 import { renderReport } from '../../src/engine/report-renderer.js';
+import { InMemoryWorkClaims } from '../../src/engine/work-claims.js';
 
 const FEATURE_SLUG = 'boundary-aware-operator-parking';
 
@@ -110,6 +124,93 @@ afterEach(async () => {
 });
 
 describe('boundary-aware operator parking acceptance', () => {
+  it('Task 3: returns a boundary-parked worktree to selection after its operator park is cleared', async () => {
+    const worktreeBase = await makeRoot('operator-park-selection-');
+    const worktreeRoot = join(worktreeBase, FEATURE_SLUG);
+    await mkdir(worktreeRoot, { recursive: true });
+    const statePath = join(worktreeRoot, 'conduct-state.json');
+    await seedPending(statePath, ['memory', 'explore']);
+
+    let parked = false;
+    const conductor = makeConductor(
+      worktreeRoot,
+      statePath,
+      {
+        run: vi.fn(async () => {
+          parked = true;
+          return { success: true };
+        }),
+      },
+      { operatorParkBoundary: async () => parked },
+    );
+
+    const termination = await conductor.run() as unknown as OperatorParkedTermination;
+    const claims = new InMemoryWorkClaims();
+    claims.park(FEATURE_SLUG);
+    const selected = await pickEligible(
+      { items: [{ slug: FEATURE_SLUG, tier: 'M', track: 'technical' }] },
+      {
+        claims,
+        isHalted: (slug) => isHalted(worktreeBase, slug),
+        isParked: async () => false,
+      },
+    );
+
+    expect(termination).toMatchObject({
+      kind: 'operator-parked',
+      boundary: { kind: 'step', name: 'memory' },
+    });
+    expect(selected?.slug).toBe(FEATURE_SLUG);
+  });
+
+  it('Task 4: keeps a needs-human halted worktree excluded after its operator park is cleared', async () => {
+    const worktreeBase = await makeRoot('operator-park-needs-human-');
+    const worktreeRoot = join(worktreeBase, FEATURE_SLUG);
+    await mkdir(worktreeRoot, { recursive: true });
+    await writeHaltMarker(
+      worktreeRoot,
+      'markerless daemon exit requires operator attention\n',
+      'needs-human',
+    );
+
+    const claims = new InMemoryWorkClaims();
+    claims.park(FEATURE_SLUG);
+    const selected = await pickEligible(
+      { items: [{ slug: FEATURE_SLUG, tier: 'M', track: 'technical' }] },
+      {
+        claims,
+        isHalted: (slug) => isHalted(worktreeBase, slug),
+        isParked: async () => false,
+      },
+    );
+    const log: string[] = [];
+    const abortRebase = vi.fn(async () => {});
+    const clearMarker = vi.fn(async () => {});
+    const sweep = await rekickSweep(
+      {
+        listHaltedWorktrees: () => listHaltedWorktrees(worktreeBase),
+        readHaltReason: (slug) => readHaltReason(worktreeBase, slug),
+        readHaltClass: (slug) => readHaltClass(join(worktreeBase, slug)),
+        // Git is a third-party boundary here; this fixture has no rebase.
+        hasRebaseInProgress: async () => false,
+        abortRebase,
+        clearMarker,
+        lastRekickSha: new Map(),
+        log: (line) => log.push(line),
+      },
+      'a'.repeat(40),
+    );
+
+    expect(selected).toBeUndefined();
+    expect(sweep.skipped).toContain(FEATURE_SLUG);
+    expect(sweep.cleared).not.toContain(FEATURE_SLUG);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(clearMarker).not.toHaveBeenCalled();
+    expect(log).toContain(
+      `re-kick ${FEATURE_SLUG}: skipped — halt disposition needs-human (markerless daemon exit requires operator attention)`,
+    );
+  });
+
   it('FR-1/FR-3/FR-4/FR-10: drains one serial step, persists its normal result, and stops before the next step', async () => {
     const root = await makeRoot('operator-park-serial-');
     const statePath = join(root, 'conduct-state.json');
@@ -221,7 +322,7 @@ describe('boundary-aware operator parking acceptance', () => {
     });
   });
 
-  it('FR-8: inventories configured, SHIP, and deterministic BUILD groups through the shared scheduler registry', () => {
+  it('FR-8: inventories configured and SHIP groups through the shared scheduler registry', () => {
     const groups = Object.values(STEP_GROUPS).map((group) => group.members);
 
     expect(groups).toContainEqual([
@@ -229,7 +330,6 @@ describe('boundary-aware operator parking acceptance', () => {
       'prd_audit',
       'architecture_review_as_built',
     ]);
-    expect(groups).toContainEqual(['wiring_check', 'test_suite']);
   });
 
   it.each([
@@ -253,21 +353,6 @@ describe('boundary-aware operator parking acceptance', () => {
       ] as StepName[],
       expectedGroup: 'validation',
       later: 'rebase' as StepName,
-    },
-    {
-      label: 'BUILD',
-      pending: [
-        'wiring_check',
-        'test_suite',
-        'build_review',
-      ] as StepName[],
-      expectedMembers: ['wiring_check', 'test_suite'] as StepName[],
-      // wiring_check is a deprecated no-op: it is still a group member and
-      // still settles 'done' at the join, but it settles in-process and never
-      // reaches a dispatch.
-      expectedCalls: ['test_suite'] as StepName[],
-      expectedGroup: 'build_verification',
-      later: 'build_review' as StepName,
     },
   ])('FR-8: $label built-in group joins before the accepted park boundary', async ({
     pending,
@@ -498,11 +583,11 @@ describe('boundary-aware operator parking acceptance', () => {
       'conflict_check',
       'plan',
       'coherence_check',
+      'coverage_binding',
     ];
     for (const step of resolvedBeforeBuild) state[step] = 'done';
     state.acceptance_specs = 'failed';
     state.build = 'stale';
-    state.wiring_check = 'skipped';
     await writeState(statePath, state);
 
     const calls: StepName[] = [];
@@ -523,7 +608,6 @@ describe('boundary-aware operator parking acceptance', () => {
     expect(calls[0]).toBe('acceptance_specs');
     expect(calls).toContain('build');
     expect(calls).not.toContain('memory');
-    expect(calls).not.toContain('wiring_check');
   });
 
   it('FR-9: an interactive run ignores the same repo-root park marker and preserves its ordinary sequence', async () => {

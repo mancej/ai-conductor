@@ -1,0 +1,192 @@
+// Covers: task:4
+
+import type { CriterionCoherenceRow } from '../../src/engine/coherence-parse.js';
+
+/**
+ * Regression corpus for the retired discovery predicate and the shared
+ * coherence parser. Both parser- and discovery-level tests consume this file
+ * so their acceptance boundary cannot silently diverge.
+ */
+export interface CoherenceCorpusFixture {
+  slug: string;
+  name: string;
+  content: string | null;
+  oracleAccepted: boolean;
+  parserAccepted: boolean;
+  /**
+   * The pre-correction parse shape for every accepted six-cell criterion row.
+   * Keeping it in the shared corpus makes the parser's compatibility promise
+   * visible to every consumer of these fixtures.
+   */
+  sixCellCriterionRows?: readonly CriterionCoherenceRow[];
+  /**
+   * A seven-cell failing criterion row paired with a six-cell corpus shape.
+   * Consumers that do not adjudicate corrections must treat it identically.
+   */
+  sevenCellFailCriterionTable?: string;
+}
+
+// Retired discovery predicate, copied verbatim from daemon-backlog.ts before
+// the shared parser replaced it. It remains test-only regression evidence.
+export function retiredHasCoherenceTableDataRow(content: string | null): boolean {
+  if (content === null || content.trim().length === 0) return false;
+
+  const rows = content.split(/\r?\n/).map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) return null;
+    return trimmed
+      .slice(1, -1)
+      .split('|')
+      .map((cell) => cell.trim());
+  });
+
+  for (let index = 0; index + 2 < rows.length; index += 1) {
+    const header = rows[index];
+    const separator = rows[index + 1];
+    const data = rows[index + 2];
+    if (
+      header === null ||
+      separator === null ||
+      data === null ||
+      header.length === 0 ||
+      header.length !== separator.length ||
+      data.length === 0 ||
+      !separator.every((cell) => /^:?-{2,}:?$/.test(cell))
+    ) {
+      continue;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+export const coherenceRegressionCorpus: readonly CoherenceCorpusFixture[] = [
+  {
+    slug: 'minimal-valid-table',
+    name: 'minimal valid table',
+    content: `| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| task | task:6 | story:2 | covered | fixture |
+`,
+    oracleAccepted: true,
+    parserAccepted: true,
+  },
+  {
+    slug: 'ragged-mixed-rows',
+    name: 'ragged mixed legacy and criterion rows',
+    content: `| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| task | task:6 | story:2 | covered | fixture |
+| criterion | Given a fixture | task:6 | covered | fixture | diff-local |
+`,
+    oracleAccepted: true,
+    parserAccepted: true,
+    sixCellCriterionRows: [
+      {
+        rowClass: 'criterion',
+        criterion: 'Given a fixture',
+        citedIds: ['task:6'],
+        verdict: 'covered',
+        quote: 'fixture',
+        disposition: 'diff-local',
+      },
+    ],
+    sevenCellFailCriterionTable: `| Row Class | Criterion | Cited Task Ids | Verdict | Quote | Disposition | Correction |
+| --- | --- | --- | --- | --- | --- |
+| criterion | Given a fixture | task:6 | fail | fixture | diff-local | plan |
+`,
+  },
+  {
+    slug: 'five-wide-header-criterion',
+    name: 'five-wide header over six-wide separator and criterion row',
+    content: `| Row Class | Criterion | Cited Task Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- | --- |
+| criterion | Given a fixture | task:6 | covered | fixture | diff-local |
+`,
+    oracleAccepted: false,
+    parserAccepted: true,
+    sixCellCriterionRows: [
+      {
+        rowClass: 'criterion',
+        criterion: 'Given a fixture',
+        citedIds: ['task:6'],
+        verdict: 'covered',
+        quote: 'fixture',
+        disposition: 'diff-local',
+      },
+    ],
+  },
+  {
+    slug: 'six-wide-header-legacy',
+    name: 'six-wide header over five-wide separator and legacy row',
+    content: `| Row Class | Id | Cited Ids | Verdict | Quote | Disposition |
+| --- | --- | --- | --- | --- |
+| task | task:6 | story:2 | covered | fixture |
+`,
+    oracleAccepted: false,
+    parserAccepted: true,
+  },
+  {
+    slug: 'zero-criterion-legacy',
+    name: 'zero-criterion legacy artifact',
+    content: `| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| outcome | outcome:1 | fr:1 | covered | fixture |
+| fr | fr:1 | story:2 | covered | fixture |
+| story | story:2 | task:6 | covered | fixture |
+| task | task:6 | story:2 | covered | fixture |
+| adr | adr-2026-08-26-example | task:6 | covered | fixture |
+`,
+    oracleAccepted: true,
+    parserAccepted: true,
+  },
+  {
+    // Real shipped-artifact shape: accepted trailing prose after the mapping
+    // table must not change the artifact's acceptance.
+    slug: 'decide-artifact-coherence-check',
+    name: 'shipped second-table artifact',
+    content: `| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| task | task:6 | story:2 | covered | fixture |
+
+| Decision | Status |
+| --- | --- |
+| coherence parser | accepted |
+`,
+    oracleAccepted: true,
+    parserAccepted: true,
+  },
+  {
+    slug: 'two-mapping-tables',
+    name: 'two mapping tables',
+    content: `| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| story | story:1 | outcome:1 | covered | fixture |
+
+| Row Class | Id | Cited Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- |
+| task | task:2 | story:1 | covered | fixture |
+`,
+    oracleAccepted: true,
+    parserAccepted: true,
+  },
+  {
+    slug: 'stranded-mapping-row',
+    name: 'stranded mapping row in prose table',
+    content: `| Row Class | Criterion | Cited Task Ids | Verdict | Quote |
+| --- | --- | --- | --- | --- | --- |
+| criterion | Given a fixture | task:6 | covered | fixture | diff-local |
+
+| Topic | Notes |
+| --- | --- | --- |
+| Follow-up | This is ordinary prose. |
+| task | task:2 | story:1 | covered | fixture |
+`,
+    oracleAccepted: false,
+    parserAccepted: false,
+  },
+  { slug: 'absent-artifact', name: 'absent artifact', content: null, oracleAccepted: false, parserAccepted: false },
+  { slug: 'empty-artifact', name: 'empty artifact', content: ' \t\n ', oracleAccepted: false, parserAccepted: false },
+  { slug: 'table-less-content', name: 'table-less content', content: '# Coherence\n\nNo table here.\n', oracleAccepted: false, parserAccepted: false },
+];

@@ -33,23 +33,25 @@
 //      branch is the worktree's branch — never deleted here.
 
 import { access, readdir, readFile } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { TargetPathMissingError } from './target.js';
 import { AuthoringGuard } from './authoring-guard.js';
-import { slugify } from './authoring.js';
+import { slugify } from './spec-branch.js';
 import {
   adrApprovalStatus,
+  isCanonicalAdrFilename,
   isStoriesApproved,
   featureArtifactPatternsAreRecursive,
+  parseAdrDecisions,
   parseComplexityTier,
   parseTrack,
   planStem,
   validateFeatureArtifactStems,
 } from '../artifacts.js';
 import type { ComplexityTier, StepName, Track } from '../../types/index.js';
-import { deriveDefaultBranch } from './authoring.js';
+import { deriveDefaultBranch } from './spec-branch.js';
 import { withEngineCommitEnv } from '../engine-commit-env.js';
 import { writeIntakeMarker } from './intake-marker.js';
 import {
@@ -59,10 +61,17 @@ import {
 } from './outcome-staging.js';
 import { runCoherenceGate } from './coherence-validator.js';
 import { resolveDaemonOwner, type OwnerConfig, type GhRunner } from '../owner-gate/identity.js';
-import { checkDiagramsForFile, defaultRenderDeps, type RenderDeps } from '../mermaid-renderer.js';
+import {
+  checkDiagramsForFile,
+  defaultRenderDeps,
+  extractMermaidBlocks,
+  type RenderDeps,
+} from '../mermaid-renderer.js';
 import { resolvePlanStoriesPath } from '../plan-stories-reference.js';
 import { scanPlanProtectedTargets } from '../plan-protected-targets.js';
 import { validatePlanDoneWhen } from '../plan-done-when.js';
+import { PLAN_TASK_HARD_STOP_BOUNDARY, validatePlanTaskCount } from '../plan-task-count.js';
+import { composeSpecCommitMessage } from './spec-commit-message.js';
 
 const execFile = promisify(execFileCb);
 
@@ -131,7 +140,7 @@ export async function landSpec(
   } catch {
     throw new Error(
       `landSpec: per-idea worktree "${worktreePath}" does not exist. ` +
-        'Create the worktree (conduct-ts engineer worktree) before landing — landSpec never ' +
+        'Create the worktree (ai-conductor compose worktree) before landing — landSpec never ' +
         'falls back to the primary checkout.',
     );
   }
@@ -216,8 +225,10 @@ export async function landSpec(
   // and have no PRD. Track is read from `.docs/track/<slug>.md` (written by
   // /explore); a missing marker defaults to `product` (back-compat).
   const ideaFiles = await resolveIdeaFiles(worktreePath, canonical);
+  const featureSlug = slugify(idea);
+  const featureFiles = await resolveFeatureFiles(worktreePath, canonical, ideaFiles, featureSlug);
   const trackDir = join(worktreePath, '.docs', 'track');
-  const trackFile = await pickIdeaFile(trackDir, ideaFiles);
+  const trackFile = await pickIdeaFile(trackDir, featureFiles);
   const track = parseTrack(trackFile ? await readFile(trackFile, 'utf-8') : null) ?? 'product';
   if (opts.requireLifecycleReconciliation && !trackFile) {
     throw new Error(
@@ -227,10 +238,9 @@ export async function landSpec(
   const specRequired = track === 'product';
 
   // 4. C2: require stories + plan always; spec only on the product track.
-  const specFile = await pickIdeaFile(specsDir, ideaFiles);
-  const storiesFile = await pickIdeaFile(storiesDir, ideaFiles);
-  const planFile = await pickIdeaFile(plansDir, ideaFiles);
-  const featureSlug = slugify(idea);
+  const specFile = await pickIdeaFile(specsDir, featureFiles);
+  const storiesFile = await pickIdeaFile(storiesDir, featureFiles);
+  const planFile = await pickIdeaFile(plansDir, featureFiles);
 
   if ((specRequired && !specFile) || !storiesFile || !planFile) {
     const missing: string[] = [];
@@ -283,6 +293,17 @@ export async function landSpec(
     throw new Error(`landSpec: ${violations}`);
   }
 
+  const taskCountValidation = validatePlanTaskCount(planContent);
+  if (taskCountValidation?.kind === 'unauthorized' || taskCountValidation?.kind === 'malformed') {
+    const declarationProblem = taskCountValidation.kind === 'unauthorized'
+      ? 'no scope exception declaration was provided'
+      : 'the scope exception declaration is malformed';
+    throw new Error(
+      `landSpec: plan has ${taskCountValidation.taskCount} addressable tasks, reaching hard-stop ` +
+        `boundary ${PLAN_TASK_HARD_STOP_BOUNDARY}; ${declarationProblem}.`,
+    );
+  }
+
   // Land and daemon discovery must agree on the exact stories artifact. Resolve
   // the plan's reference with the same machinery backlog discovery uses, then
   // compare it to the idea-scoped artifact selected above. This prevents a
@@ -320,7 +341,7 @@ export async function landSpec(
   //     spec can never reach the daemon missing conflict-check or architecture.
   const complexityDir = join(worktreePath, '.docs', 'complexity');
   const decisionsDir = join(worktreePath, '.docs', 'decisions');
-  const complexityFile = await pickIdeaFile(complexityDir, ideaFiles);
+  const complexityFile = await pickIdeaFile(complexityDir, featureFiles);
   const tier = complexityFile
     ? parseComplexityTier(await readFile(complexityFile, 'utf-8'))
     : undefined;
@@ -332,9 +353,9 @@ export async function landSpec(
 
   let conflictsFile: string | null = null;
   if (tier && tier !== 'S') {
-    conflictsFile = await pickIdeaFile(join(worktreePath, '.docs', 'conflicts'), ideaFiles);
-    const architectureFile = await pickIdeaFile(join(worktreePath, '.docs', 'architecture'), ideaFiles);
-    const reviewFile = await pickIdeaFile(decisionsDir, ideaFiles);
+    conflictsFile = await pickIdeaFile(join(worktreePath, '.docs', 'conflicts'), featureFiles);
+    const architectureFile = await pickIdeaFile(join(worktreePath, '.docs', 'architecture'), featureFiles);
+    const reviewFile = await pickIdeaFile(decisionsDir, featureFiles);
     const missing: string[] = [];
     if (!conflictsFile) missing.push('conflicts');
     if (!architectureFile) missing.push('architecture');
@@ -346,6 +367,12 @@ export async function landSpec(
           'Run /conflict-check, /architecture-diagram, and /architecture-review before landing.',
       );
     }
+    if (architectureFile && extractMermaidBlocks(await readFile(architectureFile, 'utf-8')).length === 0) {
+      throw new Error(
+        `landSpec: non-Small architecture artifact "${architectureFile}" is missing a fenced mermaid diagram. ` +
+          'Regenerate the diagram through /architecture-diagram before landing.',
+      );
+    }
   }
 
   // The coherence gate below reads `.docs/coherence/<plan-stem>.md` BY NAME, so
@@ -354,9 +381,9 @@ export async function landSpec(
   // the misnamed one it is looking straight past. Validate it here, through the
   // same feature-stem contract as every other feature-scoped family, so no
   // artifact family keeps a private naming path.
-  const coherenceFile = await pickIdeaFile(join(worktreePath, '.docs', 'coherence'), ideaFiles);
+  const coherenceFile = await pickIdeaFile(join(worktreePath, '.docs', 'coherence'), featureFiles);
 
-  // Validate EVERY idea-attributable file in each feature-scoped family, not the
+  // Validate EVERY current-feature file in each feature-scoped family, not the
   // single `pickIdeaFile` pick. The picks above deliberately reduce a family to
   // its newest file so the gates have one artifact to read, but land stages every
   // `.docs/` file the idea authored (see the `git add` below). Validating only the
@@ -367,7 +394,7 @@ export async function landSpec(
   // whose pattern matches descendants (`stories` is `.docs/stories/**\/*.md`) is
   // walked recursively, so a nested artifact cannot be staged unvalidated.
   const familyPaths = async (step: StepName, dir: string): Promise<string[]> =>
-    (await listIdeaFiles(dir, ideaFiles, {
+    (await listIdeaFiles(dir, featureFiles, {
       recursive: featureArtifactPatternsAreRecursive(step),
     })).map((file) => relative(worktreePath, file));
 
@@ -395,13 +422,53 @@ export async function landSpec(
     throw new Error(`landSpec: feature-scoped artifact stems do not match the feature: ${violations}`);
   }
 
-  // 4e. ADR hard gate — no spec lands with an unapproved ADR (mirrors the
-  //     conduct architecture-review gate). Scan every `.docs/decisions/adr-*.md`.
+  // 4e. ADR hard gates — no spec lands with an unapproved ADR (mirrors the
+  //     conduct architecture-review gate). The citability rung applies only to
+  //     ADRs this spec added or changed; legacy ADRs remain backwards-compatible.
+  const changedAdrPaths = new Set(
+    [...ideaFiles, ...(await collectChangedDocsMarkdown(worktreePath)).map((path) => relative(worktreePath, path))]
+      .map((path) => path.replaceAll('\\', '/'))
+      .filter((path) => /^\.docs\/decisions\/adr-.*\.md$/i.test(path)),
+  );
+  const defaultBranch = await deriveDefaultBranch(canonical);
+  const { stdout: mergeBaseOut } = await execFile(
+    'git',
+    ['merge-base', 'HEAD', defaultBranch],
+    { cwd: worktreePath },
+  );
+  const mergeBase = mergeBaseOut.trim();
+  const baseAdrPaths = new Set<string>();
+  try {
+    const { stdout } = await execFile(
+      'git',
+      ['ls-tree', '-r', '--name-only', mergeBase, '--', '.docs/decisions'],
+      { cwd: worktreePath },
+    );
+    for (const path of stdout.split('\n')) {
+      if (path !== '') baseAdrPaths.add(path.replaceAll('\\', '/'));
+    }
+  } catch {
+    // A missing tree is equivalent to no pre-existing ADRs.
+  }
   const unapprovedAdrs: Array<{ path: string; found: string | null }> = [];
+  const uncitableAdrs: string[] = [];
+  const nonCanonicalNewAdrs: string[] = [];
   for (const adrFile of await listAdrFiles(decisionsDir)) {
+    const adrPath = relative(worktreePath, adrFile).replaceAll('\\', '/');
     const adrContent = await readFile(adrFile, 'utf-8');
     const approval = adrApprovalStatus(adrContent);
     if (!approval.approved) unapprovedAdrs.push({ path: adrFile, found: approval.found });
+    if (approval.approved && changedAdrPaths.has(adrPath)) {
+      const parsed = parseAdrDecisions(adrContent);
+      if (parsed.kind !== 'decisions' || parsed.ids.size === 0) uncitableAdrs.push(adrFile);
+    }
+    if (
+      changedAdrPaths.has(adrPath) &&
+      !baseAdrPaths.has(adrPath) &&
+      !isCanonicalAdrFilename(basename(adrFile))
+    ) {
+      nonCanonicalNewAdrs.push(adrFile);
+    }
   }
   if (unapprovedAdrs.length > 0) {
     const offenders = unapprovedAdrs
@@ -409,10 +476,21 @@ export async function landSpec(
       .join('; ');
     throw new Error(
       `landSpec: ADRs are not approved: ${offenders}. All ADRs must be ` +
-        'APPROVED before landing. Approve the ADRs via /architecture-review, then land.',
+      'APPROVED before landing. Approve the ADRs via /architecture-review, then land.',
     );
   }
-
+  if (uncitableAdrs.length > 0) {
+    throw new Error(
+      `landSpec: approved ADRs have no citable decision: ${uncitableAdrs.join('; ')}. ` +
+        'Each added or changed APPROVED ADR must declare at least one citable decision before landing.',
+    );
+  }
+  if (nonCanonicalNewAdrs.length > 0) {
+    throw new Error(
+      `landSpec: newly added ADRs must use canonical filenames: ${nonCanonicalNewAdrs.join('; ')}. ` +
+        'Required format: adr-YYYY-MM-DD-lowercase-hyphenated-slug.md.',
+    );
+  }
   // 4e2. Coherence gate (DECIDE artifact coherence check): the traceability
   //     mapping (outcomes -> FRs -> stories -> tasks) authored by
   //     /coherence-check must be present, parseable, cross-checked against
@@ -503,13 +581,54 @@ export async function landSpec(
   // can bleed in (FR-9). Commit in place on the worktree's branch — no checkout of the
   // primary tree (FR-2).
   await execFile('git', ['add', '.docs'], { cwd: worktreePath });
-  await execFile(
-    'git',
-    ['commit', '-m', `spec: land authored artifacts for "${idea}" [engineer/land]`],
-    { cwd: worktreePath, env: withEngineCommitEnv() },
-  );
+  const hasStagedDocs = await execFile('git', ['diff', '--cached', '--quiet'], { cwd: worktreePath })
+    .then(() => false)
+    .catch((error: { code?: number }) => {
+      if (error.code === 1) return true;
+      throw error;
+    });
+  if (hasStagedDocs) {
+    await execFile(
+      'git',
+      ['commit', '-m', composeSpecCommitMessage(idea, track, tier, storiesContent, planContent)],
+      { cwd: worktreePath, env: withEngineCommitEnv() },
+    );
+  }
 
   return { slug, branch, repoPath: worktreePath, track, ...(tier ? { tier } : {}) };
+}
+
+/** Existing paths retain their owning feature during DECIDE amendments. New paths,
+ * including rename destinations, still belong to this feature and must match its stem.
+ * Keep the full change set separately for ADR/coherence checks and the final commit.
+ */
+async function resolveFeatureFiles(
+  worktreePath: string,
+  canonicalPath: string,
+  ideaFiles: Set<string>,
+  featureSlug: string,
+): Promise<Set<string>> {
+  const defaultBranch = await deriveDefaultBranch(canonicalPath);
+  const { stdout: base } = await execFile('git', ['merge-base', 'HEAD', defaultBranch], { cwd: worktreePath });
+  const { stdout: tree } = await execFile('git', ['ls-tree', '-r', '-z', base.trim(), '--', '.docs'], { cwd: worktreePath });
+  const existing = new Set(tree.split('\0').flatMap((entry) => {
+    const match = entry.match(/^100(?:644|755) blob [a-f0-9]+\t([\s\S]+)$/);
+    return match ? [match[1]] : [];
+  }));
+  const families: Array<{ step: StepName; directory: string }> = [
+    { step: 'prd', directory: 'specs' },
+    { step: 'stories', directory: 'stories' },
+    { step: 'plan', directory: 'plans' },
+    { step: 'conflict_check', directory: 'conflicts' },
+    { step: 'coherence_check', directory: 'coherence' },
+  ];
+  const amendments = validateFeatureArtifactStems(families.map(({ step, directory }) => ({
+    step,
+    paths: [...ideaFiles].filter((path) => path.startsWith(`.docs/${directory}/`) && existing.has(path)),
+  })), featureSlug);
+  const featureFiles = new Set(ideaFiles);
+  for (const amendment of amendments) featureFiles.delete(amendment.path);
+  return featureFiles;
 }
 
 // ── Idea-scoped attribution (foundational helper; wired in later tasks) ───────

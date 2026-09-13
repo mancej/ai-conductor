@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { ViewMode } from './ui/types.js';
 import type {
   EffortLevel,
@@ -11,6 +11,8 @@ import type {
 import { scanPlanProtectedTargets } from './engine/plan-protected-targets.js';
 import { loadMergedConfigForRead, projectConfigPath, validateConfig } from './engine/config.js';
 import { readUserConfig, userConfigPath, writeUserConfig } from './engine/user-config.js';
+import { grantStorePath } from './engine/decide-entry-policy.js';
+import { resolveMainRepoRootStrict } from './engine/park-marker.js';
 
 const VALID_EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -55,7 +57,7 @@ export interface CLIOptions {
   report: boolean;
 }
 
-// Daemon mode (Phase 6) is its own subcommand (`conduct daemon …`), parsed by
+// Daemon mode (Phase 6) is its own subcommand (`ai-conductor daemon …`), parsed by
 // detectDaemonCommand in engine/daemon-command.ts and dispatched from index.ts
 // before the interactive pipeline boots — NOT a flag on the base program. See
 // DaemonCommandOptions there for the daemon's own options.
@@ -68,7 +70,7 @@ function applyPipelineOptions(cmd: Command): Command {
     .argument('[feature]', 'Feature description')
     .option('--resume', 'Resume from last state')
     .option('--fresh', 'Start a new feature; skip auto-resume even if a worktree for this feature description already exists')
-    .option('--auto', 'Deprecated: use `conduct-ts daemon start` instead')
+    .option('--auto', 'Deprecated: use `ai-conductor daemon start` instead')
     .option('--status', 'Show dashboard only')
     .option('--from <step>', 'Start from specific step')
     .option('--cleanup', 'Clean up worktrees')
@@ -89,7 +91,7 @@ function applyPipelineOptions(cmd: Command): Command {
 function createBaseProgram(): Command {
   const program = new Command();
   program
-    .name('conduct')
+    .name('ai-conductor')
     .description(
       'Orchestrate SDLC pipeline — two loops: the build/ship daemon (`daemon`) and the ' +
         'engineer/brain idea→spec loop (`engineer`, or `engineer --help` for its full command reference)',
@@ -99,7 +101,7 @@ function createBaseProgram(): Command {
 
 /**
  * The inline pipeline now runs under an explicit `inline` subcommand
- * (`conduct inline "<feature>"`), not as a bare positional. detectInline strips
+ * (`ai-conductor inline "<feature>"`), not as a bare positional. detectInline strips
  * that token so parseArgs sees just the feature + flags.
  *
  * @returns isInline=true and the argv with `inline` removed when argv[2] is
@@ -370,6 +372,46 @@ export interface DecideGrantDispatch {
   reason: string;
 }
 
+export interface KickbackBudgetDispatch {
+  kind: 'kickback-budget';
+  action: 'inspect' | 'raise' | 'reset';
+  feature: string;
+  gate?: string;
+  by?: number;
+  rationale?: string;
+  format: 'human' | 'json';
+}
+
+/** Parse the explicit operator budget-recovery command without booting the pipeline. */
+export function detectKickbackBudgetCommand(argv: string[]): KickbackBudgetDispatch | null {
+  if (argv[2] !== 'kickback-budget' || !['inspect', 'raise', 'reset'].includes(argv[3] ?? '')) return null;
+  const action = argv[3] as KickbackBudgetDispatch['action'];
+  const values = new Map<string, string>();
+  for (let i = 4; i < argv.length; i += 2) {
+    const flag = argv[i]; const value = argv[i + 1];
+    if (!flag || value === undefined || !['--feature', '--gate', '--by', '--rationale', '--format'].includes(flag) || values.has(flag)) return null;
+    values.set(flag, value);
+  }
+  const feature = values.get('--feature');
+  const format = values.get('--format') ?? 'human';
+  if (!feature || feature.includes('/') || feature === '.' || feature === '..' || (format !== 'human' && format !== 'json')) return null;
+  if (action === 'inspect') return values.size <= 2 && !values.has('--gate') ? { kind: 'kickback-budget', action, feature, format } : null;
+  const gate = values.get('--gate'); const rationale = values.get('--rationale');
+  if (!gate || !rationale?.trim()) return null;
+  if (action === 'raise') {
+    const by = Number(values.get('--by'));
+    if (!Number.isSafeInteger(by) || by <= 0) return null;
+    return { kind: 'kickback-budget', action, feature, gate, by, rationale, format };
+  }
+  return !values.has('--by') ? { kind: 'kickback-budget', action, feature, gate, rationale, format } : null;
+}
+
+export interface DecideGrantCommandDeps {
+  readonly resolveMainRoot?: (cwd: string) => Promise<string | null>;
+  readonly stdout?: (message: string) => void;
+  readonly stderr?: (message: string) => void;
+}
+
 /** Parse the explicit, operator-only DECIDE grant command without booting the pipeline. */
 export function detectDecideGrantCommand(argv: string[]): DecideGrantDispatch | null {
   if (argv[2] !== 'decide-grant') return null;
@@ -403,22 +445,32 @@ export function detectDecideGrantCommand(argv: string[]): DecideGrantDispatch | 
 export async function dispatchDecideGrantCommand(
   command: DecideGrantDispatch,
   cwd: string = process.cwd(),
+  deps: DecideGrantCommandDeps = {},
 ): Promise<number> {
+  const stdout = deps.stdout ?? ((message: string) => process.stdout.write(message));
+  const stderr = deps.stderr ?? ((message: string) => process.stderr.write(message));
   // `plan` is ungrantable — refused here as well as in the policy, so the operator
   // learns at the point of the mistake rather than from a HALT one dispatch later.
   if (command.step === 'plan') {
-    console.error(
+    stderr(
       "decide-grant: 'plan' cannot be granted — the daemon may not re-plan. " +
-        'Drive the plan revision interactively, then resume the feature.',
+        'Drive the plan revision interactively, then resume the feature.\n',
     );
     return 2;
   }
+
+  const mainRoot = await (deps.resolveMainRoot ?? resolveMainRepoRootStrict)(cwd);
+  if (mainRoot === null) {
+    stderr(`decide-grant: unresolved repository from '${cwd}'; grant was not recorded.\n`);
+    return 1;
+  }
+
   // The grant is daemon-owned and lives OUTSIDE the feature worktree: a build agent
   // writing its own `.pipeline/decide-grant.json` must not be able to authorize itself.
-  const grantsDir = join(cwd, '.daemon', 'grants');
-  await mkdir(grantsDir, { recursive: true });
+  const grantPath = grantStorePath(mainRoot, command.slug);
+  await mkdir(dirname(grantPath), { recursive: true });
   await writeFile(
-    join(grantsDir, `${command.slug}.json`),
+    grantPath,
     JSON.stringify({
       version: 1,
       step: command.step,
@@ -428,11 +480,11 @@ export async function dispatchDecideGrantCommand(
     }) + '\n',
     'utf-8',
   );
-  console.log(`DECIDE grant recorded for '${command.step}' in '${command.slug}'.`);
+  stdout(`DECIDE grant recorded for '${command.step}' in '${command.slug}' at '${grantPath}'.\n`);
   return 0;
 }
 
-/** Parse argv for `conduct-ts plan-protected-targets <path>` without I/O. */
+/** Parse argv for `ai-conductor plan-protected-targets <path>` without I/O. */
 export function detectPlanProtectedTargetsCommand(
   argv: string[],
 ): PlanProtectedTargetsDispatch | null {
@@ -484,16 +536,26 @@ function registerCommands(program: Command): void {
 export function createProgram(): Command {
   const program = createBaseProgram();
 
+  // Version report. Declared here (not on the base program) because parseArgs
+  // parses the base program for the inline pipeline, and a commander-owned
+  // `--version` there would intercept before index.ts could dispatch. Both
+  // spellings are dispatched in index.ts (detectVersionCommand); these
+  // declarations exist so `--help` documents them.
+  program.option('-V, --version', 'Print the harness version and the pinned engine build, then exit');
   // Inline pipeline subcommand. This is the DEFAULT mode — running the SDLC
-  // pipeline in the foreground (`conduct inline "<feature>"`), the counterpart to
+  // pipeline in the foreground (`ai-conductor inline "<feature>"`), the counterpart to
   // the background `daemon`. Dispatched in index.ts (detectInline) before the
   // pipeline boots; declared here with the full pipeline option surface so
-  // `--help` and `conduct inline --help` list it.
+  // `--help` and `ai-conductor inline --help` list it.
   applyPipelineOptions(
     program
       .command('inline')
       .description('Run the SDLC pipeline inline, in the foreground (the default mode)'),
   );
+
+  program
+    .command('version')
+    .description('Print the harness version and the pinned engine build, then exit');
 
   // Registry subcommands (Phase 9.2). These are NON-INTERACTIVE: they run to
   // completion and exit, rather than entering the interactive pipeline. The
@@ -766,7 +828,7 @@ export function createProgram(): Command {
 
 /**
  * Render a SINGLE, root-level help document that recurses through every command
- * and sub-subcommand — so `conduct --help` is a complete reference (each command's
+ * and sub-subcommand — so `ai-conductor --help` is a complete reference (each command's
  * options + nested subcommands), not just a top-level name list. Commander only
  * renders one level per `helpInformation()`; this walks the tree depth-first and
  * appends a titled section per command (skipping the auto-generated `help`).
@@ -778,7 +840,7 @@ export function renderFullHelp(program: Command = createProgram()): string {
   const walk = (cmd: Command, path: string[]): void => {
     for (const sub of cmd.commands) {
       if (sub.name() === 'help') continue; // commander's auto `help [command]`
-      const fullPath = ['conduct', ...path, sub.name()].join(' ');
+      const fullPath = ['ai-conductor', ...path, sub.name()].join(' ');
       sections.push(`${rule}\n${fullPath}\n${rule}\n${sub.helpInformation().trimEnd()}`);
       walk(sub, [...path, sub.name()]);
     }
@@ -791,7 +853,7 @@ export function renderFullHelp(program: Command = createProgram()): string {
 /**
  * Render help for the `daemon` command subtree only — the run flags plus every
  * sub-verb (status/logs + the tmux management verbs). Used by index.ts to answer
- * `conduct daemon --help` WITHOUT falling through to detectDaemonCommand (which
+ * `ai-conductor daemon --help` WITHOUT falling through to detectDaemonCommand (which
  * would treat `--help` as an unknown flag and LAUNCH a daemon run).
  */
 export function renderDaemonHelp(program: Command = createProgram()): string {
@@ -802,7 +864,7 @@ export function renderDaemonHelp(program: Command = createProgram()): string {
   for (const sub of daemon.commands) {
     if (sub.name() === 'help') continue; // commander's auto `help [command]`
     sections.push(
-      `${rule}\nconduct daemon ${sub.name()}\n${rule}\n${sub.helpInformation().trimEnd()}`,
+      `${rule}\nai-conductor daemon ${sub.name()}\n${rule}\n${sub.helpInformation().trimEnd()}`,
     );
   }
   return sections.join('\n\n') + '\n';

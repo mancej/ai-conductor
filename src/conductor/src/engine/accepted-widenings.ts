@@ -24,6 +24,61 @@ export async function readOverScopeDecisions(projectRoot: string): Promise<{ dec
 export type OverScopeDecisionInput = Omit<OverScopeDecision, 'decidedAt'> & { decidedAt?: string };
 export interface RecordOverScopeDecisionsResult { recorded: OverScopeDecision[]; failure?: 'write-failed' | 'missing-operator' }
 
+function isNoOwnerCriterion(criterion: string): boolean {
+  return /^NC\.\d+$/i.test(criterion);
+}
+
+/**
+ * NC ordinals are lap-local and evidence summaries re-anchor their `file:line`
+ * spans on every re-grade, so neither is stable identity on its own. Comparing
+ * with the anchors collapsed lets a decision survive a re-graded lap.
+ */
+export function normalizeOverScopeSummary(summary: string): string {
+  return summary.replace(/:\d+(?:-\d+)?\b/g, ':L').replace(/\s+/g, ' ').trim();
+}
+
+const SUMMARY_EQUIVALENCE_THRESHOLD = 0.8;
+
+function summaryTokens(summary: string): Set<string> {
+  return new Set(
+    normalizeOverScopeSummary(summary)
+      .toLowerCase()
+      .replace(/[`*"'()\[\]{};,.]/g, ' ')
+      .split(/\s+/)
+      .filter((token) => token.length > 0),
+  );
+}
+
+/**
+ * The evidence summary is LLM-authored prose that re-grades reword freely (a
+ * fourth halt on one feature rewrote the same finding four ways, and one lap
+ * appended decision history into the summary itself — #2145), so exact
+ * equality drops recorded decisions. Equivalence is exact normalized match,
+ * or a token-overlap coefficient (shared over the smaller token set) at
+ * 0.8+: the smaller-set denominator keeps a summary equivalent to itself
+ * plus appended history, while a genuinely different finding fails closed.
+ */
+export function overScopeSummariesEquivalent(a: string, b: string): boolean {
+  if (normalizeOverScopeSummary(a) === normalizeOverScopeSummary(b)) return true;
+  const tokensA = summaryTokens(a);
+  const tokensB = summaryTokens(b);
+  if (!tokensA.size || !tokensB.size) return false;
+  let shared = 0;
+  for (const token of tokensA) if (tokensB.has(token)) shared += 1;
+  return shared / Math.min(tokensA.size, tokensB.size) >= SUMMARY_EQUIVALENCE_THRESHOLD;
+}
+
+/** NC decisions bind their evidence summary; regular criterion decisions remain criterion-keyed. */
+function decisionMatchesFinding(
+  decision: Pick<OverScopeDecision, 'criterion' | 'summary'>,
+  criterion: string,
+  summary: string,
+): boolean {
+  if (!isNoOwnerCriterion(criterion)) return decision.criterion === criterion;
+  return isNoOwnerCriterion(decision.criterion)
+    && overScopeSummariesEquivalent(decision.summary, summary);
+}
+
 /** Append new decisions atomically; repeated decisions are inert and the last decision is authoritative. */
 export async function recordOverScopeDecisions(projectRoot: string, inputs: readonly OverScopeDecisionInput[]): Promise<RecordOverScopeDecisionsResult> {
   if (inputs.some((entry) => !entry.operator.trim())) return { recorded: [], failure: 'missing-operator' };
@@ -32,7 +87,9 @@ export async function recordOverScopeDecisions(projectRoot: string, inputs: read
   for (const input of inputs) {
     const entry: OverScopeDecision = { criterion: input.criterion.trim(), summary: input.summary.trim(), decision: input.decision, rationale: input.rationale.trim(), operator: input.operator.trim(), decidedAt: input.decidedAt ?? new Date().toISOString() };
     if (!isOverScopeDecision(entry)) continue;
-    const effective = [...current.decisions, ...recorded].filter((d) => d.criterion === entry.criterion).at(-1);
+    const effective = [...current.decisions, ...recorded]
+      .filter((decision) => decisionMatchesFinding(decision, entry.criterion, entry.summary))
+      .at(-1);
     if (effective?.decision === entry.decision) continue;
     recorded.push(entry);
   }
@@ -53,9 +110,25 @@ export type IntentRelation = 'within' | 'outside-harmless' | 'outside-visible';
 export type OverScopeCriterionClassification = 'not-blocking' | 'blocking-undecided' | 'blocking-refused' | 'accepted';
 
 /** The one definition used by routing and completion; decisions are last-write-wins. */
-export function classifyOverScopeCriterion(criterion: string, relations: ReadonlyMap<string, IntentRelation>, decisions: readonly OverScopeDecision[]): OverScopeCriterionClassification {
+export function classifyOverScopeCriterion(criterion: string, relations: ReadonlyMap<string, IntentRelation>, decisions: readonly OverScopeDecision[]): OverScopeCriterionClassification;
+export function classifyOverScopeCriterion(criterion: string, summary: string, relations: ReadonlyMap<string, IntentRelation>, decisions: readonly OverScopeDecision[]): OverScopeCriterionClassification;
+export function classifyOverScopeCriterion(
+  criterion: string,
+  summaryOrRelations: string | ReadonlyMap<string, IntentRelation>,
+  relationsOrDecisions: ReadonlyMap<string, IntentRelation> | readonly OverScopeDecision[],
+  decisions: readonly OverScopeDecision[] = [],
+): OverScopeCriterionClassification {
+  const summary = typeof summaryOrRelations === 'string' ? summaryOrRelations : '';
+  const relations = typeof summaryOrRelations === 'string'
+    ? relationsOrDecisions as ReadonlyMap<string, IntentRelation>
+    : summaryOrRelations;
+  const applicableDecisions = typeof summaryOrRelations === 'string'
+    ? decisions
+    : relationsOrDecisions as readonly OverScopeDecision[];
   if (relations.get(criterion) !== 'outside-visible') return 'not-blocking';
-  const decision = decisions.filter((entry) => entry.criterion === criterion).at(-1)?.decision;
+  const decision = applicableDecisions
+    .filter((entry) => decisionMatchesFinding(entry, criterion, summary))
+    .at(-1)?.decision;
   return decision === 'accept' ? 'accepted' : decision === 'refuse' ? 'blocking-refused' : 'blocking-undecided';
 }
 
@@ -77,7 +150,10 @@ export interface OverScopeDecisionDefect { kind: OverScopeDecisionDefectKind; cr
 export type ParsedOverScopeDecisions = { kind: 'absent' } | { kind: 'parsed'; decisions: Array<Pick<OverScopeDecision, 'criterion' | 'summary' | 'decision' | 'rationale'>>; defects: OverScopeDecisionDefect[] };
 
 /** Parse each operator-authored entry independently: one bad entry never discards valid siblings. */
-export function parseClearedOverScopeDecisions(body: string, blockingCriteria: ReadonlySet<string>): ParsedOverScopeDecisions {
+export function parseClearedOverScopeDecisions(
+  body: string,
+  blockingFindings: ReadonlyMap<string, string> | ReadonlySet<string>,
+): ParsedOverScopeDecisions {
   const match = body.match(/```json\s+over-scope-decisions\s*\n([\s\S]*?)\n```/i);
   if (!match) return { kind: 'absent' };
   let entries: unknown;
@@ -87,12 +163,36 @@ export function parseClearedOverScopeDecisions(body: string, blockingCriteria: R
   for (const raw of entries) {
     const entry = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     const criterion = typeof entry.criterion === 'string' ? entry.criterion.trim() : undefined;
-    if (!criterion || !blockingCriteria.has(criterion)) { defects.push({ kind: 'unknown-criterion', ...(criterion ? { criterion } : {}) }); continue; }
+    const authoredSummary = typeof entry.summary === 'string' ? entry.summary.trim() : '';
+    // NC ordinals are lap-local, so a re-graded lap may renumber the same
+    // finding out from under a recorded decision. Rebind by evidence summary
+    // (anchors normalized) when it identifies exactly one current NC finding.
+    let bound = criterion;
+    if (criterion && isNoOwnerCriterion(criterion) && authoredSummary && 'get' in blockingFindings) {
+      const currentEvidence = blockingFindings.get(criterion);
+      const summaryDrifted = currentEvidence !== undefined
+        && !overScopeSummariesEquivalent(currentEvidence, authoredSummary);
+      if (!blockingFindings.has(criterion) || summaryDrifted) {
+        const rebound = [...blockingFindings.entries()].filter(([id, evidence]) =>
+          isNoOwnerCriterion(id) && overScopeSummariesEquivalent(evidence, authoredSummary));
+        if (rebound.length === 1) bound = rebound[0]![0];
+        else if (summaryDrifted) bound = criterion; // fall through to the strict check's defect
+      }
+    }
+    if (!bound || !blockingFindings.has(bound)) { defects.push({ kind: 'unknown-criterion', ...(criterion ? { criterion } : {}) }); continue; }
     if (entry.decision === 'pending' || entry.decision === undefined) continue;
-    if (entry.decision !== 'accept' && entry.decision !== 'refuse') { defects.push({ kind: 'invalid-decision', criterion }); continue; }
-    if (typeof entry.rationale !== 'string' || !entry.rationale.trim()) { defects.push({ kind: 'missing-rationale', criterion }); continue; }
-    if (typeof entry.summary !== 'string' || !entry.summary.trim()) { defects.push({ kind: 'invalid-decision', criterion }); continue; }
-    decisions.push({ criterion, summary: entry.summary.trim(), decision: entry.decision, rationale: entry.rationale.trim() });
+    if (entry.decision !== 'accept' && entry.decision !== 'refuse') { defects.push({ kind: 'invalid-decision', criterion: bound }); continue; }
+    if (typeof entry.rationale !== 'string' || !entry.rationale.trim()) { defects.push({ kind: 'missing-rationale', criterion: bound }); continue; }
+    if (!authoredSummary) { defects.push({ kind: 'invalid-decision', criterion: bound }); continue; }
+    const currentSummary = 'get' in blockingFindings ? blockingFindings.get(bound) : undefined;
+    if (isNoOwnerCriterion(bound) && currentSummary !== undefined
+      && !overScopeSummariesEquivalent(currentSummary, authoredSummary)) {
+      defects.push({ kind: 'invalid-decision', criterion: bound });
+      continue;
+    }
+    // Record under the current lap's id and summary so the stored decision
+    // matches this lap's report verbatim.
+    decisions.push({ criterion: bound, summary: currentSummary ?? authoredSummary, decision: entry.decision, rationale: entry.rationale.trim() });
   }
   return { kind: 'parsed', decisions, defects };
 }
@@ -111,6 +211,18 @@ export function overScopeRelations(reportText: string): Map<string, IntentRelati
     const cells = prdAuditTableCells(line); if (cells.every((cell) => /^:?-{3,}:?$/.test(cell)) || cells[gradeIndex]?.toUpperCase() !== 'OVER_SCOPE') continue;
     const criterion = cells[criterionIndex]?.trim().toUpperCase(); const relation = cells[relationIndex]?.trim().toLowerCase();
     if (criterion && (relation === 'within' || relation === 'outside-harmless' || relation === 'outside-visible')) relations.set(criterion, relation);
+  }
+  const noOwnerSectionIndex = lines.findIndex((line) => /^\s*##\s+Findings without an owning criterion\s*$/i.test(line));
+  const noOwnerHeaderIndex = noOwnerSectionIndex === -1 ? -1 : lines.findIndex((line, index) => index > noOwnerSectionIndex && /^\s*\|/.test(line) && (() => { const header = prdAuditTableCells(line).map((cell) => cell.toLowerCase()); return header.includes('finding') && header.includes('grade'); })());
+  if (noOwnerHeaderIndex === -1) return relations;
+  const noOwnerHeader = prdAuditTableCells(lines[noOwnerHeaderIndex]!).map((cell) => cell.toLowerCase()); const findingIndex = noOwnerHeader.indexOf('finding'); const noOwnerGradeIndex = noOwnerHeader.indexOf('grade'); const noOwnerRelationIndex = noOwnerHeader.findIndex((cell) => cell === 'intent relation' || cell === 'intentrelation');
+  if (noOwnerRelationIndex === -1) return relations;
+  for (const line of lines.slice(noOwnerHeaderIndex + 1)) {
+    if (/^\s*##\s/.test(line)) break;
+    if (!/^\s*\|/.test(line)) continue;
+    const cells = prdAuditTableCells(line); if (cells.every((cell) => /^:?-{3,}:?$/.test(cell)) || cells[noOwnerGradeIndex]?.toUpperCase() !== 'OVER_SCOPE') continue;
+    const finding = cells[findingIndex]?.trim().toUpperCase(); const relation = cells[noOwnerRelationIndex]?.trim().toLowerCase();
+    if (finding && /^NC\.\d+$/.test(finding) && (relation === 'within' || relation === 'outside-harmless' || relation === 'outside-visible')) relations.set(finding, relation);
   }
   return relations;
 }

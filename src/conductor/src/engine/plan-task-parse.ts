@@ -13,6 +13,78 @@ import { PROTECTED_ARTIFACT_DIRECTORIES, namesOwnFeature } from './protected-art
 // grammar instead of re-deriving a narrower ad hoc regex.)
 export const TASK_ID_PATTERN = '[A-Za-z0-9._-]+';
 
+/**
+ * The commit-message line shape the build evidence reader treats as task
+ * routing telemetry: a flush-left `Task: <id>`, optionally followed by
+ * trailing horizontal whitespace. The trailing-whitespace tolerance is not
+ * cosmetic — Git's message cleanup (`git stripspace`) rewrites `Task: 71   `
+ * to `Task: 71`, so a producer that only rejects the exact form lets a copied
+ * line become real evidence after the commit is written.
+ *
+ * Exported so message *producers* (e.g. the spec land commit composer) drop
+ * exactly what the reader in `autoheal.ts` accepts, instead of re-deriving a
+ * narrower regex that drifts from it.
+ */
+export const TASK_TRAILER_LINE_PATTERN = `^Task: (${TASK_ID_PATTERN})[ \\t]*$`;
+
+export type PlanTaskReferenceResolution =
+  | { kind: 'resolved'; ids: string[] }
+  | { kind: 'unresolvable'; ids: string[] }
+  | { kind: 'malformed'; raw: string };
+
+/**
+ * The cited plan-task id with any trailing annotation removed.
+ *
+ * Every caller that builds a set for `resolvePlanTaskReference` to look up in
+ * MUST normalize through this, because the resolver normalizes before it looks
+ * up. A caller that built its set from the raw cell — as the prd_audit gate
+ * scorer's no-active-plan fallback did — holds `rem-x (landed)` while the
+ * resolver asks for `rem-x`, so an annotated citation can never resolve
+ * against its own row.
+ */
+export function normalizePlanTaskId(raw: string): string {
+  return raw.trim().replace(/\s*\([^()]*\)$/, '');
+}
+
+/** Resolves a cited plan-task id against the active plan's declared task ids. */
+export function resolvePlanTaskReference(
+  raw: string,
+  planTaskIds: ReadonlySet<string>,
+): PlanTaskReferenceResolution {
+  // A citation may name more than one task: a criterion's evidence legitimately
+  // spans several, and the single-id form made that honest answer
+  // unrepresentable — the auditor either wrote the truth and had the row
+  // rejected as malformed, or narrowed the citation to fit the parser. Every
+  // segment must satisfy the same grammar, and one bad segment rejects the
+  // whole citation rather than silently resolving the good half.
+  const grammar = new RegExp(`^${TASK_ID_PATTERN}$`);
+  const ids: string[] = [];
+  for (const segment of raw.split(',')) {
+    const id = normalizePlanTaskId(segment);
+    if (!grammar.test(id)) return { kind: 'malformed', raw };
+    if (!ids.includes(id)) ids.push(id);
+  }
+  if (ids.length === 0) return { kind: 'malformed', raw };
+
+  const absent = ids.filter((id) => !planTaskIds.has(id));
+  return absent.length === 0
+    ? { kind: 'resolved', ids }
+    : { kind: 'unresolvable', ids: absent };
+}
+
+/** Resolves criterion-carrier citations against plan headings. */
+export function resolveCitedPlanTaskIds(
+  citedIds: readonly string[],
+  planTaskIds: ReadonlySet<string>,
+): PlanTaskReferenceResolution {
+  // `task-` is carrier presentation only. The shared resolver owns all
+  // remaining normalization, grammar, de-duplication, and membership rules.
+  return resolvePlanTaskReference(
+    citedIds.map((segment) => segment.replace(/^\s*task-/i, '')).join(','),
+    planTaskIds,
+  );
+}
+
 // Shared task-header grammar for parsers that identify task blocks without
 // requiring a title. Keep every consumer on this expression so a supported
 // heading form cannot silently drift between Files and Verify-only metadata.
@@ -21,6 +93,20 @@ export const TASK_HEADER_PATTERN =
 
 const PATH_EXTENSIONS = /\.(?:ts|tsx|js|jsx|mjs|cjs|md|json|yml|yaml|sh|rb|py|go|rs|html|css|scss|vue|toml)$/i;
 const BACKTICK_TOKEN = /`([^`\s]+)`/g;
+const STORY_LINE = /^[ \t]*\*\*Story:\*\*[ \t]*(?:(?:story|epic)\b[-\t ]+)?(n\/a|[A-Za-z0-9.-]+)/i;
+
+/** Returns unique story ids cited by leading `**Story:**` lines in a task block. */
+export function parsePlanTaskStoryIds(text: string): string[] {
+  const ids: string[] = [];
+  for (const line of text.split('\n')) {
+    const match = line.match(STORY_LINE);
+    if (!match) continue;
+    const id = match[1];
+    if (/^(n\/?a|prerequisite|none|all)$/i.test(id)) continue;
+    if (!ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
 
 /**
  * Plan task paths with provenance for explicit `**Files:**` declarations.

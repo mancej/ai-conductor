@@ -10,6 +10,8 @@ harness_version: ">=0.99.0"
 # The test-quality reviewer is opt-in by default. Project configuration can
 # enable it once a supported scoped test command is declared.
 build_review:
+  adjudication:
+    enabled: true
   rubrics:
     testQuality:
       enabled: false
@@ -59,5 +61,3 @@ markdown_viewer:
 # steps:
 #   explore:
 #     model: haiku
-# complexity:
-#   default_tier: M

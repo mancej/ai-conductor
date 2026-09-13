@@ -1,3 +1,4 @@
+// Covers: task:2, task:4
 import { describe, expect, it, vi } from 'vitest';
 import type {
   InvokeOptions,
@@ -133,7 +134,7 @@ describe('executeProviderCandidates', () => {
       memberId: 'scope',
       policy: {
         enabled: true, llm_provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh',
-        model_fallback_ladder: ['gpt-5.6-sol', 'gpt-5.6-terra'], max_retries: 2, escalate: true,
+        model_fallback_ladder: ['gpt-5.6-sol', 'gpt-5.6-terra'], max_retries: 2, escalate: true, min_confidence: 0,
       },
       runtimes: new ProviderRuntimeSet([
         runtime('codex', { lifecycleCapability: { synchronousSpawnPermit: true }, invoke: codexInvoke, }),
@@ -158,6 +159,83 @@ describe('executeProviderCandidates', () => {
     // Fresh session per ladder attempt, never the injected store's ids.
     expectFreshSessions(codexInvoke.mock.calls.map(([options]) => options));
   });
+
+  it('stops auxiliary retries and provider walking for an unresolved command while retaining ordinary retries', async () => {
+    const unresolvedInvoke = vi.fn(async (): Promise<InvokeResult> => ({
+      success: false,
+      output: 'unknown skill command',
+      exitCode: 1,
+      commandUnresolved: true,
+      commandUnresolvedName: '$build-review-scope',
+    }));
+    const secondCandidateInvoke = vi.fn(async (): Promise<InvokeResult> => ({
+      success: true,
+      output: 'must not run',
+      exitCode: 0,
+    }));
+    const unresolvedResult = await executeAuxiliaryProviderCandidates({
+      step: 'build_review',
+      memberId: 'scope',
+      policy: {
+        enabled: true, llm_provider: ['codex', 'claude'], model: 'gpt-5.6-sol', effort: 'high',
+        model_fallback_ladder: ['gpt-5.6-sol'], max_retries: 3, escalate: false, min_confidence: 0,
+      },
+      runtimes: new ProviderRuntimeSet([
+        runtime('codex', { invoke: unresolvedInvoke }),
+        runtime('claude', { invoke: secondCandidateInvoke }),
+      ]),
+      sessions: new ProviderSessionScope(vi.fn().mockReturnValue('unresolved-session')),
+      options: { prompt: '$build-review-scope', cwd: '/workspace' },
+    });
+
+    const ordinaryInvoke = vi.fn(async (): Promise<InvokeResult> => ({
+      success: false,
+      output: 'ordinary failure',
+      exitCode: 1,
+    }));
+    const ordinaryResult = await executeAuxiliaryProviderCandidates({
+      step: 'build_review',
+      memberId: 'scope',
+      policy: {
+        enabled: true, llm_provider: 'codex', model: 'gpt-5.6-sol', effort: 'high',
+        model_fallback_ladder: ['gpt-5.6-sol'], max_retries: 3, escalate: false, min_confidence: 0,
+      },
+      runtimes: new ProviderRuntimeSet([runtime('codex', { invoke: ordinaryInvoke })]),
+      sessions: new ProviderSessionScope(vi.fn().mockReturnValue('ordinary-session')),
+      options: { prompt: '$build-review-scope', cwd: '/workspace' },
+    });
+
+    expect({
+      unresolvedCalls: unresolvedInvoke.mock.calls.length,
+      secondCandidateCalls: secondCandidateInvoke.mock.calls.length,
+      unresolvedResult: {
+        success: unresolvedResult.success,
+        commandUnresolved: unresolvedResult.commandUnresolved,
+        commandUnresolvedName: unresolvedResult.commandUnresolvedName,
+      },
+      ordinaryCalls: ordinaryInvoke.mock.calls.length,
+      ordinaryResult: {
+        success: ordinaryResult.success,
+        commandUnresolved: ordinaryResult.commandUnresolved,
+        commandUnresolvedName: ordinaryResult.commandUnresolvedName,
+      },
+    }).toEqual({
+      unresolvedCalls: 1,
+      secondCandidateCalls: 0,
+      unresolvedResult: {
+        success: false,
+        commandUnresolved: true,
+        commandUnresolvedName: '$build-review-scope',
+      },
+      ordinaryCalls: 3,
+      ordinaryResult: {
+        success: false,
+        commandUnresolved: undefined,
+        commandUnresolvedName: undefined,
+      },
+    });
+  });
+
   it('keeps native model fallback on the active lifecycle permit without using a replacement', async () => {
     const fallbackPermit = vi.fn(() => ({ permitted: false as const, reason: 'revoked' as const }));
     const consumedPermits: InvokeOptions['spawnPermit'][] = [];
@@ -750,6 +828,59 @@ describe('executeProviderCandidates', () => {
     });
   });
 
+  it('carries resolved dispatch dimensions in attempt metadata and omits absent values', async () => {
+    const { buildProviderAttemptMetadata } = await import('../../src/engine/provider-execution.js');
+    const result: InvokeResult = { success: true, exitCode: 0, output: 'completed' };
+    const selected = buildProviderAttemptMetadata({
+      providerKey: 'claude',
+      result,
+      resolvedModel: 'sonnet',
+      preferredProvider: 'codex',
+      resolvedEffort: 'high',
+      tier: 'M',
+    });
+    const absent = buildProviderAttemptMetadata({
+      providerKey: 'claude',
+      result,
+      resolvedModel: 'sonnet',
+      preferredProvider: '',
+    });
+
+    expect({
+      selected: (selected as { preferredProvider?: string }).preferredProvider,
+      absent: (absent as { preferredProvider?: string }).preferredProvider,
+      effort: (selected as { effort?: string }).effort,
+      tier: (selected as { tier?: string }).tier,
+    }).toEqual({ selected: 'codex', absent: undefined, effort: 'high', tier: 'M' });
+  });
+
+  it('emits resolved dispatch dimensions on a real provider attempt', async () => {
+    const attempts: Array<Record<string, unknown>> = [];
+    const { executeProviderCandidates } = await import('../../src/engine/provider-execution.js');
+
+    await executeProviderCandidates({
+      step: 'build',
+      configuredProviders: ['codex'],
+      preferredProvider: 'codex',
+      tier: 'M',
+      effortOverride: 'high',
+      runtimes: new ProviderRuntimeSet([
+        runtime('codex', {
+          invoke: vi.fn(async (): Promise<InvokeResult> => ({
+            success: true, exitCode: 0, output: 'completed',
+          })),
+        }),
+      ]),
+      sessions: new ProviderSessionScope(vi.fn().mockReturnValue('attempt-session')),
+      options: { prompt: 'Build.', cwd: '/workspace' },
+      onAttempt: (_step, attempt) => { attempts.push({ ...attempt }); },
+    });
+
+    expect(attempts as unknown as Record<string, unknown>[]).toMatchObject([
+      { provider: 'codex', preferredProvider: 'codex', effort: 'high', tier: 'M' },
+    ]);
+  });
+
   it('wraps each resolved candidate through safety before fallback advances', async () => {
     const transcript: string[] = [];
     const unavailable = (): InvokeResult => ({
@@ -1233,7 +1364,9 @@ describe('executeProviderCandidates', () => {
           {
             provider: 'codex',
             authenticationSource: 'api-key',
+            preferredProvider: 'codex',
             model: 'gpt-step/verbatim',
+            effort: 'high',
             tokenUsage: { input: 13, output: 8 },
             outcome: 'success',
             invoked: true,
@@ -1652,7 +1785,9 @@ describe('executeProviderCandidates', () => {
         attempts: [
           {
             provider: 'codex',
+            preferredProvider: 'codex',
             model: 'gpt-cli-primary',
+            effort: 'max',
             outcome: 'unavailable',
             reason: missingReason,
             fallbackReason: missingReason,
@@ -1660,7 +1795,9 @@ describe('executeProviderCandidates', () => {
           },
           {
             provider: 'claude',
+            preferredProvider: 'codex',
             model: 'opus',
+            effort: 'high',
             outcome: 'success',
             invoked: true,
           },
@@ -1684,7 +1821,9 @@ describe('executeProviderCandidates', () => {
           },
           {
             provider: 'claude',
+            preferredProvider: 'codex',
             model: 'opus',
+            effort: 'high',
             outcome: 'success',
             invoked: true,
           },
@@ -1898,7 +2037,9 @@ describe('executeProviderCandidates', () => {
           attempts: [
             {
               provider: 'codex',
+              preferredProvider: 'codex',
               model: 'gpt-5.6-terra',
+              effort: 'medium',
               tokenUsage: { input: 22, output: 11 },
               outcome: 'success',
               invoked: true,
@@ -1937,7 +2078,9 @@ describe('executeProviderCandidates', () => {
           attempts: [
             {
               provider: 'codex',
+              preferredProvider: 'codex',
               model: 'gpt-5.6-luna',
+              effort: 'medium',
               tokenUsage: { input: 3, output: 0 },
               outcome: 'unavailable',
               reason: 'model unavailable: gpt-5.6-luna',
@@ -1946,7 +2089,9 @@ describe('executeProviderCandidates', () => {
             },
             {
               provider: 'claude',
+              preferredProvider: 'codex',
               model: 'sonnet',
+              effort: 'high',
               outcome: 'success',
               invoked: true,
             },
@@ -1973,7 +2118,9 @@ describe('executeProviderCandidates', () => {
           attempts: [
             {
               provider: 'codex',
+              preferredProvider: 'codex',
               model: 'gpt-5.6-sol',
+              effort: 'high',
               outcome: 'success',
               invoked: true,
             },
@@ -2151,7 +2298,9 @@ describe('executeProviderCandidates', () => {
           attempts: [
             {
               provider: 'codex',
+              preferredProvider: 'codex',
               model: 'gpt-5.6-terra',
+              effort: 'medium',
               outcome: 'failure',
               reason: failure.output,
               invoked: true,
@@ -2227,7 +2376,9 @@ describe('executeProviderCandidates', () => {
       attempts: [
         {
           provider: 'codex',
+          preferredProvider: 'codex',
           model: 'gpt-5.6-terra',
+          effort: 'medium',
           tokenUsage: { input: 3, output: 1 },
           observedIntervals: [failedInterval],
           outcome: 'unavailable',
@@ -2238,6 +2389,8 @@ describe('executeProviderCandidates', () => {
         {
           provider: 'claude',
           model: 'sonnet',
+          preferredProvider: 'codex',
+          effort: 'medium',
           tokenUsage: { input: 20, output: 8 },
           observedIntervals: [fallbackInterval],
           outcome: 'success',
@@ -2490,7 +2643,9 @@ describe('executeProviderCandidates', () => {
           attempts: [
             {
               provider: 'codex',
+              preferredProvider: 'codex',
               model: 'gpt-5.6-terra',
+              effort: 'medium',
               outcome: 'unavailable',
               reason: 'codex binary missing',
               fallbackReason: 'codex binary missing',
@@ -2505,7 +2660,9 @@ describe('executeProviderCandidates', () => {
             },
             {
               provider: 'third',
+              preferredProvider: 'codex',
               model: 'sonnet',
+              effort: 'medium',
               outcome: 'unavailable',
               reason: 'third integration missing',
               invoked: true,

@@ -97,6 +97,10 @@ function isAlreadyHeld(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === 'EEXIST';
 }
 
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
 function ownerPath(leasePath: string): string {
   return `${leasePath}/${LEASE_OWNER_FILE}`;
 }
@@ -171,12 +175,18 @@ export function createConductStateLease(
   async function recoverDeadOwner(): Promise<
     | { status: 'recovered'; ownerPid: number }
     | { status: 'occupied'; ownerPid?: number }
+    // `mkdir` succeeds before the owner metadata write. A peer that observes
+    // that short creation window must wait for the owner (or release), not
+    // misclassify a healthy concurrent writer as an ambiguous lease.
+    | { status: 'initializing' }
+    | { status: 'vanished' }
     | { status: 'refused'; message: string }
   > {
     let serializedOwner: string;
     try {
       serializedOwner = await filesystem.readOwner(ownerPath(leasePath));
     } catch (error) {
+      if (isMissing(error)) return { status: 'initializing' };
       reportRecovery({ kind: 'refused', statePath, reason: 'ownership_changed' });
       return {
         status: 'refused',
@@ -209,6 +219,12 @@ export function createConductStateLease(
       await filesystem.writeRecoveryClaim(recoveryClaimPath(leasePath), claim);
     } catch (error) {
       if (isAlreadyHeld(error)) return { status: 'occupied', ownerPid: owner.pid };
+      // The lease directory disappeared between reading its owner and claiming
+      // recovery: the owner released it (or a peer recovered it first) while this
+      // process was probing liveness. Nothing was stolen and nothing is ambiguous
+      // — the lease is simply unheld now, so the caller retries the creation
+      // rather than failing an otherwise healthy mutation.
+      if (isMissing(error)) return { status: 'vanished' };
       reportRecovery({ kind: 'refused', statePath, reason: 'ownership_changed' });
       return {
         status: 'refused',
@@ -304,7 +320,7 @@ export function createConductStateLease(
           if (recovery.status === 'refused') {
             return { ok: false, kind: 'recovery_refused', message: recovery.message };
           }
-          lastLiveOwnerPid = recovery.ownerPid;
+          if (recovery.status === 'occupied') lastLiveOwnerPid = recovery.ownerPid;
 
           const elapsedMs = now() - startedAt;
           if (elapsedMs >= waitTimeoutMs) {
@@ -314,6 +330,11 @@ export function createConductStateLease(
               message: `Unable to acquire ${leaseName} lease within ${waitTimeoutMs}ms${lastLiveOwnerPid === undefined ? '' : `; owner pid ${lastLiveOwnerPid} is live`}`,
             };
           }
+          // A vanished lease is unheld right now, so retry the creation without
+          // burning a retry delay. An initializing lease is still live, but its
+          // owner write has not become visible yet; wait for it or its creator's
+          // cleanup. The wait budget still bounds both races.
+          if (recovery.status === 'vanished') continue;
           try {
             await wait(Math.min(retryDelayMs, waitTimeoutMs - elapsedMs));
           } catch (waitError) {

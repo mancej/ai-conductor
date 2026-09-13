@@ -66,17 +66,28 @@ halt (adr-2026-07-27-daemon-decide-kickback-halt, adr-2026-08-03-fail-closed-dec
    > the gate; the subsequent halt names it as refused — rework required — instead of re-offering
    > acceptance. A later acceptance overrides a refusal; a refusal is moot once the audit no
    > longer flags the criterion. See adr-2026-08-24-over-scope-decision-block-and-durable-refusals.
+> **Amended 2026-09-07 by #2429:** Explicit refusal revision and NC relationship authority now follow adr-2026-09-07-durable-prd-widening-decision-reconciliation D1-D4/D8. An old cleared acceptance cannot override a newer refusal; an explicit revision names the prior decision. The report-local NC key remains presentation, and valid original decisions are captured before current-report reconciliation. No NC case becomes a BUILD task, and the existing FIXABLE/PLAN_GAP routing and allowances below remain unchanged.
+
 5. **Bounded kickback.** `FIXABLE` findings route to BUILD through the existing remediation append
    seam — the only plan appender — under engine-enforced caps: **one lap per feature**, at most
    **5** added tasks and at most **25% of the authored task count**, whichever is lower; all three
    operator-configurable. Each appended task carries `Criterion:` and its parent task. Exceeding a
    cap, or a second lap, converts to a needs-human HALT listing every finding. The lap rides the
    durable per-gate kickback ledger (`gates.prd_audit`), never the build_review cumulative counter.
+
+   > **Amended 2026-08-31 by #2119:** A `FIXABLE` finding whose remedy is owned by task ids
+   > already in the active plan may instead take the non-appending `existing-task` disposition
+   > (adr-2026-08-25-as-built-remediable-findings-bounded-build-route decision 9). It routes to
+   > BUILD without the append seam, adds no tasks, and is bounded by the gate's lap cap alone;
+   > the 5-task and 25% caps continue to govern appending dispositions only.
 6. **Growth ledger.** The kickback ledger gains a per-feature `growth` record:
    `{authored, added, byGate, remaining}`; pre-existing `rem-*` tasks found in a plan at first read
    count toward `authored`. Surfaced by `conduct-ts` status output and emitted on the spine.
    (Extending the ledger was chosen over a new spine record because the ledger already owns
    per-feature kickback state and the removal guard reads appended ids from it.)
+
+   > **Amended 2026-08-31 by #2119:** An `existing-task` disposition leaves `added` and
+   > `remaining` untouched by design — a plan that did not grow records no growth.
 7. **PLAN_GAP.** Happy-path criterion unmet with no owning task → HALT (class `plan-gap`); negative/
    edge criterion → recorded in the verdict and the shipped record, ships, unless configuration
    requires a halt. Never a kickback; the daemon DECIDE-halt rule is unchanged.

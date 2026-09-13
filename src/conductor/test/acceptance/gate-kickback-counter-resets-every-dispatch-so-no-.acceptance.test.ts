@@ -35,14 +35,12 @@
  *        production caller of `classifyBuildProgress`), reached from
  *        `manual_test` (`:2468`), the validation-group join (`:3288`),
  *        `build_review` (`:5115`), `prd_audit` (`:5438`), and the generic
- *        gate site (`:5597`). `wiring_check` reaches it from NOWHERE today —
- *        that absence is Story 3.
+ *        gate site (`:5597`). The retired BUILD gate has no remaining route.
  *      * `conductor.ts:2396` — `captureKickbackToBuildContext`, the baseline
  *        producer, currently `currentCommitSha`.
  *
- * `wiring_check` is the vehicle for most cases: it is the gate that actually
- * livelocked on 2026-07-26, its failure reason is deterministic (no LLM
- * grader), and its self-heal block is not daemon-gated
+ * build_review is the vehicle for the remaining cases: its failure reason is
+ * deterministic (no LLM grader), and its self-heal block is not daemon-gated
  * (`conductor.ts:5246-5254`), so the fixture stays small. `build_review` is
  * driven separately for Story 5's second converted HALT site.
  *
@@ -51,7 +49,7 @@
  *    of it (plan Tasks 1-2, 6, 8, 10). Nothing in `src/` mentions it.
  *  - `currentTreeHash` / `git rev-parse HEAD^{tree}` — verified absent from
  *    the whole repo (plan Task 4).
- *  - `wiring_check`'s D2 capture/check pair (plan Tasks 12-13).
+ *  - the retired gate's D2 capture/check pair (plan Tasks 12-13).
  *  - `.pipeline/HALT.class` on either cap-HALT path — both hand-roll
  *    `writeFile` today (`conductor.ts:5218-5227`, `:5325-5334`) and write no
  *    class sidecar (plan Tasks 14-15).
@@ -161,6 +159,7 @@ function frontDone(): ConductState {
     plan: 'done',
     architecture_diagram: 'skipped',
     architecture_review: 'skipped',
+    coverage_binding: 'done',
     acceptance_specs: 'skipped',
   };
 }
@@ -168,9 +167,7 @@ function frontDone(): ConductState {
 /** The kickback vehicle. `build_review` is the deterministic BUILD gate that
  * still routes an unsatisfied verdict back to `build`: a test-quality
  * rubric FAIL re-enters `build` directly, which is the cap path
- * this file bounds. (`wiring_check`, the original 2026-07-26 vehicle, is now a
- * deprecated no-op that never kicks back —
- * adr-2026-08-11-wiring-judged-in-build-review.) */
+ * this file bounds. */
 const FAIL_VERDICT = (message: string): string =>
   JSON.stringify({
     verdict: 'FAIL',
@@ -411,14 +408,14 @@ describe('acceptance: cross-dispatch kickback livelock bound (#984)', () => {
   );
 
   it(
-    'Story 1 negative: a corrupt ledger is treated as absent — the dispatch survives it, ' +
-    'warns, and proceeds on a fresh budget',
+    'Story 1 regression: a corrupt ledger fails closed — the dispatch warns, preserves the record, ' +
+    'and requires a human rather than granting fresh budget',
     async () => {
       await writeState(statePath, {
         ...frontDone(),
         track: 'technical',
-        // An unset value means a fresh session and deliberately clears the
-        // ledger before its tolerant reader can observe corruption.
+        // A populated value preserves the ledger across this re-dispatch, so
+        // the reader must enforce its corrupt-record behavior.
         run_started_at: 1,
       });
       await writeFile(join(dir, KICKBACK_LEDGER), '{ not json at all');
@@ -435,13 +432,10 @@ describe('acceptance: cross-dispatch kickback livelock bound (#984)', () => {
       };
       await expect(makeConductor(runner, { escalationEnabled: false }).run()).resolves.not.toThrow();
 
-      expect(kicks.filter((k) => k.from === 'build_review' && k.to === 'build')).toHaveLength(
-        MAX_KICKBACKS_PER_GATE,
-      );
+      expect(kicks.filter((k) => k.from === 'build_review' && k.to === 'build')).toHaveLength(0);
       expect(warn).toHaveBeenCalled();
-      // The corrupt document is replaced, not left to poison the next dispatch.
-      const entry = await readLedgerEntry(dir, 'build_review');
-      expect(entry).not.toBeNull();
+      expect(await readFile(join(dir, KICKBACK_LEDGER), 'utf8')).toBe('{ not json at all');
+      expect(await readHaltClass(dir)).toBe('needs-human');
       warn.mockRestore();
     },
     60_000,

@@ -23,6 +23,27 @@ export type GhRunner = (
   opts: { cwd: string },
 ) => Promise<{ stdout: string }>;
 
+/** A `gh` command requested a JSON field that this installed CLI does not support. */
+export class GhCapabilityError extends Error {
+  readonly cli = 'gh';
+  readonly field: string;
+
+  constructor(field: string, cause: unknown) {
+    super(`gh does not support JSON field "${field}"`, { cause });
+    this.name = 'GhCapabilityError';
+    this.field = field;
+  }
+}
+
+function unsupportedJsonField(cause: unknown): string | undefined {
+  const failure = cause as { code?: unknown; stderr?: unknown };
+  if (typeof failure?.code !== 'number' || failure.code === 0 || typeof failure.stderr !== 'string') {
+    return undefined;
+  }
+
+  return /^Unknown JSON field:\s*"([^"]+)"/m.exec(failure.stderr)?.[1];
+}
+
 /**
  * Test kill-switch. When `AI_CONDUCTOR_NO_REAL_EXEC` is set (the vitest global setup
  * sets it — see `test/setup.ts`), the production `gh`/`git` runners refuse to
@@ -44,11 +65,19 @@ export function assertRealExecAllowed(bin: string): void {
 export function makeProductionGh(): GhRunner {
   return async (args: string[], opts: { cwd: string }) => {
     assertRealExecAllowed('gh');
-    const result = await execFileP('gh', args, {
-      cwd: opts.cwd,
-      maxBuffer: GH_STDOUT_MAX_BUFFER,
-    });
-    return { stdout: String(result.stdout) };
+    try {
+      const result = await execFileP('gh', args, {
+        cwd: opts.cwd,
+        maxBuffer: GH_STDOUT_MAX_BUFFER,
+      });
+      return { stdout: String(result.stdout) };
+    } catch (cause) {
+      const field = unsupportedJsonField(cause);
+      if (field) {
+        throw new GhCapabilityError(field, cause);
+      }
+      throw cause;
+    }
   };
 }
 
@@ -67,6 +96,12 @@ interface AssignedIssue {
  *
  */
 export interface TrackerClient {
+  /** Locate a previously-created intake issue whose body contains this exact hidden effect marker. */
+  findIssueByEffectMarker?(
+    marker: string,
+    repo: string,
+    cwd: string,
+  ): Promise<string | null>;
   /** `gh api repos/<owner>/<repo>/issues/<number>` — returns label names. */
   getIssueLabels(repo: string, number: number, cwd: string): Promise<string[]>;
   /** `gh issue view <owner/repo#number> --json state` — raw stdout JSON. */
@@ -102,6 +137,10 @@ export interface TrackerClient {
   createLabel(repo: string, name: string, cwd: string): Promise<void>;
   /** `gh api --method DELETE repos/<repo>/issues/<number>/labels/<name>` — remove a label via REST. */
   removeIssueLabel(repo: string, number: number, label: string, cwd: string): Promise<void>;
+}
+
+export interface EffectMarkerTrackerClient extends TrackerClient {
+  findIssueByEffectMarker(marker: string, repo: string, cwd: string): Promise<string | null>;
 }
 
 /** Error thrown when a `GhRunner` invocation rejects; carries argv/stderr/exit-code and, if
@@ -175,8 +214,34 @@ function parseJsonOrThrow<T>(operation: string, stdout: string): T {
 }
 
 /** Construct a `TrackerClient` backed by the GitHub `gh` CLI via the given runner. */
-export function createGithubTrackerClient(runner: GhRunner): TrackerClient {
+export function createGithubTrackerClient(runner: GhRunner): EffectMarkerTrackerClient {
   return {
+    async findIssueByEffectMarker(marker, repo, cwd) {
+      const args = [
+        'issue',
+        'list',
+        '--state',
+        'all',
+        '--search',
+        `${JSON.stringify(marker)} in:body`,
+        '--json',
+        'url,body',
+        '--limit',
+        '2',
+        '-R',
+        repo,
+      ];
+      const { stdout } = await runOrThrow(runner, args, { cwd });
+      const issues = parseJsonOrThrow<Array<{ url?: unknown; body?: unknown }>>(
+        'findIssueByEffectMarker',
+        stdout || '[]',
+      );
+      const matchingIssue = issues.find(
+        (issue) => typeof issue.url === 'string' && typeof issue.body === 'string' && issue.body.includes(marker),
+      );
+      return typeof matchingIssue?.url === 'string' ? matchingIssue.url : null;
+    },
+
     async getIssueLabels(repo, number, cwd) {
       const { stdout } = await runOrThrow(runner, ['api', `repos/${repo}/issues/${number}`], {
         cwd,

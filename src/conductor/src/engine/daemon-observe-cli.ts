@@ -25,7 +25,8 @@ import { summarizeAccuracyLedger } from './attribution-audit.js';
 import { scanInheritedState } from './daemon-dashboard.js';
 import { prdAuditAppendCap } from './conductor.js';
 import { loadConfig } from './config.js';
-import { readGrowth } from './kickback-ledger.js';
+import { readGrowth, readKickbackLedger } from './kickback-ledger.js';
+import { renderKickbackBudgetView } from './kickback-budget-view.js';
 import type { HarnessConfig } from '../types/config.js';
 
 /** Fallback label when a pidfile record has no `engineDir`, or its basename
@@ -295,9 +296,12 @@ const STATE_BADGE: Record<DaemonState, string> = {
 };
 
 function formatStatusRow(row: DaemonStatusRow): string {
+  const drainSlugs = row.restartPending?.drainSlugs;
   const badge =
-    row.state === 'restart-pending' && row.restartPending?.blockingSlug
-      ? `⏳ restart-pending (waiting on ${row.restartPending.blockingSlug})`
+    row.state === 'restart-pending' && drainSlugs && drainSlugs.length > 0
+      ? `⏳ restart-pending (waiting on ${drainSlugs.join(', ')})`
+      : row.state === 'restart-pending' && row.restartPending?.blockingSlug
+        ? `⏳ restart-pending (waiting on ${row.restartPending.blockingSlug})`
       : STATE_BADGE[row.state];
   const parts = [`${badge}  ${row.name}`, `  ${row.path}`];
   if (row.pid !== undefined) parts.push(`  pid ${row.pid}`);
@@ -468,7 +472,11 @@ async function renderPlanGrowthSection(repoPath: string, out: (line: string) => 
     discover: async () => [],
   });
 
-  for (const feature of state.inProgress) {
+  // A fresh authorization normally belongs to a halted feature; excluding it
+  // would hide the only recovery budget the operator needs to inspect.
+  const visibleFeatures = [...state.inProgress, ...state.halted]
+    .filter((feature, index, features) => features.findIndex((item) => item.slug === feature.slug) === index);
+  for (const feature of visibleFeatures) {
     const featureRoot = join(repoPath, '.worktrees', feature.slug);
     const initial = await readGrowth(featureRoot, 0);
     const config = await loadConfig(featureRoot);
@@ -485,6 +493,17 @@ async function renderPlanGrowthSection(repoPath: string, out: (line: string) => 
       `added ${growth.added}${byGate ? ` (${byGate})` : ''}; ` +
       `remaining ${growth.remaining}/${cap}`,
     );
+    const ledger = await readKickbackLedger(featureRoot);
+    for (const [gate, entry] of Object.entries(ledger.gates)) {
+      if ((entry.adjustments?.length ?? 0) === 0) continue;
+      const limit = gate === 'build_review'
+        ? 5
+        : gate === 'prd_audit'
+          ? (config.ok ? (config.config as HarnessConfig & { prd_audit?: { max_remediation_laps?: number } }).prd_audit?.max_remediation_laps ?? 1 : 1)
+          : (config.ok ? (config.config as HarnessConfig & { architecture_review_as_built?: { max_remediation_laps?: number } }).architecture_review_as_built?.max_remediation_laps ?? 1 : 1);
+      const view = renderKickbackBudgetView(entry, gate, limit).replace(/\n/g, ' | ');
+      out(`  KICKBACK BUDGET [${feature.slug}]: ${view}`);
+    }
   }
 }
 

@@ -1,3 +1,4 @@
+// Covers: task:4
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -284,9 +285,24 @@ describe('CodexProvider', () => {
         expected: { rateLimited: true, usageExhausted: true, waitSeconds: 900 },
       },
       {
+        name: 'exhaustion with an hour retry-after scales the parsed wait',
+        stderr: 'usage limit reached; retry after 2 hours',
+        expected: { rateLimited: true, usageExhausted: true, waitSeconds: 7200 },
+      },
+      {
         name: 'a transient 429 keeps its parsed short wait and is not exhaustion',
         stderr: 'Error 429: rate limit exceeded; retry after 45 seconds',
         expected: { rateLimited: true, usageExhausted: undefined, waitSeconds: 45 },
+      },
+      {
+        name: 'a transient throttle with a minute retry-after scales the parsed wait',
+        stderr: 'Error 429: rate limit exceeded; retry after 90 minutes',
+        expected: { rateLimited: true, usageExhausted: undefined, waitSeconds: 5400 },
+      },
+      {
+        name: 'a transient throttle with an unrecognized retry unit keeps the fallback',
+        stderr: 'Error 429: rate limit exceeded; retry after 3 fortnights',
+        expected: { rateLimited: true, usageExhausted: undefined, waitSeconds: 300 },
       },
       {
         name: 'a transient throttle without retry-after keeps the 300s default',
@@ -402,6 +418,42 @@ describe('CodexProvider', () => {
       cachedInputTokens: 5,
       outputTokens: 7,
     })]);
+  });
+
+  it('returns usage observed in the live stream when retained terminal stdout omits usage', async () => {
+    const stdout = new PassThrough();
+    let resolveProcess: (result: { stdout: string; stderr: string; exitCode: number }) => void;
+    let resolveStarted: () => void;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    const process = Object.assign(new Promise<{ stdout: string; stderr: string; exitCode: number }>((resolve) => {
+      resolveProcess = resolve;
+    }), { stdout, kill: vi.fn() });
+    provider = new CodexProvider(vi.fn(async () => readyDoctorResult()), 'codex', undefined, () => {
+      resolveStarted!();
+      return process as any;
+    });
+
+    const invocation = provider.invoke({
+      ...baseOptions,
+      streamConsumer: {
+        onProviderStream: vi.fn(),
+        close: vi.fn(),
+      },
+    });
+    await started;
+    stdout.write(`${JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 17, cached_input_tokens: 5, output_tokens: 7 },
+    })}\n`);
+    const retainedTerminal = JSON.stringify({ type: 'turn.completed' });
+    resolveProcess!({ stdout: retainedTerminal, stderr: '', exitCode: 0 });
+
+    await expect(invocation).resolves.toMatchObject({
+      success: true,
+      tokenUsage: { input: 12, cacheRead: 5, output: 7, numTurns: 1 },
+    });
   });
 
   it('checks a current permit before readiness and immediately before the injected subprocess factory', async () => {

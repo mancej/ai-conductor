@@ -5,11 +5,15 @@ import { join } from 'node:path';
 import { deriveEffectiveBuildReviewVerdictWithDispositions, parseBuildReviewAggregate } from './build-review-aggregate.js';
 import { BuildReviewDispositionStore, type BuildReviewDispositionAppendResult, type BuildReviewDispositionListResult, type BuildReviewDispositionRecord, type BuildReviewFeatureIdentity, type BuildReviewReducedCoverageAppendResult, type BuildReviewReducedCoverageListResult, type BuildReviewReducedCoverageDispositionRecord } from './build-review-dispositions.js';
 import { canonicalizeBuildReviewFindingIdentity } from './build-review-finding-identity.js';
-import { parseBuildReviewLapId } from './build-review-domain.js';
+import { deriveBuildReviewScopeIncompleteFault, parseBuildReviewLapId, type BuildReviewInfrastructureFailureReason } from './build-review-domain.js';
 import { resolveBuildReviewFeatureIdentity } from './build-review-effective.js';
+import { RemediationCaseStore, type RemediationCaseRecord, type RemediationCaseStoreReadResult } from './remediation-case-store.js';
 import { resolveMainRepoRoot } from './park-marker.js';
+import { resolveCliFeatureWorktree } from './cli-operator-authority.js';
 import { appendCloseoutEvent, type BuildReviewExternalEvent } from './closeout-events.js';
-import { MAX_MECHANICAL_FAULTS_BUILD_REVIEW, readKickbackLedger, type KickbackGateEntry } from './kickback-ledger.js';
+import { MAX_MECHANICAL_FAULTS_BUILD_REVIEW, isUnreadableKickbackGate, readKickbackLedger, type KickbackGateEntry } from './kickback-ledger.js';
+import { loadConfig as loadConfigDefault, type ConfigResult } from './config.js';
+import { resolveBuildReviewConfig } from './resolved-config.js';
 import type { BuildReviewRubricId } from '../types/config.js';
 
 export interface BuildReviewFindingsCommand {
@@ -24,8 +28,10 @@ export interface BuildReviewFindingsDeps {
   readonly realpath?: (path: string) => Promise<string>;
   readonly readFile?: (path: string) => Promise<string>;
   readonly createStore?: (worktree: string) => DispositionStore;
+  readonly createCaseStore?: (worktree: string, feature: BuildReviewFeatureIdentity) => RemediationCaseStoreReader;
   readonly readKickbackGateEntry?: (worktree: string) => Promise<Pick<KickbackGateEntry, 'mechanicalFaults' | 'lastMechanicalFault'> | undefined>;
   readonly readMechanicalFaults?: (worktree: string) => Promise<number | undefined>;
+  readonly loadConfig?: (worktree: string) => Promise<ConfigResult>;
   readonly print?: (output: string) => void;
 }
 
@@ -50,6 +56,10 @@ type DispositionStore = {
   listReducedCoverage?(feature: unknown): Promise<BuildReviewReducedCoverageListResult>;
   append(input: Parameters<BuildReviewDispositionStore['append']>[0]): Promise<BuildReviewDispositionAppendResult>;
   appendIfCurrent?: BuildReviewDispositionStore['appendIfCurrent'];
+};
+
+type RemediationCaseStoreReader = {
+  read(): Promise<RemediationCaseStoreReadResult>;
 };
 
 type ReducedCoverageDispositionStore = {
@@ -86,19 +96,29 @@ type AcceptedDisposition = {
 
 type ExhaustedMechanicalFault = {
   readonly rubric: BuildReviewRubricId;
-  readonly cause: string;
+  readonly cause: BuildReviewInfrastructureFailureReason;
   readonly diagnostic: string;
 };
 
-/** Only an infrastructure result published after its mechanical allowance is exhausted is terminal. */
+/** The closed faults an operator may cover after the existing allowance is exhausted. */
+function reducedCoverageFault(result: NonNullable<ReturnType<typeof parseBuildReviewAggregate>>['results'][BuildReviewRubricId]): ExhaustedMechanicalFault | undefined {
+  if (result.kind === 'infrastructure-failure') {
+    return { rubric: result.rubric, cause: result.reason, diagnostic: result.detail };
+  }
+  const scopeFault = result.kind === 'judged' ? deriveBuildReviewScopeIncompleteFault(result) : undefined;
+  return scopeFault && { rubric: scopeFault.rubric, cause: scopeFault.reason, diagnostic: scopeFault.detail };
+}
+
+/** Only a published mechanical fault after its allowance is exhausted is terminal. */
 function exhaustedMechanicalFaults(
   aggregate: NonNullable<ReturnType<typeof parseBuildReviewAggregate>>,
   mechanicalFaults: number,
 ): readonly ExhaustedMechanicalFault[] {
   if (mechanicalFaults < MAX_MECHANICAL_FAULTS_BUILD_REVIEW) return [];
-  return Object.values(aggregate.results).flatMap((result) => result.kind === 'infrastructure-failure'
-    ? [{ rubric: result.rubric, cause: result.reason, diagnostic: result.detail }]
-    : []);
+  return Object.values(aggregate.results).flatMap((result) => {
+    const fault = reducedCoverageFault(result);
+    return fault ? [fault] : [];
+  });
 }
 
 function acceptedDispositions(
@@ -127,14 +147,26 @@ function acceptedDispositions(
   });
 }
 
-function renderHuman(feature: string, aggregate: NonNullable<ReturnType<typeof parseBuildReviewAggregate>>, effective: NonNullable<ReturnType<typeof deriveEffectiveBuildReviewVerdictWithDispositions>>, accepted: readonly AcceptedDisposition[], faults: readonly ExhaustedMechanicalFault[], lastMechanicalFault: KickbackGateEntry['lastMechanicalFault']): string {
+function renderCase(caseRecord: RemediationCaseRecord): string {
+  const effect = caseRecord.effect.kind === 'none'
+    ? 'none'
+    : `${caseRecord.effect.kind}/${caseRecord.effect.status}`;
+  const assertions = caseRecord.refutation?.assertions
+    .map((assertion) => `${assertion.assertion} (${assertion.verdict})`).join('; ') ?? 'none';
+  return `Autonomous case outcome: ${caseRecord.id}; disposition: ${caseRecord.disposition}; resolution: ${caseRecord.resolution}; source ids: ${caseRecord.sources.map((source) => source.sourceId).join(', ') || 'none'}; effect: ${effect}; claim: ${caseRecord.refutation?.claim ?? 'none'}; assertions: ${assertions}; rationale: ${caseRecord.rationale}`;
+}
+
+function renderHuman(feature: string, aggregate: NonNullable<ReturnType<typeof parseBuildReviewAggregate>>, effective: NonNullable<ReturnType<typeof deriveEffectiveBuildReviewVerdictWithDispositions>>, accepted: readonly AcceptedDisposition[], cases: readonly RemediationCaseRecord[], faults: readonly ExhaustedMechanicalFault[], lastMechanicalFault: KickbackGateEntry['lastMechanicalFault']): string {
   return [
     `Build review findings: ${feature}`,
     `Lap: ${aggregate.lapId}`,
     `Raw verdict: ${effective.rawVerdict}`,
     `Effective verdict: ${effective.verdict}`,
     `Accepted findings: ${effective.acceptedFindingIds.join(', ') || 'none'}`,
+    `Operator dispositions: ${accepted.length === 0 ? 'none' : ''}`,
     ...accepted.map(({ findingId, disposition }) => `Accepted disposition: ${findingId} (lap ${disposition.sourceLapId}; operator ${disposition.operator}; rationale: ${disposition.rationale})`),
+    `Autonomous case outcomes: ${cases.length === 0 ? 'none' : ''}`,
+    ...cases.map(renderCase),
     `Unresolved findings: ${effective.unresolvedFindingIds.join(', ') || 'none'}`,
     `Skipped rubrics: ${effective.skippedRubrics.join(', ') || 'none'}`,
     `Infrastructure failures: ${effective.infrastructureFailureRubrics.join(', ') || 'none'}`,
@@ -153,6 +185,16 @@ type ResolvedCliFeature = {
   readonly feature: BuildReviewFeatureIdentity;
 };
 
+async function resolveCliMinConfidence(
+  worktree: string,
+  deps: Pick<BuildReviewFindingsDeps, 'loadConfig'>,
+): Promise<Partial<Record<BuildReviewRubricId, number>>> {
+  const loaded = await (deps.loadConfig ?? loadConfigDefault)(worktree);
+  if (!loaded.ok) throw new Error(loaded.error.message);
+  return Object.fromEntries(Object.entries(resolveBuildReviewConfig(loaded.config).rubrics)
+    .map(([id, policy]) => [id, policy.min_confidence]));
+}
+
 /** The CLI and live runner must address the same canonical feature state. */
 async function resolveCliFeature(
   command: Pick<BuildReviewFindingsCommand, 'feature'>,
@@ -161,8 +203,17 @@ async function resolveCliFeature(
   try {
     const resolveMainRoot = deps.resolveMainRoot ?? resolveMainRepoRoot;
     const realpath = deps.realpath ?? realpathDefault;
-    const root = await resolveMainRoot(deps.cwd ?? process.cwd());
-    const worktree = await realpath(join(root, '.worktrees', command.feature));
+    // The shared named-worktree resolution every operator command uses
+    // (adr-2026-08-29 D3: factored into a shared module rather than copied).
+    const worktree = await resolveCliFeatureWorktree(command.feature, {
+      cwd: deps.cwd,
+      resolveMainRoot: deps.resolveMainRoot,
+      realpath: deps.realpath,
+      // `resolveBuildReviewFeatureIdentity` below is this command's existence
+      // proof; a separate stat would reject an injected resolution seam.
+      verifyDirectory: false,
+    });
+    if (!worktree) return undefined;
     const feature = await resolveBuildReviewFeatureIdentity(worktree, { resolveMainRoot, realpath });
     return feature?.feature === command.feature ? { worktree, feature } : undefined;
   } catch {
@@ -184,27 +235,51 @@ export async function dispatchBuildReviewFindings(command: BuildReviewFindingsCo
     const listed = await store.list(feature);
     if (!listed.ok) throw new Error(listed.message);
     const records = listed.records;
+    const caseStore = (deps.createCaseStore ?? ((projectRoot: string, caseFeature: BuildReviewFeatureIdentity) => new RemediationCaseStore(projectRoot, caseFeature)))(worktree, feature);
+    const caseRead = await caseStore.read();
+    if (!caseRead.ok) throw new Error(`remediation case store is ${caseRead.reason}`);
+    const cases = caseRead.state.cases;
     const reducedCoverage = store.listReducedCoverage
       ? await store.listReducedCoverage(feature)
       : { ok: true as const, records: [] as BuildReviewReducedCoverageDispositionRecord[] };
     if (!reducedCoverage.ok) throw new Error(reducedCoverage.message);
+    const minConfidence = await resolveCliMinConfidence(worktree, deps);
     const gateEntry = deps.readKickbackGateEntry
       ? await deps.readKickbackGateEntry(worktree)
       : deps.readMechanicalFaults
         ? { mechanicalFaults: await deps.readMechanicalFaults(worktree) }
-        : (await readKickbackLedger(worktree)).gates.build_review;
-    const effective = deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, records, reducedCoverage.records);
+        : await (async () => {
+          const ledger = await readKickbackLedger(worktree);
+          if (isUnreadableKickbackGate(ledger, 'build_review')) {
+            throw new Error("kickback ledger gate 'build_review' is unreadable");
+          }
+          return ledger.gates.build_review;
+        })();
+    const effective = deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, records, reducedCoverage.records, minConfidence);
     if (!effective) throw new Error('current findings are invalid');
     const accepted = acceptedDispositions(aggregate, feature, effective, records);
     const faults = exhaustedMechanicalFaults(aggregate, gateEntry?.mechanicalFaults ?? 0);
+    // Uncovered coverage projections are engine-routing-only. The operator
+    // already sees coverage through the rendered failures and reduced-coverage
+    // decisions, so keep this command's published machine contract byte-stable.
+    const {
+      uncoveredInfrastructureFailureRubrics: _uncoveredInfrastructure,
+      uncoveredScopeIncompleteRubrics: _uncoveredScopeIncomplete,
+      ...reported
+    } = effective;
     const output = {
-      feature: command.feature, lapId: aggregate.lapId, snapshotDigest: aggregate.snapshotDigest, ...effective, acceptedDispositions: accepted,
+      feature: command.feature, lapId: aggregate.lapId, snapshotDigest: aggregate.snapshotDigest, ...reported, acceptedDispositions: accepted,
+      cases,
       ...(gateEntry?.lastMechanicalFault === undefined ? {} : { lastMechanicalFault: gateEntry.lastMechanicalFault }),
       ...(faults.length > 0 ? { exhaustedMechanicalFaults: faults } : {}),
     };
-    print(command.format === 'json' ? JSON.stringify(output) : renderHuman(command.feature, aggregate, effective, accepted, faults, gateEntry?.lastMechanicalFault));
+    print(command.format === 'json' ? JSON.stringify(output) : renderHuman(command.feature, aggregate, effective, accepted, cases, faults, gateEntry?.lastMechanicalFault));
     return 0;
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('remediation case store is ')) {
+      print(`build-review findings: ${error.message} for '${command.feature}'.`);
+      return 1;
+    }
     print(`build-review findings: current feature state is invalid or unavailable for '${command.feature}'.`);
     return 1;
   }
@@ -274,6 +349,7 @@ export async function dispatchBuildReviewAccept(command: BuildReviewAcceptComman
   }
   const identity = currentFinding.identity;
   try {
+    const minConfidence = await resolveCliMinConfidence(worktree, deps);
     const store = (deps.createStore ?? ((projectRoot: string) => new BuildReviewDispositionStore(projectRoot)))(worktree);
     const appendInput = { feature, finding: identity, sourceLapId: requestedLap, summary: currentFinding.finding.summary, rationale: command.rationale.trim(), operator: operator.trim() };
     const unchanged = async (): Promise<boolean> => {
@@ -284,7 +360,7 @@ export async function dispatchBuildReviewAccept(command: BuildReviewAcceptComman
     const appended = store.appendIfCurrent
       ? await store.appendIfCurrent(appendInput, async (records) => {
         if (!await unchanged()) return false;
-        const effective = deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, records);
+        const effective = deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, records, [], minConfidence);
         return effective?.unresolvedFindingIds.includes(identity.id) === true;
       })
       : await (async () => {
@@ -293,7 +369,7 @@ export async function dispatchBuildReviewAccept(command: BuildReviewAcceptComman
         if (!await unchanged()) {
           return { ok: false as const, kind: 'invalid' as const, message: 'current review lap changed while waiting for disposition state' };
         }
-        const effective = deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, listed.records);
+        const effective = deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, listed.records, [], minConfidence);
         if (!effective || !effective.unresolvedFindingIds.includes(identity.id)) return { ok: false as const, kind: 'invalid' as const, message: 'finding is already accepted or not actionable' };
         return store.append(appendInput);
       })();
@@ -357,18 +433,23 @@ export async function dispatchBuildReviewRecordReducedCoverage(
     const readFile = deps.readFile ?? ((path: string) => readFileDefault(path, 'utf8'));
     const aggregate = parseBuildReviewAggregate(JSON.parse(await readFile(join(worktree, '.pipeline/build-review.json'))));
     if (!aggregate || aggregate.lapId !== requestedLap) throw new Error('requested lap is not current');
-    const result = aggregate.results[rubric];
-    if (result.kind !== 'infrastructure-failure') {
-      return refuse('rubric-not-infrastructure-failure', `build-review record-reduced-coverage: '${rubric}' has no current infrastructure failure.`);
+    const fault = reducedCoverageFault(aggregate.results[rubric]);
+    if (!fault) {
+      return refuse('rubric-not-reduced-coverage-fault', `build-review record-reduced-coverage: '${rubric}' has no current infrastructure failure or scope-incomplete fault.`);
     }
     if (!feature) throw new Error('feature identity is unavailable');
     let stateRefusal: string | undefined;
-    const readMechanicalFaults = deps.readMechanicalFaults ?? (async (root: string) =>
-      (await readKickbackLedger(root)).gates.build_review?.mechanicalFaults);
+    const readMechanicalFaults = deps.readMechanicalFaults ?? (async (root: string) => {
+      const ledger = await readKickbackLedger(root);
+      if (isUnreadableKickbackGate(ledger, 'build_review')) {
+        throw new Error("kickback ledger gate 'build_review' is unreadable");
+      }
+      return ledger.gates.build_review?.mechanicalFaults;
+    });
     const appended = await (deps.createStore ?? ((projectRoot: string) => new BuildReviewDispositionStore(projectRoot)))(worktree).appendReducedCoverageIfCurrent({
       feature,
       rubric,
-      reason: result.reason,
+      reason: fault.cause,
       rationale: command.rationale.trim(),
       operator: operator.trim(),
     }, async (records) => {
@@ -377,16 +458,16 @@ export async function dispatchBuildReviewRecordReducedCoverage(
         stateRefusal = 'the inspected review lap changed';
         return false;
       }
-      const currentResult = current.results[rubric];
-      if (currentResult.kind !== 'infrastructure-failure' || currentResult.reason !== result.reason) {
-        stateRefusal = `the current '${rubric}' infrastructure failure changed`;
+      const currentFault = reducedCoverageFault(current.results[rubric]);
+      if (!currentFault || currentFault.cause !== fault.cause) {
+        stateRefusal = `the current '${rubric}' reduced-coverage fault changed`;
         return false;
       }
       if (((await readMechanicalFaults(worktree!)) ?? 0) < MAX_MECHANICAL_FAULTS_BUILD_REVIEW) {
         stateRefusal = 'the mechanical-fault allowance remains';
         return false;
       }
-      if (records.some((record) => record.identity.rubric === rubric && record.identity.reason === result.reason)) {
+      if (records.some((record) => record.identity.rubric === rubric && record.identity.reason === fault.cause)) {
         stateRefusal = `reduced coverage is already recorded for '${rubric}'`;
         return false;
       }
@@ -402,7 +483,7 @@ export async function dispatchBuildReviewRecordReducedCoverage(
         feature: command.feature,
         lapId: requestedLap,
         rubric,
-        reason: result.reason,
+        reason: fault.cause,
         operator: operator.trim(),
         ts: new Date().toISOString(),
       });

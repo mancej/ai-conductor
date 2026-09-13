@@ -5,7 +5,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { dispatchEngineer } from '../../../src/engine/engineer-cli.js';
-import { mkdir, rm, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLedger } from '../../../src/engine/engineer/intake/ledger.js';
 import { createFileQueue } from '../../../src/engine/engineer/intake/queue.js';
@@ -19,13 +20,14 @@ describe('engineer unclaim: happy path (Task 8)', () => {
     const opts = (extra: Partial<Parameters<typeof dispatchEngineer>[1]>): Parameters<typeof dispatchEngineer>[1] => ({
       print: (s) => out.push(s),
       printErr: (s) => err.push(s),
+      probeGhVersion: async () => ({ kind: 'ok', version: { major: 2, minor: 73, patch: 0 } }),
       ...extra,
     });
     return { out, err, opts };
   }
 
   it('claimed entry → unclaim → becomes pending, capturedAt preserved, success reported', async () => {
-    const testDir = `/tmp/unclaim-test-${Date.now()}-${Math.random()}`;
+    const testDir = await mkdtemp(join(tmpdir(), 'unclaim-test-'));
     try {
       const engDir = join(testDir, 'engineer');
       await mkdir(engDir, { recursive: true });

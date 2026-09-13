@@ -1,0 +1,225 @@
+// Covers: task:9
+/**
+ * Acceptance seam: the daemon's real feature scope wires the OTel warning bus
+ * to both the persisted feature ledger and daemon.log. A failing exporter is a
+ * faithful third-party-boundary fake; the daemon, event spine, renderer
+ * subscription, and log sink are production code.
+ */
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFile as execFileCb } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  type PushMetricExporter,
+  type ResourceMetrics,
+} from '@opentelemetry/sdk-metrics';
+import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
+import type { ConductorEvent } from '../../src/types/events.js';
+
+const fixture = vi.hoisted(() => ({
+  worktreePath: '',
+  exportCalls: 0,
+}));
+const buildExporters = vi.hoisted(() => vi.fn());
+
+vi.mock('../../src/engine/otel/transport.js', () => ({ buildExporters }));
+vi.mock('../../src/engine/self-host/daemon-build-token.js', () => ({
+  readDaemonBuildToken: vi.fn(async () => ({ state: 'ok' as const, token: 'test-daemon-token' })),
+}));
+vi.mock('../../src/engine/ci-fix.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/engine/ci-fix.js')>()),
+  defaultCiFixProbe: vi.fn(async () => ({ exitCode: 0, stdout: 'claude 1.0.0', stderr: '' })),
+}));
+vi.mock('../../src/engine/daemon-runner.js', () => ({
+  makeRunFeature: (deps: {
+    beginFeatureRun: (
+      worktree: { path: string; branch: string },
+      item: { slug: string },
+    ) => Promise<Record<string, unknown>>;
+  }) => async (item: { slug: string }) => {
+    const scope = await deps.beginFeatureRun(
+      { path: fixture.worktreePath, branch: `feat/${item.slug}` },
+      item,
+    );
+    const events = scope.events as { emit: (event: ConductorEvent) => Promise<void> };
+    await events.emit({ type: 'step_started', step: 'build', index: 0 });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await events.emit({
+        type: 'provider_attempt',
+        step: 'build',
+        provider: 'claude',
+        outcome: 'success',
+        invoked: true,
+        tokenUsage: { input: 10, output: 2, costUsd: 0.25 },
+      });
+      if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(60_000);
+    }
+    await events.emit({ type: 'step_completed', step: 'build', status: 'done' });
+    // Periodic exports use fake time, while meter shutdown awaits the SDK's
+    // real completion path.
+    vi.useRealTimers();
+    await (scope.stop as () => Promise<void>)();
+    return { slug: item.slug, status: 'halted', reason: 'test dispatch complete' };
+  },
+}));
+
+import { runDaemonMode } from '../../src/daemon-cli.js';
+
+const execFile = promisify(execFileCb);
+
+function failingMetricExporter(): PushMetricExporter {
+  return {
+    export(_metrics: ResourceMetrics, callback: (result: ExportResult) => void): void {
+      fixture.exportCalls += 1;
+      callback({ code: ExportResultCode.FAILED, error: new Error('collector refused metrics') });
+    },
+    async forceFlush(): Promise<void> {},
+    async shutdown(): Promise<void> {},
+  };
+}
+
+function rejectingLifecycleMetricExporter(): PushMetricExporter {
+  return {
+    export(_metrics: ResourceMetrics, callback: (result: ExportResult) => void): void {
+      callback({ code: ExportResultCode.SUCCESS });
+    },
+    async forceFlush(): Promise<void> {
+      throw new Error('flush rejected');
+    },
+    async shutdown(): Promise<void> {},
+  };
+}
+
+let dirs: string[] = [];
+
+afterEach(async () => {
+  buildExporters.mockReset();
+  fixture.exportCalls = 0;
+  vi.useRealTimers();
+  await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
+  dirs = [];
+});
+
+async function runExportDaemon(metricExporter: PushMetricExporter): Promise<{
+  events: ConductorEvent[];
+  log: string;
+  outcome: { slug: string; status: string; reason?: string };
+}> {
+  const repo = await mkdtemp(join(tmpdir(), 'daemon-export-failure-'));
+  dirs.push(repo);
+  fixture.worktreePath = join(repo, '.worktrees', 'feature-a');
+  await mkdir(join(fixture.worktreePath, '.pipeline'), { recursive: true });
+  await mkdir(join(repo, '.docs', 'stories'), { recursive: true });
+  await mkdir(join(repo, '.docs', 'plans'), { recursive: true });
+  await mkdir(join(repo, '.ai-conductor'), { recursive: true });
+  await writeFile(join(repo, '.docs', 'stories', 'feature-a.md'), '# feature-a\n');
+  await writeFile(join(repo, '.docs', 'plans', 'feature-a.md'), '# feature-a\n');
+  await writeFile(
+    join(repo, '.ai-conductor/config.yml'),
+    'otel:\n  exporter: otlp\n  endpoint: http://fake-collector:4318\n',
+  );
+  await execFile('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+  await execFile('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+  await execFile('git', ['config', 'user.name', 'Test'], { cwd: repo });
+  await execFile('git', ['add', '.'], { cwd: repo });
+  await execFile('git', ['commit', '-qm', 'fixture'], { cwd: repo });
+  // The daemon lifetime meter and the feature-scoped span visualizer each use
+  // the transport seam. They intentionally share this fake metric exporter.
+  buildExporters.mockReturnValue({
+    spanExporter: new InMemorySpanExporter(),
+    metricExporter,
+  });
+
+  const daemonResult = await runDaemonMode({
+    projectRoot: repo,
+    concurrency: 1,
+    maxItems: 1,
+    baseBranch: 'main',
+    ensureFresh: async () => {},
+    probeGhVersion: async () => ({ kind: 'ok', version: { major: 2, minor: 73, patch: 0 } }),
+    watch: false,
+    workSource: { discover: async () => [{ slug: 'feature-a' }] },
+  });
+
+  const [rawFeatureEvents, rawDaemonEvents] = await Promise.all([
+    readFile(join(fixture.worktreePath, '.pipeline/events.jsonl'), 'utf8'),
+    readFile(join(repo, '.daemon/events.jsonl'), 'utf8'),
+  ]);
+  const events = [rawFeatureEvents, rawDaemonEvents]
+    .flatMap((raw) => raw.trim().split('\n').filter(Boolean))
+    .map((line) => JSON.parse(line) as ConductorEvent);
+  const log = await readFile(join(repo, '.daemon/daemon.log'), 'utf8');
+  const outcome = daemonResult?.processed.at(-1);
+  if (!outcome) throw new Error('daemon completed without a feature outcome');
+  return { events, log, outcome };
+}
+
+function terminalVerdicts(events: ConductorEvent[]): Array<Record<string, unknown>> {
+  const verdicts: Array<Record<string, unknown>> = [];
+  for (const event of events) {
+    switch (event.type) {
+      case 'step_completed':
+        verdicts.push({ type: event.type, step: event.step, status: event.status });
+        break;
+      case 'step_failed':
+        verdicts.push({ type: event.type, step: event.step, error: event.error, retryCount: event.retryCount });
+        break;
+      case 'feature_complete':
+        verdicts.push({ type: event.type });
+        break;
+      case 'loop_halt':
+        verdicts.push({ type: event.type, reason: event.reason });
+        break;
+      default:
+        break;
+    }
+  }
+  return verdicts;
+}
+
+describe('acceptance: failed telemetry export is visible without changing daemon outcome', () => {
+  it('contains a rejected daemon per-dispatch flush and preserves the dispatch outcome', async () => {
+    const result = await runExportDaemon(rejectingLifecycleMetricExporter());
+    const lifecycleWarnings = result.events.filter((event): event is Extract<ConductorEvent, { type: 'renderer_error' }> =>
+      event.type === 'renderer_error' && event.error === '[otel] metric export failed: flush rejected',
+    );
+
+    expect(lifecycleWarnings).toHaveLength(1);
+    expect(result.outcome).toEqual({
+      slug: 'feature-a',
+      status: 'halted',
+      reason: 'test dispatch complete',
+    });
+    expect(terminalVerdicts(result.events)).toEqual([
+      { type: 'step_completed', step: 'build', status: 'done' },
+    ]);
+  });
+
+  it('logs and persists one matching otel failure across repeated export attempts', async () => {
+    vi.useFakeTimers();
+    const failed = await runExportDaemon(failingMetricExporter());
+    const succeeded = await runExportDaemon(new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE));
+    const rendererErrors = failed.events.filter((event) => event.type === 'renderer_error');
+    const failureLines = failed.log.split('\n').filter((line) => line.includes('renderer otel failed'));
+
+    expect(rendererErrors).toHaveLength(1);
+    expect(fixture.exportCalls).toBeGreaterThanOrEqual(3);
+    expect(rendererErrors[0]).toMatchObject({
+      type: 'renderer_error',
+      rendererName: 'otel',
+      error: expect.stringContaining('collector refused metrics'),
+    });
+    expect(failureLines).toHaveLength(1);
+    expect(failureLines[0]).toContain('otel');
+    expect(failureLines[0]).toContain('collector refused metrics');
+    expect(terminalVerdicts(failed.events)).toEqual([
+      { type: 'step_completed', step: 'build', status: 'done' },
+    ]);
+    expect(failed.outcome).toEqual(succeeded.outcome);
+  });
+});

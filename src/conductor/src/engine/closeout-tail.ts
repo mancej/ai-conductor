@@ -1,10 +1,28 @@
 import { readFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ExternalPipelineEvent } from './closeout-events.js';
 import type { ConductorEventEmitter } from '../ui/events.js';
 
 const PIPELINE_CLOSEOUT_LEDGER = '.pipeline/pipeline-events.jsonl';
+const CANONICAL_EVENTS_LEDGER = '.pipeline/events.jsonl';
+
+function isAlreadyProjected(projectRoot: string, event: ExternalPipelineEvent): boolean {
+  if (event.type !== 'kickback_budget_adjustment_authorized') return false;
+  const path = join(projectRoot, CANONICAL_EVENTS_LEDGER);
+  if (!existsSync(path)) return false;
+  return readFileSync(path, 'utf8').split('\n').some((line) => {
+    try {
+      const parsed = JSON.parse(line) as { type?: unknown; adjustmentId?: unknown };
+      return parsed.type === event.type && parsed.adjustmentId === event.adjustmentId;
+    } catch { return false; }
+  });
+}
+
+type TailRecord =
+  | { kind: 'event'; event: ExternalPipelineEvent }
+  | { kind: 'malformed-line'; byteOffset: number };
 
 /**
  * Incrementally reads pipeline-owned closeout events without consuming a
@@ -14,13 +32,16 @@ const PIPELINE_CLOSEOUT_LEDGER = '.pipeline/pipeline-events.jsonl';
 class CloseoutTailReader {
   private offset = 0;
 
-  constructor(private readonly projectRoot: string) {}
+  constructor(
+    private readonly projectRoot: string,
+    private readonly readLedger: (path: string) => Promise<Buffer> = readFile,
+  ) {}
 
   /** Return each newly completed JSONL record exactly once. */
-  async read(): Promise<ExternalPipelineEvent[]> {
+  async read(): Promise<TailRecord[]> {
     let content: Buffer;
     try {
-      content = await readFile(join(this.projectRoot, PIPELINE_CLOSEOUT_LEDGER));
+      content = await this.readLedger(join(this.projectRoot, PIPELINE_CLOSEOUT_LEDGER));
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
       throw error;
@@ -32,14 +53,22 @@ class CloseoutTailReader {
     if (lastNewline === -1) return [];
 
     const completed = unread.subarray(0, lastNewline + 1);
-    const events = completed
-      .toString('utf8')
-      .split('\n')
-      .filter((line) => line.length > 0)
-      .map((line) => JSON.parse(line) as ExternalPipelineEvent);
-
+    const records: TailRecord[] = [];
+    let lineStart = 0;
+    while (lineStart < completed.byteLength) {
+      const lineEnd = completed.indexOf(0x0a, lineStart);
+      const line = completed.subarray(lineStart, lineEnd);
+      if (line.byteLength > 0) {
+        try {
+          records.push({ kind: 'event', event: JSON.parse(line.toString('utf8')) as ExternalPipelineEvent });
+        } catch {
+          records.push({ kind: 'malformed-line', byteOffset: this.offset + lineStart });
+        }
+      }
+      lineStart = lineEnd + 1;
+    }
     this.offset += completed.byteLength;
-    return events;
+    return records;
   }
 }
 
@@ -47,22 +76,48 @@ class CloseoutTailReader {
 export class CloseoutEventTail {
   private readonly reader: CloseoutTailReader;
   private readonly events: ConductorEventEmitter;
+  private readonly projectRoot: string;
   private interval: ReturnType<typeof setInterval> | null = null;
+  private inFlight: Promise<void> | null = null;
 
   constructor({
     projectRoot,
     events,
+    readLedger,
   }: {
     projectRoot: string;
     events: ConductorEventEmitter;
+    readLedger?: (path: string) => Promise<Buffer>;
   }) {
-    this.reader = new CloseoutTailReader(projectRoot);
+    this.projectRoot = projectRoot;
+    this.reader = new CloseoutTailReader(projectRoot, readLedger);
     this.events = events;
   }
 
-  async poll(): Promise<void> {
-    for (const event of await this.reader.read()) {
-      await this.events.emit(event);
+  poll(): Promise<void> {
+    if (this.inFlight) return this.inFlight;
+    const operation = this.pollOnce();
+    this.inFlight = operation;
+    void operation.then(
+      () => { if (this.inFlight === operation) this.inFlight = null; },
+      () => { if (this.inFlight === operation) this.inFlight = null; },
+    );
+    return operation;
+  }
+
+  private async pollOnce(): Promise<void> {
+    for (const record of await this.reader.read()) {
+      if (record.kind === 'event') {
+        if (isAlreadyProjected(this.projectRoot, record.event)) continue;
+        await this.events.emit(record.event);
+      } else {
+        await this.events.emit({
+          type: 'pipeline_tail_diagnostic',
+          reason: 'malformed-line',
+          path: PIPELINE_CLOSEOUT_LEDGER,
+          byteOffset: record.byteOffset,
+        });
+      }
     }
   }
 
@@ -71,7 +126,13 @@ export class CloseoutEventTail {
     if (this.interval) return;
 
     this.interval = setInterval(() => {
-      void this.poll();
+      void this.poll().catch(() =>
+        this.events.emit({
+          type: 'pipeline_tail_diagnostic',
+          reason: 'poll-failed',
+          path: PIPELINE_CLOSEOUT_LEDGER,
+        }).catch(() => undefined),
+      );
     }, 1_000);
     this.interval.unref(); // portability-ok: detaches the closeout polling interval from process exit
   }

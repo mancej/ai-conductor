@@ -1,9 +1,9 @@
-// `conduct-ts engineer` command handler (Phase 9.3, ADR-008 conformance rework).
+// `ai-conductor compose` command handler (Phase 9.3, ADR-008 conformance rework).
 //
 // AGENT-HOSTED EXECUTION MODEL (ADR-008):
-//   The engineer subsystem is driven by the /engineer host-agent skill in a Claude
-//   Code session. The bare `conduct-ts engineer` command is the FRONT DOOR: it launches
-//   an INTERACTIVE `claude /engineer` session (stdio inherited, operator present),
+//   The composer subsystem is driven by the /composer host-agent skill in a Claude
+//   Code session. The bare `ai-conductor compose` command is the FRONT DOOR: it launches
+//   an INTERACTIVE `claude /composer` session (stdio inherited, operator present),
 //   dropping the operator into the human-in-the-loop idea→spec loop. This is NOT the
 //   forbidden `claude -p` substrate — that was a headless subprocess doing autonomous
 //   routing/authoring (ADR-008 removes it). Launching an interactive, operator-driven
@@ -14,17 +14,18 @@
 //   routing/authoring.
 //
 // Subcommands:
-//   conduct-ts engineer               → {kind:'launch'}   — launch interactive `claude /engineer`
-//   conduct-ts engineer projects      → {kind:'projects'} — list registry to stdout as JSON
-//   conduct-ts engineer land          → {kind:'land'}     — commit pre-written artifacts to spec branch
-//   conduct-ts engineer handoff       → {kind:'handoff'}  — open spec PR + ensureRunning
+//   ai-conductor compose                → {kind:'launch'}   — launch interactive `claude /composer`
+//   ai-conductor compose projects       → {kind:'projects'} — list registry to stdout as JSON
+//   ai-conductor compose land           → {kind:'land'}     — commit pre-written artifacts to spec branch
+//   ai-conductor compose handoff        → {kind:'handoff'}  — open spec PR + ensureRunning
 //   (malformed subcommand / missing flags → {kind:'guide'} — print usage)
 
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import type { EngineerIO, EngineerDeps } from './engineer/loop.js';
 import { createRegistryReader } from './registry.js';
+import { ConductorEventEmitter } from '../ui/events.js';
+import { EventPersister } from './event-persister.js';
 import { resolveEngineerDir } from './engineer-store.js';
 import { resolveTargetRepo } from './engineer/target.js';
 import { landSpec } from './engineer/land-spec.js';
@@ -60,12 +61,11 @@ import {
   resolveEngineerRetentionMs,
   type EngineerRetentionDeps,
 } from './engineer/retention.js';
-import { ConductorEventEmitter } from '../ui/events.js';
 import type { EngineerStepName } from '../types/index.js';
 import { readEngineerRunMarker, writeEngineerRunMarker } from './engineer/run-marker.js';
 import { ensureRunning } from './daemon-lock.js';
-// The CLI is the composition root for the github-issues intake adapter — the
-// engineer loop must NOT import a concrete adapter (FR-13), but the CLI must.
+// The CLI is the composition root for the github-issues intake adapter used by
+// deterministic engineer commands and the interactive launch pre-poll.
 import { brainLoopAlive } from './engineer/brain-liveness.js';
 import { CorruptLedgerError, createLedger, type LedgerEntry } from './engineer/intake/ledger.js';
 import { createFileQueue } from './engineer/intake/queue.js';
@@ -85,49 +85,16 @@ import { isStaleClaim } from './engineer/intake/stale-claim.js';
 import { resolveStaleClaimWindowMs } from './resolved-config.js';
 import { parseSourceRef } from './engineer/intake/source-ref.js';
 import { parseDependencyProse, createDependencyLinks, runMigration } from './engineer/issue-dep-migration.js';
-import { makeProductionGh } from './tracker-client.js';
-
-/**
- * Production DECIDE seam: gates each authoring step through the io surface.
- * Presents the prompt and waits for the operator to provide the approved artifact.
- * An empty response → rejected (blocks authoring). NO claude subprocess spawned.
- */
-function makeProductionDecide(io: EngineerIO): NonNullable<EngineerDeps['decide']> {
-  return async ({ step, idea, project, prompt }) => {
-    io.print(`\n── DECIDE: ${step} — project "${project}" — idea: ${idea}`);
-    io.print(prompt);
-    io.print(
-      `Provide the approved ${step} artifact as your next response (empty = reject, blocks authoring):`,
-    );
-    const line = await io.prompt();
-    const artifact = line ?? '';
-    if (artifact.trim() === '') return { approved: false, artifact: '' };
-    return { approved: true, artifact };
-  };
-}
-
-/**
- * Production complexity-assessment seam: gates the tier through the io surface.
- * Presents the prompt and waits for the operator to provide S/M/L. An empty or
- * unparseable response → rejected (blocks authoring). NO claude subprocess.
- */
-function makeProductionAssessComplexity(
-  io: EngineerIO,
-): NonNullable<EngineerDeps['assessComplexity']> {
-  return async ({ idea, project, recommended }) => {
-    io.print(`\n── DECIDE: complexity — project "${project}" — idea: ${idea}`);
-    if (recommended) io.print(`Recommended tier: ${recommended}`);
-    io.print('Provide the complexity tier (S, M, or L; empty = reject, blocks authoring):');
-    const line = await io.prompt();
-    const m = (line ?? '').trim().match(/^([SMLsml])/);
-    if (!m) return { approved: false, tier: recommended ?? 'M' };
-    return { approved: true, tier: m[1].toUpperCase() as 'S' | 'M' | 'L' };
-  };
-}
+import { createGithubTrackerClient, makeProductionGh } from './tracker-client.js';
+import {
+  GH_VERSION_FLOOR,
+  probeGhVersion,
+  type GhVersionFloorVerdict,
+} from './gh-version-floor.js';
 
 // ── Dispatch descriptor ───────────────────────────────────────────────────────
 
-export type EngineerDispatch =
+type EngineerDispatchDescriptor =
   | { kind: 'launch'; idea?: string }
   | { kind: 'guide' }
   | { kind: 'projects' }
@@ -168,13 +135,21 @@ export type EngineerDispatch =
   | { kind: 'maintenance' }
   | { kind: 'poll' }
   | { kind: 'claim' }
-  | { kind: 'forget'; sourceRef: string }
+  | { kind: 'forget'; sourceRef: string; resolvedBy?: string }
   | { kind: 'unclaim'; sourceRef: string }
   | { kind: 'requeue'; stale: true; olderThan?: string }
   | { kind: 'resolve'; sourceRef: string; prUrl: string; branch?: string }
   | { kind: 'migrate-issue-deps'; confirm: boolean }
   | { kind: 'reject'; sub: string; flag: string }
   | { kind: 'help'; topic: string };
+
+/**
+ * The legacy verb is dispatch metadata, deliberately non-enumerable so the
+ * established descriptor data contract remains unchanged for callers.
+ */
+export type EngineerDispatch = EngineerDispatchDescriptor & {
+  readonly invokedVerb?: 'engineer';
+};
 
 /** Single source of truth for the known deterministic subcommands (#524). */
 export const ENGINEER_SUBCOMMANDS = [
@@ -188,10 +163,10 @@ export const ENGINEER_SUBCOMMANDS = [
 
 /**
  * Parse process.argv into an EngineerDispatch descriptor, or return null if
- * argv[2] is not 'engineer'.
+ * argv[2] is neither 'engineer' nor 'compose'.
  *
  * Subcommand grammar (argv[3]):
- *   absent / undefined   → {kind:'launch'}   (drop into interactive `claude /engineer`)
+ *   absent / undefined   → {kind:'launch'}   (drop into interactive `claude /composer`)
  *   'projects'           → {kind:'projects'}
  *   'land'               → {kind:'land', project, idea}  (--project <n> --idea <i>)
  *   'handoff'            → {kind:'handoff', project, branch}  (--project <n> --branch <b>)
@@ -207,15 +182,15 @@ function findUnknownFlag(argv: string[], allowed: string[]): string | null {
   return null;
 }
 
-export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
+function parseEngineerCommand(argv: string[]): EngineerDispatchDescriptor | null {
   // argv is process.argv: [node, entry, sub, ...]
   const sub = argv[2];
-  if (sub !== 'engineer') return null;
+  if (sub !== 'engineer' && sub !== 'compose') return null;
 
   const subCmd = argv[3];
 
   if (!subCmd || subCmd === '') {
-    // Bare `conduct-ts engineer` → launch the interactive host-agent loop.
+    // Bare `ai-conductor compose` → launch the interactive host-agent loop.
     return { kind: 'launch' };
   }
 
@@ -379,7 +354,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
   }
 
   if (subCmd === 'worktree') {
-    // `conduct-ts engineer worktree --project <n> --idea "<i>"` — create the per-idea
+    // `ai-conductor engineer worktree --project <n> --idea "<i>"` — create the per-idea
     // worktree for authoring; prints `{ slug, branch, worktreePath, reconcile }`.
     const project = parseFlag(argv, '--project');
     const idea = parseFlag(argv, '--idea');
@@ -448,32 +423,39 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
   }
 
   if (subCmd === 'poll') {
-    // `conduct-ts engineer poll` — poll intake sources and enqueue; no routing/process.
+    // `ai-conductor engineer poll` — poll intake sources and enqueue; no routing/process.
     const unk = findUnknownFlag(argv, []);
     if (unk) return { kind: 'reject', sub: 'poll', flag: unk };
     return { kind: 'poll' };
   }
 
   if (subCmd === 'claim') {
-    // `conduct-ts engineer claim` — atomically dequeue the oldest pending idea.
+    // `ai-conductor engineer claim` — atomically dequeue the oldest pending idea.
     const unk = findUnknownFlag(argv, []);
     if (unk) return { kind: 'reject', sub: 'claim', flag: unk };
     return { kind: 'claim' };
   }
 
   if (subCmd === 'forget') {
-    // `conduct-ts engineer forget <sourceRef>` — drop a ledger entry + strip the label.
+    // `ai-conductor engineer forget <sourceRef> [--resolved-by <reference>]` — drop a
+    // ledger entry + strip the label, optionally recording resolution evidence.
     const sourceRef = argv[4];
-    if (!sourceRef || sourceRef.startsWith('--')) {
+    if (!sourceRef || !sourceRef.trim() || sourceRef.startsWith('--')) {
       return { kind: 'guide' };
     }
-    const unk = findUnknownFlag(argv, []);
+    const resolvedBy = parseFlag(argv, '--resolved-by');
+    if (argv.includes('--resolved-by') && (!resolvedBy || !resolvedBy.trim())) {
+      return { kind: 'guide' };
+    }
+    const unk = findUnknownFlag(argv, ['--resolved-by']);
     if (unk) return { kind: 'reject', sub: 'forget', flag: unk };
-    return { kind: 'forget', sourceRef };
+    return resolvedBy
+      ? { kind: 'forget', sourceRef, resolvedBy }
+      : { kind: 'forget', sourceRef };
   }
 
   if (subCmd === 'unclaim') {
-    // `conduct-ts engineer unclaim <sourceRef>` — requeue a claimed ledger entry
+    // `ai-conductor engineer unclaim <sourceRef>` — requeue a claimed ledger entry
     // back to pending (single-idea recovery, FR-5).
     const sourceRef = argv[4];
     if (!sourceRef || sourceRef.startsWith('--')) {
@@ -485,7 +467,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
   }
 
   if (subCmd === 'requeue') {
-    // `conduct-ts engineer requeue --stale [--older-than <dur>]` — bulk recovery
+    // `ai-conductor engineer requeue --stale [--older-than <dur>]` — bulk recovery
     // of stranded `claimed` ledger entries (FR-8). `--stale` is required to
     // invoke this mode; `--older-than` overrides the resolved stale-claim window.
     if (!argv.includes('--stale')) {
@@ -498,7 +480,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
   }
 
   if (subCmd === 'resolve') {
-    // `conduct-ts engineer resolve <sourceRef> --pr-url <url> [--branch <b>]` — mark
+    // `ai-conductor engineer resolve <sourceRef> --pr-url <url> [--branch <b>]` — mark
     // a claimed entry as delivered when write-back fails. Recovers from the stranded
     // state (claimed + no prUrl) by stamping prUrl + optional branch evidence.
     // The sourceRef is the first positional arg that doesn't start with --.
@@ -527,7 +509,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
   }
 
   if (subCmd === 'migrate-issue-deps') {
-    // `conduct-ts engineer migrate-issue-deps [--confirm]` — one-time prose→link
+    // `ai-conductor engineer migrate-issue-deps [--confirm]` — one-time prose→link
     // migration (Task 22-25). Dry-run by default (proposal only, zero writes);
     // `--confirm` applies via the GET-before-POST writer.
     const unk = findUnknownFlag(argv, ['--confirm']);
@@ -536,7 +518,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
     return { kind: 'migrate-issue-deps', confirm };
   }
 
-  // `conduct-ts engineer --idea "<text>"` — launch driving a specific idea.
+  // `ai-conductor engineer --idea "<text>"` — launch driving a specific idea.
   if (subCmd === '--idea') {
     const idea = parseFlag(argv, '--idea');
     if (!idea) return { kind: 'guide' };
@@ -544,7 +526,7 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
   }
 
   // A bare non-flag positional is free-text idea input:
-  //   `conduct-ts engineer add a /healthz endpoint`
+  //   `ai-conductor engineer add a /healthz endpoint`
   // (Recognized subcommands are handled above, so this cannot shadow them.)
   if (!subCmd.startsWith('--')) {
     const idea = argv.slice(3).join(' ').trim();
@@ -553,6 +535,19 @@ export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
 
   // Unknown flag-form / empty — treat as guide.
   return { kind: 'guide' };
+}
+
+/**
+ * Parse the compose/engineer command once, retaining legacy-verb provenance for
+ * the dispatcher without changing the enumerable descriptor data contract.
+ */
+export function detectEngineerCommand(argv: string[]): EngineerDispatch | null {
+  const dispatch = parseEngineerCommand(argv);
+  if (!dispatch || argv[2] !== 'engineer') return dispatch;
+
+  return Object.defineProperty(dispatch, 'invokedVerb', {
+    value: 'engineer',
+  });
 }
 
 /**
@@ -623,12 +618,13 @@ async function persistClaimRecord(
   engDir: string,
   sourceRef: string | null | undefined,
   body: string | null | undefined,
+  inbound?: Envelope['inbound'],
 ): Promise<void> {
   if (!sourceRef) return;
   try {
     const dir = join(engDir, 'claims');
     await mkdir(dir, { recursive: true });
-    await writeFile(claimRecordPath(engDir, sourceRef), JSON.stringify({ sourceRef, body: body ?? null }), 'utf8');
+    await writeFile(claimRecordPath(engDir, sourceRef), JSON.stringify({ sourceRef, body: body ?? null, inbound }), 'utf8');
   } catch {
     // Best-effort — degrade to no staging at worktree time (matches the chat-origin
     // negative path in worktree-authoring.ts).
@@ -643,12 +639,16 @@ async function persistClaimRecord(
 async function loadClaimRecord(
   engDir: string,
   sourceRef: string,
-): Promise<{ sourceRef: string; body: string | null } | null> {
+): Promise<{ sourceRef: string; body: string | null; inbound?: Envelope['inbound'] } | null> {
   try {
     const raw = await readFile(claimRecordPath(engDir, sourceRef), 'utf8');
-    const parsed = JSON.parse(raw) as { sourceRef?: string; body?: string | null };
+    const parsed = JSON.parse(raw) as { sourceRef?: string; body?: string | null; inbound?: Envelope['inbound'] };
     if (typeof parsed.sourceRef !== 'string') return null;
-    return { sourceRef: parsed.sourceRef, body: typeof parsed.body === 'string' ? parsed.body : null };
+    return {
+      sourceRef: parsed.sourceRef,
+      body: typeof parsed.body === 'string' ? parsed.body : null,
+      inbound: parsed.inbound,
+    };
   } catch {
     return null;
   }
@@ -811,6 +811,8 @@ export interface DispatchEngineerOpts {
   printErr?: (s: string) => void;
   /** Injected gh runner (for tests). */
   gh?: (args: string[], opts: { cwd: string }) => Promise<{ stdout: string }>;
+  /** Machine-level gh capability probe; injectable so entry refusal is testable. */
+  probeGhVersion?: () => Promise<GhVersionFloorVerdict>;
   /** Injected git runner (for tests). */
   git?: GitRunner;
   /** Injected deterministic readiness command dependencies. */
@@ -873,14 +875,14 @@ export function engineerLaunchArgs(env: NodeJS.ProcessEnv = process.env, idea?: 
   const mode = requested && requested !== 'plan' ? requested : 'default';
   // The slash command is the initial prompt; a CLI-supplied idea is appended so
   // the skill receives it directly instead of prompting in chat. With no idea the
-  // prompt is exactly `/engineer` (backward-compatible).
+  // prompt is exactly `/composer`.
   const trimmed = (idea ?? '').trim();
-  const prompt = trimmed ? `/engineer ${trimmed}` : '/engineer';
+  const prompt = trimmed ? `/composer ${trimmed}` : '/composer';
   return ['--permission-mode', mode, prompt];
 }
 
 /**
- * Default interactive launcher: drop the operator into `claude /engineer`, inheriting
+ * Default interactive launcher: drop the operator into `claude /composer`, inheriting
  * the terminal so the human drives the loop. Resolves with the child's exit code.
  * Rejects on spawn error (e.g. `claude` not on PATH) so the caller can fall back.
  */
@@ -971,83 +973,84 @@ export const SUBCOMMAND_HELP = {
     'engineer maintenance - reconcile retained review worktrees.\n' +
     'Flags: none.\nMutates: eligible retirement journals and cleanup metadata.\nLoop fit: daemon maintenance.',
   projects:
-    'engineer projects — list the registered projects from the project registry.\n' +
+    'compose projects — list the registered projects from the project registry.\n' +
     'Flags: none.\n' +
     'Mutates: nothing (read-only).\n' +
     'Loop fit: informational only — inspect which projects the engineer can route ideas to; not a step in the claim → worktree → land → handoff → resolve/forget loop.',
   worktree:
-    'engineer worktree --project <name> --idea "<idea>" [--source-ref <ref>] [--permit-inconclusive] - create the per-idea worktree used to author a spec.\n' +
+    'compose worktree --project <name> --idea "<idea>" [--source-ref <ref>] [--permit-inconclusive] - create the per-idea worktree used to author a spec.\n' +
     'Flags: --project <name> (required), --idea "<text>" (required), --source-ref <ref> (optional - resolves the claim record for intake-sourced ideas), --permit-inconclusive (optional - explicitly authorizes authoring when push permission cannot be proven without mutation).\n' +
     'Mutates: creates a git worktree and branch on disk for the project.\n' +
     'Loop fit: second step of the loop — claim → worktree → land → handoff → resolve/forget.',
   land:
-    'engineer land --project <name> --idea "<idea>" --worktree <path> [--source-ref <ref>] — land the authored spec from the worktree onto the spec/<slug> branch and open the spec PR.\n' +
+    'compose land --project <name> --idea "<idea>" --worktree <path> [--source-ref <ref>] — land the authored spec from the worktree onto the spec/<slug> branch and open the spec PR.\n' +
     'Flags: --project <name> (required), --idea "<text>" (required), --worktree <path> (required — strict isolation, never falls back to the primary checkout), --source-ref <ref> (optional — intake write-back anchor for github-issues-sourced ideas).\n' +
     'Mutates: commits to the worktree, pushes the spec/<slug> branch, opens a PR.\n' +
     'Loop fit: third step — claim → worktree → land → handoff → resolve/forget.',
   handoff:
-    'engineer handoff --project <name> --branch <branch> --worktree <path> [--source-ref <ref>] [--permit-inconclusive] - hand the landed spec off to the daemon/build phase.\n' +
+    'compose handoff --project <name> --branch <branch> --worktree <path> [--source-ref <ref>] [--permit-inconclusive] - hand the landed spec off to the daemon/build phase.\n' +
     'Flags: --project <name> (required), --branch <branch> (required), --worktree <path> (required), --source-ref <ref> (optional - intake write-back anchor), --permit-inconclusive (optional - explicitly authorizes handoff when push permission cannot be proven without mutation).\n' +
     'Mutates: notifies/nudges the daemon for the target project; updates ledger write-back state when --source-ref is present.\n' +
     'Loop fit: fourth step — claim → worktree → land → handoff → resolve/forget.',
   poll:
-    'engineer poll — poll configured intake sources (e.g. github-issues) and enqueue new ideas into the durable inbox.\n' +
+    'compose poll — poll configured intake sources (e.g. github-issues) and enqueue new ideas into the durable inbox.\n' +
     'Flags: none.\n' +
     'Mutates: writes new envelopes to the file-backed inbox queue.\n' +
     'Loop fit: out-of-band maintenance op — primes the inbox but is not itself a step in claim → worktree → land → handoff → resolve/forget.',
   claim:
-    'engineer claim — atomically dequeue the oldest pending idea from the inbox for the operator to work.\n' +
+    'compose claim — atomically dequeue the oldest pending idea from the inbox for the operator to work.\n' +
     'Flags: none.\n' +
     'Mutates: dequeues from the inbox and records a claimed entry in the ledger.\n' +
     'Loop fit: first step of the loop — claim → worktree → land → handoff → resolve/forget.',
   forget:
-    'engineer forget <sourceRef> — drop a ledger entry and strip its intake label.\n' +
-    'Flags: <sourceRef> positional (required, must not start with --).\n' +
-    'Mutates: removes the entry from the ledger and strips the source label (e.g. on the GitHub issue).\n' +
+    'compose forget <sourceRef> [--resolved-by <reference>] — drop a ledger entry and strip its intake label.\n' +
+    'Flags: <sourceRef> positional (required, must not start with --), --resolved-by <reference> (optional — comments the reference on the originating GitHub issue, then closes it).\n' +
+    'Mutates: removes the entry from the ledger and strips the source label (e.g. on the GitHub issue); with --resolved-by, comments and closes the originating issue first. Without --resolved-by, it does not close the issue.\n' +
     'Loop fit: terminal step — claim → worktree → land → handoff → resolve/forget (abandon path, alternative to resolve).',
   resolve:
-    'engineer resolve <sourceRef> --pr-url <url> [--branch <branch>] — mark a claimed ledger entry as delivered when the normal write-back failed.\n' +
+    'compose resolve <sourceRef> --pr-url <url> [--branch <branch>] — mark a claimed ledger entry as delivered when the normal write-back failed.\n' +
     'Flags: <sourceRef> positional (required), --pr-url <url> (required, must be http:// or https://), --branch <branch> (optional).\n' +
     'Mutates: stamps the ledger entry with prUrl (and branch, if given), recovering from a stranded claimed-but-undelivered state.\n' +
     'Loop fit: terminal step — claim → worktree → land → handoff → resolve/forget (recovery path, alternative to forget).',
   unclaim:
-    'engineer unclaim <sourceRef> — requeue a claimed ledger entry back to pending (single-idea recovery).\n' +
+    'compose unclaim <sourceRef> — requeue a claimed ledger entry back to pending (single-idea recovery).\n' +
     'Flags: <sourceRef> positional (required, must not start with --).\n' +
     'Mutates: flips the ledger entry from claimed to pending, preserving capturedAt; refuses (acted:false) as a non-error on absent or non-claimed entries.\n' +
     'Loop fit: out-of-band maintenance op — recovers a stale/stranded claim so it can be re-claimed; not a step in claim → worktree → land → handoff → resolve/forget.',
   requeue:
-    'engineer requeue --stale [--older-than <dur>] — bulk-recover stranded claimed ledger entries (e.g. "24h", "2d").\n' +
+    'compose requeue --stale [--older-than <dur>] — bulk-recover stranded claimed ledger entries (e.g. "24h", "2d").\n' +
     'Flags: --stale (required — invokes bulk recovery mode), --older-than <dur> (optional, overrides the resolved default stale-claim window).\n' +
     'Mutates: flips each eligible claimed entry to pending (preserving capturedAt), or forgets it (removes from ledger) when its originating GitHub issue is confirmed closed; never forgets on an unconfirmed/errored liveness read.\n' +
     'Loop fit: out-of-band maintenance op — bulk recovery of the whole stranded class; not a step in claim → worktree → land → handoff → resolve/forget.',
   'migrate-issue-deps':
-    'engineer migrate-issue-deps [--confirm] — one-time migration of prose-based issue dependency references to structured links.\n' +
+    'compose migrate-issue-deps [--confirm] — one-time migration of prose-based issue dependency references to structured links.\n' +
     'Flags: --confirm (optional — without it, dry-run only: proposes changes with zero writes; with it, applies via the GET-before-POST writer).\n' +
     'Mutates: nothing by default (dry-run); with --confirm, updates issue bodies/links on the source tracker.\n' +
     'Loop fit: out-of-band maintenance op, not a step in claim → worktree → land → handoff → resolve/forget.',
 } satisfies Record<(typeof ENGINEER_SUBCOMMANDS)[number], string>;
 
-/** Print the engineer usage/guide text (front door + deterministic primitives). */
+/** Print the canonical compose usage/guide text (front door + deterministic primitives). */
 function printGuide(print: (s: string) => void): void {
   print(
-    'The engineer is the agent-hosted idea→spec loop. Run `conduct-ts engineer` (no\n' +
-      'subcommand) to drop into an interactive `claude /engineer` session and drive it\n' +
-      'with a human in the loop. The subcommands below are the deterministic primitives\n' +
-      'the /engineer skill calls in-chat:\n' +
+    'Compose is the agent-hosted idea→spec loop. Run `ai-conductor compose` (no\n' +
+      'subcommand) to drop into an interactive `claude /composer` session and drive it\n' +
+      'with a human in the loop. `conduct-ts engineer` remains a deprecated alias. The\n' +
+      'subcommands below are the deterministic primitives\n' +
+      'the /composer skill calls in-chat:\n' +
       '\n' +
-      '  conduct-ts engineer                                     — launch the interactive /engineer loop (pre-polls intake)\n' +
-      '  conduct-ts engineer --idea "<text>"                     — launch driving a specific idea (skips intake poll)\n' +
-      '  conduct-ts engineer projects                            — list registered projects\n' +
-      '  conduct-ts engineer claim                               — dequeue the oldest pending intake idea (JSON)\n' +
-      '  conduct-ts engineer worktree --project <n> --idea "<i>" [--source-ref <ref>] [--permit-inconclusive]  - create the per-idea authoring worktree\n' +
-      '  conduct-ts engineer land --project <n> --idea "<i>" --worktree <p> [--source-ref <ref>]    — commit spec artifacts in the worktree\n' +
-      '  conduct-ts engineer handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] [--permit-inconclusive] - open spec PR + retain review worktree + nudge daemon\n' +
-      '  conduct-ts engineer resolve <ref> --pr-url <url> [--branch <b>]              — mark a claimed entry as delivered (recovery from write-back failure)\n' +
-      '  conduct-ts engineer unclaim <owner/repo#N>              — requeue a claimed ledger entry back to pending (single-idea recovery)\n' +
-      '  conduct-ts engineer requeue --stale [--older-than <dur>] — bulk-recover stranded claimed ledger entries (e.g. "24h")\n' +
-      '  conduct-ts engineer poll                                — poll github issues → enqueue new ideas\n' +
-      '  conduct-ts engineer forget <owner/repo#N>               — drop an intake ledger entry + label\n' +
-      '  conduct-ts engineer migrate-issue-deps [--confirm]      — one-time prose→link dependency migration ' +
+      '  ai-conductor compose                                     — launch the interactive /composer loop (pre-polls intake)\n' +
+      '  ai-conductor compose --idea "<text>"                     — launch driving a specific idea (skips intake poll)\n' +
+      '  ai-conductor compose projects                            — list registered projects\n' +
+      '  ai-conductor compose claim                               — dequeue the oldest pending intake idea (JSON)\n' +
+      '  ai-conductor compose worktree --project <n> --idea "<i>" [--source-ref <ref>] [--permit-inconclusive]  - create the per-idea authoring worktree\n' +
+      '  ai-conductor compose land --project <n> --idea "<i>" --worktree <p> [--source-ref <ref>]    — commit spec artifacts in the worktree\n' +
+      '  ai-conductor compose handoff --project <n> --branch <b> --worktree <p> [--source-ref <ref>] [--permit-inconclusive] - open spec PR + retain review worktree + nudge daemon\n' +
+      '  ai-conductor compose resolve <ref> --pr-url <url> [--branch <b>]              — mark a claimed entry as delivered (recovery from write-back failure)\n' +
+      '  ai-conductor compose unclaim <owner/repo#N>              — requeue a claimed ledger entry back to pending (single-idea recovery)\n' +
+      '  ai-conductor compose requeue --stale [--older-than <dur>] — bulk-recover stranded claimed ledger entries (e.g. "24h")\n' +
+      '  ai-conductor compose poll                                — poll github issues → enqueue new ideas\n' +
+      '  ai-conductor compose forget <owner/repo#N> [--resolved-by <reference>] — drop an intake ledger entry + label; the optional flag comments and closes the issue\n' +
+      '  ai-conductor compose migrate-issue-deps [--confirm]      — one-time prose→link dependency migration ' +
       '(dry-run by default; --confirm writes)\n',
   );
 }
@@ -1102,7 +1105,7 @@ export function buildIntake(deps: {
 /**
  * Pre-poll the github-issues source and enqueue new ideas into the durable inbox,
  * returning the count enqueued. This is the launch-time half of intake: the bare
- * `conduct-ts engineer` primes the inbox here so the spawned `claude /engineer`
+ * `ai-conductor compose` primes the inbox here so the spawned `claude /composer`
  * session can `claim` an idea instead of starting blank. Idempotent — the ledger
  * dedups, so a re-poll enqueues nothing new. Exported for direct testing.
  */
@@ -1125,7 +1128,7 @@ export async function prePollIntake(deps: {
 /**
  * Dispatch an engineer command.
  *
- * The bare `launch` kind spawns an INTERACTIVE `claude /engineer` session (the front
+ * The bare `launch` kind spawns an INTERACTIVE `claude /composer` session (the front
  * door — operator present, drives the loop). The `projects`/`land`/`handoff` primitives
  * are deterministic and spawn no claude: no Node readline REPL, and no `claude -p`
  * subprocess for routing or authoring (those happen in-chat in the launched session).
@@ -1144,6 +1147,33 @@ export async function dispatchEngineer(
     engineerDir: engineerDir ?? resolveEngineerDir({}),
     events: opts.events ?? new ConductorEventEmitter(),
   });
+
+  // This is a machine precondition, not an intake failure: refuse before any
+  // command can create a worktree, branch, or claim record.
+  const canSkipCapabilityProbe = dispatch.kind === 'guide' || dispatch.kind === 'reject' || dispatch.kind === 'help';
+  const ghVersion = canSkipCapabilityProbe
+    ? ({ kind: 'ok' } as const)
+    : await (opts.probeGhVersion ?? (opts.gh || opts.launchInteractive
+      ? async () => ({ kind: 'ok' } as const)
+      : probeGhVersion))();
+  if (ghVersion.kind !== 'ok') {
+    if (ghVersion.kind === 'absent') {
+      printErr('engineer: gh is not installed; install gh before entering DECIDE or engineer workflows.');
+    } else if (ghVersion.kind === 'below-floor') {
+      const { major, minor, patch } = ghVersion.version;
+      printErr(
+        `engineer: gh ${major}.${minor}.${patch} is below the required ` +
+        `${GH_VERSION_FLOOR.major}.${GH_VERSION_FLOOR.minor}.${GH_VERSION_FLOOR.patch}; upgrade gh before entering DECIDE or engineer workflows.`,
+      );
+    } else {
+      printErr(`engineer: cannot verify gh capability (${ghVersion.kind}); install or repair gh before entering DECIDE or engineer workflows.`);
+    }
+    return 1;
+  }
+
+  if (dispatch.invokedVerb === 'engineer') {
+    printErr('Warning: `engineer` is deprecated; use `compose` instead.');
+  }
 
   const reportCorruptLedger = (error: CorruptLedgerError): number => {
     const quarantineLocation = error.quarantinePath ?? error.quarantineDiagnostic ?? 'unavailable';
@@ -1293,7 +1323,7 @@ export async function dispatchEngineer(
     }
 
     // ── launch ──────────────────────────────────────────────────────────────────
-    // Bare `conduct-ts engineer`: drop the operator into the interactive /engineer loop.
+    // Bare `ai-conductor compose`: drop the operator into the interactive /composer loop.
     case 'launch': {
       const launchOne =
         opts.launchInteractive ?? ((idea?: string) => launchClaudeEngineer(process.cwd(), idea));
@@ -1306,7 +1336,7 @@ export async function dispatchEngineer(
         const inside = opts.insideClaudeSession ?? Boolean(process.env.CLAUDECODE);
         if (inside) {
           print(
-            "You're already inside a Claude Code session — run /engineer directly to start " +
+            "You're already inside a Claude Code session — run /composer directly to start " +
               'the idea→spec loop (no need to launch a nested session).',
           );
           return 0;
@@ -1314,7 +1344,7 @@ export async function dispatchEngineer(
       }
 
       // Intake pre-poll: prime the durable inbox before launching so the spawned
-      // /engineer session can `claim` a github-issue idea. Defaults to a real sweep
+      // /composer session can `claim` a github-issue idea. Defaults to a real sweep
       // only on the production spawn path (launchInteractive not injected) so tests
       // that stub the launcher never hit the network. A CLI-supplied idea drives a
       // specific idea and skips polling. Best-effort — a poll failure never blocks
@@ -1335,7 +1365,7 @@ export async function dispatchEngineer(
                 printErr,
               }));
 
-      // Outer loop: ONE fresh `claude /engineer` session per idea, so each idea
+      // Outer loop: ONE fresh `claude /composer` session per idea, so each idea
       // starts with clean context. Durable state (registry, lessons, processed
       // markers) is file-backed, so a fresh process loses nothing. The skill delivers
       // a single idea's spec then asks the operator to `/quit`; on exit we offer to
@@ -1390,7 +1420,7 @@ export async function dispatchEngineer(
     // rather than silently ignoring the flag and running the subcommand anyway.
     case 'reject': {
       printErr(
-        `engineer ${dispatch.sub}: unknown flag '${dispatch.flag}' — run \`engineer ${dispatch.sub} --help\` for usage.`,
+        `compose ${dispatch.sub}: unknown flag '${dispatch.flag}' — run \`compose ${dispatch.sub} --help\` for usage.`,
       );
       return 1;
     }
@@ -1411,7 +1441,7 @@ export async function dispatchEngineer(
     }
 
     // ── worktree ────────────────────────────────────────────────────────────────
-    // `conduct-ts engineer worktree --project <n> --idea "<i>"`: create the per-idea
+    // `ai-conductor engineer worktree --project <n> --idea "<i>"`: create the per-idea
     // isolated worktree the skill authors + lands in. Strict-abort (FR-7): a failure
     // makes zero mutation to the primary tree and returns exit 1. Prints
     // `{ slug, branch, worktreePath, reconcile }` on success.
@@ -1438,10 +1468,12 @@ export async function dispatchEngineer(
       // explicit --body always wins. A missing/unreadable record degrades to no
       // staging (matches worktree-authoring.ts's chat-origin negative path) — never throws.
       let resolvedBody = body;
-      if (sourceRef && resolvedBody == null) {
+      let inbound: Envelope['inbound'];
+      if (sourceRef) {
         const engDir = engineerDir ?? resolveEngineerDir({});
         const record = await loadClaimRecord(engDir, sourceRef);
-        resolvedBody = record?.body ?? undefined;
+        if (resolvedBody == null) resolvedBody = record?.body ?? undefined;
+        inbound = record?.inbound;
       }
 
       let lifecycle = engineerRunId
@@ -1508,6 +1540,33 @@ export async function dispatchEngineer(
           branch: wt.branch,
           planSlug: wt.slug,
         });
+        // The occurrence rides the one telemetry spine. This CLI process owns no
+        // long-lived bus, so it builds the spine for the duration of the emit —
+        // a ConductorEventEmitter with EventPersister attached to the canonical
+        // `<worktree>/.pipeline/events.jsonl` — exactly as the `operator_rewind`
+        // emit in `engine/rewind.ts` does. No sibling ledger and no bespoke
+        // format: one union, one reader path. Best-effort — a persistence failure
+        // reports on stderr and never fails worktree creation.
+        if (sourceRef && inbound) {
+          const events = new ConductorEventEmitter();
+          const persister = new EventPersister(
+            join(wt.worktreePath, '.pipeline', 'events.jsonl'),
+            events,
+          );
+          try {
+            persister.start();
+            await events.emitOrThrow({
+              type: 'intake_inbound_sanitized',
+              sourceRef,
+              neutralizations: inbound.neutralizations,
+              digest: inbound.digest,
+            });
+          } catch (err) {
+            printErr(`engineer worktree: could not record inbound intake event: ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            persister.stop();
+          }
+        }
         print(JSON.stringify({ kind: 'worktree', engineerRunId: lifecycle.engineerRunId, ...wt }));
         return 0;
       } catch (err: unknown) {
@@ -1906,7 +1965,7 @@ export async function dispatchEngineer(
     }
 
     // ── poll ────────────────────────────────────────────────────────────────────
-    // `conduct-ts engineer poll`: poll the github-issues source across registered
+    // `ai-conductor engineer poll`: poll the github-issues source across registered
     // repos and enqueue new envelopes into the durable inbox. NO routing, NO
     // processing, NO setInterval/detached spawn — a single synchronous sweep. The
     // ledger dedups, so a double-poll enqueues nothing new.
@@ -1923,8 +1982,8 @@ export async function dispatchEngineer(
     }
 
     // ── claim ─────────────────────────────────────────────────────────────────
-    // `conduct-ts engineer claim`: atomically dequeue the oldest pending idea so the
-    // /engineer skill can route it. claim+ack removes it from the inbox (the ledger
+    // `ai-conductor compose claim`: atomically dequeue the oldest pending idea so the
+    // /composer skill can route it. claim+ack removes it from the inbox (the ledger
     // is the durable record); the ledger advances to `claimed`. On an empty inbox,
     // reports {empty:true} — the skill then falls back to a CLI idea arg or chat.
     //
@@ -2003,7 +2062,7 @@ export async function dispatchEngineer(
       }
       // FR-13: persist a claim record so `engineer worktree --source-ref` can later
       // resolve the Desired-outcome body without the skill ever passing --body itself.
-      await persistClaimRecord(engDir, envelope.sourceRef, envelope.text);
+      await persistClaimRecord(engDir, envelope.sourceRef, envelope.text, envelope.inbound);
       print(
         JSON.stringify({
           kind: 'claim',
@@ -2011,13 +2070,14 @@ export async function dispatchEngineer(
           body: envelope.text,
           source: envelope.source,
           sourceRef: envelope.sourceRef,
+          inbound: envelope.inbound,
         }),
       );
       return 0;
     }
 
     // ── forget ──────────────────────────────────────────────────────────────────
-    // `conduct-ts engineer forget <sourceRef>`: drop the ledger entry so the issue
+    // `ai-conductor engineer forget <sourceRef>`: drop the ledger entry so the issue
     // is re-capturable, and strip the `engineer:handled` label so poll sees it again.
     // An absent ref is reported (found:false) and is NOT an error.
     case 'forget': {
@@ -2027,15 +2087,57 @@ export async function dispatchEngineer(
 
       const entry = await ledger.get(GITHUB_ISSUES_SOURCE, sourceRef);
       if (!entry) {
+        if (dispatch.resolvedBy) {
+          printErr(
+            `engineer forget: cannot record resolution for ${sourceRef}: no intake ledger entry; ` +
+            'rerun without --resolved-by to remove only the source label.',
+          );
+          return 1;
+        }
         print(JSON.stringify({ kind: 'forget', sourceRef, found: false }));
         return 0;
+      }
+
+      const parsedForget = parseSourceRef(sourceRef);
+      const closed = Boolean(dispatch.resolvedBy && parsedForget);
+      if (dispatch.resolvedBy && !parsedForget) {
+        printErr(
+          `engineer forget: cannot record resolution for ${sourceRef}: it is not a GitHub issue reference; ` +
+          'rerun without --resolved-by to remove only the source label.',
+        );
+        return 1;
+      }
+      if (dispatch.resolvedBy && parsedForget) {
+        const tracker = createGithubTrackerClient(gh);
+        try {
+          await tracker.commentOnIssue(
+            parsedForget.repo,
+            Number(parsedForget.issue),
+            `Resolved by ${dispatch.resolvedBy}`,
+            process.cwd(),
+          );
+        } catch (err: unknown) {
+          printErr(
+            `engineer forget: failed to comment on ${sourceRef}: ${err instanceof Error ? err.message : String(err)}; ` +
+            'ledger entry retained.',
+          );
+          return 1;
+        }
+        try {
+          await tracker.closeIssue(parsedForget.repo, String(parsedForget.issue), process.cwd());
+        } catch (err: unknown) {
+          printErr(
+            `engineer forget: failed to close ${sourceRef}: ${err instanceof Error ? err.message : String(err)}; ` +
+            `close the issue by hand, then rerun \`engineer forget ${sourceRef}\` without --resolved-by.`,
+          );
+          return 1;
+        }
       }
 
       await ledger.forget(GITHUB_ISSUES_SOURCE, sourceRef);
 
       // Best-effort label strip; a gh failure must not fail `forget` (the ledger
       // entry is already gone, which is the authoritative dedup state).
-      const parsedForget = parseSourceRef(sourceRef);
       if (parsedForget) {
         try {
           await gh(restRemoveLabelArgs(parsedForget.repo, parsedForget.issue, HANDLED_LABEL), { cwd: process.cwd() });
@@ -2044,12 +2146,19 @@ export async function dispatchEngineer(
         }
       }
 
-      print(JSON.stringify({ kind: 'forget', sourceRef, found: true, removed: true }));
+      print(JSON.stringify({
+        kind: 'forget',
+        sourceRef,
+        found: true,
+        removed: true,
+        closed,
+        ...(closed ? { resolvedBy: dispatch.resolvedBy } : {}),
+      }));
       return 0;
     }
 
     // ── unclaim ─────────────────────────────────────────────────────────────
-    // `conduct-ts engineer unclaim <sourceRef>` — single-idea recovery (FR-5):
+    // `ai-conductor engineer unclaim <sourceRef>` — single-idea recovery (FR-5):
     // requeue a claimed ledger entry back to pending, preserving capturedAt.
     // An absent ref is reported (found:false) and is NOT an error (Story 5, FR-7).
     // A non-claimed (terminal) or already PR-delivered entry refuses and directs
@@ -2092,7 +2201,7 @@ export async function dispatchEngineer(
     }
 
     // ── requeue ───────────────────────────────────────────────────────────────
-    // `conduct-ts engineer requeue --stale [--older-than <dur>]` — bulk recovery
+    // `ai-conductor engineer requeue --stale [--older-than <dur>]` — bulk recovery
     // of the whole stranded claimed class (Story 6, FR-8). Before requeueing each
     // eligible entry, probe its GitHub issue liveness (Story 7, FR-9): closed →
     // forget (drop); open → requeueClaimed. A liveness read that errors, returns
@@ -2184,7 +2293,7 @@ export async function dispatchEngineer(
     }
 
     // ── resolve ─────────────────────────────────────────────────────────────
-    // `conduct-ts engineer resolve <sourceRef> --pr-url <url> [--branch <b>]`:
+    // `ai-conductor engineer resolve <sourceRef> --pr-url <url> [--branch <b>]`:
     // mark a claimed entry as delivered when write-back fails (recovery from the
     // stranded state where the spec was authored/handed off but not recorded as done).
     // If entry doesn't exist: return {kind:'resolve', found:false} exit 0 (soft failure).
@@ -2235,7 +2344,7 @@ export async function dispatchEngineer(
     }
 
     // ── migrate-issue-deps ────────────────────────────────────────────────────
-    // `conduct-ts engineer migrate-issue-deps [--confirm]`: one-time prose→link
+    // `ai-conductor engineer migrate-issue-deps [--confirm]`: one-time prose→link
     // migration over the current repo's open issues. Scans, classifies prose
     // into deterministic edges + manual-review items, prints the full proposal,
     // and only WRITES anything when `--confirm` is passed — a bare run is a

@@ -1,7 +1,8 @@
+// Covers: task:1, task:4, task:6, task:7, task:8, task:9, task:10, task:11, task:13, task:14, task:15
 import { afterEach, describe, expect, it } from 'vitest';
 import { execa } from 'execa';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,10 +16,25 @@ import type { FullSuiteExecutionResult } from '../../src/engine/full-suite-execu
 import {
   FullSuiteVerifier,
   probeProcessStartIdentity,
+  inspectFullSuiteRecoveryClaim,
+  deriveFullSuiteScopedSelection,
 } from '../../src/engine/full-suite-verifier.js';
 
 const scratches: string[] = [];
 const CONDUCTOR_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+const DEFAULT_TEST_SUITE_VERIFICATION = {
+  mode: 'aggregate',
+  drift_budget: {
+    additional_inputs: 'none',
+    dependencies: 'none',
+    environment: 'none',
+    migrations: 'none',
+    project_config: 'none',
+    source: 'none',
+    test_infrastructure: 'none',
+    tests: 'none',
+  },
+} as const;
 const TSX_LOADER = join(CONDUCTOR_ROOT, 'node_modules/tsx/dist/loader.mjs');
 const CONCURRENT_ENSURE_FIXTURE = join(
   CONDUCTOR_ROOT,
@@ -51,6 +67,27 @@ describe('process start identity portability', () => {
       .resolves.toMatchObject({ status: 'FOUND' });
   });
 });
+function attestedPassEvidence(projectRoot: string): FullSuitePassEvidence {
+  return {
+    version: FULL_SUITE_EVIDENCE_VERSION,
+    outcome: 'PASS',
+    reason: 'exit_zero',
+    fingerprint: 'sha256:attested',
+    categoryFingerprints: CATEGORY_FINGERPRINTS,
+    provenanceHeadSha: 'attested-head',
+    mode: 'aggregate',
+    selectors: [],
+    driftLedger: [],
+    command: 'node suite.mjs --all',
+    workingDirectory: projectRoot,
+    startedAt: '2026-08-29T10:00:00.000Z',
+    endedAt: '2026-08-29T10:00:01.000Z',
+    durationMs: 1_000,
+    exitCode: 0,
+    stdout: 'all suites passed\n',
+    stderr: '',
+  };
+}
 
 async function writeProjectFile(
   projectRoot: string,
@@ -116,6 +153,683 @@ afterEach(async () => {
 });
 
 describe('FullSuiteVerifier', () => {
+  it('classifies existing recovery claims by liveness and bounded age', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-recovery-claim-classification-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const staleThresholdMs = 1_000;
+    const inspect = async () => (await inspectFullSuiteRecoveryClaim(lockPath, {
+      clock: () => now,
+      processIsLive: (pid) => pid === 22,
+      unownedStaleMs: staleThresholdMs,
+    })).classification;
+
+    await writeProjectFile(lockPath, 'recovery.json', JSON.stringify({
+      version: 1,
+      pid: 11,
+      token: 'dead-claimant',
+      claimedAt: '2026-09-07T11:59:59.900Z',
+    }));
+    await utimes(claimPath, new Date(now), new Date(now));
+    const deadClaim = await inspect();
+
+    await writeFile(claimPath, JSON.stringify({
+      version: 1,
+      pid: 22,
+      token: 'live-claimant',
+      claimedAt: '2026-09-07T11:59:59.900Z',
+    }));
+    await utimes(claimPath, new Date(now), new Date(now));
+    const liveFreshClaim = await inspect();
+
+    await writeFile(claimPath, 'not json');
+    await utimes(claimPath, new Date(now), new Date(now));
+    const unparseableFreshClaim = await inspect();
+    await utimes(claimPath, new Date(now - staleThresholdMs), new Date(now - staleThresholdMs));
+    const unparseableStaleClaim = await inspect();
+
+    await writeFile(claimPath, JSON.stringify({ version: 1, pid: 0 }));
+    await utimes(claimPath, new Date(now - staleThresholdMs), new Date(now - staleThresholdMs));
+    const invalidStaleClaim = await inspect();
+
+    await rm(claimPath);
+    const vanishedClaim = await inspect();
+
+    expect({
+      deadClaim,
+      liveFreshClaim,
+      unparseableFreshClaim,
+      unparseableStaleClaim,
+      invalidStaleClaim,
+      vanishedClaim,
+    }).toEqual({
+      deadClaim: { status: 'ORPHANED' },
+      liveFreshClaim: { status: 'OCCUPIED' },
+      unparseableFreshClaim: { status: 'OCCUPIED' },
+      unparseableStaleClaim: { status: 'ORPHANED' },
+      invalidStaleClaim: { status: 'ORPHANED' },
+      vanishedClaim: { status: 'VANISHED' },
+    });
+  });
+
+  it('reports recovery-claim read, liveness, and age probe failures', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-recovery-claim-errors-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    await mkdir(claimPath, { recursive: true });
+    const readFailure = (await inspectFullSuiteRecoveryClaim(lockPath, {
+      clock: () => now,
+      processIsLive: () => false,
+      unownedStaleMs: 1_000,
+    })).classification;
+    await rm(claimPath, { recursive: true });
+    await writeFile(claimPath, JSON.stringify({
+      version: 1,
+      pid: 22,
+      token: 'live-claimant',
+      claimedAt: '2026-09-07T11:59:59.900Z',
+    }));
+    const livenessFailure = (await inspectFullSuiteRecoveryClaim(lockPath, {
+      clock: () => now,
+      processIsLive: () => { throw new Error('liveness denied'); },
+      unownedStaleMs: 1_000,
+    })).classification;
+    await writeFile(claimPath, 'not json');
+    const ageFailure = (await inspectFullSuiteRecoveryClaim(lockPath, {
+      clock: () => { throw new Error('clock denied'); },
+      processIsLive: () => false,
+      unownedStaleMs: 1_000,
+    })).classification;
+
+    expect({ readFailure, livenessFailure, ageFailure }).toEqual({
+      readFailure: expect.objectContaining({
+        status: 'FAILED',
+        message: expect.stringContaining('recovery claim'),
+      }),
+      livenessFailure: expect.objectContaining({
+        status: 'FAILED',
+        message: expect.stringContaining('recovery claim'),
+      }),
+      ageFailure: expect.objectContaining({
+        status: 'FAILED',
+        message: expect.stringContaining('recovery claim'),
+      }),
+    });
+  });
+
+  it('derives changed test paths as scoped selectors', async () => {
+    const gitCalls: string[][] = [];
+
+    const selection = await deriveFullSuiteScopedSelection(async (args) => {
+      gitCalls.push(args);
+      if (args[0] === 'symbolic-ref') {
+        return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+      }
+      if (args[0] === 'merge-base') {
+        return { exitCode: 0, stdout: 'feature-base\n', stderr: '' };
+      }
+      return {
+        exitCode: 0,
+        stdout: [
+          'src/feature.ts',
+          'test/feature.test.ts',
+          'spec/widget.spec.ts',
+          'test/support/helpers.ts',
+        ].join('\n'),
+        stderr: '',
+      };
+    });
+
+    expect(selection).toEqual({
+      status: 'SELECTED',
+      selectors: ['test/feature.test.ts', 'spec/widget.spec.ts'],
+    });
+    expect(gitCalls).toEqual([
+      ['symbolic-ref', 'refs/remotes/origin/HEAD'],
+      ['merge-base', 'origin/main', 'HEAD'],
+      ['diff', '--name-only', 'feature-base', 'HEAD'],
+    ]);
+  });
+
+  it('returns an explicit empty selection when the feature surface has no changed tests', async () => {
+    const selection = await deriveFullSuiteScopedSelection(async (args) => {
+      if (args[0] === 'symbolic-ref') {
+        return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+      }
+      if (args[0] === 'merge-base') {
+        return { exitCode: 0, stdout: 'feature-base\n', stderr: '' };
+      }
+      return { exitCode: 0, stdout: 'src/feature.ts\npackage-lock.json\n', stderr: '' };
+    });
+
+    expect(selection).toEqual({ status: 'EMPTY' });
+  });
+
+  it('runs scoped verification through the scoped-run interface and records its selected PASS', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-scoped-mode-');
+    const scopedCommands: string[] = [];
+    const scopedRunner = async (command: string) => {
+      scopedCommands.push(command);
+      return 0;
+    };
+    let aggregateCalls = 0;
+    const aggregateExecute = async () => {
+      aggregateCalls += 1;
+      throw new Error('aggregate command must not run in scoped mode');
+    };
+    await writeProjectFile(
+      projectRoot,
+      '.ai-conductor/config.yml',
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  scoped_command: npx vitest run {selectors}',
+        '  verification:',
+        '    mode: scoped',
+        '',
+      ].join('\n'),
+    );
+
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      execute: aggregateExecute,
+      scopedRunner,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:scoped-mode',
+          headSha: 'scoped-mode-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+      git: async (args: string[]) => {
+        if (args[0] === 'symbolic-ref') {
+          return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+        }
+        if (args[0] === 'merge-base') {
+          return { exitCode: 0, stdout: 'scoped-mode-base\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: 'test/with space.test.ts\n', stderr: '' };
+      },
+    } as never);
+
+    const result = await verifier.ensure();
+
+    expect({
+      result,
+      scopedCommand: scopedCommands[0],
+      aggregateCalls,
+      inspection: await verifier.inspect(),
+    }).toEqual({
+      result: expect.objectContaining({
+        status: 'EXECUTED',
+        evidence: expect.objectContaining({
+          mode: 'scoped',
+          selectors: ['test/with space.test.ts'],
+        }),
+      }),
+      scopedCommand: "npx vitest run 'test/with space.test.ts'",
+      aggregateCalls: 0,
+      inspection: expect.objectContaining({ status: 'CURRENT' }),
+    });
+  });
+
+  it('routes an empty scoped selection through aggregate verification with a recorded basis', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-scoped-empty-selection-');
+    const scopedRunner = async () => {
+      throw new Error('scoped command must not run with zero selectors');
+    };
+    let aggregateCalls = 0;
+    const aggregateExecute = async () => {
+      aggregateCalls += 1;
+      return {
+        ok: true as const,
+        command: 'node suite.mjs --all',
+        cwd: projectRoot,
+        startedAt: '2026-08-29T10:00:00.000Z',
+        endedAt: '2026-08-29T10:00:01.000Z',
+        durationMs: 1_000,
+        exitCode: 0 as const,
+        stdout: '',
+        stderr: '',
+      };
+    };
+    await writeProjectFile(
+      projectRoot,
+      '.ai-conductor/config.yml',
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  scoped_command: npx vitest run {selectors}',
+        '  verification:',
+        '    mode: scoped',
+        '',
+      ].join('\n'),
+    );
+
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      execute: aggregateExecute,
+      scopedRunner,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:scoped-empty-selection',
+          headSha: 'scoped-empty-selection-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+      git: async (args: string[]) => {
+        if (args[0] === 'symbolic-ref') {
+          return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+        }
+        if (args[0] === 'merge-base') {
+          return { exitCode: 0, stdout: 'scoped-empty-selection-base\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: 'src/feature.ts\n', stderr: '' };
+      },
+    } as never).ensure();
+
+    expect({ result, aggregateCalls }).toEqual({
+      result: expect.objectContaining({
+        status: 'EXECUTED',
+        evidence: expect.objectContaining({
+          mode: 'scoped',
+          selectors: [],
+          executionBasis: 'scoped-empty-selection-aggregate',
+        }),
+      }),
+      aggregateCalls: 1,
+    });
+  });
+
+  it('rebases a project-root scoped selector when the configured runner directory differs', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-scoped-rebase-');
+    const scopedCalls: Array<{ command: string; cwd: string | undefined }> = [];
+    await writeProjectFile(projectRoot, 'test/with space.test.ts', 'export {}\n');
+    await writeProjectFile(projectRoot, 'packages/app/.gitkeep', '');
+    await writeProjectFile(
+      projectRoot,
+      '.ai-conductor/config.yml',
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  scoped_command: npx vitest run {selectors}',
+        '  working_directory: packages/app',
+        '  verification:',
+        '    mode: scoped',
+        '',
+      ].join('\n'),
+    );
+
+    await new FullSuiteVerifier({
+      projectRoot,
+      execute: async () => {
+        throw new Error('aggregate command must not run in scoped mode');
+      },
+      scopedRunner: async (command, { cwd }) => {
+        scopedCalls.push({ command, cwd });
+        return 0;
+      },
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:scoped-rebase',
+          headSha: 'scoped-rebase-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+      git: async (args: string[]) => {
+        if (args[0] === 'symbolic-ref') {
+          return { exitCode: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+        }
+        if (args[0] === 'merge-base') {
+          return { exitCode: 0, stdout: 'scoped-rebase-base\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: 'test/with space.test.ts\n', stderr: '' };
+      },
+    }).ensure();
+
+    expect(scopedCalls).toEqual([
+      {
+        command: "npx vitest run '../../test/with space.test.ts'",
+        cwd: join(projectRoot, 'packages/app'),
+      },
+    ]);
+  });
+
+  it('rejects scoped PASS evidence in aggregate mode and executes the aggregate command', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-aggregate-mode-mismatch-');
+    const scopedCommands: string[] = [];
+    const scopedRunner = async (command: string) => {
+      scopedCommands.push(command);
+      return 0;
+    };
+    let aggregateCalls = 0;
+    const aggregateExecute = async () => {
+      aggregateCalls += 1;
+      return {
+        ok: true as const,
+        command: 'node suite.mjs --all',
+        cwd: projectRoot,
+        startedAt: '2026-08-29T10:00:00.000Z',
+        endedAt: '2026-08-29T10:00:01.000Z',
+        durationMs: 1_000,
+        exitCode: 0 as const,
+        stdout: '',
+        stderr: '',
+      };
+    };
+    await writeProjectFile(
+      projectRoot,
+      '.ai-conductor/config.yml',
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  scoped_command: npx vitest run {selectors}',
+        '  verification:',
+        '    mode: aggregate',
+        '',
+      ].join('\n'),
+    );
+    const evidence = {
+      ...attestedPassEvidence(projectRoot),
+      fingerprint: 'sha256:aggregate-mode',
+      mode: 'scoped' as const,
+      selectors: ['test/selected.test.ts'],
+    };
+    await writeFullSuiteEvidence(projectRoot, evidence);
+
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      execute: aggregateExecute,
+      scopedRunner,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:aggregate-mode',
+          headSha: 'aggregate-mode-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+    });
+    const inspection = await verifier.inspect();
+    const result = await verifier.ensure();
+
+    expect({ inspection, result, aggregateCalls, scopedCommands }).toEqual({
+      inspection: expect.objectContaining({ status: 'STALE' }),
+      result: expect.objectContaining({
+        status: 'EXECUTED',
+        evidence: expect.objectContaining({ mode: 'aggregate', selectors: [] }),
+      }),
+      aggregateCalls: 1,
+      scopedCommands: [],
+    });
+  });
+
+  it('measures deduplicated changed and dirty paths by shared fingerprint category', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-drift-measurement-');
+    const gitCalls: string[][] = [];
+    const git = async (args: string[]) => {
+      gitCalls.push(args);
+      if (args[0] === 'diff') {
+        return {
+          exitCode: 0,
+          stdout: [
+            'src/app.ts',
+            'package-lock.json',
+            'test/app.test.ts',
+            'private/state.bin',
+          ].join('\n'),
+          stderr: '',
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: [
+          ' M src/app.ts',
+          ' M db/migrations/001.sql',
+          '?? test/setup.ts',
+          '?? .ai-conductor/config.yml',
+          ' M private/state.bin',
+        ].join('\n'),
+        stderr: '',
+      };
+    };
+    const verifier = new FullSuiteVerifier({ projectRoot, git } as never) as FullSuiteVerifier & {
+      measureDriftFromAttestedPass: (
+        provenanceHeadSha: string,
+        explicitlyDeclaredPaths?: ReadonlySet<string>,
+      ) => Promise<unknown>;
+    };
+
+    const result = await verifier.measureDriftFromAttestedPass(
+      'attested-pass-sha',
+      new Set(['private/state.bin']),
+    );
+
+    expect(result).toEqual({
+      status: 'MEASURED',
+      categoryCounts: {
+        additional_inputs: 1,
+        dependencies: 1,
+        environment: 0,
+        migrations: 1,
+        project_config: 1,
+        source: 1,
+        test_infrastructure: 1,
+        tests: 1,
+      },
+    });
+    expect(gitCalls).toEqual([
+      ['diff', '--name-only', 'attested-pass-sha..HEAD'],
+      ['status', '--porcelain'],
+      ['ls-files', '--others', '--ignored', '--exclude-standard'],
+    ]);
+  });
+
+  it('counts a globbed declared-input child as additional input drift', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-globbed-input-drift-');
+    await writeProjectFile(projectRoot, 'private/glob/child.bin', 'declared child\n');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  inputs:',
+        '    - private/glob/*.bin',
+        '  verification:',
+        '    drift_budget:',
+        '      additional_inputs: unlimited',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    const gitCalls: string[][] = [];
+    const inspection = await new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:globbed-input-current',
+          headSha: 'globbed-input-head',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            additional_inputs: 'category:additional_inputs:current',
+          },
+        },
+      }),
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === 'diff') {
+          return { exitCode: 0, stdout: 'private/glob/child.bin\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      worktreeStatus: async () => '',
+    }).inspect();
+
+    expect(inspection).toEqual(expect.objectContaining({
+      status: 'PRESERVED_WITHIN_BUDGET',
+      evidence: expect.objectContaining({
+        driftLedger: [expect.objectContaining({
+          categories: expect.objectContaining({ additional_inputs: 1 }),
+        })],
+      }),
+    }));
+    expect(gitCalls).toEqual([
+      ['diff', '--name-only', 'attested-head..HEAD'],
+      ['status', '--porcelain'],
+      ['ls-files', '--others', '--ignored', '--exclude-standard'],
+    ]);
+  });
+
+  it('counts a declared ignored input as additional input drift', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-ignored-input-drift-');
+    const gitCalls: string[][] = [];
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === 'ls-files') {
+          return { exitCode: 0, stdout: 'private/state.bin\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    }) as FullSuiteVerifier & {
+      measureDriftFromAttestedPass: (
+        provenanceHeadSha: string,
+        explicitlyDeclaredPaths?: ReadonlySet<string>,
+      ) => Promise<unknown>;
+    };
+
+    await expect(verifier.measureDriftFromAttestedPass(
+      'attested-pass-sha',
+      new Set(['private/state.bin']),
+    )).resolves.toEqual({
+      status: 'MEASURED',
+      categoryCounts: {
+        additional_inputs: 1,
+        dependencies: 0,
+        environment: 0,
+        migrations: 0,
+        project_config: 0,
+        source: 0,
+        test_infrastructure: 0,
+        tests: 0,
+      },
+    });
+    expect(gitCalls).toEqual([
+      ['diff', '--name-only', 'attested-pass-sha..HEAD'],
+      ['status', '--porcelain'],
+      ['ls-files', '--others', '--ignored', '--exclude-standard'],
+    ]);
+  });
+
+  it('returns an indeterminate drift result when ignored-input enumeration fails', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-ignored-input-enumeration-failure-');
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      git: async (args: string[]) => args[0] === 'ls-files'
+        ? { exitCode: 1, stdout: '', stderr: 'fatal: ignored enumeration failed' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+    } as never) as FullSuiteVerifier & {
+      measureDriftFromAttestedPass: (
+        provenanceHeadSha: string,
+        explicitlyDeclaredPaths?: ReadonlySet<string>,
+      ) => Promise<unknown>;
+    };
+
+    await expect(verifier.measureDriftFromAttestedPass(
+      'attested-pass-sha',
+      new Set(['private/state.bin']),
+    )).resolves.toEqual({ status: 'INDETERMINATE' });
+  });
+
+  it('treats declared-input expansion failure as indeterminate drift', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-input-expansion-failure-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  inputs:',
+        '    - private/missing.bin',
+        '  verification:',
+        '    drift_budget:',
+        '      additional_inputs: unlimited',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    const gitCalls: string[][] = [];
+    const inspection = await new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:input-expansion-failure-current',
+          headSha: 'input-expansion-failure-head',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            additional_inputs: 'category:additional_inputs:current',
+          },
+        },
+      }),
+      git: async (args) => {
+        gitCalls.push(args);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      worktreeStatus: async () => '',
+    }).inspect();
+
+    expect(inspection).toEqual({
+      status: 'STALE',
+      reason: 'drift_measurement_indeterminate',
+    });
+    expect(gitCalls).toEqual([]);
+  });
+
+  it('returns an indeterminate drift result for an unresolvable attested PASS SHA', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-drift-bad-sha-');
+    const gitCalls: string[][] = [];
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      git: async (args: string[]) => {
+        gitCalls.push(args);
+        return { exitCode: 128, stdout: '', stderr: 'fatal: bad object' };
+      },
+    } as never) as FullSuiteVerifier & {
+      measureDriftFromAttestedPass: (provenanceHeadSha: string) => Promise<unknown>;
+    };
+
+    await expect(verifier.measureDriftFromAttestedPass('missing-sha')).resolves.toEqual({
+      status: 'INDETERMINATE',
+    });
+    expect(gitCalls).toEqual([['diff', '--name-only', 'missing-sha..HEAD']]);
+  });
+
+  it('returns an indeterminate drift result when Git fails while measuring paths', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-drift-git-failure-');
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      git: async (args: string[]) => {
+        if (args[0] === 'diff') return { exitCode: 0, stdout: 'src/app.ts', stderr: '' };
+        throw new Error('git status failed');
+      },
+    } as never) as FullSuiteVerifier & {
+      measureDriftFromAttestedPass: (provenanceHeadSha: string) => Promise<unknown>;
+    };
+
+    await expect(verifier.measureDriftFromAttestedPass('attested-pass-sha')).resolves.toEqual({
+      status: 'INDETERMINATE',
+    });
+  });
+
   it('fails aggregate verification explicitly when only scoped_command is configured', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'full-suite-scoped-only-'));
     scratches.push(projectRoot);
@@ -259,6 +973,7 @@ describe('FullSuiteVerifier', () => {
           command: secret,
           working_directory: secret,
           environment: ['SUITE_SECRET'],
+          verification: DEFAULT_TEST_SUITE_VERIFICATION,
         });
         return {
           ok: true,
@@ -284,6 +999,7 @@ describe('FullSuiteVerifier', () => {
       command: secret,
       working_directory: secret,
       environment: ['SUITE_SECRET'],
+      verification: DEFAULT_TEST_SUITE_VERIFICATION,
     });
     expect({
       resultLeaks: JSON.stringify(result).includes(secret),
@@ -394,6 +1110,10 @@ describe('FullSuiteVerifier', () => {
       fingerprint: 'sha256:current-inputs',
       categoryFingerprints: CATEGORY_FINGERPRINTS,
       provenanceHeadSha: '0123456789abcdef',
+      mode: 'aggregate',
+      selectors: [],
+      executionBasis: 'aggregate',
+      driftLedger: [],
       command: 'node suite.mjs --all',
       workingDirectory,
       startedAt: '2026-07-25T15:00:00.000Z',
@@ -466,6 +1186,7 @@ describe('FullSuiteVerifier', () => {
             working_directory: 'packages/app',
             timeout_seconds: 42,
             environment: ['SUITE_MODE'],
+            verification: DEFAULT_TEST_SUITE_VERIFICATION,
           },
           environmentValues: environment,
         },
@@ -478,6 +1199,7 @@ describe('FullSuiteVerifier', () => {
             working_directory: 'packages/app',
             timeout_seconds: 42,
             environment: ['SUITE_MODE'],
+            verification: DEFAULT_TEST_SUITE_VERIFICATION,
           },
           environment,
         },
@@ -518,6 +1240,10 @@ describe('FullSuiteVerifier', () => {
       fingerprint: 'sha256:byte-identical-content',
       categoryFingerprints: CATEGORY_FINGERPRINTS,
       provenanceHeadSha: originalHeadSha,
+      mode: 'aggregate',
+      selectors: [],
+      executionBasis: 'aggregate',
+      driftLedger: [],
       command: 'node suite.mjs --all',
       workingDirectory,
       startedAt: '2026-07-25T16:00:00.000Z',
@@ -601,6 +1327,1177 @@ describe('FullSuiteVerifier', () => {
       executionCount: 1,
       fingerprintCount: 5,
       persisted: { usable: true, evidence: expectedEvidence },
+    });
+  });
+
+  it('preserves a PASS within a declared source drift budget without launching the suite', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-within-source-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 20',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const attestedPass = attestedPassEvidence(projectRoot);
+    await writeFullSuiteEvidence(projectRoot, attestedPass);
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:current',
+          headSha: 'evaluation-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:current' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/a.ts\nsrc/b.ts\nsrc/c.ts\n', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        throw new Error('The suite must not launch for within-budget drift');
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const evidenceBytesBeforeInspection = await readFile(
+      join(projectRoot, '.pipeline', 'test-suite-evidence.json'),
+      'utf8',
+    );
+    const inspection = await verifier.inspect();
+    const evidenceBytesAfterInspection = await readFile(
+      join(projectRoot, '.pipeline', 'test-suite-evidence.json'),
+      'utf8',
+    );
+    const ensured = await verifier.ensure(inspection);
+    if (inspection.status === 'PRESERVED_WITHIN_BUDGET') {
+      await verifier.recordPreservation(inspection);
+    }
+    const persisted = await readFullSuiteEvidence(projectRoot);
+
+    expect(evidenceBytesAfterInspection).toBe(evidenceBytesBeforeInspection);
+
+    expect({ inspection, ensured: ensured.status, launches, persisted }).toEqual({
+      inspection: {
+        status: 'PRESERVED_WITHIN_BUDGET',
+        evidence: {
+          ...attestedPass,
+          fingerprint: 'sha256:current',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            source: 'category:source:current',
+          },
+          driftLedger: [{
+            at: expect.any(String),
+            headSha: 'evaluation-head',
+            categories: {
+              additional_inputs: 0,
+              dependencies: 0,
+              environment: 0,
+              migrations: 0,
+              project_config: 0,
+              source: 3,
+              test_infrastructure: 0,
+              tests: 0,
+            },
+          }],
+        },
+      },
+      ensured: 'REUSED',
+      launches: 0,
+      persisted: {
+        usable: true,
+        evidence: {
+          ...attestedPass,
+          fingerprint: 'sha256:current',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            source: 'category:source:current',
+          },
+          driftLedger: [{
+            at: expect.any(String),
+            headSha: 'evaluation-head',
+            categories: {
+              additional_inputs: 0,
+              dependencies: 0,
+              environment: 0,
+              migrations: 0,
+              project_config: 0,
+              source: 3,
+              test_infrastructure: 0,
+              tests: 0,
+            },
+          }],
+        },
+      },
+    });
+  });
+
+  it('preserves a PASS when two changed categories are both within their declared budgets', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-two-category-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 2',
+        '      tests: 4',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:current',
+          headSha: 'two-category-head',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            source: 'category:source:current',
+            tests: 'category:tests:current',
+          },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/a.ts\ntest/a.test.ts\ntest/b.test.ts\n', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        throw new Error('The suite must not launch for within-budget drift');
+      },
+      worktreeStatus: async () => '',
+    });
+
+    await expect(verifier.inspect()).resolves.toMatchObject({
+      status: 'PRESERVED_WITHIN_BUDGET',
+      evidence: {
+        driftLedger: [{
+          headSha: 'two-category-head',
+          categories: {
+            source: 1,
+            tests: 2,
+          },
+        }],
+      },
+    });
+  });
+
+  it('measures a second tolerated source drift cumulatively from the attested PASS', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-cumulative-source-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 20',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    const gitCalls: string[][] = [];
+    let fingerprintCount = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => {
+        fingerprintCount += 1;
+        return {
+          ok: true,
+          fingerprint: {
+            digest: `sha256:preserved-${fingerprintCount}`,
+            headSha: `head-${fingerprintCount}`,
+            categoryFingerprints: {
+              ...CATEGORY_FINGERPRINTS,
+              source: `category:source:${fingerprintCount}`,
+            },
+          },
+        };
+      },
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === 'diff') {
+          const pathCount = gitCalls.filter(([command]) => command === 'diff').length === 1 ? 15 : 19;
+          return {
+            exitCode: 0,
+            stdout: Array.from({ length: pathCount }, (_, index) => `src/${index}.ts`).join('\n'),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      execute: async () => {
+        throw new Error('The suite must not launch for cumulative within-budget drift');
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const first = await verifier.inspect();
+    if (first.status === 'PRESERVED_WITHIN_BUDGET') {
+      await verifier.recordPreservation(first);
+    }
+    const second = await verifier.inspect();
+
+    expect({ first, second, gitCalls }).toEqual({
+      first: expect.objectContaining({ status: 'PRESERVED_WITHIN_BUDGET' }),
+      second: expect.objectContaining({
+        status: 'PRESERVED_WITHIN_BUDGET',
+        evidence: expect.objectContaining({
+          driftLedger: [
+            expect.objectContaining({ categories: expect.objectContaining({ source: 15 }) }),
+            expect.objectContaining({ categories: expect.objectContaining({ source: 19 }) }),
+          ],
+        }),
+      }),
+      gitCalls: [
+        ['diff', '--name-only', 'attested-head..HEAD'],
+        ['status', '--porcelain'],
+        ['diff', '--name-only', 'attested-head..HEAD'],
+        ['status', '--porcelain'],
+      ],
+    });
+  });
+
+  it('reruns when cumulative source drift exceeds the budget instead of ratcheting preservation', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-ratchet-source-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 20',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    const gitCalls: string[][] = [];
+    let fingerprintCount = 0;
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => {
+        fingerprintCount += 1;
+        return {
+          ok: true,
+          fingerprint: {
+            digest: `sha256:ratchet-${fingerprintCount}`,
+            headSha: `head-${fingerprintCount}`,
+            categoryFingerprints: {
+              ...CATEGORY_FINGERPRINTS,
+              source: `category:source:${fingerprintCount}`,
+            },
+          },
+        };
+      },
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === 'diff') {
+          const pathCount = gitCalls.filter(([command]) => command === 'diff').length === 1 ? 19 : 21;
+          return {
+            exitCode: 0,
+            stdout: Array.from({ length: pathCount }, (_, index) => `src/${index}.ts`).join('\n'),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const preserved = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ preserved, ensured: ensured.status, launches, gitCalls }).toEqual({
+      preserved: expect.objectContaining({ status: 'PRESERVED_WITHIN_BUDGET' }),
+      ensured: 'EXECUTED',
+      launches: 1,
+      gitCalls: [
+        ['diff', '--name-only', 'attested-head..HEAD'],
+        ['status', '--porcelain'],
+        ['diff', '--name-only', 'attested-head..HEAD'],
+        ['status', '--porcelain'],
+      ],
+    });
+  });
+
+  it('reruns the same source drift when no drift budget is declared', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-absent-drift-budget-');
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:current',
+          headSha: 'unbudgeted-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:current' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/a.ts\nsrc/b.ts\nsrc/c.ts\n', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, launches }).toEqual({
+      inspection: { status: 'STALE', reason: 'source_changed' },
+      ensured: 'EXECUTED',
+      launches: 1,
+    });
+  });
+
+  it('resolves absent verification as aggregate mode with all-none drift bounds', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-absent-verification-resolution-');
+    let resolvedTestSuite: unknown;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:absent-verification',
+          headSha: 'absent-verification-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+      execute: async ({ testSuite }) => {
+        resolvedTestSuite = testSuite;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    await expect(verifier.ensure()).resolves.toMatchObject({ status: 'EXECUTED' });
+
+    expect((resolvedTestSuite as { verification: unknown }).verification).toEqual(
+      DEFAULT_TEST_SUITE_VERIFICATION,
+    );
+  });
+
+  it('reruns one source-path drift without verification using the existing stale reason', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-absent-verification-source-drift-');
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:source-drift',
+          headSha: 'source-drift-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:drifted' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/changed.ts\n', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, launches }).toEqual({
+      inspection: { status: 'STALE', reason: 'source_changed' },
+      ensured: 'EXECUTED',
+      launches: 1,
+    });
+  });
+
+  it('reuses fingerprint-identical evidence without executing when verification is absent', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-absent-verification-reuse-');
+    const evidence = attestedPassEvidence(projectRoot);
+    await writeFullSuiteEvidence(projectRoot, evidence);
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: evidence.fingerprint,
+          headSha: 'reused-head',
+          categoryFingerprints: evidence.categoryFingerprints,
+        },
+      }),
+      execute: async () => {
+        launches += 1;
+        throw new Error('Fingerprint-identical evidence must be reused');
+      },
+      worktreeStatus: async () => '',
+    });
+
+    await expect(verifier.ensure()).resolves.toEqual({ status: 'REUSED', evidence });
+    expect(launches).toBe(0);
+  });
+
+  it('never appends a drift-ledger entry for absent verification configuration', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-absent-verification-ledger-');
+    const evidence = attestedPassEvidence(projectRoot);
+    await writeFullSuiteEvidence(projectRoot, evidence);
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:ledger-source-drift',
+          headSha: 'ledger-source-drift-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:drifted' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/changed.ts\n', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        throw new Error('A stale inspection must not execute the suite');
+      },
+      worktreeStatus: async () => '',
+    });
+
+    await expect(verifier.inspect()).resolves.toEqual({
+      status: 'STALE',
+      reason: 'source_changed',
+    });
+    await expect(readFullSuiteEvidence(projectRoot)).resolves.toEqual({
+      usable: true,
+      evidence,
+    });
+  });
+
+  it('reruns source drift that exceeds its declared budget with the measured count and bound', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-exhausted-source-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 5',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:source-exhausted',
+          headSha: 'source-exhausted-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:current' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? {
+          exitCode: 0,
+          stdout: Array.from({ length: 6 }, (_, index) => `src/${index}.ts`).join('\n'),
+          stderr: '',
+        }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: {
+        status: 'STALE',
+        reason: 'drift_budget_exceeded',
+        category: 'source',
+        count: 6,
+        bound: 5,
+      },
+      ensured: 'EXECUTED',
+      freshness: {
+        status: 'STALE',
+        reason: 'drift_budget_exceeded',
+        category: 'source',
+        count: 6,
+        bound: 5,
+      },
+      launches: 1,
+    });
+  });
+
+  it('starts a new drift epoch when an exhausted source budget reruns and passes', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-reset-drift-epoch-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 5',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, {
+      ...attestedPassEvidence(projectRoot),
+      driftLedger: [{
+        at: '2026-08-29T09:00:00.000Z',
+        headSha: 'previous-epoch-head',
+        categories: {
+          additional_inputs: 0,
+          dependencies: 0,
+          environment: 0,
+          migrations: 0,
+          project_config: 0,
+          source: 3,
+          test_infrastructure: 0,
+          tests: 0,
+        },
+      }],
+    });
+    const gitCalls: string[][] = [];
+    let passedRerun = false;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: passedRerun ? 'sha256:post-rerun' : 'sha256:exhausted',
+          headSha: passedRerun ? 'post-rerun-head' : 'rerun-head',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            source: passedRerun ? 'category:source:post-rerun' : 'category:source:exhausted',
+          },
+        },
+      }),
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === 'diff') {
+          return {
+            exitCode: 0,
+            stdout: passedRerun
+              ? 'src/post-rerun.ts\n'
+              : Array.from({ length: 6 }, (_, index) => `src/${index}.ts`).join('\n'),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      execute: async () => {
+        passedRerun = true;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const rerun = await verifier.ensure();
+    const evidenceAfterRerun = await readFullSuiteEvidence(projectRoot);
+    const postRerunInspection = await verifier.inspect();
+
+    expect({ rerun, evidenceAfterRerun, postRerunInspection, gitCalls }).toEqual({
+      rerun: expect.objectContaining({
+        status: 'EXECUTED',
+        evidence: expect.objectContaining({
+          provenanceHeadSha: 'rerun-head',
+          driftLedger: [],
+        }),
+      }),
+      evidenceAfterRerun: {
+        usable: true,
+        evidence: expect.objectContaining({
+          provenanceHeadSha: 'rerun-head',
+          driftLedger: [],
+        }),
+      },
+      postRerunInspection: expect.objectContaining({
+        status: 'PRESERVED_WITHIN_BUDGET',
+        evidence: expect.objectContaining({
+          provenanceHeadSha: 'rerun-head',
+          driftLedger: [expect.objectContaining({
+            headSha: 'post-rerun-head',
+            categories: expect.objectContaining({ source: 1 }),
+          })],
+        }),
+      }),
+      gitCalls: [
+        ['diff', '--name-only', 'attested-head..HEAD'],
+        ['status', '--porcelain'],
+        ['diff', '--name-only', 'rerun-head..HEAD'],
+        ['status', '--porcelain'],
+      ],
+    });
+  });
+
+  it('preserves source drift exactly at its declared budget bound', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-source-budget-boundary-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 5',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:source-boundary',
+          headSha: 'source-boundary-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:current' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? {
+          exitCode: 0,
+          stdout: Array.from({ length: 5 }, (_, index) => `src/${index}.ts`).join('\n'),
+          stderr: '',
+        }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        throw new Error('The suite must not launch for drift at the declared bound');
+      },
+      worktreeStatus: async () => '',
+    });
+
+    await expect(verifier.inspect()).resolves.toMatchObject({
+      status: 'PRESERVED_WITHIN_BUDGET',
+      evidence: {
+        driftLedger: [
+          expect.objectContaining({
+            headSha: 'source-boundary-head',
+            categories: expect.objectContaining({ source: 5 }),
+          }),
+        ],
+      },
+    });
+  });
+
+  it.each([
+    { category: 'dependencies', path: 'package-lock.json' },
+    { category: 'migrations', path: 'db/migrations/001.sql' },
+    { category: 'environment', path: '.pipeline/test-suite-environment.key' },
+    { category: 'project_config', path: '.ai-conductor/config.yml' },
+  ] as const)('reruns unbudgetable $category drift regardless of other declared budget', async ({
+    category,
+    path,
+  }) => {
+    const projectRoot = await makeConfiguredProject(`full-suite-unbudgetable-${category}-`);
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: unlimited',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: `sha256:unbudgetable-${category}`,
+          headSha: `unbudgetable-${category}-head`,
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            [category]: `category:${category}:current`,
+          },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: path, stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: {
+        status: 'STALE',
+        reason: 'unbudgetable_drift',
+        category,
+        count: 1,
+        bound: 'none',
+      },
+      ensured: 'EXECUTED',
+      freshness: {
+        status: 'STALE',
+        reason: 'unbudgetable_drift',
+        category,
+        count: 1,
+        bound: 'none',
+      },
+      launches: 1,
+    });
+  });
+
+  it('reruns mixed drift using the category whose bound is exceeded', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-mixed-exhausted-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 5',
+        '      tests: 5',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:mixed-exhausted',
+          headSha: 'mixed-exhausted-head',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            source: 'category:source:current',
+            tests: 'category:tests:current',
+          },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? {
+          exitCode: 0,
+          stdout: [
+            ...Array.from({ length: 3 }, (_, index) => `src/${index}.ts`),
+            ...Array.from({ length: 6 }, (_, index) => `test/${index}.test.ts`),
+          ].join('\n'),
+          stderr: '',
+        }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: {
+        status: 'STALE',
+        reason: 'drift_budget_exceeded',
+        category: 'tests',
+        count: 6,
+        bound: 5,
+      },
+      ensured: 'EXECUTED',
+      freshness: {
+        status: 'STALE',
+        reason: 'drift_budget_exceeded',
+        category: 'tests',
+        count: 6,
+        bound: 5,
+      },
+      launches: 1,
+    });
+  });
+
+  it('reruns an unlisted budgetable category using the default none bound', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-default-budget-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: 5',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:default-budget',
+          headSha: 'default-budget-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, tests: 'category:tests:current' },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'test/a.test.ts', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: {
+        status: 'STALE',
+        reason: 'drift_budget_exceeded',
+        category: 'tests',
+        count: 1,
+        bound: 'none',
+      },
+      ensured: 'EXECUTED',
+      freshness: {
+        status: 'STALE',
+        reason: 'drift_budget_exceeded',
+        category: 'tests',
+        count: 1,
+        bound: 'none',
+      },
+      launches: 1,
+    });
+  });
+
+  it('fails closed when a fingerprint-only environment drift is not represented by measured paths', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-unaccounted-environment-drift-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: unlimited',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:unaccounted-environment',
+          headSha: 'unaccounted-environment-head',
+          categoryFingerprints: {
+            ...CATEGORY_FINGERPRINTS,
+            environment: 'category:environment:current',
+          },
+        },
+      }),
+      git: async (args) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/a.ts', stderr: '' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: {
+        status: 'STALE',
+        reason: 'unbudgetable_drift',
+        category: 'environment',
+        count: 0,
+        bound: 'none',
+      },
+      ensured: 'EXECUTED',
+      freshness: {
+        status: 'STALE',
+        reason: 'unbudgetable_drift',
+        category: 'environment',
+        count: 0,
+        bound: 'none',
+      },
+      launches: 1,
+    });
+  });
+
+  it.each([
+    {
+      name: 'the attested provenance SHA cannot be resolved',
+      git: async (args: string[]) => args[0] === 'diff'
+        ? { exitCode: 128, stdout: '', stderr: 'fatal: bad object attested-head' }
+        : { exitCode: 0, stdout: '', stderr: '' },
+    },
+    {
+      name: 'Git fails while measuring the worktree',
+      git: async (args: string[]) => args[0] === 'diff'
+        ? { exitCode: 0, stdout: 'src/a.ts\n', stderr: '' }
+        : { exitCode: 1, stdout: '', stderr: 'fatal: status failed' },
+    },
+  ])('reruns rather than preserving when $name', async ({ git }) => {
+    const projectRoot = await makeConfiguredProject('full-suite-indeterminate-drift-');
+    await writeFile(
+      join(projectRoot, '.ai-conductor/config.yml'),
+      [
+        'test_suite:',
+        '  command: node suite.mjs --all',
+        '  verification:',
+        '    drift_budget:',
+        '      source: unlimited',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFullSuiteEvidence(projectRoot, attestedPassEvidence(projectRoot));
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:indeterminate-current',
+          headSha: 'indeterminate-evaluation-head',
+          categoryFingerprints: { ...CATEGORY_FINGERPRINTS, source: 'category:source:current' },
+        },
+      }),
+      git,
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: { status: 'STALE', reason: 'drift_measurement_indeterminate' },
+      ensured: 'EXECUTED',
+      freshness: { status: 'STALE', reason: 'drift_measurement_indeterminate' },
+      launches: 1,
+    });
+  });
+
+  it('reruns prior-version evidence with a version-staleness reason', async () => {
+    const projectRoot = await makeConfiguredProject('full-suite-prior-version-evidence-');
+    await writeProjectFile(
+      projectRoot,
+      '.pipeline/test-suite-evidence.json',
+      JSON.stringify({ version: 3, outcome: 'PASS' }),
+    );
+    let launches = 0;
+    const verifier = new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true,
+        fingerprint: {
+          digest: 'sha256:version-current',
+          headSha: 'version-evaluation-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+      execute: async () => {
+        launches += 1;
+        return {
+          ok: true,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-08-29T10:00:00.000Z',
+          endedAt: '2026-08-29T10:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0,
+          stdout: 'all suites passed\n',
+          stderr: '',
+        };
+      },
+      worktreeStatus: async () => '',
+    });
+
+    const inspection = await verifier.inspect();
+    const ensured = await verifier.ensure();
+
+    expect({ inspection, ensured: ensured.status, freshness: ensured.status === 'EXECUTED'
+      ? ensured.freshness
+      : undefined, launches }).toEqual({
+      inspection: { status: 'STALE', reason: 'evidence_version_stale' },
+      ensured: 'EXECUTED',
+      freshness: { status: 'STALE', reason: 'evidence_version_stale' },
+      launches: 1,
     });
   });
 
@@ -996,7 +2893,7 @@ describe('FullSuiteVerifier', () => {
       },
       {
         name: 'unsupported',
-        reason: 'unsupported_version',
+        reason: 'evidence_version_stale',
         arrange: (root) => writeProjectFile(
           root,
           '.pipeline/test-suite-evidence.json',
@@ -1625,6 +3522,420 @@ describe('FullSuiteVerifier', () => {
       executions: 0,
     });
   });
+
+  it('reclaims orphaned recovery claims while recovering a dead full-suite owner', async () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const cases = [
+      {
+        name: 'dead-process claim',
+        claim: JSON.stringify({
+          version: 1,
+          pid: 2_147_483_646,
+          token: 'dead-recoverer',
+          claimedAt: '2026-09-07T11:59:59.999Z',
+        }),
+        claimMtime: now,
+      },
+      {
+        name: 'stale unparseable claim',
+        claim: 'not json',
+        claimMtime: now - 1_000,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const projectRoot = await makeConfiguredProject(`full-suite-orphaned-${testCase.name}-`);
+      const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+      const claimPath = join(lockPath, 'recovery.json');
+      await writeProjectFile(lockPath, 'owner.json', JSON.stringify({
+        version: 1,
+        pid: 2_147_483_647,
+        token: 'dead-owner',
+        acquiredAt: '2026-09-07T11:00:00.000Z',
+      }));
+      await writeFile(claimPath, testCase.claim, 'utf8');
+      await utimes(claimPath, new Date(testCase.claimMtime), new Date(testCase.claimMtime));
+      let executions = 0;
+
+      const result = await new FullSuiteVerifier({
+        projectRoot,
+        fingerprint: async () => ({
+          ok: true as const,
+          fingerprint: {
+            digest: `sha256:orphaned-${testCase.name}`,
+            headSha: 'orphaned-head',
+            categoryFingerprints: CATEGORY_FINGERPRINTS,
+          },
+        }),
+        execute: async () => {
+          executions += 1;
+          return {
+            ok: true as const,
+            command: 'node suite.mjs --all',
+            cwd: projectRoot,
+            startedAt: '2026-09-07T12:00:00.000Z',
+            endedAt: '2026-09-07T12:00:01.000Z',
+            durationMs: 1_000,
+            exitCode: 0 as const,
+            stdout: 'passed\n',
+            stderr: '',
+          };
+        },
+        lock: {
+          waitTimeoutMs: 0,
+          clock: () => now,
+          processIsLive: () => false,
+          unownedStaleMs: 100,
+        },
+      }).ensure();
+
+      expect({
+        result: result.status,
+        executions,
+        lockExists: await readdir(join(projectRoot, '.pipeline'))
+          .then((entries) => entries.includes('test-suite.lock')),
+      }).toEqual({ result: 'EXECUTED', executions: 1, lockExists: false });
+    }
+  });
+
+  it('keeps a replacement recovery claim when it changes after orphan classification', async () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const projectRoot = await makeConfiguredProject('full-suite-replacement-recovery-claim-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    const orphanClaim = JSON.stringify({
+      version: 1,
+      pid: 2_147_483_646,
+      token: 'dead-recoverer',
+      claimedAt: '2026-09-07T11:59:59.999Z',
+    });
+    const replacementClaim = JSON.stringify({
+      version: 1,
+      pid: 22,
+      token: 'live-recoverer',
+      claimedAt: '2026-09-07T12:00:00.000Z',
+    });
+    await writeProjectFile(lockPath, 'owner.json', JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      token: 'dead-owner',
+      acquiredAt: '2026-09-07T11:00:00.000Z',
+    }));
+    await writeFile(claimPath, orphanClaim, 'utf8');
+    let executions = 0;
+
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      execute: async () => {
+        executions += 1;
+        throw new Error('must not execute while a replacement claim holds the lock');
+      },
+      lock: {
+        waitTimeoutMs: 0,
+        clock: () => now,
+        processIsLive: (pid) => {
+          if (pid === 2_147_483_646) writeFileSync(claimPath, replacementClaim, 'utf8');
+          return pid === 22;
+        },
+      },
+    }).ensure();
+
+    expect({ result, executions, claim: await readFile(claimPath, 'utf8') }).toEqual({
+      result: {
+        status: 'FAILED',
+        reason: 'internal_error',
+        message: 'Unable to acquire full-suite verification lock within 0ms',
+      },
+      executions: 0,
+      claim: replacementClaim,
+    });
+  });
+
+  it('takes a vanished orphaned recovery claim only once during stale-lock recovery', async () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const projectRoot = await makeConfiguredProject('full-suite-vanished-recovery-claim-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    await writeProjectFile(lockPath, 'owner.json', JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      token: 'dead-owner',
+      acquiredAt: '2026-09-07T11:00:00.000Z',
+    }));
+    await writeFile(claimPath, JSON.stringify({
+      version: 1,
+      pid: 2_147_483_646,
+      token: 'vanishing-recoverer',
+      claimedAt: '2026-09-07T11:59:59.999Z',
+    }), 'utf8');
+    let executions = 0;
+    const livenessProbes: number[] = [];
+
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({
+        ok: true as const,
+        fingerprint: {
+          digest: 'sha256:vanished-recovery-claim',
+          headSha: 'vanished-recovery-claim-head',
+          categoryFingerprints: CATEGORY_FINGERPRINTS,
+        },
+      }),
+      execute: async () => {
+        executions += 1;
+        return {
+          ok: true as const,
+          command: 'node suite.mjs --all',
+          cwd: projectRoot,
+          startedAt: '2026-09-07T12:00:00.000Z',
+          endedAt: '2026-09-07T12:00:01.000Z',
+          durationMs: 1_000,
+          exitCode: 0 as const,
+          stdout: 'passed\n',
+          stderr: '',
+        };
+      },
+      lock: {
+        waitTimeoutMs: 0,
+        clock: () => now,
+        processIsLive: (pid) => {
+          livenessProbes.push(pid);
+          if (pid === 2_147_483_646) rmSync(claimPath);
+          return false;
+        },
+      },
+    }).ensure();
+
+    expect({
+      result: result.status,
+      executions,
+      livenessProbes,
+      lockExists: await readdir(join(projectRoot, '.pipeline'))
+        .then((entries) => entries.includes('test-suite.lock')),
+    }).toEqual({
+      result: 'EXECUTED',
+      executions: 1,
+      livenessProbes: [2_147_483_647, 2_147_483_646],
+      lockExists: false,
+    });
+  });
+
+  it('fails closed when recovery-claim classification cannot probe liveness', async () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const projectRoot = await makeConfiguredProject('full-suite-recovery-claim-probe-failure-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    const existingClaim = JSON.stringify({
+      version: 1,
+      pid: 2_147_483_646,
+      token: 'unprobeable-recoverer',
+      claimedAt: '2026-09-07T11:59:59.999Z',
+    });
+    await writeProjectFile(lockPath, 'owner.json', JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      token: 'dead-owner',
+      acquiredAt: '2026-09-07T11:00:00.000Z',
+    }));
+    await writeFile(claimPath, existingClaim, 'utf8');
+    let executions = 0;
+
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      execute: async () => {
+        executions += 1;
+        throw new Error('must not execute after a recovery-claim probe failure');
+      },
+      lock: {
+        waitTimeoutMs: 0,
+        clock: () => now,
+        processIsLive: (pid) => {
+          if (pid === 2_147_483_646) throw new Error('liveness denied');
+          return false;
+        },
+      },
+    }).ensure();
+
+    expect({
+      result,
+      executions,
+      claim: await readFile(claimPath, 'utf8'),
+    }).toEqual({
+      result: {
+        status: 'FAILED',
+        reason: 'internal_error',
+        message: 'Unable to verify full-suite recovery claim liveness: liveness denied',
+      },
+      executions: 0,
+      claim: existingClaim,
+    });
+  });
+
+  it('keeps a live recovery claim exclusive until lock acquisition times out', async () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const projectRoot = await makeConfiguredProject('full-suite-live-recovery-claim-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    const existingClaim = JSON.stringify({
+      version: 1,
+      pid: 22,
+      token: 'live-recoverer',
+      claimedAt: '2026-09-07T11:59:59.999Z',
+    });
+    await writeProjectFile(lockPath, 'owner.json', JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      token: 'dead-owner',
+      acquiredAt: '2026-09-07T11:00:00.000Z',
+    }));
+    await writeFile(claimPath, existingClaim, 'utf8');
+    await utimes(claimPath, new Date(now), new Date(now));
+    let executions = 0;
+
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      execute: async () => {
+        executions += 1;
+        throw new Error('must not execute while a live recovery claim holds the lock');
+      },
+      lock: {
+        waitTimeoutMs: 0,
+        clock: () => now,
+        processIsLive: (pid) => pid === 22,
+      },
+    }).ensure();
+
+    expect({
+      result,
+      executions,
+      claim: await readFile(claimPath, 'utf8'),
+    }).toEqual({
+      result: {
+        status: 'FAILED',
+        reason: 'internal_error',
+        message: 'Unable to acquire full-suite verification lock within 0ms',
+      },
+      executions: 0,
+      claim: existingClaim,
+    });
+  });
+
+  it('keeps a fresh unparseable recovery claim exclusive without renaming it', async () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    const projectRoot = await makeConfiguredProject('full-suite-fresh-unparseable-recovery-claim-');
+    const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
+    const claimPath = join(lockPath, 'recovery.json');
+    const existingClaim = 'not json';
+    await writeProjectFile(lockPath, 'owner.json', JSON.stringify({
+      version: 1,
+      pid: 2_147_483_647,
+      token: 'dead-owner',
+      acquiredAt: '2026-09-07T11:00:00.000Z',
+    }));
+    await writeFile(claimPath, existingClaim, 'utf8');
+    await utimes(claimPath, new Date(now), new Date(now));
+    let executions = 0;
+
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      execute: async () => {
+        executions += 1;
+        throw new Error('must not execute while an unparseable recovery claim is fresh');
+      },
+      lock: {
+        waitTimeoutMs: 0,
+        clock: () => now,
+        processIsLive: () => false,
+        unownedStaleMs: 100,
+      },
+    }).ensure();
+
+    expect({
+      result,
+      executions,
+      claim: await readFile(claimPath, 'utf8'),
+      lockEntries: await readdir(lockPath),
+    }).toEqual({
+      result: {
+        status: 'FAILED',
+        reason: 'internal_error',
+        message: 'Unable to acquire full-suite verification lock within 0ms',
+      },
+      executions: 0,
+      claim: existingClaim,
+      lockEntries: ['owner.json', 'recovery.json'],
+    });
+  });
+
+  it('executes exactly once when two verifiers contend over an orphaned lock', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'full-suite-orphaned-lock-processes-'));
+    scratches.push(projectRoot);
+    await writeProjectFile(projectRoot, '.gitignore', '.pipeline/\n');
+    await writeProjectFile(
+      projectRoot,
+      '.ai-conductor/config.yml',
+      'test_suite:\n  command: node suite.mjs\n  timeout_seconds: 10\n',
+    );
+    await writeProjectFile(projectRoot, 'src/app.ts', 'export const value = 1;\n');
+    await writeProjectFile(
+      projectRoot,
+      'suite.mjs',
+      [
+        "import { mkdir, writeFile } from 'node:fs/promises';",
+        "import { setTimeout as delay } from 'node:timers/promises';",
+        "await mkdir('.pipeline/launches', { recursive: true });",
+        "await writeFile(`.pipeline/launches/${process.pid}`, 'launched');",
+        'await delay(250);',
+        "console.log('all suites passed');",
+        '',
+      ].join('\n'),
+    );
+    await execa('git', ['init', '-q', '-b', 'main'], { cwd: projectRoot });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: projectRoot });
+    await execa('git', ['config', 'user.name', 'Test'], { cwd: projectRoot });
+    await execa('git', ['add', '.'], { cwd: projectRoot });
+    await execa('git', ['commit', '-q', '-m', 'fixture'], { cwd: projectRoot });
+    await writeProjectFile(
+      projectRoot,
+      '.pipeline/test-suite.lock/owner.json',
+      JSON.stringify({
+        version: 1,
+        pid: 2_147_483_647,
+        token: 'orphaned-owner',
+        acquiredAt: '2026-09-07T11:00:00.000Z',
+      }),
+    );
+
+    const resultPaths = [
+      join(projectRoot, '.pipeline/orphaned-caller-1.json'),
+      join(projectRoot, '.pipeline/orphaned-caller-2.json'),
+    ];
+    const invoke = (resultPath: string) => execa(
+      process.execPath,
+      [
+        '--import',
+        TSX_LOADER,
+        CONCURRENT_ENSURE_FIXTURE,
+        projectRoot,
+        resultPath,
+      ],
+      { cwd: CONDUCTOR_ROOT },
+    );
+    await Promise.all(resultPaths.map(invoke));
+    const results = await Promise.all(resultPaths.map(async (path) =>
+      JSON.parse(await readFile(path, 'utf8')) as { status: string }));
+    const launches = await readdir(join(projectRoot, '.pipeline/launches'));
+
+    expect({
+      statuses: results.map(({ status }) => status).sort(),
+      launches: launches.length,
+      persisted: await readFullSuiteEvidence(projectRoot),
+    }).toMatchObject({
+      statuses: ['EXECUTED', 'REUSED'],
+      launches: 1,
+      persisted: { usable: true, evidence: { outcome: 'PASS' } },
+    });
+  }, 20_000);
 
   it('recovers a provably dead owner but refuses a live verification lock', async () => {
     const makeLockedProject = async (pid: number, token: string) => {

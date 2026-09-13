@@ -48,7 +48,7 @@ function containsToken(text: string, token: string): boolean {
 
 describe('STEP_RATIONALE completeness (TS-1)', () => {
   it('classifies only the deterministic BUILD gates as model-free engine machinery', () => {
-    expect(MODEL_FREE_ENGINE_STEPS).toEqual(['wiring_check', 'test_suite']);
+    expect(MODEL_FREE_ENGINE_STEPS).toEqual(['test_suite']);
   });
 
   it('describes current explore and prd defaults with provider-neutral high-effort policy language', () => {
@@ -91,19 +91,13 @@ describe('STEP_RATIONALE completeness (TS-1)', () => {
 
     expect(missing).toEqual([]);
     expect(empty).toEqual([]);
-    expect(policySteps.size).toBe(26);
+    expect(policySteps.size).toBe(25);
   });
 
   it('describes deterministic BUILD gates as engine machinery rather than generative review', () => {
-    expect({
-      wiring_check: STEP_RATIONALE.wiring_check,
-      test_suite: STEP_RATIONALE.test_suite,
-    }).toEqual({
-      wiring_check: expect.stringMatching(/deprecated/i),
-      test_suite: expect.stringMatching(
-        /mechanical.*(?:aggregate|full).*test.*(?:verifier|proof)/i,
-      ),
-    });
+    expect(STEP_RATIONALE.test_suite).toMatch(
+      /mechanical.*(?:aggregate|full).*test.*(?:verifier|proof)/i,
+    );
   });
 
   it('type-checks as a complete Record<StepName, string>', () => {
@@ -178,6 +172,7 @@ const EXPECTED_EXTRA_ROW_NAMES = [
   'code-review',
   'debugging',
   'simplify',
+  'composer',
   'engineer',
   'intake',
   'conduct',
@@ -222,23 +217,44 @@ describe('EXTRA_MODEL_TABLE_ROWS completeness (TS-1 happy path 2)', () => {
 
     expect(violations).toEqual([]);
   });
+
+  it('registers the canonical composer at the Opus tier and keeps engineer as its compatibility delegate', () => {
+    const rowsByName = new Map(EXTRA_MODEL_TABLE_ROWS.map((row) => [row.name, row]));
+    const composer = rowsByName.get('composer');
+    const engineer = rowsByName.get('engineer');
+
+    expect(composer).toMatchObject({
+      executionPath: 'supported-host interactive',
+      claudeModel: 'opus',
+      claudeEffort: '',
+      codexModel: expect.stringMatching(/inherits.*Codex.*session/i),
+      codexEffort: expect.stringMatching(/inherits.*Codex.*session/i),
+      why: expect.stringMatching(/canonical.*authoring/i),
+    });
+    expect(readSkillModelPin(join(skillsDir, 'composer'))).toBe('opus');
+    expect(PIN_EXEMPT_SKILLS).toContain('composer');
+
+    expect(engineer).toMatchObject({
+      executionPath: 'supported-host interactive',
+      why: expect.stringMatching(/compatibility delegate/i),
+    });
+  });
 });
 
-describe('AUXILIARY_MODEL_TABLE_ROWS build-review rubric registration', () => {
-  it('defines the test-quality rubric without inventing a lifecycle step', () => {
+describe('AUXILIARY_MODEL_TABLE_ROWS auxiliary-judge registration', () => {
+  it('defines the test-quality rubric and coverage-binding judge without inventing lifecycle steps', () => {
     const names = AUXILIARY_MODEL_TABLE_ROWS.map((row) => row.name);
 
     expect(names).toEqual([
       'build-review-test-quality',
+      'coverage-binding',
     ]);
     expect(Object.keys(STEP_RATIONALE)).not.toEqual(expect.arrayContaining(names));
-    expect(AUXILIARY_MODEL_TABLE_ROWS.every((row) =>
-      row.executionPath === 'engine-managed auxiliary rubric' &&
-      row.claudeModel === 'inherits resolved rubric policy' &&
-      row.claudeEffort === 'inherits resolved rubric policy' &&
-      row.codexModel === 'inherits resolved rubric policy' &&
-      row.codexEffort === 'inherits resolved rubric policy',
-    )).toBe(true);
+
+    expect(AUXILIARY_MODEL_TABLE_ROWS.find((row) => row.name === 'coverage-binding')).toMatchObject({
+      name: 'coverage-binding',
+      executionPath: 'engine-managed auxiliary judge',
+    });
   });
 });
 
@@ -339,7 +355,6 @@ function _typeFixture() {
     manual_test: 'x',
     prd_audit: 'x',
     architecture_review_as_built: 'x',
-    retro: 'x',
     rebase: 'x',
     finish: 'x',
     // 'remediate' intentionally omitted

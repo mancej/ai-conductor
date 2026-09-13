@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   BUILD_REVIEW_VERDICT,
   canonicalizeBuildReviewGraderVerdict,
+  discardStaleLapBuildReviewFail,
   validateBuildReviewVerdict,
 } from '../../src/engine/artifacts.js';
 import { parseBuildReviewLapId } from '../../src/engine/build-review-domain.js';
@@ -19,8 +20,7 @@ import { resolveBuildReviewConfig } from '../../src/engine/resolved-config.js';
 import {
   MAX_MECHANICAL_FAULTS_BUILD_REVIEW,
   readKickbackLedger,
-  writeKickbackLedger,
-} from '../../src/engine/kickback-ledger.js';
+  } from '../../src/engine/kickback-ledger.js';
 import { coordinateBuildReviewRubrics } from '../../src/engine/build-review-coordinator.js';
 import type { BuildReviewFrozenInputs } from '../../src/engine/build-review-inputs.js';
 import type { LLMProvider } from '../../src/execution/llm-provider.js';
@@ -166,7 +166,7 @@ describe('engine/build-review verdict wiring contract', () => {
         feature: { version: 'v1' as const, repository: '/repo', feature: 'feature' },
         effective: {
           rawVerdict: 'PASS' as const, verdict: 'PASS' as const,
-          acceptedFindingIds: [], unresolvedFindingIds: [], skippedRubrics: [], infrastructureFailureRubrics: [],
+          acceptedFindingIds: [], unresolvedFindingIds: [], suppressedFindingIds: [], skippedRubrics: [], infrastructureFailureRubrics: [], uncoveredInfrastructureFailureRubrics: [],
         },
       }),
     })).resolves.toMatchObject({ done: true });
@@ -236,13 +236,15 @@ describe('engine/build-review verdict wiring contract', () => {
         feature: { version: 'v1' as const, repository: '/repo', feature: 'feature' },
         effective: {
           rawVerdict: 'FAIL' as const, verdict: 'PASS' as const,
-          acceptedFindingIds: [id], unresolvedFindingIds: [], skippedRubrics: [], infrastructureFailureRubrics: [],
+          acceptedFindingIds: [id], unresolvedFindingIds: [], suppressedFindingIds: [], skippedRubrics: [], infrastructureFailureRubrics: [], uncoveredInfrastructureFailureRubrics: [],
         },
       }));
     await expect(checkGateCompletion(dir, 'build_review', {
       buildReviewEffectiveResolver: resolver,
     })).resolves.toMatchObject({ done: true });
-    expect(resolver).toHaveBeenCalledWith(dir, aggregate);
+    expect(resolver).toHaveBeenCalledWith(dir, aggregate, {
+      minConfidence: { testQuality: 0 },
+    });
   });
 
   it('routes unresolved siblings and infrastructure failures by their effective cause', async () => {
@@ -263,8 +265,8 @@ describe('engine/build-review verdict wiring contract', () => {
         feature: { version: 'v1' as const, repository: '/repo', feature: 'feature' },
         effective: {
           rawVerdict: 'FAIL' as const, verdict: 'FAIL' as const,
-          acceptedFindingIds: ['sha256:accepted'], unresolvedFindingIds: ['sha256:unresolved-sibling'],
-          skippedRubrics: [], infrastructureFailureRubrics: [],
+          acceptedFindingIds: ['sha256:accepted'], unresolvedFindingIds: ['sha256:unresolved-sibling'], suppressedFindingIds: [],
+          skippedRubrics: [], infrastructureFailureRubrics: [], uncoveredInfrastructureFailureRubrics: [],
         },
       }),
     })).resolves.toMatchObject({ done: false, routeClass: 'named-route', reason: expect.stringMatching(/unresolved.*unresolved-sibling/i) });
@@ -275,8 +277,8 @@ describe('engine/build-review verdict wiring contract', () => {
         feature: { version: 'v1' as const, repository: '/repo', feature: 'feature' },
         effective: {
           rawVerdict: 'FAIL' as const, verdict: 'FAIL' as const,
-          acceptedFindingIds: [], unresolvedFindingIds: [],
-          skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'],
+          acceptedFindingIds: [], unresolvedFindingIds: [], suppressedFindingIds: [],
+          skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'], uncoveredInfrastructureFailureRubrics: ['testQuality'],
         },
       }),
     })).resolves.toMatchObject({ done: false, routeClass: 'named-route', reason: expect.stringMatching(/infrastructure.*testQuality/i) });
@@ -402,6 +404,46 @@ describe('engine/build-review verdict wiring contract', () => {
     expect((await readKickbackLedger(dir)).gates.build_review.mechanicalFaults).toBe(1);
   });
 
+  it('charges valid scope indeterminacy through the existing allowance without discarding its independent finding', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'build-review-scope-incomplete-'));
+    dirs.push(dir);
+    await writeKickbackLedger(dir, { version: 1, gates: { build_review: {
+      count: 0, cumulative: 0, mechanicalFaults: 0, treeHash: null,
+      lastReason: '', priorVerdict: true, resolvedBefore: 0,
+    } } });
+    const lapId = parseBuildReviewLapId('scope-incomplete')!;
+    const snapshotDigest = 'sha256:scope-incomplete';
+    const result = {
+      kind: 'judged' as const, rubric: 'testQuality' as const, lapId, snapshotDigest, contractVersion: 'v3' as const,
+      findings: [{
+        concernKind: 'test-insensitive' as const, summary: 'A resolved target remains insensitive.', evidenceLocations: ['test/a.test.ts:1'],
+        anchor: { rubric: 'testQuality' as const, locus: { path: 'test/a.test.ts', contentHash: `sha256:${'a'.repeat(64)}`, display: 'fixture test' } },
+      }],
+      scopeResolutions: [{
+        candidateId: 'candidate:setup', status: 'indeterminate' as const,
+        sourceRegion: { path: 'test/a.test.ts', startLine: 1, endLine: 2, contentHash: `sha256:${'b'.repeat(64)}`, display: 'fixture setup' },
+        obligationReferences: ['story:S6.1'], missingEvidenceReason: 'the setup association is ambiguous',
+      }],
+      verdict: 'FAIL' as const,
+    };
+    vi.mocked(coordinateBuildReviewRubrics).mockResolvedValue({
+      kind: 'ready', branches: [{ kind: 'dispatched', rubric: 'testQuality', result }],
+    });
+    const runner = new DefaultStepRunner({ invoke: vi.fn() }, 'scope-incomplete', dir, {
+      pipelineDir: join(dir, '.pipeline'),
+      buildReviewArtifactReader: async (_root, rubric, readLapId, readSnapshotDigest) => ({
+        version: 1, rubric, lapId: readLapId, snapshotDigest: readSnapshotDigest, result, provenance: { kind: 'fresh' as const },
+      }),
+    });
+    const outcome = await (runner as unknown as {
+      runRubricBuildReview: (inputs: BuildReviewFrozenInputs, config: ReturnType<typeof resolveBuildReviewConfig>) => Promise<{ success: boolean; currentLapMechanicalFault?: boolean; output: string }>;
+    }).runRubricBuildReview({ sourceSnapshot: { headSha: 'scope-incomplete', digest: snapshotDigest, mergeBase: 'base' } } as BuildReviewFrozenInputs, resolveBuildReviewConfig({ build_review: { enabled: true } } as HarnessConfig));
+
+    expect(outcome).toMatchObject({ success: false, currentLapMechanicalFault: true, output: expect.stringContaining('(scope-incomplete)') });
+    expect((await readKickbackLedger(dir)).gates.build_review.lastMechanicalFault).toMatchObject({ reason: 'scope-incomplete', lapId: 'lap-scope-incomplete' });
+    await expect(readFile(join(dir, '.pipeline/build-review.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('does not consume the mechanical allowance when a judged lap publishes a finding', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'build-review-mixed-lap-'));
     dirs.push(dir);
@@ -428,8 +470,8 @@ describe('engine/build-review verdict wiring contract', () => {
         feature: { version: 'v1' as const, repository: dir, feature: 'mixed-lap' },
         effective: {
           rawVerdict: 'FAIL' as const, verdict: 'FAIL' as const,
-          acceptedFindingIds: [], unresolvedFindingIds: ['sha256:unresolved'],
-          skippedRubrics: [], infrastructureFailureRubrics: [],
+          acceptedFindingIds: [], unresolvedFindingIds: ['sha256:unresolved'], suppressedFindingIds: [],
+          skippedRubrics: [], infrastructureFailureRubrics: [], uncoveredInfrastructureFailureRubrics: [],
         },
       }),
       buildReviewArtifactReader: async (_root, rubric, lapId, snapshotDigest) => ({
@@ -596,3 +638,78 @@ describe('engine/build-review verdict wiring contract', () => {
     },
   );
 });
+
+describe('engine/build-review stale-lap FAIL discard (daemon kickback guard)', () => {
+  const dirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  const gitAtHead = (sha: string | null) => (async (args: string[]) => {
+    if (args[0] === 'rev-parse' && sha !== null) {
+      return { exitCode: 0, stdout: `${sha}\n`, stderr: '' };
+    }
+    return { exitCode: 128, stdout: '', stderr: 'fatal' };
+  });
+
+  function failAggregate(lap: string): unknown {
+    const lapId = parseBuildReviewLapId(lap)!;
+    return joinBuildReviewRubricOutcomes({
+      lapId,
+      snapshotDigest: 'sha256:fixture',
+      results: {
+        testQuality: {
+          kind: 'judged', rubric: 'testQuality', lapId, snapshotDigest: 'sha256:fixture',
+          contractVersion: 'v3',
+          findings: [{
+            concernKind: 'test-insensitive', summary: 'Prior-lap finding',
+            evidenceLocations: ['test/old.test.ts:1'],
+            anchor: { rubric: 'testQuality', locus: { path: 'test/old.test.ts', contentHash: 'sha256:fixture', display: 'fixture test' } },
+          }],
+          verdict: 'FAIL',
+        },
+      },
+    });
+  }
+
+  async function writeAggregate(aggregate: unknown): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'build-review-stale-lap-'));
+    dirs.push(dir);
+    const path = join(dir, BUILD_REVIEW_VERDICT);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify(aggregate));
+    return dir;
+  }
+
+  it('discards a prior-lap FAIL aggregate and reports the lap mismatch', async () => {
+    const dir = await writeAggregate(failAggregate('lap-previous'));
+    const result = await discardStaleLapBuildReviewFail(dir, failAggregate('lap-previous'), gitAtHead('current'));
+    expect(result).toEqual({ storedLapId: 'lap-previous', currentLapId: 'lap-current' });
+    await expect(readFile(join(dir, BUILD_REVIEW_VERDICT), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps a current-lap FAIL aggregate for the kickback route', async () => {
+    const dir = await writeAggregate(failAggregate('lap-current'));
+    const result = await discardStaleLapBuildReviewFail(dir, failAggregate('lap-current'), gitAtHead('current'));
+    expect(result).toBeNull();
+    await expect(readFile(join(dir, BUILD_REVIEW_VERDICT), 'utf8')).resolves.toBeTruthy();
+  });
+
+  it('never discards a legacy scalar FAIL verdict', async () => {
+    const legacy = { verdict: 'FAIL', reasons: ['legacy reason'], rubric: { testQuality: true } };
+    const dir = await writeAggregate(legacy);
+    const result = await discardStaleLapBuildReviewFail(dir, legacy, gitAtHead('current'));
+    expect(result).toBeNull();
+    await expect(readFile(join(dir, BUILD_REVIEW_VERDICT), 'utf8')).resolves.toBeTruthy();
+  });
+
+  it('preserves the aggregate when the HEAD probe fails (advisory guard)', async () => {
+    const dir = await writeAggregate(failAggregate('lap-previous'));
+    const result = await discardStaleLapBuildReviewFail(dir, failAggregate('lap-previous'), gitAtHead(null));
+    expect(result).toBeNull();
+    await expect(readFile(join(dir, BUILD_REVIEW_VERDICT), 'utf8')).resolves.toBeTruthy();
+  });
+});
+
+import { writeKickbackLedger } from '../kickback-ledger-test-support.js';

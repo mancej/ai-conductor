@@ -1,3 +1,4 @@
+// Covers: task:1, task:2, task:3, task:4
 // land-spec.test.ts — Story 2 (Slice B): landSpec fails CLOSED on unresolved
 // identity (adr-2026-07-01-machine-scoped-operator-identity, D3).
 //
@@ -10,7 +11,7 @@
 // with valid Accepted DECIDE artifacts.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile, utimes } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, readFile, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
@@ -46,6 +47,37 @@ const PLAN_WITH_DEPS = [
   '',
 ].join('\n');
 
+const SMALL_TIER_STORIES = [
+  '# Stories: dep bump',
+  '',
+  '**Status:** Accepted',
+  '',
+  '## Story 1: bump',
+  '### Happy Path',
+  '- Given X, when Y, then Z.',
+  '',
+].join('\n');
+
+const SMALL_TIER_PLAN = [
+  '# Implementation Plan: dep bump',
+  '',
+  '**Stories:** .docs/stories/dep-bump.md',
+  '',
+  '### Task 1: Bump dependency',
+  '**Story:** Story 1',
+  '',
+  '**Done when:**',
+  '- Given X, when Y, then Z.',
+  '- The dependency update is documented.',
+  '',
+  '## Coverage Check',
+  '',
+  '| Criterion | Task ids | Quote | Disposition |',
+  '| --- | --- | --- | --- |',
+  '| Story 1 happy: Given X, when Y, then Z. | 1 | "Given X, when Y, then Z." | diff-local |',
+  '',
+].join('\n');
+
 /** Stories artifact with a DRAFT ADR present — an "also invalid" artifact set
  *  (Task 8): stories itself is Accepted (so the stories-approval guard alone
  *  doesn't fire first), but a DRAFT ADR under .docs/decisions/ must still
@@ -61,6 +93,28 @@ const DRAFT_ADR = [
   '',
 ].join('\n');
 
+const APPROVED_CITABLE_ADR = [
+  '# ADR: citable decision',
+  '',
+  '**Status:** Approved',
+  '',
+  '## Decision',
+  '',
+  '1. **Keep the decision citable.**',
+  '',
+].join('\n');
+
+const APPROVED_UNCITABLE_ADR = [
+  '# ADR: uncitable decision',
+  '',
+  '**Status:** Approved',
+  '',
+  '## Decision',
+  '',
+  'The decision has no numbered identifier.',
+  '',
+].join('\n');
+
 let repoPath: string;
 
 async function git(args: string[], cwd = repoPath): Promise<string> {
@@ -70,6 +124,20 @@ async function git(args: string[], cwd = repoPath): Promise<string> {
 
 function target() {
   return { name: 'alpha', canonicalPath: repoPath };
+}
+
+/**
+ * Land fixtures that include Mermaid only to satisfy the non-Small artifact
+ * presence gate must not start the real mmdc/Chromium process. Rendering
+ * behavior has dedicated tests below; these cases exercise land selection and
+ * stem validation only.
+ */
+function passingRenderDeps() {
+  return {
+    hasTool: async () => true,
+    writeTemp: async () => '/tmp/land-spec-fixture.mmd',
+    runMmdc: async () => ({ ok: true }),
+  };
 }
 
 /** Create the per-idea worktree and seed valid Accepted DECIDE artifacts. */
@@ -121,7 +189,10 @@ async function seedNamedTierMWorktree(
   );
   await writeFile(join(dir, '.docs', 'complexity', `${slug}.md`), '# Complexity\n\nTier: M\n');
   await writeFile(join(dir, '.docs', 'conflicts', `${datePrefix}${conflictStem}.md`), '# Conflicts\n\nNone.\n');
-  await writeFile(join(dir, '.docs', 'architecture', `${slug}.md`), '# Architecture\n\nApproved.\n');
+  await writeFile(
+    join(dir, '.docs', 'architecture', `${slug}.md`),
+    '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n',
+  );
   await writeFile(join(dir, '.docs', 'decisions', `${slug}.md`), '# Review\n\nApproved.\n');
   if (options.coherenceStem !== undefined) {
     await mkdir(join(dir, '.docs', 'coherence'), { recursive: true });
@@ -160,6 +231,181 @@ afterEach(async () => {
   await rm(repoPath, { recursive: true, force: true });
 });
 
+describe('Task 3: landSpec commits the DECIDE artifact summary', () => {
+  it('preserves the subject while committing the plan, track, tier, stories, and task list in the body', async () => {
+    const idea = 'dep bump';
+    const dir = await seedValidWorktree(idea);
+    const stories = [
+      '# Stories: dep bump',
+      '',
+      '**Status:** Accepted',
+      '',
+      '## Story 1: Explain the landed decision',
+      '### Acceptance Criteria',
+      '#### Happy Path',
+      '- Given X, when Y, then Z.',
+      '',
+      '## Story 2: Keep the commit evidence inert',
+      '### Acceptance Criteria',
+      '#### Happy Path',
+      '- Given X, when Y, then Z.',
+      '',
+    ].join('\n');
+    const plan = [
+      '# Implementation Plan: dep bump',
+      '',
+      '**Stories:** .docs/stories/dep-bump.md',
+      '',
+      '## Summary',
+      '',
+      'Give reviewers a concise record of the decisions this spec lands.',
+      '',
+      '### Task 1: Compose the summary',
+      '**Story:** Story 1',
+      '**Done when:**',
+      '- Given X, when Y, then Z.',
+      '- The subject remains unchanged.',
+      '',
+      '### Task 2: Keep prose inert',
+      '**Story:** Story 2',
+      '**Done when:**',
+      '- Given X, when Y, then Z.',
+      '- No trailer-shaped line is emitted.',
+      '',
+      '### Task 3: Commit the summary',
+      '**Story:** Story 2',
+      '**Done when:**',
+      '- Given X, when Y, then Z.',
+      '- The committed body is reviewable.',
+      '',
+      '## Coverage Check',
+      '',
+      '| Criterion | Task ids | Quote | Disposition |',
+      '| --- | --- | --- | --- |',
+      '| Story 1 happy: Given X, when Y, then Z. | 1 | "Given X, when Y, then Z." | diff-local |',
+      '| Story 2 happy: Given X, when Y, then Z. | 2 | "Given X, when Y, then Z." | diff-local |',
+      '',
+    ].join('\n');
+    await mkdir(join(dir, '.docs', 'track'), { recursive: true });
+    await mkdir(join(dir, '.docs', 'complexity'), { recursive: true });
+    await writeFile(join(dir, '.docs', 'stories', 'dep-bump.md'), stories);
+    await writeFile(join(dir, '.docs', 'plans', 'dep-bump.md'), plan);
+    await writeFile(join(dir, '.docs', 'track', 'dep-bump.md'), '# Track\n\nTrack: technical\n');
+    await writeFile(join(dir, '.docs', 'complexity', 'dep-bump.md'), '# Complexity\n\nTier: S\n');
+
+    const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+
+    expect(result).toEqual({ slug: 'dep-bump', branch: 'spec/dep-bump', repoPath: dir, track: 'technical', tier: 'S' });
+
+    const message = await git(['log', '-1', '--format=%B'], dir);
+    expect(message.split('\n')[0]).toBe('spec: land authored artifacts for "dep bump" [engineer/land]');
+    expect(message).toContain('Summary:\nGive reviewers a concise record of the decisions this spec lands.');
+    expect(message).toContain('Track: technical; Tier: S');
+    expect(message).toContain('Stories:\n- Story 1: Explain the landed decision\n- Story 2: Keep the commit evidence inert');
+    expect(message).toContain('Tasks: 3\n- Task 1\n- Task 2\n- Task 3');
+  });
+
+  it('succeeds without a duplicate commit when valid artifacts are landed twice', async () => {
+    const idea = 'dep bump';
+    const dir = await seedValidWorktree(idea);
+    await mkdir(join(dir, '.docs', 'track'), { recursive: true });
+    await mkdir(join(dir, '.docs', 'complexity'), { recursive: true });
+    await writeFile(
+      join(dir, '.docs', 'stories', 'dep-bump.md'),
+      [
+        '# Stories: dep bump',
+        '',
+        '**Status:** Accepted',
+        '',
+        '## Story 1: Land idempotently',
+        '### Acceptance Criteria',
+        '#### Happy Path',
+        '- Given valid artifacts, when land runs twice, then the second run does not add a commit.',
+        '',
+      ].join('\n'),
+    );
+    await writeFile(
+      join(dir, '.docs', 'plans', 'dep-bump.md'),
+      [
+        '# Implementation Plan: dep bump',
+        '',
+        '**Stories:** .docs/stories/dep-bump.md',
+        '',
+        '## Summary',
+        '',
+        'Keep repeated land operations idempotent.',
+        '',
+        '### Task 1: Land once',
+        '**Story:** Story 1',
+        '**Done when:**',
+        '- Given valid artifacts, when land runs, then the commit succeeds.',
+        '- The commit remains reviewable.',
+        '',
+        '## Coverage Check',
+        '',
+        '| Criterion | Task ids | Quote | Disposition |',
+        '| --- | --- | --- | --- |',
+        '| Story 1 happy: Given valid artifacts, when land runs twice, then the second run does not add a commit. | 1 | "Given valid artifacts, when land runs, then the commit succeeds." | diff-local |',
+        '',
+      ].join('\n'),
+    );
+    await writeFile(join(dir, '.docs', 'track', 'dep-bump.md'), '# Track\n\nTrack: technical\n');
+    await writeFile(join(dir, '.docs', 'complexity', 'dep-bump.md'), '# Complexity\n\nTier: S\n');
+
+    const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+    const first = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+    const firstMessage = await git(['log', '-1', '--format=%B'], dir);
+    expect(firstMessage).toContain('Summary:\nKeep repeated land operations idempotent.');
+    expect(firstMessage).toContain('Track: technical; Tier: S');
+    expect(firstMessage).toContain('Stories:\n- Story 1: Land idempotently');
+    expect(firstMessage).toContain('Tasks: 1\n- Task 1');
+
+    const headBeforeSecondLand = await git(['rev-parse', 'HEAD'], dir);
+    const countBeforeSecondLand = await git(['rev-list', '--count', 'HEAD'], dir);
+    const second = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+
+    expect(second).toEqual(first);
+    expect(await git(['rev-parse', 'HEAD'], dir)).toBe(headBeforeSecondLand);
+    expect(await git(['rev-list', '--count', 'HEAD'], dir)).toBe(countBeforeSecondLand);
+  });
+});
+
+describe('Task 4: landSpec keeps degraded DECIDE artifacts landable', () => {
+  it('commits the unchanged subject without empty summary or stories sections', async () => {
+    const idea = 'dep bump';
+    const dir = await seedValidWorktree(idea);
+    await writeFile(
+      join(dir, '.docs', 'stories', 'dep-bump.md'),
+      '# Stories: dep bump\n\n**Status:** Accepted\n\nDecision prose without a story heading.\n',
+    );
+    await writeFile(
+      join(dir, '.docs', 'plans', 'dep-bump.md'),
+      [
+        '# Implementation Plan: dep bump',
+        '',
+        '**Stories:** .docs/stories/dep-bump.md',
+        '',
+        '### Task 1: Preserve degraded landing',
+        '',
+        '**Done when:**',
+        '- Given the artifact set, when it lands, then the commit succeeds.',
+        '- The subject remains unchanged.',
+        '',
+      ].join('\n'),
+    );
+
+    const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+
+    expect(result).toEqual({ slug: 'dep-bump', branch: 'spec/dep-bump', repoPath: dir, track: 'product' });
+    const message = await git(['log', '-1', '--format=%B'], dir);
+    expect(message.split('\n')[0]).toBe('spec: land authored artifacts for "dep bump" [engineer/land]');
+    expect(message).not.toContain('Summary:');
+    expect(message).not.toContain('Stories:');
+  });
+});
+
 describe('landSpec ADR approval diagnostics (Task 6)', () => {
   const gh: GhRunner = async () => ({ stdout: 'operator\n' });
 
@@ -194,6 +440,237 @@ describe('landSpec ADR approval diagnostics (Task 6)', () => {
     await expect(
       landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
     ).rejects.toThrow(/adr-proposed\.md[\s\S]*adr-accepted\.md|adr-accepted\.md[\s\S]*adr-proposed\.md/i);
+  });
+});
+
+describe('landSpec ADR citability gate (Task 6)', () => {
+  const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+
+  it('lands an added APPROVED ADR with a canonical filename and numbered decision', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(join(dir, '.docs', 'decisions', 'adr-2026-09-08-citable.md'), APPROVED_CITABLE_ADR);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).resolves.toMatchObject({ slug: 'dep-bump' });
+  });
+
+  it('rejects an added APPROVED ADR with no citable decision and names the file', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(join(dir, '.docs', 'decisions', 'adr-uncitable.md'), APPROVED_UNCITABLE_ADR);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/no citable decision.*adr-uncitable\.md/i);
+  });
+
+  it('rejects an edited ADR made uncitable and names the file', async () => {
+    await mkdir(join(repoPath, '.docs', 'decisions'), { recursive: true });
+    await writeFile(join(repoPath, '.docs', 'decisions', 'adr-existing.md'), APPROVED_CITABLE_ADR);
+    await git(['add', '.docs/decisions/adr-existing.md']);
+    await git(['commit', '-m', 'add existing ADR']);
+
+    const dir = await seedValidWorktree();
+    await writeFile(join(dir, '.docs', 'decisions', 'adr-existing.md'), APPROVED_UNCITABLE_ADR);
+    await git(['add', '.docs/decisions/adr-existing.md'], dir);
+    await git(['commit', '-m', 'make existing ADR uncitable'], dir);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/no citable decision.*adr-existing\.md/i);
+  });
+});
+
+describe('Task 2: landSpec canonical ADR filename gate', () => {
+  const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+
+  it('lands a newly introduced approved citable ADR with a canonical filename', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(
+      join(dir, '.docs', 'decisions', 'adr-2026-09-08-canonical.md'),
+      APPROVED_CITABLE_ADR,
+    );
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).resolves.toMatchObject({ slug: 'dep-bump' });
+  });
+
+  it('rejects a newly introduced approved citable ADR with a sequential filename', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(
+      join(dir, '.docs', 'decisions', 'adr-001-canonical.md'),
+      APPROVED_CITABLE_ADR,
+    );
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(
+      /adr-001-canonical\.md.*adr-YYYY-MM-DD-lowercase-hyphenated-slug\.md/i,
+    );
+  });
+
+  it('rejects a newly introduced approved citable ADR whose date is impossible', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(
+      join(dir, '.docs', 'decisions', 'adr-2026-02-29-impossible.md'),
+      APPROVED_CITABLE_ADR,
+    );
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/adr-2026-02-29-impossible\.md/i);
+  });
+
+  it('reports every non-canonical newly introduced ADR in one refusal', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(dir, '.docs', 'decisions', 'adr-2026-09-08-canonical.md'),
+        APPROVED_CITABLE_ADR,
+      ),
+      writeFile(join(dir, '.docs', 'decisions', 'adr-001-first.md'), APPROVED_CITABLE_ADR),
+      writeFile(
+        join(dir, '.docs', 'decisions', 'adr-2026-02-29-second.md'),
+        APPROVED_CITABLE_ADR,
+      ),
+    ]);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(
+      /adr-001-first\.md[\s\S]*adr-2026-02-29-second\.md|adr-2026-02-29-second\.md[\s\S]*adr-001-first\.md/i,
+    );
+  });
+});
+
+describe('Task 3: landSpec canonical ADR filename gate merge-base exemptions', () => {
+  const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+
+  it('lands a new canonical ADR while legacy sequential ADRs inherited from main remain exempt', async () => {
+    await mkdir(join(repoPath, '.docs', 'decisions'), { recursive: true });
+    await Promise.all([
+      writeFile(join(repoPath, '.docs', 'decisions', 'adr-001-legacy.md'), APPROVED_CITABLE_ADR),
+      writeFile(join(repoPath, '.docs', 'decisions', 'adr-0002-legacy.md'), APPROVED_CITABLE_ADR),
+    ]);
+    await git(['add', '.docs/decisions']);
+    await git(['commit', '-m', 'add legacy sequential ADRs']);
+
+    const dir = await seedValidWorktree();
+    await writeFile(
+      join(dir, '.docs', 'decisions', 'adr-2026-09-08-new-decision.md'),
+      APPROVED_CITABLE_ADR,
+    );
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).resolves.toMatchObject({ slug: 'dep-bump' });
+  });
+
+  it('lands after a merge-base-existing sequential ADR is modified and committed in the worktree', async () => {
+    await mkdir(join(repoPath, '.docs', 'decisions'), { recursive: true });
+    await writeFile(join(repoPath, '.docs', 'decisions', 'adr-001-legacy.md'), APPROVED_CITABLE_ADR);
+    await git(['add', '.docs/decisions/adr-001-legacy.md']);
+    await git(['commit', '-m', 'add legacy sequential ADR']);
+
+    const dir = await seedValidWorktree();
+    const adrPath = join(dir, '.docs', 'decisions', 'adr-001-legacy.md');
+    await writeFile(adrPath, `${APPROVED_CITABLE_ADR}\nUpdated while preserving citation.\n`);
+    await git(['add', '.docs/decisions/adr-001-legacy.md'], dir);
+    await git(['commit', '-m', 'update legacy sequential ADR'], dir);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).resolves.toMatchObject({ slug: 'dep-bump' });
+  });
+
+  it('reports approval before filename canonicality for a newly introduced draft sequential ADR', async () => {
+    const dir = await seedValidWorktree();
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(join(dir, '.docs', 'decisions', 'adr-001-unapproved.md'), DRAFT_ADR);
+
+    let caught: Error | null = null;
+    try {
+      await landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh });
+    } catch (error) {
+      caught = error instanceof Error ? error : new Error(String(error));
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toMatch(
+      /adr-001-unapproved\.md.*DRAFT.*ADRs are not approved|ADRs are not approved.*adr-001-unapproved\.md.*DRAFT/i,
+    );
+    expect(caught!.message).not.toContain('canonical filenames');
+  });
+});
+
+describe('landSpec ADR citability gate negatives (Task 7)', () => {
+  const gh: GhRunner = async () => ({ stdout: 'operator\n' });
+
+  it('leaves a legacy approved but uncitable ADR untouched when this spec changes no ADR', async () => {
+    await mkdir(join(repoPath, '.docs', 'decisions'), { recursive: true });
+    await writeFile(join(repoPath, '.docs', 'decisions', 'adr-legacy.md'), APPROVED_UNCITABLE_ADR);
+    await git(['add', '.docs/decisions/adr-legacy.md']);
+    await git(['commit', '-m', 'add legacy uncitable ADR']);
+
+    const dir = await seedValidWorktree();
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).resolves.toMatchObject({ slug: 'dep-bump' });
+  });
+
+  it('refuses an uncitable changed ADR without mutating artifacts or appending plan tasks', async () => {
+    const dir = await seedValidWorktree();
+    const planPath = join(dir, '.docs', 'plans', 'dep-bump.md');
+    const adrPath = join(dir, '.docs', 'decisions', 'adr-uncitable.md');
+    await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
+    await writeFile(adrPath, APPROVED_UNCITABLE_ADR);
+
+    const [planBefore, adrBefore, statusBefore, headBefore] = await Promise.all([
+      readFile(planPath, 'utf-8'),
+      readFile(adrPath, 'utf-8'),
+      git(['status', '--porcelain', '--untracked-files=all'], dir),
+      git(['rev-parse', 'HEAD'], dir),
+    ]);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/no citable decision.*adr-uncitable\.md/i);
+
+    await expect(Promise.all([
+      readFile(planPath, 'utf-8'),
+      readFile(adrPath, 'utf-8'),
+      git(['status', '--porcelain', '--untracked-files=all'], dir),
+      git(['rev-parse', 'HEAD'], dir),
+    ])).resolves.toEqual([planBefore, adrBefore, statusBefore, headBefore]);
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(join(dir, '.docs', 'intake', 'dep-bump.md'))).toBe(false);
+  });
+
+  it('rejects an uncitable changed ADR even when a waiver-shaped file is present', async () => {
+    const dir = await seedValidWorktree();
+    await Promise.all([
+      mkdir(join(dir, '.docs', 'decisions'), { recursive: true }),
+      mkdir(join(dir, '.docs', 'coherence-waivers'), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(join(dir, '.docs', 'decisions', 'adr-uncitable.md'), APPROVED_UNCITABLE_ADR),
+      writeFile(
+        join(dir, '.docs', 'coherence-waivers', 'dep-bump.md'),
+        'Waives: adr-citability\n\nRationale: this must not waive an evidentiary defect.\n',
+      ),
+    ]);
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/no citable decision.*adr-uncitable\.md/i);
   });
 });
 
@@ -710,6 +1187,113 @@ describe('Task 2: idea-scoped track+spec pickers (#488)', () => {
   });
 });
 
+describe('Task 1: non-Small architecture diagrams at land', () => {
+  const idea = 'clean rubric judgements rejected as invalid provid';
+  const slug = 'clean-rubric-judgements-rejected-as-invalid-provid';
+  const architecturePath = `.docs/architecture/${slug}.md`;
+  const gh: GhRunner = async () => ({ stdout: 'bob\n' });
+
+  function renderDeps() {
+    return {
+      hasTool: async () => true,
+      writeTemp: async () => '/tmp/non-small-architecture.mmd',
+      runMmdc: async () => ({ ok: true }),
+    };
+  }
+
+  it('lands a non-Small architecture artifact with one fenced mermaid diagram', async () => {
+    const dir = await seedNamedTierMWorktree(idea, slug);
+    await writeFile(
+      join(dir, architecturePath),
+      '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n',
+    );
+
+    const result = await landSpec(target(), idea, dir, undefined, {
+      ownerConfig: {}, gh, renderDeps: renderDeps(),
+    });
+
+    expect(result.branch).toBeTruthy();
+  });
+
+  it('rejects a non-Small architecture artifact containing only a diagram heading and prose, naming its path', async () => {
+    const dir = await seedNamedTierMWorktree(idea, slug);
+    await writeFile(
+      join(dir, architecturePath),
+      '# Architecture\n\n## Diagram\n\nThe architecture diagram is documented here.\n',
+    );
+
+    await expect(
+      landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh, renderDeps: renderDeps() }),
+    ).rejects.toThrow(architecturePath);
+    await expect(
+      landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh, renderDeps: renderDeps() }),
+    ).rejects.toThrow('/architecture-diagram');
+  });
+
+  it('rejects mid-sentence mermaid fence prose specifically for a missing fenced mermaid diagram', async () => {
+    const dir = await seedNamedTierMWorktree(idea, slug);
+    await writeFile(
+      join(dir, architecturePath),
+      '# Architecture\n\nThe diagram begins with ```mermaid but never opens a fenced block.\n',
+    );
+
+    await expect(
+      landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh, renderDeps: renderDeps() }),
+    ).rejects.toThrow(/fenced mermaid diagram/i);
+  });
+});
+
+describe('Task 2: non-Small architecture diagram gate scope at land', () => {
+  const idea = 'dep bump';
+  const gh: GhRunner = async () => ({ stdout: 'bob\n' });
+
+  it('lands a Small-tier spec that authors no architecture artifact', async () => {
+    const dir = await seedValidWorktree(idea);
+    await mkdir(join(dir, '.docs', 'complexity'), { recursive: true });
+    await writeFile(join(dir, '.docs', 'stories', 'dep-bump.md'), SMALL_TIER_STORIES);
+    await writeFile(join(dir, '.docs', 'plans', 'dep-bump.md'), SMALL_TIER_PLAN);
+    await writeFile(join(dir, '.docs', 'complexity', 'dep-bump.md'), '# Complexity\n\nTier: S\n');
+
+    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+
+    expect(result.branch).toBeTruthy();
+  });
+
+  it('ignores a diagram-free architecture artifact inherited from the base branch', async () => {
+    await mkdir(join(repoPath, '.docs', 'architecture'), { recursive: true });
+    await writeFile(
+      join(repoPath, '.docs', 'architecture', 'unrelated-feature.md'),
+      '# Architecture\n\nThis inherited document has no diagram.\n',
+    );
+    await git(['add', '.docs/architecture/unrelated-feature.md']);
+    await git(['commit', '-m', 'add unrelated inherited architecture artifact']);
+
+    const nonSmallIdea = 'clean rubric judgements rejected as invalid provid';
+    const slug = 'clean-rubric-judgements-rejected-as-invalid-provid';
+    const dir = await seedNamedTierMWorktree(nonSmallIdea, slug);
+
+    const result = await landSpec(target(), nonSmallIdea, dir, undefined, {
+      ownerConfig: {},
+      gh,
+      renderDeps: {
+        hasTool: async () => true,
+        writeTemp: async () => join(dir, 'inherited-architecture.mmd'),
+        runMmdc: async () => ({ ok: true }),
+      },
+    });
+
+    expect(result.branch).toBeTruthy();
+  });
+
+  it('preserves legacy land behavior when no complexity artifact exists', async () => {
+    const dir = await seedValidWorktree(idea);
+
+    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+
+    expect(result.branch).toBeTruthy();
+  });
+});
+
 describe('Task 3: idea-scoped stories/plan/complexity/conflicts/architecture/decisions pickers', () => {
   it('stories picker: validates the idea\'s stories content, ignoring a newer-mtime legacy stories file on main', async () => {
     // Legacy stories file committed on `main` BEFORE the worktree is created,
@@ -813,8 +1397,8 @@ describe('Task 3: idea-scoped stories/plan/complexity/conflicts/architecture/dec
     await mkdir(join(dir, '.docs', 'stories'), { recursive: true });
     await mkdir(join(dir, '.docs', 'plans'), { recursive: true });
     await writeFile(join(dir, '.docs', 'specs', 'dep-bump.md'), '# PRD: dep bump\n\nApproved.\n');
-    await writeFile(join(dir, '.docs', 'stories', 'dep-bump.md'), ACCEPTED_STORIES);
-    await writeFile(join(dir, '.docs', 'plans', 'dep-bump.md'), PLAN_WITH_DEPS);
+    await writeFile(join(dir, '.docs', 'stories', 'dep-bump.md'), SMALL_TIER_STORIES);
+    await writeFile(join(dir, '.docs', 'plans', 'dep-bump.md'), SMALL_TIER_PLAN);
     // Idea's own complexity file declares Small — no conflicts/architecture/decisions needed.
     await writeFile(join(dir, '.docs', 'complexity', 'dep-bump.md'), '# Complexity\n\nTier: S\n');
 
@@ -878,10 +1462,15 @@ describe('Task 3: idea-scoped stories/plan/complexity/conflicts/architecture/dec
 
     // Now seed the idea's own DECIDE artifacts — landing must succeed and use them.
     await writeFile(join(dir, '.docs', 'conflicts', 'dep-bump.md'), '# Conflicts\n\nNone.\n');
-    await writeFile(join(dir, '.docs', 'architecture', 'dep-bump.md'), '# Architecture\n\nDiagram.\n');
+    await writeFile(
+      join(dir, '.docs', 'architecture', 'dep-bump.md'),
+      '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n',
+    );
     await writeFile(join(dir, '.docs', 'decisions', 'dep-bump.md'), '# Review\n\nApproved.\n');
 
-    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+    const result = await landSpec(target(), idea, dir, undefined, {
+      ownerConfig: {}, gh, renderDeps: passingRenderDeps(),
+    });
     expect(result.branch).toBeTruthy();
   });
 });
@@ -914,7 +1503,9 @@ describe('Task 2: feature-scoped artifact stems at land (#1743)', () => {
   it('lands slug-named normalized artifacts with date prefixes', async () => {
     const dir = await seedNamedTierMWorktree(idea, slug, '2026-08-19-');
 
-    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+    const result = await landSpec(target(), idea, dir, undefined, {
+      ownerConfig: {}, gh, renderDeps: passingRenderDeps(),
+    });
 
     expect(result.branch).toBeTruthy();
   });
@@ -922,7 +1513,7 @@ describe('Task 2: feature-scoped artifact stems at land (#1743)', () => {
   it('preserves bare worktree-reserved stems through land, completion globs, and protected sealing', async () => {
     const dir = await seedNamedTierMWorktree(idea, slug, '');
 
-    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh, renderDeps: passingRenderDeps() });
 
     expect(result.branch).toBeTruthy();
     await expect(Promise.all([
@@ -1027,7 +1618,9 @@ describe('Task 3: negative feature-scoped artifact stems at land (#1743)', () =>
       `# Stories: ${idea}\n\n**Status:** Accepted\n\n## Story: validate\n### Acceptance Criteria\n- Given X, when Y, then Z.\n`,
     );
 
-    const result = await landSpec(target(), idea, dir, undefined, { ownerConfig: {}, gh });
+    const result = await landSpec(target(), idea, dir, undefined, {
+      ownerConfig: {}, gh, renderDeps: passingRenderDeps(),
+    });
 
     expect(result.branch).toBeTruthy();
   });
@@ -1159,7 +1752,10 @@ describe('Task 8: protected-target land gate blast radius', () => {
       await mkdir(join(dir, '.docs', 'architecture'), { recursive: true });
       await mkdir(join(dir, '.docs', 'decisions'), { recursive: true });
       await writeFile(join(dir, '.docs', 'conflicts', 'dep-bump.md'), '# Conflicts\n\nNone.\n');
-      await writeFile(join(dir, '.docs', 'architecture', 'dep-bump.md'), '# Architecture\n\nApproved.\n');
+      await writeFile(
+        join(dir, '.docs', 'architecture', 'dep-bump.md'),
+        '# Architecture\n\n```mermaid\nflowchart TD\n  A --> B\n```\n',
+      );
       await writeFile(join(dir, '.docs', 'decisions', 'dep-bump.md'), '# Review\n\nApproved.\n');
     }
 
@@ -1260,6 +1856,79 @@ describe('landSpec Done-when validation', () => {
       '- The second observable result exists.',
       '',
     ].join('\n'));
+
+    const result = await landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh });
+
+    expect(result.branch).toBeTruthy();
+  });
+});
+
+function planWithAddressableTaskCount(taskCount: number, trailingContent = ''): string {
+  const tasks = Array.from({ length: taskCount }, (_, index) => [
+    `### Task ${index + 1}: Task ${index + 1}`,
+    '**Done when:**',
+    '- The first observable result exists.',
+    '- The second observable result exists.',
+  ].join('\n')).join('\n\n');
+  return [
+    '# Implementation Plan: dep bump',
+    '',
+    '**Stories:** .docs/stories/dep-bump.md',
+    '',
+    tasks,
+    trailingContent,
+    '',
+  ].join('\n');
+}
+
+describe('landSpec plan task-count validation', () => {
+  const gh: GhRunner = async () => ({ stdout: 'bob\n' });
+
+  it('refuses a hard-stop plan with no scope exception', async () => {
+    const dir = await seedValidWorktree();
+    await writeFile(join(dir, '.docs', 'plans', 'dep-bump.md'), planWithAddressableTaskCount(41));
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/41 addressable tasks.*hard-stop boundary 41.*no scope exception/i);
+  });
+
+  it('lands an authorized hard-stop plan and preserves its rationale verbatim', async () => {
+    const dir = await seedValidWorktree();
+    const rationale = 'The coordinated migration needs all changes reviewed together.';
+    await writeFile(
+      join(dir, '.docs', 'plans', 'dep-bump.md'),
+      planWithAddressableTaskCount(41, `**Scope-exception:** ${rationale}`),
+    );
+
+    const result = await landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh });
+    const committedPlan = await git(['show', `${result.branch}:.docs/plans/dep-bump.md`], dir);
+
+    expect(committedPlan).toContain(`**Scope-exception:** ${rationale}`);
+  });
+
+  it.each([
+    ['an empty rationale', '**Scope-exception:**'],
+    ['duplicate declarations', '**Scope-exception:** First rationale.\n**Scope-exception:** Second rationale.'],
+  ])('refuses a hard-stop plan with %s as malformed', async (_caseName, declaration) => {
+    const dir = await seedValidWorktree();
+    await writeFile(
+      join(dir, '.docs', 'plans', 'dep-bump.md'),
+      planWithAddressableTaskCount(41, declaration),
+    );
+
+    await expect(
+      landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh }),
+    ).rejects.toThrow(/41 addressable tasks.*hard-stop boundary 41.*scope exception declaration is malformed/i);
+  });
+
+  it.each([
+    ['one task below the hard-stop boundary', planWithAddressableTaskCount(40)],
+    ['fenced extra task headings', planWithAddressableTaskCount(40, `\`\`\`markdown\n${planWithAddressableTaskCount(41)}\n\`\`\``)],
+    ['an inert declaration', planWithAddressableTaskCount(40, '**Scope-exception:** Not needed below the boundary.')],
+  ])('lands a below-boundary plan with %s', async (_caseName, plan) => {
+    const dir = await seedValidWorktree();
+    await writeFile(join(dir, '.docs', 'plans', 'dep-bump.md'), plan);
 
     const result = await landSpec(target(), 'dep bump', dir, undefined, { ownerConfig: {}, gh });
 
@@ -1487,5 +2156,81 @@ describe('Task 7: idea-scoped resolution preserves content validation and the di
 
     const headAfter = await git(['rev-parse', 'HEAD'], dir);
     expect(headAfter).toBe(headBefore);
+  });
+});
+
+// AB-1: landSpec's missing-worktree error is operator guidance — it must name
+// the canonical `compose` verb, not the deprecated `engineer` alias.
+describe('landSpec remediation text uses the canonical compose verb', () => {
+  it('the missing-worktree error tells the operator to run `ai-conductor compose worktree`', async () => {
+    const missing = join(repoPath, '.worktrees', 'never-created');
+
+    let caught: Error | null = null;
+    try {
+      await landSpec(target(), 'dep bump', missing, undefined, {
+        ownerConfig: { spec_owner: 'bob' },
+        gh: async () => ({ stdout: 'bob\n' }),
+      });
+    } catch (e) {
+      caught = e instanceof Error ? e : new Error(String(e));
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toContain('ai-conductor compose worktree');
+    expect(caught!.message).not.toContain('ai-conductor engineer worktree');
+  });
+});
+
+describe('DECIDE amendments at land', () => {
+  const gh: GhRunner = async () => ({ stdout: 'bob\n' });
+
+  it('lands existing story and plan amendments without selecting them as the current feature', async () => {
+    for (const family of ['stories', 'plans']) {
+      await mkdir(join(repoPath, '.docs', family), { recursive: true });
+      await writeFile(join(repoPath, '.docs', family, 'previous-feature.md'), '# Historical artifact\n');
+    }
+    await git(['add', '.docs']);
+    await git(['commit', '-m', 'existing DECIDE artifacts']);
+    const dir = await seedValidWorktree();
+    for (const family of ['stories', 'plans']) {
+      const file = join(dir, '.docs', family, 'previous-feature.md');
+      await writeFile(file, '# Historical artifact\n\nCorrected accepted assertion.\n');
+      const newer = new Date(Date.now() + 60_000);
+      await utimes(file, newer, newer);
+      await git(['add', file], dir);
+    }
+    await git(['commit', '-m', 'amend existing DECIDE assertions'], dir);
+
+    await expect(landSpec(target(), 'dep bump', dir, undefined, { gh })).resolves.toMatchObject({ branch: 'spec/dep-bump' });
+    expect(await readFile(join(dir, '.docs', 'stories', 'previous-feature.md'), 'utf8')).toContain('Corrected accepted assertion.');
+    expect(await git(['status', '--porcelain'], dir)).toBe('');
+  });
+
+  it('does not let an existing amendment satisfy a missing current-feature story', async () => {
+    await mkdir(join(repoPath, '.docs', 'stories'), { recursive: true });
+    await writeFile(join(repoPath, '.docs', 'stories', 'previous-feature.md'), ACCEPTED_STORIES);
+    await git(['add', '.docs']);
+    await git(['commit', '-m', 'existing story']);
+    const dir = await seedValidWorktree();
+    await rm(join(dir, '.docs', 'stories', 'dep-bump.md'));
+    await writeFile(join(dir, '.docs', 'stories', 'previous-feature.md'), ACCEPTED_STORIES + '\nCorrected assertion.\n');
+    await git(['add', '.docs/stories/previous-feature.md'], dir);
+    await git(['commit', '-m', 'amend previous story'], dir);
+    const head = await git(['rev-parse', 'HEAD'], dir);
+    await expect(landSpec(target(), 'dep bump', dir, undefined, { gh })).rejects.toThrow('stories');
+    expect(await git(['rev-parse', 'HEAD'], dir)).toBe(head);
+  });
+
+  it('rejects a newly committed mismatched story even when it was renamed from an existing artifact', async () => {
+    await mkdir(join(repoPath, '.docs', 'stories'), { recursive: true });
+    await writeFile(join(repoPath, '.docs', 'stories', 'previous-feature.md'), ACCEPTED_STORIES);
+    await git(['add', '.docs']);
+    await git(['commit', '-m', 'existing story']);
+    const dir = await seedValidWorktree();
+    await git(['mv', '.docs/stories/previous-feature.md', '.docs/stories/wrong-new-name.md'], dir);
+    await git(['commit', '-m', 'rename story'], dir);
+    const head = await git(['rev-parse', 'HEAD'], dir);
+    await expect(landSpec(target(), 'dep bump', dir, undefined, { gh })).rejects.toThrow('wrong-new-name.md');
+    expect(await git(['rev-parse', 'HEAD'], dir)).toBe(head);
   });
 });

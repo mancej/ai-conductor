@@ -1,3 +1,4 @@
+// Covers: task:1, task:2, task:2.1, task:3, task:9
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, writeFile, rm, mkdir, symlink } from 'fs/promises';
 import { join } from 'path';
@@ -12,7 +13,8 @@ import {
   resolveMemoryProvider,
   resolveValidationConcurrency,
 } from '../../src/engine/config.js';
-import { resolveBuildReviewConfig } from '../../src/engine/resolved-config.js';
+import { resolveDaemonConcurrency } from '../../src/engine/resolved-config.js';
+import * as resolvedConfig from '../../src/engine/resolved-config.js';
 import { PluginRegistry } from '../../src/engine/plugin-registry.js';
 
 describe('config', () => {
@@ -35,7 +37,7 @@ describe('config', () => {
         expect(result.ok).toBe(false);
         if (result.ok) return;
         expect(result.error.type).toBe('missing');
-        expect(result.error.message).toContain('conduct-ts config init');
+        expect(result.error.message).toContain('ai-conductor config init');
         expect(result.error.message).not.toContain('bin/migrate');
       } finally {
         await rm(emptyDir, { recursive: true, force: true });
@@ -59,12 +61,50 @@ steps:
       expect(result.error.message).toMatch(/line \d+/i);
     });
 
+    it('rejects retired and arbitrary undeclared step names as custom steps missing after', async () => {
+      const loadUndeclaredStep = async (name: string) => {
+        await writeFile(
+          join(tmpDir, '.ai-conductor', 'config.yml'),
+          `steps:\n  ${name}:\n    max_retries: 2\n`,
+        );
+        const result = await loadConfig(tmpDir);
+        expect(result.ok).toBe(false);
+        if (result.ok) throw new Error('expected config validation failure');
+        return result.error;
+      };
+
+      const retired = await loadUndeclaredStep('wiring_check');
+      const arbitrary = await loadUndeclaredStep('undeclared_step');
+
+      expect(retired).toMatchObject({
+        type: 'validation_error',
+        message: 'Custom step "wiring_check" requires \'after: <existing-step>\'',
+      });
+      expect(arbitrary).toMatchObject({
+        type: 'validation_error',
+        message: 'Custom step "undeclared_step" requires \'after: <existing-step>\'',
+      });
+    });
+
     it('accepts config when harness version satisfies constraint', async () => {
       const configYaml = `harness_version: ">=1.0.0"\n`;
       await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), configYaml);
 
       const result = await loadConfig(tmpDir, '1.0.0');
       expect(result.ok).toBe(true);
+    });
+
+    it('loads OTel attributes without an unknown-key warning', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'otel:\n  exporter: file\n  attributes:\n    service.name: conductor\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) return;
+      expect(result.warnings).not.toContain('Unknown key in otel: "attributes"');
     });
 
     it('rejects config when version too low', async () => {
@@ -96,8 +136,6 @@ steps:
     model: haiku
   architecture_diagram:
     disable: true
-complexity:
-  default_tier: M
 `;
       await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), configYaml);
 
@@ -111,7 +149,6 @@ complexity:
       expect(result.config.phases?.UNDERSTAND?.effort).toBe('low');
       expect(result.config.steps?.memory?.model).toBe('haiku');
       expect(result.config.steps?.architecture_diagram?.disable).toBe(true);
-      expect(result.config.complexity?.default_tier).toBe('M');
       expect(result.warnings).toEqual([]);
     });
 
@@ -514,6 +551,27 @@ complexity:
       expect(result.error.message).toContain('validation_concurrency');
     });
 
+    it.each([0, -1, 1.5, 'two'] as const)(
+      'rejects daemon_concurrency %j outside the accepted integer range [1, ∞)',
+      (daemonConcurrency) => {
+        const result = validateConfig({ daemon_concurrency: daemonConcurrency as never });
+        expect(result.ok).toBe(false);
+        if (result.ok) return;
+        expect(result.error.message).toContain('daemon_concurrency');
+        expect(result.error.message).toContain('[1, ∞)');
+      },
+    );
+
+    it('accepts daemon_concurrency 2 and resolveDaemonConcurrency returns it', () => {
+      const result = validateConfig({ daemon_concurrency: 2 });
+      expect(result.ok).toBe(true);
+      expect(resolveDaemonConcurrency({ daemon_concurrency: 2 })).toBe(2);
+    });
+
+    it('resolveDaemonConcurrency defaults to 1 when daemon_concurrency is absent', () => {
+      expect(resolveDaemonConcurrency({})).toBe(1);
+    });
+
     it('resolveValidationConcurrency defaults to 4 when absent', () => {
       expect(resolveValidationConcurrency({})).toBe(4);
     });
@@ -618,6 +676,27 @@ complexity:
       expect(result.error.message).toContain('unknown_key');
     });
 
+    it('removes the obsolete top-level auth-park resolver and rejects stray config', () => {
+      // This assertion protects the actual removal. The validator rejected
+      // this top-level key before the cleanup, so rejection alone would not
+      // distinguish a restored dead resolver from the intended API surface.
+      expect(resolvedConfig).not.toHaveProperty('resolveAuthParkTimeoutMinutes');
+
+      const result = validateConfig({ auth_park_timeout_minutes: 15 });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toBe('Unknown top-level key: "auth_park_timeout_minutes"');
+    });
+
+    it('rejects defaults.by_tier but keeps phase and step tier overrides valid', () => {
+      const rejected = validateConfig({ defaults: { by_tier: { S: {} } } });
+      expect(rejected.ok).toBe(false);
+      if (!rejected.ok) expect(rejected.error.message).toBe('Unknown key in defaults: "by_tier"');
+
+      expect(validateConfig({ phases: { BUILD: { by_tier: { S: {} } } } }).ok).toBe(true);
+      expect(validateConfig({ steps: { build: { by_tier: { S: {} } } } }).ok).toBe(true);
+    });
+
     it('rejects unknown step-level keys (fail-fast)', () => {
       const result = validateConfig({
         steps: { memory: { model: 'haiku', bogus_key: 1 } },
@@ -627,7 +706,27 @@ complexity:
       expect(result.error.message).toContain('bogus_key');
     });
 
-    it('accepts provider-native TDD RED/GREEN model overrides on the build step', () => {
+    it('rejects a stale retro step configuration by its unknown name', () => {
+      const result = validateConfig({
+        steps: { retro: { model: 'gpt-5.6-terra' } },
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toBe('Unknown step: retro');
+    });
+
+    it('accepts an empty complexity block and rejects its removed default tier as an unknown key', () => {
+      expect(validateConfig({ complexity: {} }).ok).toBe(true);
+
+      const result = validateConfig({ complexity: { default_tier: 'M' } });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toBe('Unknown key in complexity: "default_tier"');
+    });
+
+    it('rejects the removed TDD model configuration as an unknown step-level key', () => {
       const result = validateConfig({
         llm_provider: 'codex',
         steps: {
@@ -640,43 +739,9 @@ complexity:
         },
       });
 
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
-      expect(result.config.steps?.build?.tdd?.red?.model).toBe('gpt-5.6-luna');
-      expect(result.config.steps?.build?.tdd?.green?.model).toBe('gpt-5.6-terra');
-    });
-
-    it('rejects TDD models that do not belong to the selected provider', () => {
-      const result = validateConfig({
-        llm_provider: 'codex',
-        steps: { build: { tdd: { red: { model: 'haiku' } } } },
-      });
-
       expect(result.ok).toBe(false);
       if (result.ok) return;
-      expect(result.error.message).toContain('steps.build.tdd.red.model');
-      expect(result.error.message).toContain('codex');
-    });
-
-    it('rejects TDD model configuration when llm_provider is not a string', () => {
-      const result = validateConfig({
-        llm_provider: 42,
-        steps: { build: { tdd: { red: { model: 'haiku' } } } },
-      });
-
-      expect(result.ok).toBe(false);
-      if (result.ok) return;
-      expect(result.error.message).toContain('llm_provider');
-    });
-
-    it('rejects TDD model configuration outside the build step', () => {
-      const result = validateConfig({
-        steps: { memory: { tdd: { red: { model: 'haiku' } } } },
-      });
-
-      expect(result.ok).toBe(false);
-      if (result.ok) return;
-      expect(result.error.message).toContain('steps.memory.tdd');
+      expect(result.error.message).toBe('Unknown key in steps.build: "tdd"');
     });
 
     it('rejects invalid phase name', () => {
@@ -721,6 +786,60 @@ complexity:
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error.message).toMatch(/after/);
+    });
+
+    it('rejects when on gating and structural custom steps while allowing advisory custom steps', () => {
+      const customStep = (enforcement: 'gating' | 'structural' | 'advisory') => ({
+        steps: {
+          lint: {
+            after: 'build',
+            skill: 'custom-lint',
+            enforcement,
+            when: 'tier == S',
+          },
+        },
+      });
+
+      const outcomes = (['gating', 'structural', 'advisory'] as const).map((enforcement) => {
+        const result = validateConfig(customStep(enforcement));
+        return result.ok ? 'accepted' : result.error.message;
+      });
+
+      expect(outcomes).toEqual([
+        'Cannot condition gating step: "lint" with when:. Only advisory steps may be conditional.',
+        'Cannot condition structural step: "lint" with when:. Only advisory steps may be conditional.',
+        'accepted',
+      ]);
+    });
+
+    it('rejects disable on gating and structural custom steps while allowing advisory custom steps', () => {
+      const customStep = (enforcement?: 'gating' | 'structural' | 'advisory') => ({
+        steps: {
+          lint: {
+            after: 'build',
+            skill: 'custom-lint',
+            ...(enforcement === undefined ? {} : { enforcement }),
+            disable: true,
+          },
+        },
+      });
+
+      const outcomes = ([
+        'gating',
+        'structural',
+        'advisory',
+        undefined,
+      ] as const).map((enforcement) => {
+        const result = validateConfig(customStep(enforcement));
+        return result.ok ? 'accepted' : result.error.message;
+      });
+
+      expect(outcomes).toEqual([
+        'Cannot disable gating step: "lint". Only advisory steps may be disabled.',
+        'Cannot disable structural step: "lint". Only advisory steps may be disabled.',
+        'accepted',
+        'accepted',
+      ]);
     });
 
     it('accepts custom step with valid after target and existing SKILL.md', async () => {
@@ -800,6 +919,54 @@ complexity:
         'accepted',
         'steps.memory.completion_artifact is not valid for built-in steps',
       ]);
+    });
+
+    it('accepts gate and kickback_target for a custom step', () => {
+      const result = validateConfig({
+        steps: {
+          lint: {
+            after: 'build',
+            skill: 'custom-lint',
+            gate: false,
+            kickback_target: true,
+          },
+        },
+      });
+
+      expect(result.ok).toBe(true);
+    });
+
+    it('rejects gate and kickback_target for built-in steps', () => {
+      const result = validateConfig({
+        steps: { plan: { gate: false, kickback_target: true } },
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toContain('plan');
+      expect(result.error.message).toContain('custom steps only');
+    });
+
+    it('rejects a non-boolean custom-step gate', () => {
+      const result = validateConfig({
+        steps: { lint: { after: 'build', skill: 'custom-lint', gate: 'loop' } },
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toContain('gate');
+      expect(result.error.message).toContain('boolean');
+    });
+
+    it('rejects a non-boolean custom-step kickback_target', () => {
+      const result = validateConfig({
+        steps: { lint: { after: 'build', skill: 'custom-lint', kickback_target: 'yes' } },
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toContain('kickback_target');
+      expect(result.error.message).toContain('boolean');
     });
 
     it('rejects built-in step setting `after` (fail-fast)', () => {
@@ -968,6 +1135,16 @@ complexity:
       if (result.ok) return;
       expect(result.error.message).toMatch(/boolean/);
     });
+
+    it('rejects a conductor block from project source and accepts it after merge', () => {
+      const project = validateConfig({ conductor: {} }, '/repo', { source: 'project' });
+      expect(project.ok).toBe(false);
+      if (!project.ok) {
+        expect(project.error.message).toMatch(/\.ai-conductor\/config\.yml/);
+        expect(project.error.message).toMatch(/Move.*~\/.ai-conductor\/config\.yml/);
+      }
+      expect(validateConfig({ conductor: {} }, '/repo', { source: 'merged' }).ok).toBe(true);
+    });
   });
 
   describe('acceptance_spec_globs validation', () => {
@@ -1002,6 +1179,253 @@ complexity:
   });
 
   describe('test_suite config block', () => {
+    it('resolves aggregate verification with an all-none drift budget', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    mode: aggregate\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok && result.config.test_suite?.verification).toEqual({
+        mode: 'aggregate',
+        drift_budget: {
+          additional_inputs: 'none',
+          dependencies: 'none',
+          environment: 'none',
+          migrations: 'none',
+          project_config: 'none',
+          source: 'none',
+          test_infrastructure: 'none',
+          tests: 'none',
+        },
+      });
+    });
+
+    it('resolves declared budgetable drift bounds exactly', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    drift_budget:\n      source: 20\n      tests: none\n      test_infrastructure: unlimited\n      additional_inputs: 3\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok && result.config.test_suite?.verification).toEqual({
+        mode: 'aggregate',
+        drift_budget: {
+          additional_inputs: 3,
+          dependencies: 'none',
+          environment: 'none',
+          migrations: 'none',
+          project_config: 'none',
+          source: 20,
+          test_infrastructure: 'unlimited',
+          tests: 'none',
+        },
+      });
+    });
+
+    it('resolves scoped verification when the scoped command is valid', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  scoped_command: npx vitest run {selectors}\n  verification:\n    mode: scoped\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok && result.config.test_suite?.verification?.mode).toBe('scoped');
+    });
+
+    it('rejects scoped verification without test_suite.scoped_command', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    mode: scoped\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(/test_suite\.scoped_command/),
+        },
+      });
+    });
+
+    it('rejects a non-object test_suite.verification block', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification: []\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(/test_suite\.verification/),
+        },
+      });
+    });
+
+    it('rejects a non-object test_suite.verification.drift_budget block', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    drift_budget: []\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(/test_suite\.verification\.drift_budget/),
+        },
+      });
+    });
+
+    it('rejects an unknown drift_budget category and lists the valid categories', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    drift_budget:\n      deploys: 1\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(
+            /deploys.*additional_inputs.*dependencies.*environment.*migrations.*project_config.*source.*test_infrastructure.*tests/i,
+          ),
+        },
+      });
+    });
+
+    it.each(['dependencies', 'environment', 'migrations', 'project_config'])(
+      'rejects unbudgetable drift_budget category %s',
+      async (category) => {
+        await writeFile(
+          join(tmpDir, '.ai-conductor', 'config.yml'),
+          `test_suite:\n  command: npm test\n  verification:\n    drift_budget:\n      ${category}: 1\n`,
+        );
+
+        const result = await loadConfig(tmpDir);
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: {
+            type: 'validation_error',
+            message: `test_suite.verification.drift_budget.${category} is unbudgetable`,
+          },
+        });
+      },
+    );
+
+    it.each(['dependencies', 'environment', 'migrations', 'project_config'])(
+      'rejects explicit none for unbudgetable drift_budget category %s',
+      async (category) => {
+        await writeFile(
+          join(tmpDir, '.ai-conductor', 'config.yml'),
+          `test_suite:\n  command: npm test\n  verification:\n    drift_budget:\n      ${category}: none\n`,
+        );
+
+        const result = await loadConfig(tmpDir);
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: {
+            type: 'validation_error',
+            message: `test_suite.verification.drift_budget.${category} is unbudgetable`,
+          },
+        });
+      },
+    );
+
+    it.each([
+      ['zero', 0],
+      ['a negative value', -1],
+      ['a non-integer value', 1.5],
+    ])('rejects %s drift_budget bounds with the full key and value', async (_name, bound) => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        `test_suite:\n  command: npm test\n  verification:\n    drift_budget:\n      source: ${bound}\n`,
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(
+            new RegExp(`test_suite\\.verification\\.drift_budget\\.source.*${bound}`),
+          ),
+        },
+      });
+    });
+
+    it('rejects an invalid verification mode and lists aggregate and scoped', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    mode: selective\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(/selective.*aggregate.*scoped/i),
+        },
+      });
+    });
+
+    it('rejects an unknown verification key by name', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  verification:\n    retries: 2\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(/retries/i),
+        },
+      });
+    });
+
+    it('defaults absent verification to aggregate mode with an all-none drift budget', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok && result.config.test_suite?.verification).toEqual({
+        mode: 'aggregate',
+        drift_budget: {
+          additional_inputs: 'none',
+          dependencies: 'none',
+          environment: 'none',
+          migrations: 'none',
+          project_config: 'none',
+          source: 'none',
+          test_infrastructure: 'none',
+          tests: 'none',
+        },
+      });
+    });
+
     it('loads and exposes an optional scoped_command template', async () => {
       await writeFile(
         join(tmpDir, '.ai-conductor', 'config.yml'),
@@ -1073,18 +1497,39 @@ complexity:
       expect(result.config.test_suite?.scoped_command).toBeUndefined();
     });
 
-    it('accepts an aggregate suite declaration with every supported field', () => {
+    it('accepts an aggregate suite declaration with every configurable drift budget', () => {
       const testSuite = {
         command: 'npm test',
         working_directory: 'src/conductor',
         timeout_seconds: 1800,
         inputs: ['test-support/**'],
         environment: ['CI', 'DATABASE_URL'],
+        verification: {
+          mode: 'aggregate',
+          drift_budget: {
+            additional_inputs: 'none',
+            source: 'none',
+            test_infrastructure: 'none',
+            tests: 'none',
+          },
+        },
       };
 
       const result = validateConfig({ test_suite: testSuite });
 
-      expect(result.ok && result.config.test_suite).toEqual(testSuite);
+      expect(result.ok && result.config.test_suite).toEqual({
+        ...testSuite,
+        verification: {
+          ...testSuite.verification,
+          drift_budget: {
+            ...testSuite.verification.drift_budget,
+            dependencies: 'none',
+            environment: 'none',
+            migrations: 'none',
+            project_config: 'none',
+          },
+        },
+      });
     });
 
     it.each([
@@ -1304,6 +1749,30 @@ complexity:
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.config.memory_provider).toBeUndefined();
+    });
+  });
+
+  describe('visualizers config field', () => {
+    it('loads configured visualizer names and leaves an absent key undefined', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'visualizers:\n  - first\n  - second\n',
+      );
+
+      const configured = await loadConfig(tmpDir);
+      await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), '{}\n');
+      const absent = await loadConfig(tmpDir);
+
+      expect({
+        configured: configured.ok ? configured.config.visualizers : configured.error.message,
+        absent: absent.ok ? absent.config.visualizers : absent.error.message,
+      }).toEqual({ configured: ['first', 'second'], absent: undefined });
+    });
+
+    it('rejects a non-array visualizers value like acceptance_spec_globs', () => {
+      const result = validateConfig({ visualizers: 'first' });
+
+      expect(result.ok ? '' : result.error.message).toMatch(/visualizers must be an array of strings/);
     });
   });
 
@@ -1876,6 +2345,51 @@ complexity:
       });
     });
 
+    it('resolves as-built remediation defaults and preserves configured overrides', () => {
+      expect(validateConfig({})).toMatchObject({
+        ok: true,
+        config: {
+          architecture_review_as_built: {
+            remediation: { enabled: true },
+            max_remediation_laps: 1,
+          },
+        },
+      });
+
+      expect(
+        validateConfig({
+          architecture_review_as_built: {
+            remediation: { enabled: false },
+            max_remediation_laps: 2,
+          },
+        }),
+      ).toMatchObject({
+        ok: true,
+        config: {
+          architecture_review_as_built: {
+            remediation: { enabled: false },
+            max_remediation_laps: 2,
+          },
+        },
+      });
+    });
+
+    it.each([
+      [
+        { remediation: { enabled: 'yes' } },
+        'architecture_review_as_built.remediation.enabled must be a boolean',
+      ],
+      [
+        { max_remediation_laps: 1.5 },
+        'architecture_review_as_built.max_remediation_laps must be a positive integer',
+      ],
+    ])('rejects invalid as-built remediation config %#', (architecture_review_as_built, message) => {
+      expect(validateConfig({ architecture_review_as_built })).toEqual({
+        ok: false,
+        error: { type: 'validation_error', message },
+      });
+    });
+
     it('rejects an unknown as-built check name', () => {
       expect(
         validateConfig({
@@ -1975,6 +2489,7 @@ complexity:
         defaults: {
           enabled: true,
           maxParallel: 1,
+          adjudication: { enabled: true },
           rubrics: {
             testQuality: { enabled: false },
           },
@@ -1982,6 +2497,7 @@ complexity:
         configured: {
           enabled: true,
           maxParallel: 1,
+          adjudication: { enabled: true },
           rubrics: {
             testQuality: {
               enabled: true,
@@ -2052,7 +2568,12 @@ complexity:
         warnings: result.warnings,
         deprecatedKeys: result.deprecatedKeys,
       }).toEqual({
-        build_review: { enabled: false, maxParallel: 1, rubrics: { testQuality: { enabled: false } } },
+        build_review: {
+          enabled: false,
+          maxParallel: 1,
+          adjudication: { enabled: true },
+          rubrics: { testQuality: { enabled: false } },
+        },
         warnings: ['build_review.perTaskFloor is retired and ignored (adr-2026-08-22-build-review-opt-in-rubric-container).'],
         deprecatedKeys: [{
           key: 'build_review.perTaskFloor',
@@ -2072,6 +2593,30 @@ complexity:
       }).toEqual({
         build_review: expect.objectContaining({ enabled: true, scopeContainmentEnforced: true }),
         warnings: [],
+      });
+    });
+
+    it.each([
+      ['absent', {}, true],
+      ['explicit false', { adjudication: { enabled: false } }, false],
+      ['explicit true', { adjudication: { enabled: true } }, true],
+    ])('resolves build_review.adjudication.enabled for %s', (_label, buildReview, enabled) => {
+      const result = validateConfig({ build_review: buildReview });
+
+      expect(result.ok && result.config.build_review?.adjudication).toEqual({ enabled });
+      expect(result.ok && result.warnings).toEqual([]);
+    });
+
+    it.each([
+      [{ adjudication: false }, 'build_review.adjudication must be an object'],
+      [{ adjudication: { enabled: 'yes' } }, 'build_review.adjudication.enabled must be a boolean'],
+      [{ adjudication: { unknown: true } }, 'Unknown key in build_review.adjudication: "unknown"'],
+    ])('rejects invalid build_review adjudication config %#', (buildReview, message) => {
+      const result = validateConfig({ build_review: buildReview });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { type: 'validation_error', message },
       });
     });
 
@@ -2175,6 +2720,28 @@ complexity:
       if (result.ok) return;
       expect(result.error.message).toMatch(/build_review/);
       expect(result.error.message).toMatch(/gating/i);
+    });
+
+    it.each([
+      ['build_review', "tier == 'S'", 'gating'],
+      ['rebase', "x == 'y'", 'structural'],
+      ['build_review', "'a' == 'a'", 'gating'],
+    ])('rejects when: on non-disableable %s steps without evaluating the expression', (name, when, enforcement) => {
+      const result = validateConfig({ steps: { [name]: { when } } });
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(new RegExp(`Cannot condition ${enforcement} step: "${name}" with when:`, 'i')),
+        },
+      });
+    });
+
+    it.each(['manual_test', 'prd_audit', 'explore'])('accepts when: on disableable built-in step %s', (name) => {
+      const result = validateConfig({ steps: { [name]: { when: "tier == 'S'" } } });
+
+      expect(result.ok).toBe(true);
     });
   });
 
@@ -2500,6 +3067,37 @@ complexity:
       if (result.ok) return;
       expect(result.error.type).toBe('validation_error');
       expect(result.error.message).toContain('bogus_top_level');
+    });
+  });
+
+  describe('coverage_binding config field (Task 8)', () => {
+    it('resolves the omitted judge to disabled', () => {
+      const result = validateConfig({});
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.coverage_binding?.judge?.enabled).toBe(false);
+    });
+
+    it('preserves an enabled judge', () => {
+      const result = validateConfig({ coverage_binding: { judge: { enabled: true } } });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.coverage_binding?.judge?.enabled).toBe(true);
+    });
+
+    it('rejects a non-boolean judge enablement', () => {
+      const result = validateConfig({ coverage_binding: { judge: { enabled: 'yes' } } });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toContain('coverage_binding.judge.enabled');
+      expect(result.error.message).toContain('boolean');
+    });
+
+    it('rejects an unknown key under coverage_binding.judge', () => {
+      const result = validateConfig({ coverage_binding: { judge: { enabled: true, bogus: true } } });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toContain('Unknown key in coverage_binding.judge');
     });
   });
 });

@@ -20,7 +20,13 @@ import {
   ProviderStreamAssembler,
 } from './provider-stream.js';
 import { enforceFreshSessionOptions } from './fresh-session.js';
+import { scrubTmuxEnvironment } from './child-environment.js';
 import { withDaemonSessionMarker } from './daemon-session.js';
+import {
+  inferRateLimitWaitSeconds,
+  rateLimitDurationUnitAlternation,
+  scaleRateLimitDurationSeconds,
+} from './rate-limit-duration.js';
 import { validateSpawnPermit } from '../engine/provider-runtime.js';
 
 // Task 17: Extended to include session-limit family (observed 2026-07-03 incident)
@@ -173,7 +179,9 @@ function getDateInTimezone(
  * Parse rate limit wait time from output.
  * Handles three patterns:
  * 1. Duration-based: "retry after 450 seconds", "retry in 120 seconds", "try again after 60 seconds"
- *    - Applies a minutes heuristic: if extracted value < 60, treats it as minutes and converts to seconds.
+ *    - Explicit seconds, minutes, and hours scale to seconds according to their stated unit.
+ *    - Numbers with an absent or unrecognized unit are treated as minutes, floored at the
+ *      existing 300-second default and capped at 3,600 seconds to avoid an hours-long wedge.
  * 2. Time-based with timezone: "resets 3:20pm (America/New_York)"
  *    - Task 18: Extracts timezone, calculates deadline in that timezone, clamps to cap
  *    - Returns both waitSeconds and an absolute deadline (ms since epoch)
@@ -193,18 +201,20 @@ export function parseRateLimitWaitSeconds(
 
   try {
     // Try duration-based patterns first: "retry after N seconds", "retry in N seconds", etc.
-    const durationMatch = output.match(/(?:retry|try).*(after|in)\s*([0-9]+)/i);
+    const durationMatch = output.match(new RegExp(
+      `(?:retry|try).*(after|in)\\s*([0-9]+)\\s*(${rateLimitDurationUnitAlternation})?\\b`,
+      'i',
+    ));
     if (durationMatch && durationMatch[2]) {
       const value = parseInt(durationMatch[2], 10);
       // Check for NaN or non-positive values — default to 300
       if (isNaN(value) || value <= 0) {
         return { waitSeconds: 300 };
       }
-      // Apply minutes heuristic: if value < 60, treat as minutes and convert to seconds
-      if (value < 60) {
-        return { waitSeconds: value * 60 };
+      if (durationMatch[3]) {
+        return { waitSeconds: scaleRateLimitDurationSeconds(value, durationMatch[3]) ?? 300 };
       }
-      return { waitSeconds: value };
+      return { waitSeconds: inferRateLimitWaitSeconds(value) };
     }
 
     // Try time-based patterns: "resets at 23:00", "resets 11pm", etc.
@@ -812,16 +822,18 @@ export class ClaudeProvider implements LLMProvider {
    *
    * Every session env additionally carries the daemon-session marker
    * (CONDUCT_DAEMON_SESSION=1): any Claude session spawned through this
-   * adapter is engine-managed, and the conduct-ts entry guard uses the
+   * adapter is engine-managed, and the ai-conductor entry guard uses the
    * marker to refuse recursive conductor invocations from inside it (see
    * daemon-session.ts). Boundary enforcement, same pattern as
    * enforceFreshSessionOptions — no config off-switch.
    */
   private buildEnv(options: InvokeOptions): NodeJS.ProcessEnv {
-    return withDaemonSessionMarker({
+    // tmux target variables are scrubbed last so neither the inherited env
+    // nor a self-host overlay can hand the child the daemon's own pane.
+    return scrubTmuxEnvironment(withDaemonSessionMarker({
       ...process.env,
       ...options.selfHost?.env,
       ...(options.effort ? { CLAUDE_CODE_EFFORT_LEVEL: options.effort } : {}),
-    });
+    }));
   }
 }
