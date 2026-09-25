@@ -176,6 +176,11 @@ jobs:
         working-directory: src/conductor
       - run: npm test -- --shard=${{ matrix.shard }}/4
         working-directory: src/conductor
+      # Selector-based npm test runs skip the separate node:test suite. Run
+      # the fork's Engineer lifecycle CLI coverage once across the four shards.
+      - if: matrix.shard == 1
+        run: npm run test:node
+        working-directory: src/conductor
 
   # DELIBERATELY UNGATED — no `if: docs_only != 'true'`.
   #
