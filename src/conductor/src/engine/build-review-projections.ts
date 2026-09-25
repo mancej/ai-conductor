@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import type { BuildReviewRubricId } from '../types/config.js';
 import type {
+  BuildReviewEffectiveResultDescriptor,
   BuildReviewInfrastructureFailure,
   BuildReviewLapId,
   BuildReviewScopeIncompleteFault,
@@ -9,6 +10,8 @@ import type {
 import type { BuildReviewReducedCoverageDispositionRecord } from './build-review-dispositions.js';
 import type { BuildReviewFrozenInputs, BuildReviewSourceSnapshot, BuildReviewUnresolvedMarker } from './build-review-inputs.js';
 import { getBuildReviewRubricDescriptor } from './build-review-registry.js';
+import type { ResolvedBuildReviewCatalogEntry } from './resolved-config.js';
+import { buildReviewScopeCandidateIdentityKey } from './build-review-scope-identity.js';
 import type {
   RevertedProductionFileReference,
   TestQualityPreflightEvidence,
@@ -111,16 +114,106 @@ export interface TestQualityProjection extends CommonProjection<'testQuality'> {
   readonly preflight: TestQualityPreflightEvidence;
 }
 
-export type BuildReviewRubricProjection = TestQualityProjection;
+/** Whole-diff, by-reference projection for the security review branch. */
+export interface SecurityProjection extends CommonProjection<'security'> {}
+
+export type BuildReviewRubricProjection = TestQualityProjection | SecurityProjection;
+
+/** Test-scope fields belong exclusively to the test-quality rubric. */
+export function isTestQualityProjection(
+  projection: BuildReviewRubricProjection,
+): projection is TestQualityProjection {
+  return projection.rubric === 'testQuality';
+}
+
+type JsonRecord = { readonly [key: string]: BuildReviewProjectionJson };
+const asRecord = (value: unknown): JsonRecord | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : undefined;
+const asArray = (value: unknown): readonly BuildReviewProjectionJson[] => Array.isArray(value) ? value : [];
+
+function scopeIdentity(sourceValue: unknown, regionValue: unknown): string | undefined {
+  const source = asRecord(sourceValue);
+  const region = asRecord(regionValue);
+  if (typeof source?.fileName !== 'string' || (source.side !== 'base' && source.side !== 'head') || !region) return undefined;
+  return buildReviewScopeCandidateIdentityKey({
+    source: { fileName: source.fileName, side: source.side },
+    region: { start: region.start as number, end: region.end as number },
+  });
+}
+
+/**
+ * The subset of a projection serialized into the provider prompt. The full
+ * projection still owns digests, cache identity, the oversize bound, and result
+ * validation. For testQuality, the prompt keeps only what a grader can act on:
+ * scope bookkeeping for declarations that bound to no candidate (unbound notes,
+ * the declaration inventory, non-candidate evidence, and legacy title chains)
+ * cannot anchor an accepted finding, but it is re-read on every provider turn.
+ * Security keeps its full projection because its anchors bind to hunk hashes.
+ */
+export function buildReviewRubricPromptView(projection: BuildReviewRubricProjection): BuildReviewRubricProjection | JsonRecord {
+  if (!isTestQualityProjection(projection)) return projection;
+  const scope = asRecord(projection.testScope) ?? {};
+  const candidateKeys = new Set<string>();
+  for (const candidate of asArray(scope.candidates).map(asRecord)) {
+    const declaration = asRecord(candidate?.declaration) ?? asRecord(candidate?.diagnostic);
+    const key = scopeIdentity(candidate?.source, declaration?.span);
+    if (key) candidateKeys.add(key);
+  }
+  const { changedTestTitles: _titles, ...rest } = projection;
+  return {
+    ...rest,
+    changedFiles: projection.changedFiles.map((file) => ({
+      path: file.path,
+      changeKind: file.changeKind,
+      ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
+      hunks: file.hunks.map(({ oldStart, oldCount, newStart, newCount }) => ({ oldStart, oldCount, newStart, newCount })),
+    })),
+    testScope: {
+      ...scope,
+      changedDeclarations: [],
+      notes: asArray(scope.notes).filter((note) => asRecord(note)?.kind !== 'unbound'),
+      evidence: asArray(scope.evidence).filter((entry) => {
+        const record = asRecord(entry);
+        const key = scopeIdentity(record?.source, record?.region);
+        return key !== undefined && candidateKeys.has(key);
+      }),
+    },
+  } as unknown as JsonRecord;
+}
 
 export type BuildReviewRubricProjections = {
   readonly testQuality: TestQualityProjection;
+  readonly security: SecurityProjection;
 };
+
+/**
+ * Bind parser choice to one already-resolved effective catalog member.  This
+ * intentionally does not consult the built-in registry or an enabled map:
+ * custom policy ids are dynamic while built-ins retain their bespoke parser.
+ */
+export function buildReviewEffectiveResultDescriptor(
+  entry: ResolvedBuildReviewCatalogEntry,
+): BuildReviewEffectiveResultDescriptor {
+  if (entry.kind !== 'builtin') return Object.freeze({ kind: 'custom', rubric: entry.id, parser: 'custom-findings-v1' });
+  // Each built-in carries its own catalog id and parser tag; never relabel one as another.
+  return entry.id === 'security'
+    ? Object.freeze({ kind: 'builtin', rubric: 'security', parser: 'security-v3' })
+    : Object.freeze({ kind: 'builtin', rubric: 'testQuality', parser: 'test-quality-v3' });
+}
+
+/** Parse a reviewer response using the parser bound by the effective member. */
+export { parseBuildReviewReviewerPayload } from './build-review-domain.js';
+/** Custom result stamping stays adjacent to effective parser selection. */
+export {
+  stampBuildReviewCustomJudgedResult,
+  type BuildReviewCustomJudgedResult,
+  type BuildReviewCustomResultStamp,
+} from './build-review-finding-identity.js';
 
 /** One current-lap reduced-coverage stamp, shared by every reader-facing surface. */
 export interface BuildReviewReducedCoverageEntry {
-  readonly rubric: BuildReviewRubricId;
-  readonly cause: BuildReviewInfrastructureFailure['reason'] | BuildReviewScopeIncompleteFault['reason'];
+  readonly rubric: string;
+  readonly cause: BuildReviewInfrastructureFailure['reason'] | BuildReviewScopeIncompleteFault['reason'] | import('./build-review-artifacts.js').BuildReviewCustomInfrastructureFailureReason;
   readonly diagnostic: string;
   readonly operator: string;
   readonly rationale: string;
@@ -132,7 +225,12 @@ export type BuildReviewReducedCoverageEvidenceInput =
   | {
       readonly state: 'known';
       readonly records: readonly BuildReviewReducedCoverageDispositionRecord[];
-      readonly currentFailures: readonly (BuildReviewInfrastructureFailure | BuildReviewScopeIncompleteFault)[];
+      readonly currentFailures: readonly (BuildReviewInfrastructureFailure | BuildReviewScopeIncompleteFault | {
+        readonly rubric: string;
+        readonly reason: import('./build-review-artifacts.js').BuildReviewCustomInfrastructureFailureReason;
+        readonly detail: string;
+        readonly declaration: import('./build-review-artifacts.js').BuildReviewCustomDeclaration;
+      })[];
     };
 
 export type BuildReviewReducedCoverageEvidenceRenderResult =
@@ -165,7 +263,10 @@ export function renderBuildReviewReducedCoverageEvidence(
   const entries: BuildReviewReducedCoverageEntry[] = [];
   for (const failure of input.currentFailures) {
     const decision = input.records.find((record) =>
-      record.identity.rubric === failure.rubric && record.identity.reason === failure.reason,
+      record.identity.reason === failure.reason &&
+      ('declaration' in failure
+        ? JSON.stringify(record.identity.declaration) === JSON.stringify(failure.declaration)
+        : record.identity.rubric === failure.rubric),
     );
     if (!decision) continue;
     if (failure.detail.trim().length === 0) {
@@ -349,12 +450,12 @@ export function deriveChangedFileReferences(diff: string): readonly ChangedFileR
 }
 
 function common<Rubric extends BuildReviewRubricId>(source: BuildReviewProjectionSource, rubric: Rubric): Omit<CommonProjection<Rubric>, 'digest'> {
-  const descriptor = getBuildReviewRubricDescriptor('testQuality');
+  const descriptor = getBuildReviewRubricDescriptor(rubric);
   const snapshot = source.inputs.sourceSnapshot;
   return {
     rubric,
-    contractVersion: descriptor.contractVersion,
-    projectionVersion: descriptor.projectionVersion,
+    contractVersion: descriptor.contract.output.version as 'v3',
+    projectionVersion: descriptor.contract.projection.version as 'v3',
     lapId: source.lapId,
     snapshotDigest: snapshot.digest,
     contentDigest: snapshot.contentDigest,
@@ -392,5 +493,6 @@ export function deriveBuildReviewRubricProjections(source: BuildReviewProjection
     ) as unknown as readonly RevertedProductionFileReference[],
     preflight: source.testQuality.preflight,
   }) as TestQualityProjection;
-  return Object.freeze({ testQuality });
+  const security = seal(common(source, 'security')) as SecurityProjection;
+  return Object.freeze({ testQuality, security });
 }

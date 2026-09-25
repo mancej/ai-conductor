@@ -72,10 +72,15 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   engineer_run_settled: 'not-audited-by-design',
   engineer_worktree_retired: 'not-audited-by-design',
   daemon_backlog_snapshot: 'not-audited-by-design',
+  daemon_memory_sample: 'not-audited-by-design',
+  daemon_heap_dump_written: 'not-audited-by-design',
+  daemon_exited: 'not-audited-by-design',
   feature_dispatch_started: 'not-audited-by-design',
   feature_dispatch_ended: 'not-audited-by-design',
   feature_shipped: 'not-audited-by-design',
   intake_inbound_sanitized: 'not-audited-by-design',
+  // Command rejection telemetry is persisted but has no audit-trail projection.
+  land_gate_rejected: 'not-audited-by-design',
   project_setup: 'not-audited-by-design',
   memory_setup: 'not-audited-by-design',
   setup_repair: 'not-audited-by-design',
@@ -83,12 +88,16 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   coverage_binding_disabled: 'not-audited-by-design',
   config_deprecated_key: 'not-audited-by-design',
   contained_live_checkout_drift: 'not-audited-by-design',
+  self_host_dispatch_admission: 'not-audited-by-design',
   self_host_containment_verdict: 'not-audited-by-design',
+  self_host_boundary_fingerprint: 'not-audited-by-design',
   build_review_rubric_started: 'not-audited-by-design',
+  build_review_policy_resolved: 'friction-mapped',
+  build_review_policy_failed: 'friction-mapped',
   build_review_rubric_prompt: 'not-audited-by-design',
   build_review_rubric_result: 'not-audited-by-design',
   build_review_rubric_skipped: 'not-audited-by-design',
-  build_review_cache_hit: 'not-audited-by-design',
+  build_review_cache_hit: 'friction-mapped',
   build_review_scope_summary: 'not-audited-by-design',
   build_review_cache_discarded: 'friction-mapped',
   build_review_rubric_infrastructure_failure: 'not-audited-by-design',
@@ -104,6 +113,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   remediation_adjudication_failed: 'not-audited-by-design',
   remediation_case_reconciled: 'not-audited-by-design',
   remediation_case_refuted: 'friction-mapped',
+  prd_widening_reconciled: 'not-audited-by-design',
   remediation_effect_reserved: 'not-audited-by-design',
   remediation_effect_applied: 'not-audited-by-design',
   remediation_effect_failed: 'not-audited-by-design',
@@ -112,16 +122,23 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   step_started: 'not-audited-by-design',
   step_completed: 'friction-mapped', // positive evidence (gate_pass) when no verdict already recorded
   step_failed: 'not-audited-by-design', // superseded by step_retry / gate_verdict on the same step
+  step_interrupted: 'not-audited-by-design', // catchable shutdown has no independent friction record
   // adr-2026-08-24 D3 declares the refusal audited at introduction, and its
   // sink registry entry carries `audit: true` — the declaration and the writer
   // must agree.
   step_refused: 'friction-mapped',
   step_status_write_refused: 'friction-mapped',
+  // Ownership refusals remain durable in the event ledger and terminal, but
+  // are deliberately outside the audit-trail friction vocabulary.
+  github_operation_refused: 'not-audited-by-design',
   provider_attempt: 'not-audited-by-design',
   provider_stream_progress: 'not-audited-by-design',
   scratch_cleanup_reclaimed: 'not-audited-by-design',
   scratch_cleanup_retained: 'not-audited-by-design',
   scratch_cleanup_failed: 'not-audited-by-design',
+  worktree_reclaim_reclaimed: 'not-audited-by-design',
+  worktree_reclaim_retained: 'not-audited-by-design',
+  worktree_reclaim_failed: 'not-audited-by-design',
   // Whole-feature cost telemetry: durable in events.jsonl, but it describes no
   // friction — it is a summation of dispatches already mapped elsewhere.
   feature_usage_total: 'not-audited-by-design',
@@ -190,7 +207,10 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   rebase_gate_preserved: 'not-audited-by-design',
   rebase_gate_invalidated: 'not-audited-by-design',
   rebase_conflict_halt: 'not-audited-by-design',
+  rebase_untracked_quarantined: 'not-audited-by-design',
+  repair_boundary_translated: 'not-audited-by-design',
   rebase_citation_residue: 'not-audited-by-design',
+  rebase_supersession_verdict: 'not-audited-by-design',
   rebase_resolution_attempt: 'not-audited-by-design',
   rebase_resolution_succeeded: 'not-audited-by-design',
   rebase_resolution_failed: 'not-audited-by-design',
@@ -208,6 +228,7 @@ const EVENT_TYPE_CLASSIFICATION: Record<
   operator_rewind: 'friction-mapped',
   plan_growth: 'not-audited-by-design',
   ci_failed: 'not-audited-by-design',
+  ci_repair_diagnostic: 'not-audited-by-design',
   attribution_divergence: 'not-audited-by-design',
   acceptance_red: 'not-audited-by-design',
 };
@@ -300,14 +321,35 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     blocked: { paused: false, build_auth_missing: false, gh_version: false, episode_active: false },
     pollDurationMs: 1,
   },
+  daemon_memory_sample: {
+    type: 'daemon_memory_sample', rss: 1, heapUsed: 1, heapTotal: 1, external: 1,
+    slug: 'feature', step: 'build', boundary: 'started', pid: 1, dispatchSeq: 1,
+  },
+  daemon_heap_dump_written: {
+    type: 'daemon_heap_dump_written', path: '/tmp/heap.heapsnapshot', bytes: 1, rss: 1, pid: 1,
+  },
+  daemon_exited: {
+    type: 'daemon_exited', pid: 1, code: 0, signal: null, at: '2026-09-23T00:00:00.000Z',
+  },
   feature_dispatch_started: { type: 'feature_dispatch_started', slug: 'feature', kind: 'initial' },
   feature_dispatch_ended: { type: 'feature_dispatch_ended', slug: 'feature', outcome: 'complete' },
   feature_shipped: { type: 'feature_shipped', slug: 'feature', active: { state: 'unavailable' } },
+  ci_repair_diagnostic: {
+    type: 'ci_repair_diagnostic', prUrl: 'https://github.com/acme/widget/pull/1', slug: 'widget',
+    stage: 'execution', reason: 'unknown', disposition: 'failed', provider: 'codex',
+  },
   intake_inbound_sanitized: {
     type: 'intake_inbound_sanitized',
     sourceRef: 'owner/repo#12',
     neutralizations: [{ category: 'agent-directive', count: 1 }],
     digest: 'a'.repeat(64),
+  },
+  land_gate_rejected: {
+    type: 'land_gate_rejected',
+    gate: 'stories-not-approved',
+    reason: 'stories artifact is not approved',
+    project: 'alpha',
+    worktreePath: '/tmp/alpha-worktree',
   },
   project_setup: { type: 'project_setup', ran: false, reason: 'marker-valid' },
   memory_setup: { type: 'memory_setup', before: 'absent', canonical: true },
@@ -335,10 +377,15 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     attribution: 'concurrent-operator',
     summary: '1 added, 0 removed, 0 changed: added operator-edit.txt',
   },
+  self_host_dispatch_admission: { type: 'self_host_dispatch_admission', step: 'build', state: 'queued' },
   self_host_containment_verdict: {
     type: 'self_host_containment_verdict',
     contained: true,
     evidence: 'live root read-only; worktree writable',
+  },
+  self_host_boundary_fingerprint: {
+    type: 'self_host_boundary_fingerprint',
+    surfaces: [{ label: 'live checkout', elapsedMs: 1, fileCount: 1 }],
   },
   containment_check_unresolved: {
     type: 'containment_check_unresolved',
@@ -347,6 +394,15 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     ts: 1755300000000,
   },
   build_review_rubric_started: { type: 'build_review_rubric_started', rubric: 'scope', lapId: 'lap-1' },
+  build_review_policy_resolved: {
+    type: 'build_review_policy_resolved', rubric: 'portable', lapId: 'lap-1', provider: 'codex', source: 'plugin',
+    pluginId: 'portable-suite', bundleDigest: `sha256:${'a'.repeat(64)}`,
+    provenance: { inputDigest: `sha256:${'b'.repeat(64)}`, candidate: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'medium' }, plugin: { id: 'portable-suite', version: '1.0.0' } },
+  },
+  build_review_policy_failed: {
+    type: 'build_review_policy_failed', rubric: 'portable', lapId: 'lap-1', provider: 'codex', stage: 'capture', reason: 'criteria bundle unavailable',
+    provenance: { inputDigest: `sha256:${'b'.repeat(64)}`, candidate: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'medium' } },
+  },
   build_review_rubric_prompt: { type: 'build_review_rubric_prompt', rubric: 'scope', lapId: 'lap-1', promptBytes: 4096 },
   build_review_rubric_result: { type: 'build_review_rubric_result', rubric: 'scope', lapId: 'lap-1', verdict: 'FAIL' },
   build_review_rubric_skipped: { type: 'build_review_rubric_skipped', rubric: 'scope', lapId: 'lap-1', reason: 'disabled' },
@@ -366,6 +422,7 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
   remediation_adjudication_failed: { type: 'remediation_adjudication_failed', domain: 'build_review', lapId: 'lap-1', reason: 'invalid-result' },
   remediation_case_reconciled: { type: 'remediation_case_reconciled', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', resolution: 'open' },
   remediation_case_refuted: { type: 'remediation_case_refuted', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1' },
+  prd_widening_reconciled: { type: 'prd_widening_reconciled', sourceId: 'source-1', caseId: 'case-1', outcome: 'same-case' },
   remediation_effect_reserved: { type: 'remediation_effect_reserved', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', effectKind: 'action' },
   remediation_effect_applied: { type: 'remediation_effect_applied', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', effectKind: 'action' },
   remediation_effect_failed: { type: 'remediation_effect_failed', domain: 'build_review', lapId: 'lap-1', caseId: 'case-1', effectId: 'effect-1', effectKind: 'action', reason: 'intake-unavailable' },
@@ -374,6 +431,7 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
   step_started: { type: 'step_started', step: 'build', index: 0 },
   step_completed: { type: 'step_completed', step: 'build', status: 'done' },
   step_failed: { type: 'step_failed', step: 'build', error: 'boom', retryCount: 1 },
+  step_interrupted: { type: 'step_interrupted', step: 'build', reason: 'controlled shutdown' },
   step_refused: {
     type: 'step_refused',
     step: 'build',
@@ -386,6 +444,14 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     expected: 'skipped',
     requested: 'stale',
     intent: 'restage ship tail after build kickback',
+  },
+  github_operation_refused: {
+    type: 'github_operation_refused',
+    operator: 'operator',
+    target: { repository: 'acme/repo', kind: 'issue', number: 1 },
+    operation: 'issue.comment.create',
+    reason: 'other-owner',
+    remedy: 'ask-resource-owner',
   },
   provider_attempt: {
     type: 'provider_attempt',
@@ -430,6 +496,24 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     attempt: 1,
     path: '/worktree/.daemon/scratch/R/1-codex',
     reason: 'removal blocked',
+  },
+  worktree_reclaim_reclaimed: {
+    type: 'worktree_reclaim_reclaimed',
+    slug: 'reclaimed-worktree',
+    branch: 'hotfix/reclaimed-worktree',
+    proof: 'ancestry',
+  },
+  worktree_reclaim_retained: {
+    type: 'worktree_reclaim_retained',
+    slug: 'retained-worktree',
+    branch: 'hotfix/retained-worktree',
+    reason: 'in-flight',
+  },
+  worktree_reclaim_failed: {
+    type: 'worktree_reclaim_failed',
+    slug: 'failed-worktree',
+    branch: 'hotfix/failed-worktree',
+    refusal: 'worktree-remove-failed',
   },
   feature_usage_total: {
     type: 'feature_usage_total',
@@ -674,9 +758,26 @@ const EVENT_FIXTURES: { [K in ConductorEvent['type']]: Extract<ConductorEvent, {
     matchedPaths: ['src/a.ts'],
   },
   rebase_conflict_halt: { type: 'rebase_conflict_halt', reason: 'conflict', conflicts: ['a.ts'] },
+  rebase_untracked_quarantined: {
+    type: 'rebase_untracked_quarantined',
+    paths: ['generated.txt'],
+    directory: '.pipeline/rebase-untracked-quarantine',
+  },
+  repair_boundary_translated: {
+    type: 'repair_boundary_translated',
+    obligationId: 'repair-1',
+    from: 'pre-rebase-sha',
+    to: 'post-rebase-sha',
+    rule: 'direct',
+    projectRoot: '/workspace/project',
+  },
   rebase_citation_residue: {
     type: 'rebase_citation_residue',
-    residue: [{ sha: 'abc123', citingTaskIds: ['1'], reason: 'no patch-id match' }],
+    residue: [{ sha: 'abc123', citingTaskIds: ['1'], citingObligationIds: [], reason: 'no patch-id match' }],
+  },
+  rebase_supersession_verdict: {
+    type: 'rebase_supersession_verdict', choice: 'superseded', rationale: 'covered upstream', superseded: ['abc123'],
+    verification: { command: 'npm test', exitCode: 0 },
   },
   rebase_resolution_attempt: { type: 'rebase_resolution_attempt', index: 1, cap: 3 },
   rebase_resolution_succeeded: { type: 'rebase_resolution_succeeded' },
@@ -918,9 +1019,11 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
     // re-enter events.jsonl when the closeout tail re-emits them.
     const buildReviewSinkExpectations = {
       build_review_rubric_started: { render: true, persist: true, audit: false, otel: false },
+      build_review_policy_resolved: { render: true, persist: true, audit: true, otel: false },
+      build_review_policy_failed: { render: true, persist: true, audit: true, otel: false },
       build_review_rubric_result: { render: true, persist: true, audit: false, otel: false },
       build_review_rubric_skipped: { render: true, persist: true, audit: false, otel: false },
-      build_review_cache_hit: { render: true, persist: true, audit: false, otel: false },
+      build_review_cache_hit: { render: true, persist: true, audit: true, otel: false },
       build_review_scope_summary: { render: false, persist: true, audit: false, otel: false },
       build_review_rubric_infrastructure_failure: { render: true, persist: true, audit: false, otel: false },
       build_review_scope_incomplete: { render: true, persist: true, audit: false, otel: false },
@@ -967,7 +1070,16 @@ describe('Acceptance: audit-trail completeness — executed steps leave positive
       'build_review_reduced_coverage_accepted',
       'build_review_disposition_refused',
     ]));
-    expect(auditedEventTypes()).not.toEqual(expect.arrayContaining(Object.keys(buildReviewSinkExpectations)));
+    expect(auditedEventTypes()).toEqual(expect.arrayContaining([
+      'build_review_policy_resolved',
+      'build_review_policy_failed',
+      'build_review_cache_hit',
+    ]));
+    expect(auditedEventTypes()).not.toEqual(expect.arrayContaining(
+      Object.entries(buildReviewSinkExpectations)
+        .filter(([, sinks]) => !sinks.audit)
+        .map(([type]) => type),
+    ));
   });
 
   it('a UI-only event with no writer mapping produces no record and no error (allowlist, not a catch-all)', async () => {

@@ -2,11 +2,11 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { ExportResultCode } from '@opentelemetry/core';
 import { OTLPTraceExporter as OTLPHttpTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { OTLPMetricExporter as OTLPHttpMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
+import { OTLPMetricExporter as OTLPHttpMetricExporter, AggregationTemporalityPreference, LowMemoryTemporalitySelector } from '@opentelemetry/exporter-metrics-otlp-http';
 import { OTLPTraceExporter as OTLPGrpcTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
 import { OTLPMetricExporter as OTLPGrpcMetricExporter } from '@opentelemetry/exporter-metrics-otlp-grpc';
 import type { SpanExporter, ReadableSpan } from '@opentelemetry/sdk-trace-base';
-import type { PushMetricExporter, ResourceMetrics } from '@opentelemetry/sdk-metrics';
+import type { AggregationTemporality, InstrumentType, PushMetricExporter, ResourceMetrics } from '@opentelemetry/sdk-metrics';
 import { JsonTraceSerializer, JsonMetricsSerializer } from '@opentelemetry/otlp-transformer';
 import type { ResolvedOtelConfig } from './otel-config.js';
 
@@ -14,6 +14,24 @@ export interface Exporters {
   spanExporter: SpanExporter;
   metricExporter: PushMetricExporter;
 }
+
+/**
+ * Delta temporality for OTLP metrics. Backends that diff consecutive cumulative
+ * points (Datadog) need two points per series to emit a histogram sketch; the
+ * per-feature meter flushes once and exits, so its cumulative histograms
+ * (`conductor.step.duration`) never produced a distribution. Delta carries the
+ * interval's buckets in every point. Prometheus OTLP ingest drops delta unless
+ * started with `--enable-feature=otlp-deltatocumulative`.
+ *
+ * LOWMEMORY, not DELTA: counters and histograms stay delta, gauges stay
+ * cumulative. A delta gauge exports only in intervals where it was recorded,
+ * so a daemon gauge set from the poll loop vanished from Prometheus (5m
+ * staleness) whenever a long step held the loop. OTLP gauges carry no
+ * temporality on the wire, so Datadog maps them identically either way.
+ * LOWMEMORY also exports UpDownCounter and observable instruments cumulative,
+ * which Datadog's direct OTLP intake rejects; revisit before adding one.
+ */
+const METRIC_TEMPORALITY = AggregationTemporalityPreference.LOWMEMORY;
 
 /** Build the HTTP/protobuf exporter options for one OTLP signal. */
 export function buildHttpExporterOptions(
@@ -43,13 +61,13 @@ export function buildExporters(
     if (config.protocol === 'grpc') {
       return {
         spanExporter: new OTLPGrpcTraceExporter({ url }),
-        metricExporter: new OTLPGrpcMetricExporter({ url }),
+        metricExporter: new OTLPGrpcMetricExporter({ url, temporalityPreference: METRIC_TEMPORALITY }),
       };
     }
     // Default: HTTP/protobuf (port 4318)
     return {
       spanExporter: new OTLPHttpTraceExporter(buildHttpExporterOptions(config, 'traces')),
-      metricExporter: new OTLPHttpMetricExporter(buildHttpExporterOptions(config, 'metrics')),
+      metricExporter: new OTLPHttpMetricExporter({ ...buildHttpExporterOptions(config, 'metrics'), temporalityPreference: METRIC_TEMPORALITY }),
     };
   }
 
@@ -123,6 +141,11 @@ class FileMetricExporter implements PushMetricExporter {
   private dirEnsured = false;
 
   constructor(private readonly filePath: string) {}
+
+  /** Same temporality as the OTLP exporters (LOWMEMORY). */
+  selectAggregationTemporality(instrumentType: InstrumentType): AggregationTemporality {
+    return LowMemoryTemporalitySelector(instrumentType);
+  }
 
   export(
     metrics: ResourceMetrics,

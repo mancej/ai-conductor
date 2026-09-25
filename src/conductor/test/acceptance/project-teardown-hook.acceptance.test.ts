@@ -318,11 +318,21 @@ describe('project teardown hook — real removal entry points', () => {
     const record = join(root, 'reconcile-record.txt');
     const logs: string[] = [];
     await mkdir(worktree, { recursive: true });
+    // The reconciliation guard deliberately fails closed when porcelain
+    // cannot inspect the candidate.  Keep this unregistered-directory
+    // fallback fixture clean and inspectable: it remains unregistered by the
+    // parent repo, so `git worktree remove` still takes the directory-removal
+    // fallback that this test covers.
+    await execFile('git', ['init', '-q', '-b', 'main'], { cwd: worktree });
     await writeFile(join(worktree, 'witness.txt'), 'still-readable\n', 'utf8');
     await installTeardown(
       worktree,
       `test -r witness.txt\nprintf 'invoked\\n' >> ${JSON.stringify(record)}\nprintf 'reconcile-failure-marker\\n' >&2\nexit 17`,
     );
+    await execFile('git', ['config', 'user.email', 'test@example.com'], { cwd: worktree });
+    await execFile('git', ['config', 'user.name', 'Test'], { cwd: worktree });
+    await execFile('git', ['add', '-A'], { cwd: worktree });
+    await execFile('git', ['commit', '-q', '-m', 'fixture'], { cwd: worktree });
 
     const outcome = await reconcileMergedPark({
       projectRoot: root,
@@ -332,7 +342,7 @@ describe('project teardown hook — real removal entry points', () => {
     });
 
     expect({ outcome, record: await recorded(record), worktreeExists: await exists(worktree) }).toEqual({
-      outcome: { slug, steps: ['worktree-removed', 'branch-absent', 'unparked'] },
+      outcome: { slug, steps: ['worktree-removed', 'branch-absent'] },
       record: 'invoked\n',
       worktreeExists: false,
     });
@@ -355,10 +365,15 @@ describe('project teardown hook — real removal entry points', () => {
     const record = join(root, 'reconcile-timeout-record.txt');
     const logs: string[] = [];
     await mkdir(worktree, { recursive: true });
+    await execFile('git', ['init', '-q', '-b', 'main'], { cwd: worktree });
     await installTeardown(
       worktree,
       `sleep 0.25\nprintf 'completed-after-timeout\\n' >> ${JSON.stringify(record)}`,
     );
+    await execFile('git', ['config', 'user.email', 'test@example.com'], { cwd: worktree });
+    await execFile('git', ['config', 'user.name', 'Test'], { cwd: worktree });
+    await execFile('git', ['add', '-A'], { cwd: worktree });
+    await execFile('git', ['commit', '-q', '-m', 'fixture'], { cwd: worktree });
 
     const outcome = await reconcileMergedPark({
       projectRoot: root,
@@ -373,7 +388,7 @@ describe('project teardown hook — real removal entry points', () => {
       timeout: logs.some((line) => line.startsWith(`teardown: timed out in ${worktree} after 0.1 second(s):`)),
       worktreeExists: await exists(worktree),
     }).toEqual({
-      outcome: { slug, steps: ['worktree-removed', 'branch-absent', 'unparked'] },
+      outcome: { slug, steps: ['worktree-removed', 'branch-absent'] },
       record: '',
       timeout: true,
       worktreeExists: false,

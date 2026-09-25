@@ -76,6 +76,8 @@ Every field that survives into the identity hash is either a **closed vocabulary
 | rootCause | `anchor.relation` | `anchor.locus` |
 | completeness | `anchor.missingKind` | `anchor.planTask`, plus a missing-surface reference |
 
+> **Amended 2026-09-14 by #2034:** the table gains the row **security** — closed vocabulary `concernKind` over exactly `committed-secret`, `injection`, `broken-access-control`, `path-traversal`, `unsafe-deserialization`, `cryptographic-failure`, `security-misconfiguration`, `authentication-failure`, `integrity-failure`, `ssrf`; verified reference `anchor.locus` (content-region). The set is the five classes named in jstoup111/ai-conductor#2034 plus the OWASP Top 10 (2021) categories that a diff can concretely evidence; A04 Insecure Design, A06 Vulnerable and Outdated Components, and A09 Logging and Monitoring Failures are deliberately excluded because they are judged from architecture, dependency inventories, or runtime configuration rather than from changed hunks, and grading them from a diff is the false-positive shape #2034 rules out. There is no `other` member, and D5 binds the skill text to the engine set through the existing integrity check.
+
 The residual free-text subjects — `tautology.exercisedBehavior`, `rootCause.statedDefect`,
 `completeness.missingOutcome` — leave the **identity** and remain on the finding for the human
 report, joining `summary` and `evidenceLocations`, which `adr-2026-08-13` already excludes
@@ -204,6 +206,24 @@ silently dropped. It rides the existing spine as an additive `ConductorEvent` va
 `build_review_disposition_accepted` and `build_review_disposition_refused`
 (`types/events.ts:152-153`), declared in `EVENT_SINKS` with `audit: true` per
 `adr-2026-08-09-reseal-audit-rides-the-existing-event-spine`. No sidecar, no bespoke log line.
+
+> **Amended 2026-09-22 by #2384:** D3 said the vocabulary is embedded in the schema template the
+> engine sends every grader, and D5 said the closed sets live in the engine and that each SKILL.md
+> result contract enumerates its rubric's members, bound to the engine set by an integrity check in
+> both directions. The result-contract blocks are removed from the skills under
+> adr-2026-08-19-engine-stamped-rubric-judged-result-envelope D10.1; this amendment says where the
+> binding moves.
+>
+> **D5.1 — The closed set is a JSON Schema enum on the rubric contract descriptor.** Each member's
+> `concernKind` vocabulary (and any other closed set that survives into identity) is expressed as an
+> `enum` in the descriptor's output JSON Schema, which is what the provider enforces natively and
+> what the engine's parser and rejection diagnosis are rendered from. A SKILL.md still names every
+> member of its rubric's vocabulary, as the judgement definition of that kind — what it means and
+> what is not a finding of it — not as a result-format enumeration. The integrity check binds the
+> descriptor enum to the set of kinds the SKILL.md defines, in both directions: a kind the schema
+> admits that the skill does not define, or a kind the skill defines that the schema does not admit,
+> fails the check. D3's rerun-never-burns-a-lap rule and the absence of an `other` member are
+> unchanged.
 
 ## Options Considered
 

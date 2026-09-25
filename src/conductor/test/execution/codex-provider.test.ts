@@ -1,7 +1,8 @@
 // Covers: task:4
+// Covers: task:5
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -23,6 +24,13 @@ import {
   wrapForContainment,
 } from '../../src/engine/self-host/live-containment.js';
 import { classifyMetering } from '../../src/engine/metering.js';
+import { executeAuxiliaryProviderCandidates } from '../../src/engine/provider-execution.js';
+import { ProviderRuntimeSet } from '../../src/engine/provider-runtime.js';
+import { ProviderSessionScope } from '../../src/engine/provider-session.js';
+import { CODEX_MODEL_POLICY } from '../../src/engine/provider-model-policy.js';
+import { ModelAvailability } from '../../src/engine/model-availability.js';
+import { BUILD_REVIEW_RUBRIC_REGISTRY } from '../../src/engine/build-review-registry.js';
+import type { ResolvedBuildReviewRubricPolicy } from '../../src/engine/resolved-config.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -47,7 +55,8 @@ const { mockValidateSpawnPermit } = vi.hoisted(() => ({
   mockValidateSpawnPermit: vi.fn((permit, purpose) =>
     permit?.(purpose) ?? { permitted: true as const }),
 }));
-vi.mock('../../src/engine/provider-runtime.js', () => ({
+vi.mock('../../src/engine/provider-runtime.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/engine/provider-runtime.js')>(),
   validateSpawnPermit: mockValidateSpawnPermit,
 }));
 
@@ -86,6 +95,30 @@ function readyDoctorResult(source: 'api-key' | 'cached-login' = 'cached-login') 
     }),
     exitCode: 0,
   };
+}
+
+const codexRubricPolicy: ResolvedBuildReviewRubricPolicy = {
+  enabled: true,
+  max_projection_bytes: 1_048_576,
+  llm_provider: 'codex',
+  model: 'gpt-5.6-sol',
+  effort: 'high',
+  model_fallback_ladder: ['gpt-5.6-sol'],
+  max_retries: 1,
+  escalate: false,
+  min_confidence: 0,
+};
+
+function codexRuntime(provider: CodexProvider): ProviderRuntimeSet {
+  return new ProviderRuntimeSet([{
+    key: 'codex',
+    provider,
+    lifecycleCapability: provider.lifecycleCapability,
+    nativeSchemaCapability: provider.nativeSchemaCapability,
+    policy: CODEX_MODEL_POLICY,
+    builtIn: true,
+    availability: new ModelAvailability(CODEX_MODEL_POLICY.modelFallbackLadder),
+  }]);
 }
 
 describe('CodexProvider', () => {
@@ -224,6 +257,259 @@ describe('CodexProvider', () => {
       expect.arrayContaining(['--config', 'project_doc_max_bytes=0', 'exec', '--json']),
       expect.anything(),
     );
+  });
+
+  it('writes a requested native schema inside the owned Codex scratch home and reads only the final agent response', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-native-schema-worktree-'));
+    const home = join(worktree, '.daemon', 'scratch', 'run-16', '1-codex', 'self-host-codex-home');
+    const nativeSchema = { type: 'object', required: ['relationship'] };
+    let schemaPath: string | undefined;
+    let schemaContents: string | undefined;
+    const teardown = async () => { await rm(join(worktree, '.daemon'), { recursive: true, force: true }); };
+    await mkdir(home, { recursive: true });
+    mockExeca.mockImplementation(async (_file, args) => {
+      const index = args.indexOf('--output-schema');
+      schemaPath = index === -1 ? undefined : args[index + 1];
+      schemaContents = schemaPath === undefined ? undefined : await readFile(schemaPath, 'utf8');
+      return {
+        stdout: [
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ordinary progress' }, structured_output: { poisoned: true } }),
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"relationship":"same-case"}' } }),
+          JSON.stringify({ type: 'turn.completed' }),
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      } as any;
+    });
+
+    try {
+      const result = await provider.invoke({
+        ...baseOptions,
+        interactive: false,
+        cwd: worktree,
+        nativeSchema,
+        selfHost: {
+          executable: '/isolated/bin/codex',
+          env: { CODEX_HOME: home },
+          args: [],
+          teardown,
+        },
+      });
+
+      expect(schemaPath).toBe(join(home, 'output-schema.json'));
+      expect(JSON.parse(schemaContents!)).toEqual(nativeSchema);
+      expect(result).toMatchObject({
+        success: true,
+        output: '{"relationship":"same-case"}',
+        finalStructuredResult: { relationship: 'same-case' },
+      });
+      await teardown();
+      await expect(readFile(schemaPath!, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('passes the security descriptor schema through provider execution, then removes its Codex scratch home', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-security-schema-execution-'));
+    const nativeSchema = BUILD_REVIEW_RUBRIC_REGISTRY.security.contract.output.jsonSchema;
+    let schemaPath: string | undefined;
+    let schemaContents: string | undefined;
+    mockExeca.mockImplementation(async (_file, args) => {
+      const index = args.indexOf('--output-schema');
+      schemaPath = index === -1 ? undefined : args[index + 1];
+      schemaContents = schemaPath === undefined ? undefined : await readFile(schemaPath, 'utf8');
+      return {
+        stdout: [
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"findings":[]}' } }),
+          JSON.stringify({ type: 'turn.completed' }),
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      } as any;
+    });
+
+    try {
+      const result = await executeAuxiliaryProviderCandidates({
+        step: 'build_review',
+        memberId: 'security',
+        policy: codexRubricPolicy,
+        runtimes: codexRuntime(provider),
+        sessions: new ProviderSessionScope(vi.fn()),
+        runId: 'security-schema-run',
+        nativeSchemaScratch: { worktreeRoot: worktree, repository: 'acme/repo', featureSlug: 'feature' },
+        options: { prompt: 'Judge the security rubric.', cwd: worktree, nativeSchema },
+      });
+
+      expect(schemaPath).toBe(join(worktree, '.daemon', 'scratch', 'security-schema-run', '1-codex', 'output-schema.json'));
+      expect(JSON.parse(schemaContents!)).toEqual(nativeSchema);
+      expect(result).toMatchObject({ success: true, output: '{"findings":[]}', finalStructuredResult: { findings: [] } });
+      await expect(access(join(worktree, '.daemon', 'scratch', 'security-schema-run', '1-codex'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('fails a schema-constrained Codex stream without a terminal structured item but retains its transcript', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-security-missing-structured-'));
+    mockExeca.mockResolvedValue({
+      stdout: [
+        JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'I inspected the diff.' } }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } as any);
+
+    try {
+      const result = await executeAuxiliaryProviderCandidates({
+        step: 'build_review', memberId: 'security', policy: codexRubricPolicy,
+        runtimes: codexRuntime(provider), sessions: new ProviderSessionScope(vi.fn()),
+        runId: 'missing-structured-run',
+        nativeSchemaScratch: { worktreeRoot: worktree, repository: 'acme/repo', featureSlug: 'feature' },
+        options: { prompt: 'Judge the security rubric.', cwd: worktree, nativeSchema: BUILD_REVIEW_RUBRIC_REGISTRY.security.contract.output.jsonSchema },
+      });
+
+      expect(result).toMatchObject({ success: false, output: expect.stringContaining('missing its structured result'), structuredResultFailure: 'malformed' });
+      expect(result.output).toContain('I inspected the diff.');
+      expect(result.finalStructuredResult).toBeUndefined();
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('settles a native-schema scratch-home creation failure without writing outside the invocation scratch', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-security-scratch-failure-'));
+    const blockedRoot = join(worktree, 'not-a-directory');
+    await writeFile(blockedRoot, 'blocked', 'utf8');
+
+    try {
+      const result = await executeAuxiliaryProviderCandidates({
+        step: 'build_review', memberId: 'security', policy: codexRubricPolicy,
+        runtimes: codexRuntime(provider), sessions: new ProviderSessionScope(vi.fn()),
+        runId: 'scratch-failure-run',
+        nativeSchemaScratch: { worktreeRoot: blockedRoot, repository: 'acme/repo', featureSlug: 'feature' },
+        options: { prompt: 'Judge the security rubric.', cwd: worktree, nativeSchema: BUILD_REVIEW_RUBRIC_REGISTRY.security.contract.output.jsonSchema },
+      });
+
+      expect(result).toMatchObject({ success: false, output: expect.stringContaining('native schema scratch home failed') });
+      expect(mockExeca).not.toHaveBeenCalled();
+      await expect(access(join(worktree, 'output-schema.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: 'a timeout',
+      response: { stdout: '', stderr: 'child process timed out', exitCode: 1, timedOut: true },
+      expectedOutput: 'child process timed out',
+    },
+    {
+      name: 'a spawn failure',
+      response: { stdout: '', stderr: '', code: 'ENOENT', exitCode: undefined },
+      expectedOutput: "LLM provider 'codex' not found",
+    },
+    {
+      name: 'an invalid final structured response',
+      response: {
+        stdout: [
+          JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'not JSON' } }),
+          JSON.stringify({ type: 'turn.completed' }),
+        ].join('\n'),
+        stderr: '',
+        exitCode: 0,
+      },
+      expectedOutput: 'terminal result record is missing its structured result',
+    },
+    {
+      name: 'absent terminal output',
+      response: {
+        stdout: JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"relationship":"same-case"}' } }),
+        stderr: '',
+        exitCode: 0,
+      },
+      expectedOutput: 'missing terminal result record',
+    },
+  ])('returns the named failure and lets owned scratch cleanup run after $name', async ({ response, expectedOutput }) => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-native-schema-cleanup-worktree-'));
+    const home = join(worktree, '.daemon', 'scratch', 'run-16', '1-codex', 'self-host-codex-home');
+    const nativeSchema = { type: 'object' };
+    let schemaPath: string | undefined;
+    const teardown = async () => { await rm(join(worktree, '.daemon'), { recursive: true, force: true }); };
+    await mkdir(home, { recursive: true });
+    mockExeca.mockImplementation(async (_file, args) => {
+      const index = args.indexOf('--output-schema');
+      schemaPath = index === -1 ? undefined : args[index + 1];
+      return response as any;
+    });
+
+    try {
+      const result = await provider.invoke({
+        ...baseOptions,
+        interactive: false,
+        cwd: worktree,
+        nativeSchema,
+        selfHost: { executable: '/isolated/bin/codex', env: { CODEX_HOME: home }, args: [], teardown },
+      });
+
+      expect(result).toMatchObject({ success: false, output: expect.stringContaining(expectedOutput) });
+      expect(schemaPath).toBe(join(home, 'output-schema.json'));
+      expect(JSON.parse(await readFile(schemaPath!, 'utf8'))).toEqual(nativeSchema);
+      await teardown();
+      await expect(readFile(schemaPath!, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('does not materialize a schema file for a no-schema Codex invocation', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-no-native-schema-worktree-'));
+    const home = join(worktree, '.daemon', 'scratch', 'run-16', '1-codex', 'self-host-codex-home');
+    await mkdir(home, { recursive: true });
+    mockExeca.mockResolvedValue({ stdout: jsonlMessage('No schema requested.'), stderr: '', exitCode: 0 } as any);
+
+    try {
+      await provider.invoke({
+        ...baseOptions,
+        interactive: false,
+        cwd: worktree,
+        selfHost: { executable: '/isolated/bin/codex', env: { CODEX_HOME: home }, args: [], teardown: async () => {} },
+      });
+
+      expect(mockExeca.mock.calls[0]?.[1]).not.toContain('--output-schema');
+      await expect(readFile(join(home, 'output-schema.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('fails before spawn when a purported self-host schema home escapes worktree scratch', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'codex-native-schema-confinement-worktree-'));
+    const outsideHome = await mkdtemp(join(tmpdir(), 'codex-native-schema-outside-home-'));
+
+    try {
+      const result = await provider.invoke({
+        ...baseOptions,
+        interactive: false,
+        cwd: worktree,
+        nativeSchema: { type: 'object' },
+        selfHost: { executable: '/isolated/bin/codex', env: { CODEX_HOME: outsideHome }, args: [], teardown: async () => {} },
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        output: expect.stringContaining('outside the worktree scratch root'),
+      });
+      expect(mockExeca).not.toHaveBeenCalled();
+      await expect(readFile(join(outsideHome, 'output-schema.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await Promise.all([
+        rm(worktree, { recursive: true, force: true }),
+        rm(outsideHome, { recursive: true, force: true }),
+      ]);
+    }
   });
 
   it('keeps tokens from an unpriceable terminal envelope cost-unmetered', async () => {
@@ -1633,6 +1919,7 @@ describe('CodexProvider', () => {
       readiness: expect.objectContaining({ state: 'missing' }),
       execCalls: 0,
     });
+    expect(result).toMatchObject({ executionDisposition: 'not-started' });
     expect(result).not.toHaveProperty('observedIntervals');
   });
 
@@ -1678,6 +1965,7 @@ describe('CodexProvider', () => {
         },
       },
     });
+    expect(result).not.toHaveProperty('executionDisposition');
   });
 
   it.each([
@@ -2192,6 +2480,7 @@ describe('CodexProvider', () => {
       source: 'cached-login',
       state: expectedFlag === 'authFailure' ? 'unusable' : 'ready',
     });
+    expect(result).not.toHaveProperty('executionDisposition');
     if (expectedFlag === 'rateLimited') expect(result.waitSeconds).toBe(45);
   });
 

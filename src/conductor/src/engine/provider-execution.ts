@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { basename } from 'node:path';
 import type {
   InvokeOptions,
   InvokeResult,
@@ -6,7 +7,7 @@ import type {
   TokenUsage,
 } from '../execution/llm-provider.js';
 import type { ObservedInterval } from '../execution/observed-interval.js';
-import type { ComplexityTier, StepName } from '../types/index.js';
+import type { ComplexityTier, ExecutionContext, StepName } from '../types/index.js';
 import type {
   EffortLevel,
   HarnessConfig,
@@ -38,6 +39,12 @@ import { redactSafetyText } from './safety-diagnostics.js';
 import { ModelAvailability } from './model-availability.js';
 import type { ResolvedBuildReviewRubricPolicy } from './resolved-config.js';
 import type { HaltMarkerWriteResult } from './halt-marker.js';
+import {
+  normalizeProviderSetupUnavailable,
+  type ProviderSetupUnavailable,
+  type ProviderSetupExhaustion,
+} from './provider-setup-failure.js';
+import { acquireScratchHome, releaseScratchHome } from './self-host/provider-scratch.js';
 
 export interface ProviderUnavailableClassification {
   scope: 'run';
@@ -51,6 +58,8 @@ export interface ProviderCandidateFailureClassification {
 
 export interface ProviderAttemptMetadata {
   provider: string;
+  /** Logical execution identity carried by the caller-owned invocation scope. */
+  executionContext?: ExecutionContext;
   /** Auxiliary member that selected this candidate; never a lifecycle step. */
   auxiliaryMember?: string;
   /** Validated task-local telemetry; never an authorization input. */
@@ -68,6 +77,11 @@ export interface ProviderAttemptMetadata {
   outcome: 'success' | 'failure' | 'unavailable';
   reason?: string;
   fallbackReason?: string;
+  /** Why an uninvoked unavailable candidate was skipped. */
+  skipReason?: 'setup-unavailable' | 'cached-unavailable';
+  /** Structured, redacted setup diagnostic for an explicitly skipped candidate. */
+  setupCapability?: string;
+  setupRecoveryAction?: string;
   /** Visible diagnostic-only boundary notices; never controls fallback. */
   safetyDiagnostics?: readonly string[];
   invoked: boolean;
@@ -77,6 +91,8 @@ export interface ProviderAttributionMetadata {
   preferredProvider?: string;
   actualProvider?: string;
   attempts?: ProviderAttemptMetadata[];
+  /** Every candidate was unavailable during setup before an invocation began. */
+  providerSetupExhaustion?: ProviderSetupExhaustion;
 }
 
 export interface ProviderExecutionResult extends InvokeResult, ProviderAttributionMetadata {
@@ -94,6 +110,7 @@ export type ProviderTransitionWarning =
       step: StepName;
       failedProvider: string;
       reason: string;
+      recoveryAction?: string;
       nextProvider: string;
     }
   | {
@@ -114,6 +131,41 @@ export interface ProviderCandidate {
   model: string;
   effort: EffortLevel;
 }
+
+/** Identity of one actual model ladder rung; step ownership remains unchanged. */
+export type ProviderCandidateRung = Omit<ProviderCandidate, 'step'>;
+
+/**
+ * The only extension point that runs after a real provider candidate has
+ * prepared. It intentionally exposes the existing invocation callback rather
+ * than a provider adapter, so policy work cannot bypass fresh sessions,
+ * lifecycle permits, model fallback, or attempt metering.
+ */
+export interface PreparedCandidateOperationContext {
+  readonly candidate: ProviderCandidate;
+  readonly prepared: SelfHostInvocation | undefined;
+  readonly abortSignal?: AbortSignal;
+  readonly deadlineAt?: number;
+  /** Candidate-local review policy may tighten prompt, cwd, or access after preparation. */
+  invoke(
+    overrides?: Partial<Omit<InvokeOptions, 'sessionId' | 'resume' | 'model' | 'effort'>>,
+    onModelRung?: (candidate: ProviderCandidateRung, invoke: () => Promise<InvokeResult>) => Promise<InvokeResult>,
+  ): Promise<InvokeResult>;
+  /** Candidate-owned cleanup, always run from the provider execution finally. */
+  onTeardown(teardown: () => Promise<void>): void;
+  /** The model that actually answered the candidate invocation, if it ran. */
+  invokedModel(): string | undefined;
+}
+
+/** A candidate operation either reuses evidence, judges through `invoke`, or returns a classified failure. */
+export type PreparedCandidateOperationResult =
+  | { readonly kind: 'hit'; readonly result: InvokeResult }
+  | { readonly kind: 'judged'; readonly result: InvokeResult }
+  | { readonly kind: 'failure'; readonly result: InvokeResult };
+
+export type PreparedCandidateOperation = (
+  context: PreparedCandidateOperationContext,
+) => Promise<PreparedCandidateOperationResult>;
 
 /** Render safe provider capability-gap notices without affecting execution. */
 export function formatProviderCapabilityGapMessages(
@@ -168,6 +220,7 @@ export function createCandidateSafetyBoundary(options: {
         success: false,
         exitCode: 1,
         permissionDenied: true,
+        executionDisposition: 'not-started',
         output: `Required safety protection unavailable: ${verdict.requiredFailures.map((p) => p.name).join(', ')}`,
         ...(notices.length ? { safetyDiagnostics: notices } : {}),
       };
@@ -201,11 +254,25 @@ export interface ExecuteProviderCandidatesInput {
   attempt?: number;
   /** Run identity held by the enclosing step runner for self-host scratch homes. */
   runId?: string;
+  /** Feature-owned worktree identity for schema-only Codex scratch. */
+  nativeSchemaScratch?: {
+    readonly worktreeRoot: string;
+    readonly repository: string;
+    readonly featureSlug: string;
+  };
+  /** Logical execution identity for this invocation's existing event-spine metadata. */
+  executionContext?: ExecutionContext;
   escalate?: boolean;
   modelOverride?: string;
   effortOverride?: EffortLevel;
   /** A caller-owned native model ladder, used by isolated auxiliary branches. */
   modelFallbackLadder?: readonly string[];
+  /** Candidate-bound work may refuse judgment once this signal is aborted. */
+  abortSignal?: AbortSignal;
+  /** Candidate-bound work may refuse judgment after this absolute deadline. */
+  deadlineAt?: number;
+  /** Optional policy/cache operation that runs only after candidate preparation. */
+  preparedCandidateOperation?: PreparedCandidateOperation;
   /** Attribution label for an auxiliary branch; does not manufacture a StepName. */
   auxiliaryMember?: string;
   /** Task-local telemetry to validate before any candidate/session invocation. */
@@ -270,7 +337,56 @@ function unsupportedLifecycleProviderResult(providerKey: string): InvokeResult {
     providerUnavailableScope: 'run',
     providerUnavailableReason: reason,
     providerInvocationSkipped: true,
+    executionDisposition: 'not-started',
   };
+}
+
+function skippedCandidateSetupUnavailable(provider: string, result: InvokeResult, cached: boolean): ProviderSetupUnavailable | undefined {
+  if (result.providerInvocationSkipped !== true) return undefined;
+  if (cached) return {
+    provider, capability: 'cached-provider-availability',
+    reason: result.providerUnavailableReason ?? result.output ?? 'Provider is cached as unavailable.',
+    recoveryAction: 'Restore the provider availability, then re-queue this feature.',
+  };
+  if (result.providerUnavailable === true) return {
+    provider, capability: 'synchronous-spawn-permit',
+    reason: result.providerUnavailableReason ?? result.output ?? 'Provider lifecycle capability is unavailable.',
+    recoveryAction: 'Update the provider to declare and synchronously consume lifecycleCapability.synchronousSpawnPermit.',
+  };
+  return undefined;
+}
+
+/** Fail closed before dispatch rather than requesting an unconstrained answer. */
+function unsupportedNativeSchemaProviderResult(providerKey: string): InvokeResult {
+  return {
+    success: false,
+    output: `Provider ${providerKey} cannot enforce the requested native output schema: missing native output schema capability. Recovery action: select or update a provider that declares nativeSchemaCapability.nativeOutputSchema and returns InvokeResult.finalStructuredResult from its terminal result envelope.`,
+    exitCode: 1,
+    nativeSchemaUnsupported: true,
+    providerInvocationSkipped: true,
+  };
+}
+
+function cancelledPreparedCandidateResult(): InvokeResult {
+  return {
+    success: false,
+    output: 'Prepared candidate operation cancelled before judgment.',
+    exitCode: 1,
+    providerInvocationSkipped: true,
+  };
+}
+
+function timedOutPreparedCandidateResult(): InvokeResult {
+  return {
+    success: false,
+    output: 'Prepared candidate operation timed out before judgment.',
+    exitCode: 1,
+    providerInvocationSkipped: true,
+  };
+}
+
+function preparedCandidateDeadlineExpired(deadlineAt: number | undefined): boolean {
+  return deadlineAt !== undefined && Date.now() >= deadlineAt;
 }
 
 export function classifyProviderAttempt(
@@ -324,6 +440,7 @@ async function invokeRuntimeResolved(
   runtime: ProviderRuntime,
   options: InvokeOptions,
   prepareFallbackOptions?: PrepareModelFallbackOptions,
+  invokeModel?: (options: InvokeOptions) => Promise<InvokeResult>,
 ): Promise<{ result: InvokeResult; model?: string }> {
   if (runtime.runWideUnavailable) {
     const reason = runtime.runWideUnavailable.reason;
@@ -336,6 +453,7 @@ async function invokeRuntimeResolved(
         providerUnavailableReason: reason,
         providerUnavailableScope: 'run',
         providerInvocationSkipped: true,
+        executionDisposition: 'not-started',
       },
     };
   }
@@ -344,6 +462,7 @@ async function invokeRuntimeResolved(
     runtime.provider,
     options,
     prepareFallbackOptions,
+    invokeModel,
   );
   const { result } = invocation;
   const unavailable = classifyProviderAttempt(result);
@@ -419,6 +538,9 @@ export interface InvokeProviderCandidateInput {
   resolved: ResolvedProviderNativeStepConfig;
   options: Omit<InvokeOptions, 'sessionId' | 'resume' | 'model' | 'effort'>;
   modelFallbackLadder?: readonly string[];
+  /** Allocate invocation-only resources after any per-model cache lookup. */
+  prepareInvocationOptions?: (options: InvokeOptions) => Promise<InvokeOptions>;
+  onModelRung?: (candidate: ProviderCandidateRung, invoke: () => Promise<InvokeResult>) => Promise<InvokeResult>;
 }
 
 interface SessionPolicySuppression {
@@ -436,6 +558,8 @@ export async function invokeProviderCandidate({
   resolved,
   options,
   modelFallbackLadder,
+  onModelRung,
+  prepareInvocationOptions,
 }: InvokeProviderCandidateInput): Promise<{
   result: InvokeResult;
   invokedModel?: string;
@@ -458,13 +582,20 @@ export async function invokeProviderCandidate({
   };
   // Each model-fallback-ladder attempt also gets its own fresh session.
   const prepareFallback = async () => ({ sessionId: randomUUID(), resume: false });
+  const invokeModel = async (rungOptions: InvokeOptions): Promise<InvokeResult> =>
+    runtime.provider.invoke(prepareInvocationOptions ? await prepareInvocationOptions(rungOptions) : rungOptions);
   const invocation = modelFallbackLadder
     ? await new ModelAvailability(modelFallbackLadder).invokeWithLadderResolved(
         runtime.provider,
         invocationOptions,
         prepareFallback,
+        (rungOptions) => onModelRung
+          ? onModelRung({ providerKey, ...resolved, model: rungOptions.model ?? resolved.model }, () => invokeModel(rungOptions))
+          : invokeModel(rungOptions),
       )
-    : await invokeRuntimeResolved(runtime, invocationOptions, prepareFallback);
+    : onModelRung
+      ? { result: await onModelRung({ providerKey, ...resolved }, () => invokeModel(invocationOptions)), model: resolved.model }
+      : await invokeRuntimeResolved(runtime, invocationOptions, prepareFallback, invokeModel);
   return {
     result: invocation.result,
     invokedModel: invocation.model,
@@ -481,6 +612,7 @@ export async function invokeProviderCandidate({
 
 export interface BuildProviderAttemptMetadataInput {
   providerKey: string;
+  executionContext?: ExecutionContext;
   taskId?: string;
   taskAttributionDiagnostic?: TaskAttributionDiagnosticCode;
   result: InvokeResult;
@@ -492,11 +624,14 @@ export interface BuildProviderAttemptMetadataInput {
   unavailable?: ProviderCandidateFailureClassification;
   nextProvider?: string;
   auxiliaryMember?: string;
+  setupUnavailable?: ProviderSetupUnavailable;
+  cachedUnavailable?: boolean;
 }
 
 /** Construct event-boundary metadata for exactly one candidate result. */
 export function buildProviderAttemptMetadata({
   providerKey,
+  executionContext,
   taskId,
   taskAttributionDiagnostic,
   result,
@@ -508,11 +643,14 @@ export function buildProviderAttemptMetadata({
   unavailable,
   nextProvider,
   auxiliaryMember,
+  setupUnavailable,
+  cachedUnavailable,
 }: BuildProviderAttemptMetadataInput): ProviderAttemptMetadata {
   const invoked = result.providerInvocationSkipped !== true;
   const failureReason = redactSafetyText(unavailable?.reason ?? result.output ?? 'Provider attempt failed.');
   return {
     provider: providerKey,
+    ...(executionContext ? { executionContext } : {}),
     ...(auxiliaryMember ? { auxiliaryMember } : {}),
     ...(taskId ? { taskId } : {}),
     ...(taskAttributionDiagnostic ? { taskAttributionDiagnostic } : {}),
@@ -536,6 +674,23 @@ export function buildProviderAttemptMetadata({
     ...(unavailable && nextProvider
       ? { fallbackReason: redactSafetyText(unavailable.reason) }
       : {}),
+    // A cached run-wide unavailability is still a setup-only skip, but it is
+    // materially different from a capability discovered during this pass.
+    // Keep that provenance at the event boundary; otherwise an exhausted
+    // cached candidate is misleadingly reported as a newly observed setup
+    // failure.
+    ...(!invoked && unavailable && cachedUnavailable
+      ? { skipReason: 'cached-unavailable' as const }
+      : {}),
+    ...(!invoked && unavailable && setupUnavailable && !cachedUnavailable
+      ? { skipReason: 'setup-unavailable' as const }
+      : {}),
+    ...(!invoked && setupUnavailable?.capability
+      ? { setupCapability: redactSafetyText(setupUnavailable.capability) }
+      : {}),
+    ...(!invoked && setupUnavailable
+      ? { setupRecoveryAction: redactSafetyText(setupUnavailable.recoveryAction) }
+      : {}),
     ...(result.safetyDiagnostics ? { safetyDiagnostics: result.safetyDiagnostics } : {}),
     invoked,
   };
@@ -556,10 +711,15 @@ export async function executeProviderCandidates({
   tier,
   attempt = 1,
   runId,
+  nativeSchemaScratch,
+  executionContext,
   escalate = true,
   modelOverride,
   effortOverride,
   modelFallbackLadder,
+  abortSignal,
+  deadlineAt,
+  preparedCandidateOperation,
   auxiliaryMember,
   taskAttribution: attributionInput,
   onAttempt,
@@ -576,6 +736,7 @@ export async function executeProviderCandidates({
   });
   const preferredProvider = candidates[0];
   const attempts: ProviderAttemptMetadata[] = [];
+  let everyUnavailableCandidateWasNotStarted = true;
   const attribution = attributionInput
     ? validateTaskAttribution(attributionInput)
     : undefined;
@@ -583,6 +744,8 @@ export async function executeProviderCandidates({
   const taskId = attribution && 'taskId' in attribution ? attribution.taskId : undefined;
   const taskAttributionDiagnostic =
     attribution && 'diagnostic' in attribution ? attribution.diagnostic.code : undefined;
+  const setupUnavailableCandidates: ProviderSetupUnavailable[] = [];
+  let anyCandidateInvoked = false;
 
   for (const [index, providerKey] of candidates.entries()) {
     const runtime = runtimes.get(providerKey);
@@ -615,56 +778,147 @@ export async function executeProviderCandidates({
           ...(options.spawnPermit !== undefined
             ? { spawnPermit: options.spawnPermit }
             : {}),
+          // The output contract belongs to the engine-owned logical request,
+          // not candidate-local prompt rendering. A candidate cannot clear or
+          // replace it and thereby dispatch an unconstrained invocation.
+          ...(options.nativeSchema !== undefined
+            ? { nativeSchema: options.nativeSchema }
+            : {}),
         }
       : options;
+    const candidate: ProviderCandidate = {
+      step,
+      providerKey,
+      model: resolved.model,
+      effort: resolved.effort,
+    };
     let candidateObserver: ReturnType<NonNullable<typeof candidateOptions.providerStreamObserverForCandidate>> | undefined;
     let invocation: Awaited<ReturnType<typeof invokeProviderCandidate>> | undefined;
-    const invoke = async (): Promise<InvokeResult> => {
-      // The REPL path supplies no stream consumer
-      // (adr-2026-08-24-one-dispatch-member-on-the-provider-contract, and the
-      // machine-envelope ADR repeats it). An interactive dispatch renders to
-      // the operator's own terminal; an observer there watches a stream that
-      // structurally cannot carry machine envelopes, so it is not merely
-      // inert — it must never be created or attached.
-      candidateObserver = candidateOptions.interactive
-        ? undefined
-        : candidateOptions.providerStreamObserverForCandidate?.(providerKey);
-      const candidateInvocationOptions = candidateObserver
-        ? {
-            ...candidateOptions,
-            streamConsumer: candidateObserver,
-            onProviderStream: candidateObserver.onProviderStream,
-          }
-        : candidateOptions;
-      const candidate = {
-        step,
-        providerKey,
-        model: resolved.model,
-        effort: resolved.effort,
-      };
-      let selfHost: SelfHostInvocation | undefined;
-      try {
-        selfHost = await prepareCandidateSelfHost?.(candidate, runtime, {
-          runId,
-          attempt: index,
-        });
+    let selfHost: SelfHostInvocation | undefined;
+    let setupUnavailable: ProviderSetupUnavailable | undefined;
+    const cachedUnavailable = runtime.runWideUnavailable !== undefined;
+    let schemaScratchHome: string | undefined;
+    let schemaScratchRunId: string | undefined;
+    let nativeSchemaScratchFailure: unknown;
+    let invocationResult: Promise<InvokeResult> | undefined;
+    const teardownCallbacks: Array<() => Promise<void>> = [];
+    const invokeProvider = (
+      overrides?: Partial<Omit<InvokeOptions, 'sessionId' | 'resume' | 'model' | 'effort'>>,
+      onModelRung?: (candidate: ProviderCandidateRung, invoke: () => Promise<InvokeResult>) => Promise<InvokeResult>,
+    ): Promise<InvokeResult> => {
+      invocationResult ??= (async () => {
+        const candidateInvocationOptions = candidateObserver
+          ? {
+              ...candidateOptions,
+              ...overrides,
+              streamConsumer: candidateObserver,
+              onProviderStream: candidateObserver.onProviderStream,
+              ...(selfHost ? { selfHost } : {}),
+            }
+          : selfHost
+            ? { ...candidateOptions, ...overrides, selfHost }
+            : { ...candidateOptions, ...overrides };
         invocation = await invokeProviderCandidate({
           providerKey,
           runtime,
           sessions,
           resolved,
-          options: selfHost ? { ...candidateInvocationOptions, selfHost } : candidateInvocationOptions,
+          options: candidateInvocationOptions,
+          prepareInvocationOptions: async (rungOptions) => {
+            if (selfHost === undefined && providerKey === 'codex' && rungOptions.nativeSchema !== undefined && nativeSchemaScratch !== undefined) {
+              if (schemaScratchHome === undefined) {
+                schemaScratchRunId = runId ?? randomUUID();
+                try {
+                  schemaScratchHome = await acquireScratchHome({
+                    worktreeRoot: nativeSchemaScratch.worktreeRoot,
+                    repository: nativeSchemaScratch.repository,
+                    featureSlug: nativeSchemaScratch.featureSlug || basename(nativeSchemaScratch.worktreeRoot),
+                    runId: schemaScratchRunId, attempt, provider: 'codex',
+                  });
+                } catch (error) {
+                  nativeSchemaScratchFailure = error;
+                  throw error;
+                }
+              }
+              return { ...rungOptions, nativeSchemaScratchHome: schemaScratchHome };
+            }
+            return rungOptions;
+          },
           modelFallbackLadder,
+          onModelRung,
         });
         return invocation.result;
+      })();
+      return invocationResult;
+    };
+    const invoke = async (): Promise<InvokeResult> => {
+      try {
+        // The REPL path supplies no stream consumer
+        // (adr-2026-08-24-one-dispatch-member-on-the-provider-contract, and the
+        // machine-envelope ADR repeats it). An interactive dispatch renders to
+        // the operator's own terminal; an observer there watches a stream that
+        // structurally cannot carry machine envelopes, so it is not merely
+        // inert — it must never be created or attached. Create it before
+        // preparation so its close boundary survives preparation failures.
+        candidateObserver = candidateOptions.interactive
+          ? undefined
+          : candidateOptions.providerStreamObserverForCandidate?.(providerKey);
+        try {
+          selfHost = await prepareCandidateSelfHost?.(candidate, runtime, { runId, attempt: index });
+        } catch (error) {
+          setupUnavailable = normalizeProviderSetupUnavailable(error, providerKey);
+          if (!setupUnavailable) throw error;
+          return { success: false, output: setupUnavailable.reason, exitCode: 1, providerInvocationSkipped: true };
+        }
+        if (abortSignal?.aborted) return cancelledPreparedCandidateResult();
+        if (preparedCandidateDeadlineExpired(deadlineAt)) {
+          return timedOutPreparedCandidateResult();
+        }
+        if (preparedCandidateOperation) {
+          const operation = await preparedCandidateOperation({
+            candidate,
+            prepared: selfHost,
+            abortSignal,
+            deadlineAt,
+            invoke: invokeProvider,
+            invokedModel: () => invocation?.invokedModel,
+            onTeardown: (teardown) => { teardownCallbacks.push(teardown); },
+          });
+          // An operation may observe cancellation while resolving a policy or
+          // checking a cache. It cannot publish that stale work as a judgment
+          // or cache hit after the candidate's authority has ended.
+          if (abortSignal?.aborted) return cancelledPreparedCandidateResult();
+          if (preparedCandidateDeadlineExpired(deadlineAt)) {
+            return timedOutPreparedCandidateResult();
+          }
+          return operation.kind === 'hit'
+            ? { ...operation.result, providerInvocationSkipped: true }
+            : operation.result;
+        }
+        return await invokeProvider();
       } finally {
         try {
-          await selfHost?.teardown();
+          for (const teardown of teardownCallbacks.reverse()) await teardown();
         } finally {
           try {
-            candidateObserver?.close();
-          } catch {
-            // Observation close/flush is best effort and cannot affect fallback.
+            await selfHost?.teardown();
+          } finally {
+            try {
+              if (schemaScratchHome !== undefined) {
+                const released = await releaseScratchHome({
+                  worktreeRoot: nativeSchemaScratch!.worktreeRoot,
+                  runId: schemaScratchRunId!, attempt, provider: 'codex',
+                });
+                if (released.kind === 'failed') {
+                  nativeSchemaScratchFailure = new Error(`native schema scratch teardown failed: ${released.error}`);
+                  throw nativeSchemaScratchFailure;
+                }
+              }
+            } finally {
+              try { candidateObserver?.close(); } catch {
+                // Observation close/flush is best effort and cannot affect fallback.
+              }
+            }
           }
         }
       }
@@ -672,19 +926,32 @@ export async function executeProviderCandidates({
     const requiresLifecycleCapability = candidateOptions.spawnPermit !== undefined;
     const supportsLifecycleCapability =
       runtimes.lifecycleCapabilityFor(providerKey)?.synchronousSpawnPermit === true;
-    const result = requiresLifecycleCapability && !supportsLifecycleCapability
-      ? unsupportedLifecycleProviderResult(providerKey)
-      : withCandidateSafety
-        ? await withCandidateSafety(
-            {
-              step,
-              providerKey,
-              model: resolved.model,
-              effort: resolved.effort,
-            },
-            invoke,
-          )
-        : await invoke();
+    const requiresNativeSchemaCapability = candidateOptions.nativeSchema !== undefined;
+    const supportsNativeSchemaCapability =
+      runtimes.nativeSchemaCapabilityFor(providerKey)?.nativeOutputSchema === true;
+    let result: InvokeResult;
+    try {
+      result = requiresLifecycleCapability && !supportsLifecycleCapability
+        ? unsupportedLifecycleProviderResult(providerKey)
+        : requiresNativeSchemaCapability && !supportsNativeSchemaCapability
+          ? unsupportedNativeSchemaProviderResult(providerKey)
+          : withCandidateSafety
+            ? await withCandidateSafety(candidate, invoke)
+            : await invoke();
+    } catch (error) {
+      if (nativeSchemaScratchFailure === undefined) throw error;
+      result = {
+        success: false,
+        exitCode: 1,
+        output: `Codex native schema scratch home failed: ${nativeSchemaScratchFailure instanceof Error
+          ? nativeSchemaScratchFailure.message
+          : String(nativeSchemaScratchFailure)}`,
+      };
+    }
+    // A prepared cache hit or cancellation did not consult provider availability.
+    if (result.providerUnavailable === true) {
+      setupUnavailable ??= skippedCandidateSetupUnavailable(providerKey, result, cachedUnavailable);
+    }
     const invokedModel = invocation?.invokedModel;
     const suppression = invocation?.sessionPolicySuppression;
     const emittedProviders = sessionPolicyDiagnostics.get(sessions) ?? new Set<string>();
@@ -703,12 +970,18 @@ export async function executeProviderCandidates({
     }
 
     const unavailable = classifyProviderCandidateFailure(result);
+    const candidateUnavailable = setupUnavailable
+      ? { scope: 'step' as const, reason: setupUnavailable.reason }
+      : unavailable;
     const safeResult = result.output === undefined
       ? result
       : { ...result, output: redactSafetyText(result.output) };
+    everyUnavailableCandidateWasNotStarted &&=
+      !safeResult.success && safeResult.executionDisposition === 'not-started';
     const nextProvider = candidates[index + 1];
     const attemptMetadata = buildProviderAttemptMetadata({
       providerKey,
+      executionContext,
       taskId,
       taskAttributionDiagnostic,
       result: safeResult,
@@ -717,9 +990,11 @@ export async function executeProviderCandidates({
       resolvedEffort: resolved.effort,
       tier,
       invokedModel,
-      unavailable,
+      unavailable: candidateUnavailable,
       nextProvider,
       auxiliaryMember,
+      setupUnavailable,
+      cachedUnavailable,
     });
     attempts.push(attemptMetadata);
     const observedIntervals = attempts.flatMap(
@@ -736,9 +1011,15 @@ export async function executeProviderCandidates({
         // Reporting the telemetry failure is itself best effort.
       }
     }
-    if (!unavailable) {
+    if (!candidateUnavailable) {
+      const resultForReturn = safeResult.success
+        ? (() => {
+            const { executionDisposition: _executionDisposition, ...successfulResult } = safeResult;
+            return successfulResult;
+          })()
+        : safeResult;
       return {
-        ...safeResult,
+        ...resultForReturn,
         preferredProvider,
         actualProvider: providerKey,
         resolvedModel: invokedModel ?? resolved.model,
@@ -748,18 +1029,53 @@ export async function executeProviderCandidates({
       };
     }
 
+    if (setupUnavailable) {
+      setupUnavailableCandidates.push({
+        ...setupUnavailable,
+        reason: redactSafetyText(setupUnavailable.reason),
+        recoveryAction: redactSafetyText(setupUnavailable.recoveryAction),
+        ...(setupUnavailable.capability ? { capability: redactSafetyText(setupUnavailable.capability) } : {}),
+      });
+    }
+    if (attemptMetadata.invoked) anyCandidateInvoked = true;
+
+    // Setup has not created a process. Preserve the enclosing lifecycle
+    // authority before considering another candidate.
+    if (setupUnavailable && candidateOptions.spawnPermit) {
+      const permit = candidateOptions.spawnPermit();
+      if (!permit.permitted) {
+        return {
+          ...safeResult,
+          preferredProvider,
+          attempts,
+          ...(observedIntervals.length ? { observedIntervals } : {}),
+        };
+      }
+    }
+
     if (!nextProvider) {
       const diagnostic = attempts
-        .map(({ provider, reason, invoked }) =>
-          `${provider} (${reason}${invoked ? '' : ', cached skip'})`,
+        .map(({ provider, reason, invoked, skipReason }) =>
+          `${provider} (${reason}${invoked ? '' : `, ${skipReason === 'setup-unavailable' ? 'setup unavailable' : skipReason === 'cached-unavailable' ? 'cached unavailable' : 'not invoked'}`})`,
         )
         .join('; ');
+      const { executionDisposition: _executionDisposition, ...lastResult } = result;
       return {
         success: false,
         output: `All configured providers are unavailable for step ${step}: ${diagnostic}.`,
-        exitCode: result.exitCode,
+        exitCode: lastResult.exitCode,
+        ...(everyUnavailableCandidateWasNotStarted
+          ? { executionDisposition: 'not-started' as const }
+          : {}),
         preferredProvider,
         attempts,
+        ...(!anyCandidateInvoked && setupUnavailableCandidates.length === candidates.length
+          ? {
+              providerSetupExhaustion: {
+                candidates: setupUnavailableCandidates as [ProviderSetupUnavailable, ...ProviderSetupUnavailable[]],
+              },
+            }
+          : {}),
         ...(observedIntervals.length ? { observedIntervals } : {}),
       };
     }
@@ -768,11 +1084,12 @@ export async function executeProviderCandidates({
       type: 'provider_fallback',
       step,
       failedProvider: providerKey,
-      reason: redactSafetyText(unavailable.reason),
+      reason: redactSafetyText(candidateUnavailable.reason),
+      ...(setupUnavailable ? { recoveryAction: redactSafetyText(setupUnavailable.recoveryAction) } : {}),
       nextProvider,
     };
     await warn?.(
-      `Step ${step}: provider ${providerKey} unavailable (${redactSafetyText(unavailable.reason)}); falling back to ${nextProvider}.`,
+      `Step ${step}: provider ${providerKey} unavailable (${redactSafetyText(candidateUnavailable.reason)}); falling back to ${nextProvider}.`,
       transition,
     );
   }
@@ -812,7 +1129,11 @@ export async function executeAuxiliaryProviderCandidates<MemberId extends string
       modelFallbackLadder: input.policy.model_fallback_ladder,
       auxiliaryMember: input.memberId,
     });
-    if (result.success || result.commandUnresolved) return result;
+    // A setup-only exhaustion is terminal for this logical dispatch: retrying
+    // repeats the same verified capability checks without ever invoking a
+    // provider.
+    if (result.success || result.commandUnresolved || result.providerSetupExhaustion ||
+      input.abortSignal?.aborted || preparedCandidateDeadlineExpired(input.deadlineAt)) return result;
     last = result;
   }
   return last ?? {

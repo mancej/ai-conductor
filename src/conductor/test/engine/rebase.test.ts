@@ -1,6 +1,7 @@
-// Covers: task:1, task:3
+// Covers: task:1, task:3, task:5
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, readFile, access, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execa } from 'execa';
@@ -14,6 +15,7 @@ import {
   isCodeOrTestPath,
   filterCodeOrTestPaths,
   writeHalt,
+  writeRebaseOutcomeHalt,
   writeSealHalt,
   applyRebaseVerdicts,
   recordRebaseStepCompletion,
@@ -244,6 +246,11 @@ describe('engine/rebase — finish-only mergeability policy (Task 2)', () => {
           kind: 'conflict_halt',
           conflicts: ['shared.txt'],
           reason: 'rebase conflict requires human resolution',
+          replaySeed: expect.objectContaining({
+            preRebaseHead: expect.any(String),
+            mergeBase: expect.any(String),
+            target: expect.any(String),
+          }),
         },
         rebaseActive: true,
       });
@@ -283,6 +290,8 @@ describe('engine/rebase — finish-only mergeability policy (Task 2)', () => {
         kind: 'conflict_halt',
         conflicts: [],
         reason: rebaseStderr,
+        startFailure: true,
+        replaySeed: { preRebaseHead: '', mergeBase: '', target: '' },
       });
       expect(calls.some((args) => args[0] === 'rebase')).toBe(true);
     } finally {
@@ -315,6 +324,8 @@ describe('engine/rebase — finish-only mergeability policy (Task 2)', () => {
         kind: 'conflict_halt',
         conflicts: [],
         reason: rebaseStderr,
+        startFailure: true,
+        replaySeed: { preRebaseHead: '', mergeBase: '', target: '' },
       });
       expect(calls.some((args) => args[0] === 'rebase')).toBe(true);
     } finally {
@@ -725,6 +736,64 @@ describe('engine/rebase — HALT (FR-8)', () => {
     );
   });
 
+  it('writes a never-started recovery note without a rebase-continue instruction', async () => {
+    await writeRebaseOutcomeHalt(dir, {
+      kind: 'conflict_halt',
+      conflicts: [],
+      reason: 'error: The following untracked working tree files would be overwritten by checkout:',
+      startFailure: true,
+      quarantine: { paths: ['generated.txt'], directory: '.pipeline/rebase-untracked-quarantine' },
+    });
+    const note = await readFile(join(dir, '.pipeline/HALT'), 'utf-8');
+    expect(note).toContain('rebase did not start');
+    expect(note).toContain('generated.txt');
+    expect(note).toContain('Clear .pipeline/HALT and .pipeline/HALT.class');
+    expect(note).toContain('No git rebase is in progress');
+    expect(note).not.toContain('  2. git rebase --continue');
+  });
+
+  it('keeps the existing halt note byte-identical for paused and already-in-progress outcomes', async () => {
+    for (const outcome of [
+      { conflicts: ['src/conflict.ts'], reason: 'rebase conflict requires human resolution' },
+      { conflicts: [], reason: 'a rebase is already in progress; resolve it before starting another' },
+    ]) {
+      await writeHalt(dir, outcome.conflicts, outcome.reason);
+      const expected = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
+      await rm(join(dir, '.pipeline/HALT'), { force: true });
+      await rm(join(dir, '.pipeline/HALT.class'), { force: true });
+      await writeRebaseOutcomeHalt(dir, { kind: 'conflict_halt', ...outcome });
+      await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toBe(expected);
+    }
+  });
+
+  it('keeps the existing halt note byte-identical for the actual already-in-progress refusal', async () => {
+    await mkdir(join(dir, '.git/rebase-merge'), { recursive: true });
+    const git: GitRunner = async (args) => {
+      if (args.join(' ') === 'rev-parse --is-inside-work-tree') {
+        return { exitCode: 0, stdout: 'true\n', stderr: '' };
+      }
+      if (args.join(' ') === 'diff --name-only --diff-filter=U') {
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      if (args.join(' ') === 'rev-parse --git-path rebase-merge') {
+        return { exitCode: 0, stdout: '.git/rebase-merge\n', stderr: '' };
+      }
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const outcome = await performRebase(git, dir, 'main');
+    expect(outcome.kind).toBe('conflict_halt');
+    if (outcome.kind !== 'conflict_halt') throw new Error('expected already-in-progress refusal');
+
+    await writeHalt(dir, outcome.conflicts, outcome.reason);
+    const expected = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
+    await rm(join(dir, '.pipeline/HALT'), { force: true });
+    await rm(join(dir, '.pipeline/HALT.class'), { force: true });
+
+    await writeRebaseOutcomeHalt(dir, outcome);
+    await expect(readFile(join(dir, '.pipeline/HALT'), 'utf8')).resolves.toBe(expected);
+  });
+
   it('returns the marker write result for seal HALTs without an emitter', async () => {
     expect(await writeSealHalt(dir, 'protected artifact changed')).toEqual({ status: 'written' });
   });
@@ -756,6 +825,7 @@ describe('engine/rebase — HALT (FR-8)', () => {
       kind: 'conflict_halt',
       conflicts: ['CHANGELOG.md'],
       reason: 'rebase conflict requires human resolution',
+      replaySeed: { preRebaseHead: '', mergeBase: '', target: '' },
     });
   });
 });
@@ -840,6 +910,25 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
       'prd_audit',
       'architecture_review_as_built',
     ]);
+  });
+
+  it('setup_stop → rebase is refused and remains unsatisfied', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'setup_stop',
+      conflicts: ['src/x.ts'],
+      reason: 'every configured provider is unavailable during setup',
+    };
+    const r = await applyRebaseVerdicts(dir, outcome, true);
+    await recordRebaseStepCompletion(join(dir, '.pipeline', 'conduct-state.json'), outcome);
+    expect(r.satisfied).toBe(false);
+    const verdict = await readVerdict(dir, 'rebase');
+    expect(verdict?.satisfied).toBe(false);
+    expect(verdict?.reason).toContain('provider setup unavailable');
+    const statePath = join(dir, '.pipeline', 'conduct-state.json');
+    const state = existsSync(statePath)
+      ? (JSON.parse(await readFile(statePath, 'utf8')) as { rebase?: string })
+      : {};
+    expect(state.rebase).toBe('refused');
   });
 
   it('conflict_halt → rebase NOT satisfied', async () => {
@@ -1097,7 +1186,7 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     expect(manualTest).toBeNull();
   });
 
-  it('Task 6: delta-aware — foreign runtime + feature test file → audits preserved, manual_test invalidated', async () => {
+  it('Task 6: unproved prior passes are revalidated after a foreign runtime + feature test delta', async () => {
     // Feature's claimed surface is src/feature.ts only. The rebase delta
     // touches a foreign runtime file (src/foreign.ts) and one of the
     // feature's own test files (src/feature.test.ts) — no feature runtime
@@ -1108,8 +1197,8 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
       featureSurface: ['src/feature.ts', 'src/feature.test.ts'],
     };
 
-    // Pre-seed prd_audit / architecture_review_as_built as done so we can
-    // assert they are left untouched (preserved), not overwritten.
+    // Bare verdicts are not applicable original PASS evidence, so the
+    // candidate preservations must be revalidated rather than trusted.
     await writeVerdict(dir, 'prd_audit', { satisfied: true, reason: 'prior audit', checkedAt: 1 });
     await writeVerdict(dir, 'architecture_review_as_built', {
       satisfied: true,
@@ -1120,31 +1209,30 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     const r = await applyRebaseVerdicts(dir, outcome, true);
 
     expect(r.satisfied).toBe(true);
-    // build_review/test_suite ('any-codetest') and manual_test
-    // ('all-runtime', foreignSrc non-empty) are invalidated; the two
-    // feature-runtime audits are preserved (featureSrc is empty).
+    // The directly matched gates and every unproved candidate preservation
+    // are invalidated. Completed BUILD is not selected by rebase position.
     expect(r.kickedBack).toEqual([
-      'build',
+      'coverage_binding',
       'build_review',
       'test_suite',
       'manual_test',
+      'prd_audit',
+      'architecture_review_as_built',
     ]);
-    expect(r.kickedBack).not.toContain('prd_audit');
-    expect(r.kickedBack).not.toContain('architecture_review_as_built');
+    expect(r.kickedBack).toContain('prd_audit');
+    expect(r.kickedBack).toContain('architecture_review_as_built');
 
     const manualTest = await readVerdict(dir, 'manual_test');
     expect(manualTest?.satisfied).toBe(false);
 
-    // Preserved audits are untouched — verdict stays exactly what it was.
+    // Old, unstamped verdicts are replaced by the rebase invalidation.
     const prdAudit = await readVerdict(dir, 'prd_audit');
-    expect(prdAudit?.satisfied).toBe(true);
-    expect(prdAudit?.reason).toBe('prior audit');
-    expect(prdAudit?.checkedAt).toBe(1);
+    expect(prdAudit?.satisfied).toBe(false);
+    expect(prdAudit?.kickback?.from).toBe('rebase');
 
     const archReview = await readVerdict(dir, 'architecture_review_as_built');
-    expect(archReview?.satisfied).toBe(true);
-    expect(archReview?.reason).toBe('prior review');
-    expect(archReview?.checkedAt).toBe(1);
+    expect(archReview?.satisfied).toBe(false);
+    expect(archReview?.kickback?.from).toBe('rebase');
   });
 
   it('Task 8: emits rebase_gate_invalidated for each invalidated gate with matched delta paths', async () => {
@@ -1188,6 +1276,33 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     expect(byGate.architecture_review_as_built).toBeUndefined();
   });
 
+  it('emits no surface event for the mechanical BUILD kickback in an applied decision', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'changed',
+      changedCodePaths: ['src/feature.ts'],
+      featureSurface: ['src/feature.ts'],
+    };
+    const events = new ConductorEventEmitter();
+    const invalidated: string[] = [];
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') invalidated.push(event.gate);
+    });
+
+    await emitGateInvalidationEvents(events, outcome, false, {
+      kickedBack: ['build', 'coverage_binding', 'build_review', 'test_suite', 'prd_audit', 'architecture_review_as_built'],
+      reverified: [],
+    });
+
+    expect(invalidated).not.toContain('build');
+    expect(invalidated.sort()).toEqual([
+      'architecture_review_as_built',
+      'build_review',
+      'coverage_binding',
+      'prd_audit',
+      'test_suite',
+    ]);
+  });
+
   it('Task 9: emits rebase_gate_preserved for each preserved gate with its non-empty declared surface and empty matched delta', async () => {
     // Same fixture as the Task 8 test above: feature surface is
     // src/feature.ts only; the delta touches a foreign runtime file and a
@@ -1221,30 +1336,88 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     expect(Object.keys(byGate).sort()).toEqual(
       ['coverage_binding', 'prd_audit', 'architecture_review_as_built'].sort(),
     );
-    // prd_audit now has a document-input surface as well as feature runtime,
-    // so its non-enumerable declaration uses the broad surface sentinel.
-    expect(byGate.prd_audit.surface).toEqual(['<all runtime source>']);
-    expect(byGate.coverage_binding.surface).toEqual(['<all runtime source>']);
-    // The as-built review remains feature-runtime scoped; its test path is
-    // excluded from the declared source surface.
-    expect(byGate.architecture_review_as_built.surface).toEqual(['src/feature.ts']);
-    // The widened PRD input declaration observes the complete relevant delta;
-    // neither path is a declared story/PRD input, so classification still
-    // preserves the audit despite retaining the diagnostic context.
-    expect(byGate.prd_audit.deltaConsidered).toEqual([
-      'src/feature.test.ts',
-      'src/foreign.ts',
+    expect(byGate.prd_audit.surface).toEqual([
+      'src/feature.ts',
+      '<.docs/stories/|.docs/specs/>',
     ]);
-    expect(byGate.coverage_binding.deltaConsidered).toEqual([
-      'src/feature.test.ts',
-      'src/foreign.ts',
+    expect(byGate.coverage_binding.surface).toEqual([
+      'src/feature.ts',
+      '<.docs/stories/|.docs/specs/|.docs/plans/|.docs/coherence/|.docs/decisions/>',
     ]);
-    // The as-built review only considers feature runtime source and sees no
-    // matching delta.
+    // The as-built review consumes the same coverage/review decision inputs
+    // as coverage_binding; its test path is excluded from the source surface.
+    expect(byGate.architecture_review_as_built.surface).toEqual([
+      'src/feature.ts',
+      '<.docs/stories/|.docs/specs/|.docs/plans/|.docs/coherence/|.docs/decisions/>',
+    ]);
+    expect(byGate.prd_audit.deltaConsidered).toEqual([]);
+    expect(byGate.coverage_binding.deltaConsidered).toEqual([]);
+    // The as-built review sees neither feature runtime nor declared inputs.
     expect(byGate.architecture_review_as_built.deltaConsidered).toEqual([]);
     // Invalidated gates must not appear in the preserved set.
     expect(byGate.build_review).toBeUndefined();
     expect(byGate.manual_test).toBeUndefined();
+  });
+
+  it('emits only feature runtime and declared document inputs for PRD-input gates', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'changed',
+      changedCodePaths: [
+        'src/feature.ts',
+        'src/foreign.ts',
+        '.docs/stories/feature.md',
+        '.docs/specs/feature.md',
+        'docs/unrelated.md',
+      ],
+      featureSurface: ['src/feature.ts'],
+    };
+    const events = new ConductorEventEmitter();
+    const invalidated: Array<{ gate: string; matchedPaths: string[] }> = [];
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') invalidated.push(event);
+    });
+
+    await emitGateInvalidationEvents(events, outcome, true);
+
+    const byGate = Object.fromEntries(invalidated.map((event) => [event.gate, event.matchedPaths]));
+    expect(byGate.coverage_binding).toEqual([
+      'src/feature.ts',
+      '.docs/stories/feature.md',
+      '.docs/specs/feature.md',
+    ]);
+    expect(byGate.prd_audit).toEqual([
+      'src/feature.ts',
+      '.docs/stories/feature.md',
+      '.docs/specs/feature.md',
+    ]);
+    expect(byGate.prd_audit).not.toContain('src/foreign.ts');
+    expect(byGate.prd_audit).not.toContain('docs/unrelated.md');
+  });
+
+  it('emits the applied replay decision rather than recomputing a legacy preservation set', async () => {
+    const outcome: RebaseOutcome = {
+      kind: 'changed',
+      changedCodePaths: ['src/foreign.ts'],
+      featureSurface: ['src/feature.ts'],
+    };
+    const events = new ConductorEventEmitter();
+    const preserved: string[] = [];
+    const invalidated: string[] = [];
+    events.on('rebase_gate_preserved', (event) => {
+      if (event.type === 'rebase_gate_preserved') preserved.push(event.gate);
+    });
+    events.on('rebase_gate_invalidated', (event) => {
+      if (event.type === 'rebase_gate_invalidated') invalidated.push(event.gate);
+    });
+
+    await emitGateInvalidationEvents(events, outcome, false, {
+      kickedBack: ['build_review'],
+      reverified: [],
+      preservedGates: ['prd_audit'],
+    });
+
+    expect(invalidated).toEqual(['build_review']);
+    expect(preserved).toEqual(['prd_audit']);
   });
 
   it('preserves a within-budget test-suite PASS through the rebase-preserved event', async () => {
@@ -1328,7 +1501,7 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
    * without F, so the uncomputable-surface path stays the documented no-op —
    * the fix must not start inventing classification events.
    */
-  it('S7.5: stays a no-op on an uncomputable surface with no pre-verified preservation', async () => {
+  it('emits the applied conservative invalidations when feature surface is uncomputable', async () => {
     const outcome: RebaseOutcome = {
       kind: 'changed',
       changedCodePaths: ['src/feature.ts'],
@@ -1343,9 +1516,14 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
       if (event.type === 'rebase_gate_invalidated') seen.push(event.gate);
     });
 
-    await emitGateInvalidationEvents(events, outcome, false, []);
+    await emitGateInvalidationEvents(events, outcome, false, {
+      kickedBack: ['build', 'coverage_binding', 'build_review', 'test_suite', 'prd_audit', 'architecture_review_as_built'],
+      reverified: [],
+    });
 
-    expect(seen).toEqual([]);
+    expect(seen.sort()).toEqual([
+      'architecture_review_as_built', 'build_review', 'coverage_binding', 'prd_audit', 'test_suite',
+    ]);
   });
 
   it('Task 6: delta-aware — feature runtime source changed → all judged gates invalidated including audits', async () => {
@@ -1366,7 +1544,6 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
 
     expect(r.satisfied).toBe(true);
     expect(r.kickedBack).toEqual([
-      'build',
       'coverage_binding',
       'build_review',
       'test_suite',
@@ -1439,15 +1616,14 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
     const r = await applyRebaseVerdicts(dir, outcome, true);
 
     expect(r.satisfied).toBe(true);
-    // prd_audit is preserved (not invalidated) — it must not appear in
-    // kickedBack.
-    expect(r.kickedBack).not.toContain('prd_audit');
+    // A candidate preservation without an original PASS is revalidated.
+    expect(r.kickedBack).toContain('prd_audit');
 
-    // Preservation is a pure no-op: it never writes a verdict for a gate
-    // that never ran. A never-run gate stays exactly as it was —
-    // no-verdict/pending — never manufactured into `done`/satisfied.
+    // Revalidation records an unsatisfied rebase kickback; it never
+    // manufactures a passing verdict.
     const after = await readVerdict(dir, 'prd_audit');
-    expect(after).toBeNull();
+    expect(after?.satisfied).toBe(false);
+    expect(after?.kickback?.from).toBe('rebase');
     expect(after?.satisfied).not.toBe(true);
   });
 
@@ -1506,17 +1682,17 @@ describe('engine/rebase — applyRebaseVerdicts (FR-4/FR-5)', () => {
         await rm(dirA, { recursive: true, force: true });
       }
 
-      // Case 2: preVerify('build') finds evidence stale → kicked back,
-      // again regardless of the delta's judged-gate classification.
+      // Case 2: a stale build pre-verification does not turn the selective
+      // review transition into a positional BUILD replay. The conductor's
+      // completed-BUILD recovery owner blocks this before application.
       const dirB = await mkdtemp(join(tmpdir(), 'rebase-build-preverify-'));
       await mkdir(join(dirB, '.pipeline'), { recursive: true });
       try {
         const rB = await applyRebaseVerdicts(dirB, outcome, true, preVerifyNotDone);
-        expect(rB.kickedBack).toContain('build');
+        expect(rB.kickedBack).not.toContain('build');
         expect(rB.reverified).toEqual([]);
         const buildB = await readVerdict(dirB, 'build');
-        expect(buildB?.satisfied).toBe(false);
-        expect(buildB?.reason).toBe('invalidated by file-changing rebase');
+        expect(buildB).toBeNull();
       } finally {
         await rm(dirB, { recursive: true, force: true });
       }
@@ -1548,6 +1724,7 @@ describe('engine/rebase — emitRebaseEvent (FR-10)', () => {
       'rebase_mergeable_skip',
       'rebase_changed',
       'rebase_conflict_halt',
+      'rebase_untracked_quarantined',
     ] as const) {
       events.on(t, (e) => {
         seen.push(e.type);
@@ -1570,6 +1747,34 @@ describe('engine/rebase — emitRebaseEvent (FR-10)', () => {
       'rebase_conflict_halt',
     ]);
     expect(conflictHalt).toMatchObject({ step: 'rebase' });
+  });
+
+  it('reports a quarantine before its healed outcome', async () => {
+    const events = new ConductorEventEmitter();
+    const seen: Array<{ type: string; paths?: string[]; directory?: string }> = [];
+    for (const type of ['rebase_untracked_quarantined', 'rebase_changed', 'rebase_conflict_halt'] as const) {
+      events.on(type, (event) => {
+        seen.push(event.type === 'rebase_untracked_quarantined'
+          ? { type: event.type, paths: event.paths, directory: event.directory }
+          : { type: event.type });
+      });
+    }
+    const quarantine = {
+      paths: ['generated.txt', 'nested/generated.json'],
+      directory: '.pipeline/rebase-untracked-quarantine',
+    };
+
+    await emitRebaseEvent(events, {
+      kind: 'changed', changedCodePaths: ['generated.txt', 'nested/generated.json'], quarantine,
+    });
+    await emitRebaseEvent(events, {
+      kind: 'conflict_halt', conflicts: [], reason: 'still refused', startFailure: true, quarantine,
+    });
+
+    expect(seen).toEqual([
+      { type: 'rebase_untracked_quarantined', ...quarantine }, { type: 'rebase_changed' },
+      { type: 'rebase_untracked_quarantined', ...quarantine }, { type: 'rebase_conflict_halt' },
+    ]);
   });
 
   it('best-effort: emission failure does not throw', async () => {
@@ -1818,6 +2023,12 @@ describe('engine/rebase — performRebase translateAfterRebase capability (Task 
     // capability is never supplied.
     if (outcome.kind === 'changed') {
       expect(outcome.changedCodePaths.length).toBeGreaterThan(0);
+      expect(outcome.replay).toMatchObject({
+        preRebaseHead: expect.stringMatching(/^[0-9a-f]{40}$/),
+        mergeBase: expect.stringMatching(/^[0-9a-f]{40}$/),
+        target: expect.stringMatching(/^[0-9a-f]{40}$/),
+        completedHead: expect.stringMatching(/^[0-9a-f]{40}$/),
+      });
     }
   }, 20000);
 
@@ -2312,4 +2523,111 @@ describe('performRebase protected-artifact self-amendment (#1379, real git)', ()
       await rm(repo, { recursive: true, force: true });
     }
   }, 20000);
+});
+
+// ── Resolved rebase classifies by its true tree delta (preTree..HEAD) ────────
+//
+// Observed on projects-cannot-add (2026-09-21): main had advanced by one
+// unrelated template file, yet the conflict-resolved path reported the whole
+// `onto..HEAD` feature diff (110 paths) as the rebase delta and re-opened
+// every gate. The clean path (`classifyClean`) already classifies the true
+// delta `preTree..HEAD` and carries `featureSurface` so invalidation can be
+// delta-aware; the resolved path must produce the same outcome shape.
+describe('resolveRebaseConflicts — delta classification matches the clean path', () => {
+  let repo: string;
+  const g = (args: string[]) => execa('git', args, { cwd: repo });
+  const gc = (args: string[]) => execa('git', ['-c', 'core.editor=true', ...args], { cwd: repo });
+
+  beforeEach(async () => {
+    repo = await mkdtemp(join(tmpdir(), 'rebase-resolved-delta-'));
+    await execa('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+    await g(['config', 'user.email', 't@t.com']);
+    await g(['config', 'user.name', 'T']);
+    await writeFile(join(repo, 'shared.ts'), 'base\n');
+    await mkdir(join(repo, 'docs'));
+    await writeFile(join(repo, 'docs', 'template.md'), 'template v1\n');
+    await g(['add', '.']);
+    await g(['commit', '-q', '-m', 'init']);
+
+    // A feature with MANY commits touching many code files, one of which
+    // (shared.ts) will conflict with main.
+    await g(['checkout', '-q', '-b', 'feat']);
+    for (let i = 0; i < 6; i++) {
+      await writeFile(join(repo, `feature-${i}.ts`), `export const f${i} = ${i};\n`);
+      await g(['add', '.']);
+      await g(['commit', '-q', '-m', `feat: add feature-${i}`]);
+    }
+    await writeFile(join(repo, 'shared.ts'), 'feature\n');
+    await g(['commit', '-q', '-am', 'feat: change shared']);
+
+    // main advances by ONE unrelated file plus the conflicting edit.
+    await g(['checkout', '-q', 'main']);
+    await writeFile(join(repo, 'docs', 'template.md'), 'template v2\n');
+    await g(['commit', '-q', '-am', 'main: bump template']);
+    await writeFile(join(repo, 'shared.ts'), 'mainchange\n');
+    await g(['commit', '-q', '-am', 'main: change shared']);
+
+    await g(['checkout', '-q', 'feat']);
+  });
+
+  afterEach(async () => {
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  async function intoConflict(): Promise<{ git: GitRunner; conflict: RebaseOutcome }> {
+    const git = makeGitRunner(repo);
+    const conflict = await performRebase(git, repo, 'main');
+    expect(conflict.kind).toBe('conflict_halt');
+    return { git, conflict };
+  }
+
+  it('reports only the true preTree..HEAD delta and sets featureSurface, not the whole feature', async () => {
+    const { resolveRebaseConflicts } = await import('../../src/engine/rebase.js');
+    const { git, conflict } = await intoConflict();
+    const resolver = async () => {
+      // Resolve the one conflict; no other feature file is touched.
+      await writeFile(join(repo, 'shared.ts'), 'merged\n');
+      await g(['add', 'shared.ts']);
+      await gc(['rebase', '--continue']);
+      return { resolved: true as const };
+    };
+
+    const outcome = await resolveRebaseConflicts(git, repo, conflict, resolver, 1);
+
+    expect(outcome.kind).toBe('changed');
+    if (outcome.kind !== 'changed') return;
+    // The tree delta from the pre-rebase feature tip: main's template bump
+    // and the resolved shared.ts. NOT feature-0..5.
+    expect(outcome.allChangedPaths).toEqual(['docs/template.md', 'shared.ts']);
+    expect(outcome.changedCodePaths).toEqual(['shared.ts']);
+    expect(outcome.changedCodePaths).not.toContain('feature-0.ts');
+    // The feature's own claimed surface (mergeBase..preTree) must be carried
+    // so gate invalidation can be delta-aware instead of invalidate-all.
+    expect(outcome.featureSurface).toBeDefined();
+    expect(outcome.featureSurface).toEqual(
+      expect.arrayContaining(['feature-0.ts', 'feature-5.ts', 'shared.ts']),
+    );
+    expect(outcome.featureSurface).not.toContain('docs/template.md');
+  });
+
+  it('includes a feature file that the resolution itself changed in the delta', async () => {
+    const { resolveRebaseConflicts } = await import('../../src/engine/rebase.js');
+    const { git, conflict } = await intoConflict();
+    const resolver = async () => {
+      // The resolution rewrites shared.ts AND touches an unrelated feature file.
+      await writeFile(join(repo, 'shared.ts'), 'merged\n');
+      await writeFile(join(repo, 'feature-3.ts'), 'export const f3 = 33;\n');
+      await g(['add', 'shared.ts', 'feature-3.ts']);
+      await gc(['rebase', '--continue']);
+      return { resolved: true as const };
+    };
+
+    const outcome = await resolveRebaseConflicts(git, repo, conflict, resolver, 1);
+
+    expect(outcome.kind).toBe('changed');
+    if (outcome.kind !== 'changed') return;
+    expect(outcome.changedCodePaths).toEqual(['feature-3.ts', 'shared.ts']);
+    expect(outcome.allChangedPaths).toEqual(['docs/template.md', 'feature-3.ts', 'shared.ts']);
+    expect(outcome.featureSurface).toBeDefined();
+  });
 });

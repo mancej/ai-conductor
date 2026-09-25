@@ -1,9 +1,21 @@
 // Covers: task:2
+// Covers: task:5
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { PassThrough } from 'node:stream';
-import { ClaudeProvider, parseRateLimitWaitSeconds } from '../../src/execution/claude-provider.js';
+import {
+  ClaudeProvider,
+  detectsSessionLimit,
+  parseRateLimitWaitSeconds,
+} from '../../src/execution/claude-provider.js';
 import { classifyMetering } from '../../src/engine/metering.js';
+import { executeAuxiliaryProviderCandidates } from '../../src/engine/provider-execution.js';
+import { ProviderRuntimeSet } from '../../src/engine/provider-runtime.js';
+import { ProviderSessionScope } from '../../src/engine/provider-session.js';
+import { CLAUDE_MODEL_POLICY } from '../../src/engine/provider-model-policy.js';
+import { ModelAvailability } from '../../src/engine/model-availability.js';
+import { BUILD_REVIEW_RUBRIC_REGISTRY } from '../../src/engine/build-review-registry.js';
+import type { ResolvedBuildReviewRubricPolicy } from '../../src/engine/resolved-config.js';
 import type { InvokeOptions } from '../../src/execution/llm-provider.js';
 import type { IntervalClock } from '../../src/execution/observed-interval.js';
 
@@ -16,7 +28,8 @@ const { mockValidateSpawnPermit } = vi.hoisted(() => ({
   mockValidateSpawnPermit: vi.fn((permit, purpose) =>
     permit?.(purpose) ?? { permitted: true as const }),
 }));
-vi.mock('../../src/engine/provider-runtime.js', () => ({
+vi.mock('../../src/engine/provider-runtime.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/engine/provider-runtime.js')>(),
   validateSpawnPermit: mockValidateSpawnPermit,
 }));
 
@@ -46,6 +59,30 @@ type ExecaInvocation = (
   options?: ExecaOptions,
 ) => Promise<ExecaResult>;
 const mockExeca = vi.mocked(execa) as unknown as Mock<ExecaInvocation>;
+
+const claudeRubricPolicy: ResolvedBuildReviewRubricPolicy = {
+  enabled: true,
+  max_projection_bytes: 1_048_576,
+  llm_provider: 'claude',
+  model: 'opus',
+  effort: 'high',
+  model_fallback_ladder: ['opus'],
+  max_retries: 1,
+  escalate: false,
+  min_confidence: 0,
+};
+
+function claudeRuntime(provider: ClaudeProvider): ProviderRuntimeSet {
+  return new ProviderRuntimeSet([{
+    key: 'claude',
+    provider,
+    lifecycleCapability: provider.lifecycleCapability,
+    nativeSchemaCapability: provider.nativeSchemaCapability,
+    policy: CLAUDE_MODEL_POLICY,
+    builtIn: true,
+    availability: new ModelAvailability(CLAUDE_MODEL_POLICY.modelFallbackLadder),
+  }]);
+}
 
 describe('ClaudeProvider', () => {
   let provider: ClaudeProvider;
@@ -117,6 +154,176 @@ describe('ClaudeProvider', () => {
   describe('invoke', () => {
     it('declares synchronous spawn-permit lifecycle capability', () => {
       expect(provider.lifecycleCapability).toEqual({ synchronousSpawnPermit: true });
+    });
+
+    describe('native output schema', () => {
+      const schema = {
+        type: 'object',
+        properties: { version: { const: 1 }, relationships: { type: 'array' } },
+        required: ['version', 'relationships'],
+        additionalProperties: false,
+      };
+
+      it('passes the engine schema to Claude and extracts only the parsed terminal result', async () => {
+        const constrainedResult = { version: 1, relationships: [] };
+        mockExeca.mockResolvedValue({
+          stdout: [
+            JSON.stringify({
+              type: 'assistant',
+              message: { content: [{ type: 'tool_use', name: 'inspect', input: { structured_output: { forged: true } } }] },
+            }),
+            JSON.stringify({
+              type: 'result',
+              result: 'Reconciliation complete.',
+              structured_output: JSON.stringify(constrainedResult),
+              usage: { input_tokens: 12, output_tokens: 7 },
+            }),
+          ].join('\n'),
+          stderr: '',
+          exitCode: 0,
+          failed: false,
+        } as any);
+
+        const result = await provider.invoke({ ...baseOptions, nativeSchema: schema });
+
+        const [, args] = mockExeca.mock.calls[0] as [string, string[], any];
+        const schemaIndex = args.indexOf('--json-schema');
+        expect(schemaIndex).toBeGreaterThanOrEqual(0);
+        expect(JSON.parse(args[schemaIndex + 1]!)).toEqual(schema);
+        expect(result).toMatchObject({
+          success: true,
+          output: 'Reconciliation complete.',
+          finalStructuredResult: constrainedResult,
+        });
+      });
+
+      it('passes the security descriptor schema through provider execution to Claude argv', async () => {
+        const nativeSchema = BUILD_REVIEW_RUBRIC_REGISTRY.security.contract.output.jsonSchema;
+        mockExeca.mockResolvedValue({
+          stdout: JSON.stringify({
+            type: 'result',
+            result: 'Security judgement complete.',
+            structured_output: JSON.stringify({ findings: [] }),
+          }),
+          stderr: '',
+          exitCode: 0,
+          failed: false,
+        } as any);
+
+        const result = await executeAuxiliaryProviderCandidates({
+          step: 'build_review',
+          memberId: 'security',
+          policy: claudeRubricPolicy,
+          runtimes: claudeRuntime(provider),
+          sessions: new ProviderSessionScope(vi.fn()),
+          options: { prompt: 'Judge the security rubric.', nativeSchema },
+        });
+
+        const [, args] = mockExeca.mock.calls[0] as [string, string[], any];
+        const schemaIndex = args.indexOf('--json-schema');
+        expect(schemaIndex).toBeGreaterThanOrEqual(0);
+        expect(JSON.parse(args[schemaIndex + 1]!)).toEqual(nativeSchema);
+        expect(result).toMatchObject({
+          success: true,
+          output: 'Security judgement complete.',
+          finalStructuredResult: { findings: [] },
+        });
+      });
+
+      it.each([
+        {
+          name: 'has no terminal result envelope',
+          stdout: JSON.stringify({
+            type: 'assistant',
+            message: { content: [{ type: 'tool_use', name: 'inspect', input: { structured_output: { forged: true } } }] },
+          }),
+          expected: 'missing terminal result record',
+          structuredResultFailure: undefined,
+        },
+        {
+          name: 'is absent from the terminal result envelope',
+          stdout: JSON.stringify({ type: 'result', result: 'Reconciliation complete.' }),
+          expected: 'missing its structured result',
+          structuredResultFailure: 'missing',
+        },
+        {
+          name: 'is malformed JSON in the terminal result envelope',
+          stdout: JSON.stringify({
+            type: 'result',
+            result: 'Reconciliation complete.',
+            structured_output: '{not valid JSON',
+          }),
+          expected: 'malformed structured result',
+          structuredResultFailure: 'malformed',
+        },
+      ])('fails closed when the structured result $name', async ({ stdout, expected, structuredResultFailure }) => {
+        mockExeca.mockResolvedValue({ stdout, stderr: '', exitCode: 0, failed: false } as any);
+
+        const result = await provider.invoke({ ...baseOptions, nativeSchema: schema });
+
+        expect(result).toMatchObject({ success: false, exitCode: 0 });
+        expect(result.structuredResultFailure).toBe(structuredResultFailure);
+        expect(result.output).toContain(expected);
+        expect(result.finalStructuredResult).toBeUndefined();
+      });
+
+      it('does not expose a terminal structured value from a failed provider invocation', async () => {
+        mockExeca.mockResolvedValue({
+          stdout: JSON.stringify({
+            type: 'result',
+            result: 'Provider failed after a partial response.',
+            structured_output: JSON.stringify({ version: 1, relationships: [] }),
+          }),
+          stderr: 'service unavailable',
+          exitCode: 1,
+          failed: true,
+        } as any);
+
+        const result = await provider.invoke({ ...baseOptions, nativeSchema: schema });
+
+        expect(result).toMatchObject({ success: false, exitCode: 1 });
+        expect(result.output).toContain('service unavailable');
+        expect(result.finalStructuredResult).toBeUndefined();
+      });
+
+      it('fails with a named unsupported-capability result instead of silently using a REPL', async () => {
+        const result = await provider.invoke({
+          ...baseOptions,
+          interactive: true,
+          nativeSchema: schema,
+        });
+
+        expect(result).toMatchObject({
+          success: false,
+          nativeSchemaUnsupported: true,
+        });
+        expect(result.output).toContain('unsupported for interactive Claude invocation');
+        expect(mockExeca).not.toHaveBeenCalled();
+      });
+
+      it('keeps a no-schema invocation on its existing argument and result path', async () => {
+        mockExeca.mockResolvedValue({
+          stdout: JSON.stringify({
+            type: 'result',
+            result: 'Normal invocation complete.',
+            usage: { input_tokens: 12, output_tokens: 7 },
+          }),
+          stderr: '',
+          exitCode: 0,
+          failed: false,
+        } as any);
+
+        const result = await provider.invoke(baseOptions);
+
+        const [, args] = mockExeca.mock.calls[0] as [string, string[], any];
+        expect(args).not.toContain('--json-schema');
+        expect(result).toMatchObject({
+          success: true,
+          output: 'Normal invocation complete.',
+          tokenUsage: { input: 12, output: 7 },
+        });
+        expect(result.finalStructuredResult).toBeUndefined();
+      });
     });
 
     it('selects the stream-json envelope for a non-REPL dispatch', async () => {
@@ -685,6 +892,7 @@ describe('ClaudeProvider', () => {
         expect(options.env).toEqual({
           ...process.env,
           CONDUCT_DAEMON_SESSION: '1',
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
           TMUX: undefined,
           TMUX_PANE: undefined,
         });
@@ -1095,6 +1303,7 @@ describe('ClaudeProvider', () => {
 
       const result = await provider.invoke({ ...baseOptions, interactive: true });
       expect(result).toMatchObject({ modelUnavailable: true, success: false });
+      expect(result.rateLimited).toBeUndefined();
     });
 
     it('does not flag modelUnavailable when prose quotes the monthly spend limit message', async () => {
@@ -1149,6 +1358,116 @@ describe('ClaudeProvider', () => {
       expect(result.rateLimited).toBe(true);
       expect(result.success).toBe(false);
       expect(result.waitSeconds).toBeDefined();
+    });
+
+    it('detects weekly-limit message with reset time on exit 0', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-09-22T20:00:00-04:00'));
+      mockExeca.mockResolvedValue({
+        stdout: "You've hit your weekly limit · resets 9pm (America/New_York)",
+        stderr: '',
+        exitCode: 0,
+        failed: false,
+      } as any);
+
+      try {
+        const now = Date.now();
+        const result = await provider.invoke({ ...baseOptions, interactive: true });
+
+        expect(result.rateLimited).toBe(true);
+        expect(result.success).toBe(false);
+        expect(typeof result.deadline).toBe('number');
+        expect(result.deadline).toBeGreaterThan(now);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('resolves a weekly-limit deadline to the next 9pm in America/New_York', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-03T16:00:00Z'));
+      mockExeca.mockResolvedValue({
+        stdout: "You've hit your weekly limit · resets 9pm (America/New_York)",
+        stderr: '',
+        exitCode: 0,
+        failed: false,
+      } as any);
+
+      try {
+        const result = await provider.invoke({ ...baseOptions, interactive: true });
+
+        expect(result.rateLimited).toBe(true);
+        expect(result.success).toBe(false);
+        expect(result.deadline).toBe(Date.parse('2026-07-04T01:00:00Z'));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([
+      "You've hit your daily limit · resets 3:20pm (America/New_York)",
+      "You've hit your usage limit · resets 3:20pm (America/New_York)",
+      "You've hit your session limit · resets 3:20pm (America/New_York)",
+    ])('classifies %s as rateLimited', async (stdout) => {
+      mockExeca.mockResolvedValue({
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        failed: false,
+      } as any);
+
+      const result = await provider.invoke({ ...baseOptions, interactive: true });
+
+      expect(result.rateLimited).toBe(true);
+      expect(result.success).toBe(false);
+    });
+
+    it('classifies a weekly limit before trailing auth-failure prose', async () => {
+      mockExeca.mockResolvedValue({
+        stdout: "You've hit your weekly limit · resets 9pm (America/New_York). Failed to authenticate. API Error: 401",
+        stderr: '',
+        exitCode: 1,
+        failed: true,
+      } as any);
+
+      const result = await provider.invoke(baseOptions);
+
+      expect(result.rateLimited).toBe(true);
+      expect(result.authFailure).toBeUndefined();
+      expect(result.success).toBe(false);
+      expect(result.waitSeconds).toBeDefined();
+    });
+
+    it('keeps an ordinary ENOENT error unclassified as a rate limit', async () => {
+      mockExeca.mockResolvedValue({
+        stdout: 'Error: ENOENT reading .docs/plans/x.md',
+        stderr: '',
+        exitCode: 1,
+        failed: true,
+      } as any);
+
+      const result = await provider.invoke(baseOptions);
+
+      expect(result.rateLimited).toBeUndefined();
+      expect(result.success).toBe(false);
+      expect(result.waitSeconds).toBeUndefined();
+      expect(result.deadline).toBeUndefined();
+    });
+
+    it('keeps a prose mention of weekly limit successful and unclassified', async () => {
+      const stdout = 'Discussion about weekly limit policies in documentation';
+      mockExeca.mockResolvedValue({
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        failed: false,
+      } as any);
+
+      const result = await provider.invoke({ ...baseOptions, interactive: true });
+
+      expect(result.rateLimited).toBeUndefined();
+      expect(result.success).toBe(true);
+      expect(detectsSessionLimit(stdout)).toBe(false);
     });
 
     it('detects usage-limit variant as rateLimited', async () => {
@@ -1283,16 +1602,19 @@ describe('ClaudeProvider', () => {
       expect(result.modelUnavailable).toBeUndefined();
     });
 
-    it('detects auth failure from "Not logged in" message', async () => {
+    it('detects auth failure from "Not logged in. Please run /login" message', async () => {
+      const stdout = 'Not logged in. Please run /login';
       mockExeca.mockResolvedValue({
-        stdout: 'Error: Not logged in',
+        stdout,
         exitCode: 1,
         failed: true,
       } as any);
 
       const result = await provider.invoke(baseOptions);
       expect(result.authFailure).toBe(true);
+      expect(result.rateLimited).toBeUndefined();
       expect(result.success).toBe(false);
+      expect(detectsSessionLimit(stdout)).toBe(false);
     });
 
     it('detects auth failure from "Please run /login" message', async () => {
@@ -1644,9 +1966,24 @@ describe('ClaudeProvider', () => {
       expect(opts.env).toEqual({
         ...process.env,
         CONDUCT_DAEMON_SESSION: '1',
+        CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
         TMUX: undefined,
         TMUX_PANE: undefined,
       });
+    });
+
+    it('disables background tasks so no subagent outlives the print-mode turn (#2599)', async () => {
+      mockExeca.mockResolvedValue({ stdout: '', exitCode: 0, failed: false } as any);
+      const prior = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+      process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '0';
+      try {
+        await provider.invoke({ ...baseOptions });
+        const [, , opts] = mockExeca.mock.calls[0] as [string, string[], any];
+        expect(opts.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe('1');
+      } finally {
+        if (prior === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+        else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = prior;
+      }
     });
 
     it('invokeInteractive also forwards the effort env var', async () => {
@@ -1863,6 +2200,15 @@ describe('ClaudeProvider', () => {
 });
 
 describe('parseRateLimitWaitSeconds - direct unit tests for timezone parsing', () => {
+  it('rolls a weekly-limit deadline after 9pm to the following day', () => {
+    const now = new Date('2026-07-04T02:30:00Z');
+    const message = "You've hit your weekly limit · resets 9pm (America/New_York)";
+
+    const result = parseRateLimitWaitSeconds(message, { now });
+
+    expect(result.deadline).toBe(Date.parse('2026-07-05T01:00:00Z'));
+  });
+
   it('parses reset time in America/New_York timezone and returns deadline', () => {
     // Task 18: Test with injected "now" time to verify clamping
     // 2026-07-03T18:05:54Z is 13:05:54 EDT (UTC-4)

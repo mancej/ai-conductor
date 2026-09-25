@@ -1,6 +1,11 @@
+import { createHash } from 'node:crypto';
+
 import type { BuildReviewRubricId } from "../types/config.js";
+import type { ProviderSetupExhaustion } from './provider-setup-failure.js';
 import {
   CURRENT_BUILD_REVIEW_RUBRIC_CONTRACT_VERSION,
+  deriveBuildReviewInfrastructureFailureReason,
+  diagnoseBuildReviewJudgedResultRejection,
   describeBuildReviewJudgedResultRejection,
   parseBuildReviewCandidateScopeResolutions,
   parseBuildReviewDispatchFailure,
@@ -26,6 +31,8 @@ import {
   type BuildReviewCacheEntry,
   type BuildReviewCacheEntryCandidate,
   type BuildReviewEngineIdentity,
+  type BuildReviewCacheLookupResolution,
+  type BuildReviewCacheSemanticIdentity,
 } from "./build-review-cache.js";
 import {
   parseBuildReviewBranchArtifact,
@@ -34,10 +41,13 @@ import {
 import type { BuildReviewFrozenInputs } from "./build-review-inputs.js";
 import { buildReviewScopeCandidateIdentityKey } from "./build-review-scope-identity.js";
 import {
-  deriveBuildReviewRubricProjections,
+  isTestQualityProjection,
+  canonicalJson,
+  type BuildReviewProjectionJson,
   type BuildReviewRubricProjections,
   type BuildReviewRubricProjection,
   type BuildReviewTestQualityProjectionInput,
+  type BuildReviewProjectionSource,
 } from "./build-review-projections.js";
 import {
   projectTestQualityPreflight,
@@ -49,7 +59,6 @@ import type {
   ResolvedBuildReviewRubricPolicy,
 } from "./resolved-config.js";
 import type { ConductorEvent } from "../types/events.js";
-import { canonicalizeBuildReviewFindingSet } from "./build-review-finding-identity.js";
 
 const BUILD_REVIEW_RUBRICS = BUILD_REVIEW_RUBRIC_IDS;
 const TEST_QUALITY_RUBRIC: BuildReviewRubricId = "testQuality";
@@ -91,6 +100,10 @@ export type BuildReviewCoordinatedBranch =
       readonly reason: BuildReviewCoordinatorFailureReason;
       /** Bounded diagnostic (e.g. a raw-output excerpt); never part of routing identity. */
       readonly detail?: string;
+      /** Terminal setup-only dispatch signal, carried to the owning build-review step. */
+      readonly providerSetupExhaustion?: ProviderSetupExhaustion;
+      /** Typed structured-output rejection retained for the mechanical-fault event. */
+      readonly rejection?: import('./build-review-domain.js').BuildReviewJudgedResultRejection;
     };
 
 /**
@@ -128,14 +141,22 @@ export interface BuildReviewCoordinationInput {
   readonly inputs: BuildReviewFrozenInputs;
   readonly lapId: BuildReviewLapId;
   /** Test seam for an engine-held projection corruption at branch settlement. */
-  readonly projections?: BuildReviewRubricProjections;
+  /** Legacy test seams may override one projection; unset members use the engine-derived projection. */
+  readonly projections?: Partial<BuildReviewRubricProjections>;
   readonly preflight: () => Promise<TautologyPreflightResult>;
   /** Resolved once per dispatch by the caller; never read from the environment here (D6). */
   readonly engineIdentity: BuildReviewCoordinationEngineIdentity;
+  /**
+   * Production candidate dispatch resolves its cache identity only after a
+   * provider has prepared.  Keep the coordinator cache seam for callers that
+   * do not have that lifecycle boundary (and for its focused contract tests).
+   */
+  readonly useCandidateCache?: boolean;
   readonly readCache: (
     branch: BuildReviewDispatchableRubric,
     projection: BuildReviewRubricProjection,
     policyFingerprint: string,
+    semanticIdentity: BuildReviewCacheSemanticIdentity,
   ) => Promise<BuildReviewCacheEntryCandidate | undefined>;
   readonly dispatchModel: (
     branch: BuildReviewDispatchableRubric,
@@ -158,6 +179,22 @@ export interface BuildReviewCoordinationInput {
     | "build_review_scope_summary"
     | "build_review_scope_incomplete"
     | "build_review_outer_verdict" }>) => Promise<void>;
+}
+
+/** Publish only the identity mismatches governed by ADR D5, from every cache path. */
+export async function emitBuildReviewCacheDiscard(
+  emit: BuildReviewCoordinationInput['emit'] | undefined,
+  cache: BuildReviewCacheLookupResolution,
+  rubric: BuildReviewRubricId | string,
+  lapId: BuildReviewLapId,
+  currentEngineStamp: string,
+): Promise<void> {
+  if (cache.kind !== 'miss' || (cache.reason !== 'engine-version-mismatch' && cache.reason !== 'skill-digest-mismatch')) return;
+  await emit?.({
+    type: 'build_review_cache_discarded', rubric, lapId, reason: cache.reason,
+    ...(cache.cachedEngineStamp === undefined ? {} : { cachedEngineStamp: cache.cachedEngineStamp }),
+    currentEngineStamp,
+  });
 }
 
 async function emitScopeIncomplete(
@@ -221,8 +258,46 @@ export function preflightProjection(preflight: TautologyPreflightResult): BuildR
   };
 }
 
-function infrastructure(rubric: BuildReviewRubricId, reason: BuildReviewCoordinatorFailureReason, detail?: string): BuildReviewCoordinatedBranch {
-  return { kind: "infrastructure-failure", rubric, reason, ...(detail === undefined ? {} : { detail }) };
+function infrastructure(
+  rubric: BuildReviewRubricId,
+  reason: BuildReviewCoordinatorFailureReason,
+  detail?: string,
+  setupExhaustion?: ProviderSetupExhaustion,
+  rejection?: import('./build-review-domain.js').BuildReviewJudgedResultRejection,
+): BuildReviewCoordinatedBranch {
+  return {
+    kind: "infrastructure-failure", rubric, reason,
+    ...(detail === undefined ? {} : { detail }),
+    ...(setupExhaustion ? { providerSetupExhaustion: setupExhaustion } : {}),
+    ...(rejection ? { rejection } : {}),
+  };
+}
+
+/** Complete built-in candidate identity for the v2 cache envelope. */
+function builtinCacheIdentity(
+  branch: BuildReviewDispatchableRubric,
+  projection: BuildReviewRubricProjection,
+  engineIdentity: BuildReviewCoordinationEngineIdentity,
+  skillDigest: string,
+): BuildReviewCacheSemanticIdentity {
+  const executionPolicyFingerprint = fingerprintBuildReviewRubricPolicy(branch.policy);
+  const declarationFingerprint = `sha256:${createHash('sha256').update(JSON.stringify({
+    rubric: branch.rubric,
+    contractVersion: projection.contractVersion,
+    projectionVersion: projection.projectionVersion,
+  })).digest('hex')}`;
+  return {
+    declarationFingerprint,
+    effectiveBundleDigest: skillDigest,
+    contractVersion: projection.contractVersion,
+    projectionVersion: projection.projectionVersion,
+    semanticInputDigest: projection.digest,
+    executionPolicyFingerprint,
+    engineStamp: engineIdentity.engineStamp,
+    provider: Array.isArray(branch.policy.llm_provider) ? branch.policy.llm_provider[0]! : branch.policy.llm_provider,
+    model: branch.policy.model,
+    effort: branch.policy.effort,
+  };
 }
 
 /**
@@ -308,6 +383,7 @@ function record(value: unknown): Record<string, unknown> | undefined {
  * second provider call participate in candidate settlement.
  */
 export function buildReviewCandidateScopeResolutionContext(projection: BuildReviewRubricProjection): BuildReviewCandidateScopeResolutionContext {
+  if (!isTestQualityProjection(projection)) return { candidates: [] };
   const scope = record(projection.testScope);
   const rawCandidates = Array.isArray(scope?.candidates) ? scope.candidates : [];
   const evidence = Array.isArray(scope?.evidence) ? scope.evidence : [];
@@ -400,10 +476,15 @@ export function validateBuildReviewDispatchedResult(
   // Treat the provider list as one boundary value.  Parsing individual
   // findings is insufficient: duplicate/colliding identities would otherwise
   // become two independently persisted branch facts.
-  const canonical = result && canonicalizeBuildReviewFindingSet(result.findings.map((finding) => ({
-    rubric: result.rubric, contractVersion: result.contractVersion, ...finding,
-  })));
-  return result && canonical && canonical.length === result.findings.length ? result : undefined;
+  const canonical = result && result.findings.map((finding) =>
+    getBuildReviewRubricDescriptor(result.rubric).contract.identity.canonicalize({
+      rubric: result.rubric, contractVersion: result.contractVersion, ...finding,
+    }),
+  );
+  return result && canonical && canonical.every((identity) => identity !== undefined) &&
+    new Set(canonical.map((identity) => identity!.id)).size === result.findings.length
+    ? result
+    : undefined;
 }
 
 /**
@@ -464,7 +545,9 @@ export async function coordinateBuildReviewRubrics(
     ? inScopeTests.length > 0
     : (typedScope?.targets?.length ?? 0) > 0;
   const hasConcreteCandidates = (typedScope?.candidates?.length ?? 0) > 0;
-  if (input.config.enabled && testQualityPolicy?.enabled && !hasEstablishedTargets && !hasConcreteCandidates) {
+  const emptyTestQualityScope = !hasEstablishedTargets && !hasConcreteCandidates;
+  const otherRubricEnabled = BUILD_REVIEW_RUBRICS.some((rubric) => rubric !== TEST_QUALITY_RUBRIC && input.config.rubrics[rubric]?.enabled);
+  if (input.config.enabled && testQualityPolicy?.enabled && emptyTestQualityScope && !otherRubricEnabled) {
     // An empty scope is still a settled scope assessment: publish its counts and
     // unresolved reasons on the same event as every judged settlement, so a
     // production-only refactor or pure move is observable rather than silent.
@@ -506,7 +589,7 @@ export async function coordinateBuildReviewRubrics(
     (branch) => !("kind" in branch) && branch.rubric === TEST_QUALITY_RUBRIC,
   );
   let preflight: TautologyPreflightResult | undefined;
-  if (testQualityEnabled) {
+  if (testQualityEnabled && !emptyTestQualityScope) {
     try {
       preflight = await input.preflight();
     } catch {
@@ -527,7 +610,7 @@ export async function coordinateBuildReviewRubrics(
       ),
     },
   };
-  const derivedProjections = deriveBuildReviewRubricProjections({
+  const projectionSource: BuildReviewProjectionSource = {
     lapId: input.lapId,
     inputs: projectionInputs,
     testQuality: preflight ? {
@@ -540,8 +623,20 @@ export async function coordinateBuildReviewRubrics(
     } : {
       runnerSelectors: [], changedTestSelectors: [], unresolvedMarkers, revertedProductionManifest: [], preflight: { classification: "not-requested", excerpt: "" },
     },
-  });
-  const projections = input.projections ?? derivedProjections;
+  };
+  // The descriptor is the live projection seam.  Keeping construction here
+  // lets the coordinator retain its preflight inputs while preventing a
+  // parallel direct projection path from drifting away from the registry.
+  const derivedProjections = Object.freeze(Object.fromEntries(
+    BUILD_REVIEW_RUBRICS.map((rubric) => [
+      rubric,
+      getBuildReviewRubricDescriptor(rubric).contract.projection.build(projectionSource),
+    ]),
+  )) as BuildReviewRubricProjections;
+  const projections: Readonly<Record<BuildReviewRubricId, BuildReviewRubricProjection>> = {
+    ...derivedProjections,
+    ...input.projections,
+  };
   const resolved = new Map<BuildReviewRubricId, BuildReviewCoordinatedBranch>();
   const misses: BuildReviewDispatchableRubric[] = [];
 
@@ -551,10 +646,31 @@ export async function coordinateBuildReviewRubrics(
       await input.emit?.({ type: "build_review_rubric_skipped", rubric: branch.rubric, lapId: input.lapId, reason: branch.reason });
       continue;
     }
+    if (branch.rubric === TEST_QUALITY_RUBRIC && emptyTestQualityScope) {
+      resolved.set(branch.rubric, { kind: "skipped", rubric: branch.rubric, reason: "test_quality_empty_scope" });
+      await input.emit?.({ type: "build_review_rubric_skipped", rubric: branch.rubric, lapId: input.lapId, reason: "test_quality_empty_scope" });
+      await emitScopeSummary(input.emit, input);
+      continue;
+    }
     const projection = projections[branch.rubric];
     if (projection.rubric !== branch.rubric) {
       resolved.set(branch.rubric, infrastructure(branch.rubric, "projection-rubric-mismatch"));
       await input.emit?.({ type: "build_review_rubric_infrastructure_failure", rubric: branch.rubric, lapId: input.lapId, reason: "projection-rubric-mismatch" });
+      continue;
+    }
+    const projectionBytes = Buffer.byteLength(canonicalJson(projection as unknown as BuildReviewProjectionJson), "utf8");
+    if (projectionBytes > branch.policy.max_projection_bytes) {
+      const detail = `measured=${projectionBytes} bytes limit=${branch.policy.max_projection_bytes} bytes`;
+      resolved.set(branch.rubric, infrastructure(branch.rubric, "projection-oversized", detail));
+      await input.emit?.({
+        type: "build_review_rubric_infrastructure_failure",
+        rubric: branch.rubric,
+        lapId: input.lapId,
+        reason: "projection-oversized",
+        excerpt: detail,
+        measuredBytes: projectionBytes,
+        limitBytes: branch.policy.max_projection_bytes,
+      });
       continue;
     }
     if (branch.rubric === TEST_QUALITY_RUBRIC && preflight?.classification === "infrastructure-failure") {
@@ -568,6 +684,14 @@ export async function coordinateBuildReviewRubrics(
       });
       continue;
     }
+    // Candidate cache identity is loaded inside the actual prepared provider
+    // candidate. The harness-root digests below are legacy cache evidence;
+    // engineStamp is retained as the per-run stamp on both paths.
+    if (input.useCandidateCache) {
+      await input.emit?.({ type: "build_review_rubric_started", rubric: branch.rubric, lapId: input.lapId });
+      misses.push(branch);
+      continue;
+    }
     const skillDigest = input.engineIdentity.skillDigests[branch.rubric];
     if (skillDigest === undefined || skillDigest.kind === "unavailable") {
       // adr-2026-08-21 D3 (amended): an unreadable rubric SKILL.md is an
@@ -577,14 +701,18 @@ export async function coordinateBuildReviewRubrics(
       await input.emit?.({ type: "build_review_rubric_infrastructure_failure", rubric: branch.rubric, lapId: input.lapId, reason: "cache-read-failed", excerpt: detail });
       continue;
     }
+    // Cache identity includes the resolved provider/model. The legacy
+    // coordinator seam remains a complete cache boundary for callers without
+    // candidate lifecycle context.
     const engineIdentity: BuildReviewEngineIdentity = {
       engineStamp: input.engineIdentity.engineStamp,
       skillDigest: skillDigest.digest,
     };
     const policyFingerprint = fingerprintBuildReviewRubricPolicy(branch.policy);
+    const semanticIdentity = builtinCacheIdentity(branch, projection, input.engineIdentity, skillDigest.digest);
     let candidate: BuildReviewCacheEntryCandidate | undefined;
     try {
-      candidate = await input.readCache(branch, projection, policyFingerprint);
+      candidate = await input.readCache(branch, projection, policyFingerprint, semanticIdentity);
     } catch {
       resolved.set(branch.rubric, infrastructure(branch.rubric, "cache-read-failed"));
       await input.emit?.({ type: "build_review_rubric_infrastructure_failure", rubric: branch.rubric, lapId: input.lapId, reason: "cache-read-failed" });
@@ -597,27 +725,11 @@ export async function coordinateBuildReviewRubrics(
       projectionDigest: projection.digest,
       policyFingerprint,
       engineIdentity,
+      semanticIdentity,
       lapId: input.lapId,
       snapshotDigest: projection.snapshotDigest,
     });
-    if (cache.kind === "miss" && (cache.reason === "engine-version-mismatch" || cache.reason === "skill-digest-mismatch")) {
-      // adr-2026-08-21 D5: only the two engine-identity reasons emit a
-      // discard on the spine; ordinary projection/policy misses stay silent.
-      await input.emit?.({
-        type: "build_review_cache_discarded",
-        rubric: branch.rubric,
-        lapId: input.lapId,
-        reason: cache.reason,
-        ...(cache.cachedEngineStamp === undefined ? {} : { cachedEngineStamp: cache.cachedEngineStamp }),
-        currentEngineStamp: input.engineIdentity.engineStamp,
-      });
-    }
-    // A semantic cache identity proves only that the frozen input projection
-    // matches.  Re-run the same source-bound result predicate used for a
-    // fresh provider response before reusing the cached judgement: persisted
-    // candidate resolutions and finding anchors are evidence, never cache
-    // authority.  An invalid cached result is an ordinary miss so a fresh
-    // judgement can settle the current frozen scope.
+    await emitBuildReviewCacheDiscard(input.emit, cache, branch.rubric, input.lapId, input.engineIdentity.engineStamp);
     const cachedResult = cache.kind === "hit"
       ? validateBuildReviewDispatchedResult(cache.hit.result, branch.rubric, projection)
       : undefined;
@@ -661,15 +773,37 @@ export async function coordinateBuildReviewRubrics(
         const result = validateBuildReviewDispatchedResult(candidate, rubric, projection);
         if (!result) {
           const failure = parseBuildReviewDispatchFailure(dispatched);
+          const cacheWriteFailure = typeof dispatched === 'object' && dispatched !== null
+            && !Array.isArray(dispatched) && (dispatched as { kind?: unknown }).kind === 'cache-write-failed';
+          const cacheWriteDetail = cacheWriteFailure && typeof (dispatched as { detail?: unknown }).detail === 'string'
+            ? (dispatched as { detail: string }).detail
+            : undefined;
           // No pre-formed dispatch failure: the engine derives the failed
           // requirement itself from the stamped candidate, so the diagnosis
           // is produced by the same validation surface that rejected it.
-          const detail = failure?.detail ?? (dispatched === undefined ? undefined : (
-            typeof dispatched !== "object" || dispatched === null || Array.isArray(dispatched)
-              ? "no parseable JSON object was found in the response"
-              : describeBuildReviewDispatchedResultRejection(candidate, rubric, projection)
-          ));
-          return { rubric, branch: infrastructure(rubric, "invalid-provider-result", detail) };
+          const rejection = failure?.rejection ?? diagnoseBuildReviewJudgedResultRejection(
+            candidate,
+            rubric,
+            { lapId: projection.lapId, snapshotDigest: projection.snapshotDigest },
+            buildReviewFindingReferenceContext(projection),
+            buildReviewCandidateScopeResolutionContext(projection),
+          );
+          const detail = cacheWriteDetail ?? failure?.detail ?? describeBuildReviewDispatchedResultRejection(candidate, rubric, projection);
+          const structuredResultWasRejected = failure?.cause === 'invalid-structured-result' || dispatched !== undefined;
+          return {
+            rubric,
+            branch: infrastructure(
+              rubric,
+              cacheWriteFailure ? 'cache-write-failed' : failure?.cause === 'native-schema-unsupported'
+                ? 'native-schema-unsupported'
+                : structuredResultWasRejected
+                ? 'invalid-structured-result'
+                : 'invalid-provider-result',
+              detail,
+              failure?.providerSetupExhaustion,
+              failure?.cause === 'native-schema-unsupported' ? undefined : structuredResultWasRejected ? rejection : undefined,
+            ),
+          };
         }
         let written: BuildReviewJudgedResult | undefined;
         try {
@@ -684,25 +818,24 @@ export async function coordinateBuildReviewRubrics(
           return { rubric, branch: infrastructure(rubric, "artifact-write-failed") };
         }
         if (!written) return { rubric, branch: infrastructure(rubric, "artifact-write-failed") };
-        const skillDigest = input.engineIdentity.skillDigests[rubric];
-        if (skillDigest === undefined || skillDigest.kind === "unavailable") {
-          // Unreachable for dispatched branches (unavailable digests fail
-          // before dispatch), kept fail-closed: never write without identity.
-          return { rubric, branch: infrastructure(rubric, "cache-write-failed") };
-        }
-        try {
-          await input.writeCache({
-            version: 1,
-            rubric,
-            contractVersion: projection.contractVersion,
-            projectionVersion: projection.projectionVersion,
-            projectionDigest: projection.digest,
-            policyFingerprint: fingerprintBuildReviewRubricPolicy(branch.policy),
-            engineIdentity: { engineStamp: input.engineIdentity.engineStamp, skillDigest: skillDigest.digest },
-            result: written,
-          });
-        } catch {
-          return { rubric, branch: infrastructure(rubric, "cache-write-failed") };
+        if (!input.useCandidateCache) {
+          const skillDigest = input.engineIdentity.skillDigests[rubric];
+          if (skillDigest?.kind !== "resolved") return { rubric, branch: infrastructure(rubric, "cache-write-failed") };
+          try {
+            await input.writeCache({
+              version: 2,
+              rubric,
+              contractVersion: projection.contractVersion,
+              projectionVersion: projection.projectionVersion,
+              projectionDigest: projection.digest,
+              policyFingerprint: fingerprintBuildReviewRubricPolicy(branch.policy),
+              engineIdentity: { engineStamp: input.engineIdentity.engineStamp, skillDigest: skillDigest.digest },
+              semanticIdentity: builtinCacheIdentity(branch, projection, input.engineIdentity, skillDigest.digest),
+              result: written,
+            });
+          } catch {
+            return { rubric, branch: infrastructure(rubric, "cache-write-failed") };
+          }
         }
         return { rubric, branch: { kind: "dispatched", rubric, result: written } as BuildReviewCoordinatedBranch };
       } catch {
@@ -722,6 +855,8 @@ export async function coordinateBuildReviewRubrics(
         rubric: outcome.rubric,
         lapId: input.lapId,
         reason: outcome.branch.reason,
+        cause: deriveBuildReviewInfrastructureFailureReason(outcome.branch),
+        ...(outcome.branch.rejection !== undefined ? { rejection: outcome.branch.rejection } : {}),
         ...(outcome.branch.detail !== undefined ? { excerpt: outcome.branch.detail } : {}),
       });
     }

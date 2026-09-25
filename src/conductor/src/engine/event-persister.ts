@@ -4,9 +4,63 @@ import {
   epochAnchoredMonotonicClock,
   type IntervalClock,
 } from '../execution/observed-interval.js';
-import type { ConductorEvent } from '../types/index.js';
+import type {
+  CiRepairDiagnosticDisposition,
+  CiRepairDiagnosticReason,
+  CiRepairDiagnosticStage,
+  ConductorEvent,
+} from '../types/index.js';
 import { ConductorEventEmitter, type EventHandler } from '../ui/events.js';
+import { resolveExecutionIdentity, type ExecutionScope } from './execution-identity.js';
 import { persistedEventTypes } from './event-sinks.js';
+
+const MAX_CI_REPAIR_DIAGNOSTIC_BYTES = 8_192;
+const CI_REPAIR_STAGES = new Set<CiRepairDiagnosticStage>(['context', 'log-enrichment', 'branch', 'readiness', 'execution', 'guard', 'verification', 'publication']);
+const CI_REPAIR_REASONS = new Set<CiRepairDiagnosticReason>(['auth', 'permission', 'timeout', 'api', 'capability', 'malformed-context', 'missing-context', 'missing-branch', 'log-unavailable', 'context-truncated', 'provider-unavailable', 'readiness-degraded', 'flag-invalid', 'spawn-env', 'unknown', 'guard-refused', 'verification-failed', 'publication-refused', 'verified-publication']);
+const CI_REPAIR_DISPOSITIONS = new Set<CiRepairDiagnosticDisposition>(['deferred', 'degraded', 'failed', 'published']);
+
+/** Bound untrusted attribution; raw output and hints are not event fields. */
+export function boundCiRepairDiagnostic(event: ConductorEvent): ConductorEvent {
+  if (event.type !== 'ci_repair_diagnostic') return event;
+  const truncate = (value: string, max: number) => {
+    if (Buffer.byteLength(value, 'utf8') <= max) return value;
+    const marker = '[truncated]';
+    let result = '';
+    for (const char of value) {
+      if (Buffer.byteLength(result + char + marker, 'utf8') > max) break;
+      result += char;
+    }
+    return result + marker;
+  };
+  const safePrUrl = (value: string): string => {
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash
+        ? truncate(url.toString(), 2_048)
+        : '[invalid]';
+    } catch { return '[invalid]'; }
+  };
+  let bounded: ConductorEvent = {
+    ...event,
+    slug: /^[A-Za-z0-9._-]+$/.test(event.slug) ? truncate(event.slug, 512) : '[invalid]',
+    prUrl: safePrUrl(event.prUrl),
+    stage: CI_REPAIR_STAGES.has(event.stage) ? event.stage : 'execution',
+    reason: CI_REPAIR_REASONS.has(event.reason) ? event.reason : 'unknown',
+    disposition: CI_REPAIR_DISPOSITIONS.has(event.disposition) ? event.disposition : 'failed',
+    // Provider identity is attribution, not diagnostic text. Never preserve a
+    // prefix of an oversized value: a malformed adapter could otherwise place
+    // a credential in that prefix. Known production identities are tiny.
+    ...(event.provider === undefined ? {} : {
+      provider: /^[A-Za-z0-9._-]+$/.test(event.provider)
+        ? (Buffer.byteLength(event.provider, 'utf8') <= 64 ? event.provider : '[truncated]')
+        : 'unknown',
+    }),
+  };
+  if (Buffer.byteLength(JSON.stringify(bounded), 'utf8') > MAX_CI_REPAIR_DIAGNOSTIC_BYTES) {
+    bounded = { ...bounded, provider: '[truncated]' };
+  }
+  return bounded;
+}
 
 /**
  * Thrown when EventPersister cannot append to the event log file.
@@ -37,7 +91,9 @@ export class EventPersister {
   private readonly clock: IntervalClock;
   private readonly filter: ((event: ConductorEvent) => boolean) | undefined;
   private readonly openSteps = new Map<string, number>();
+  private readonly settledSteps = new Map<string, number>();
   private readonly openGroups = new Map<string, number>();
+  private readonly executionScope: ExecutionScope;
   private dirEnsured = false;
 
   constructor(
@@ -50,6 +106,7 @@ export class EventPersister {
     this.emitter = emitter;
     this.clock = clock;
     this.filter = filter;
+    this.executionScope = { featureId: filePath, runId: 'event-persister' };
 
     this.handler = (event: ConductorEvent): ReturnType<EventHandler> => {
       if (this.filter && !this.filter(event)) return;
@@ -88,6 +145,7 @@ export class EventPersister {
       const step = 'step' in event && typeof event.step === 'string'
         ? event.step
         : undefined;
+      const executionContext = 'executionContext' in event ? event.executionContext : undefined;
       // A refusal ends a serial step's attempt, so it closes that step's
       // interval exactly as a completion or failure does (adr-2026-08-12 D1:
       // every started execution closes on the ledger). A validation-group
@@ -97,28 +155,38 @@ export class EventPersister {
       const closesStep = (
         event.type === 'step_completed'
         || event.type === 'step_failed'
+        || event.type === 'step_interrupted'
         || event.type === 'step_refused'
       );
       const closesGroup = (
         event.type === 'parallel_completed'
         || (event.type === 'parallel_failure' && event.terminal !== false)
       );
+      const intervalKey = step === undefined
+        ? undefined
+        : this.intervalKey(step, executionContext);
       const openIntervals = closesGroup ? this.openGroups : this.openSteps;
-      const startedAtMs = step !== undefined && (closesStep || closesGroup)
-        ? openIntervals.get(step)
+      const startedAtMs = intervalKey !== undefined && (closesStep || closesGroup)
+        ? openIntervals.get(intervalKey)
         : undefined;
+      const finishedAtMs = startedAtMs === undefined
+        ? undefined
+        : closesStep ? this.settledSteps.get(intervalKey!) ?? this.clock.nowMs() : this.clock.nowMs();
       const activeInterval = closesStep
         || closesGroup
-        ? startedAtMs === undefined ? undefined : {
+        ? startedAtMs === undefined || finishedAtMs === undefined ? undefined : {
             startedAtMs,
-            durationMs: Math.max(0, this.clock.nowMs() - startedAtMs),
+            durationMs: Math.max(0, finishedAtMs - startedAtMs),
           }
         : undefined;
       const lifecycleEvent = event.type === 'provider_attempt' ? event : undefined;
       const lifecycle = lifecycleEvent?.lifecycle;
-      const lifecycleKey = lifecycle === undefined
+      const lifecycleIdentity = lifecycleEvent === undefined
         ? undefined
-        : `provider-lifecycle:${lifecycleEvent!.step}:${lifecycle.attemptId}`;
+        : this.intervalKey(lifecycleEvent.step, lifecycleEvent.executionContext);
+      const lifecycleKey = lifecycle === undefined || lifecycleIdentity === undefined
+        ? undefined
+        : `provider-lifecycle:${lifecycleIdentity}:${lifecycle.attemptId}`;
       const lifecycleNow = lifecycle === undefined ? undefined : this.clock.nowMs();
       const lifecycleStartedAt = lifecycleKey === undefined
         ? undefined
@@ -130,7 +198,7 @@ export class EventPersister {
             durationMs: Math.max(0, lifecycleNow - lifecycleStartedAt),
           };
       const record = JSON.stringify({
-        ...event,
+        ...boundCiRepairDiagnostic(event),
         ...(lifecycleInterval
           ? { observedIntervals: [...(lifecycleEvent?.observedIntervals ?? []), lifecycleInterval] }
           : {}),
@@ -138,12 +206,18 @@ export class EventPersister {
         ts: new Date().toISOString(),
       });
       appendFileSync(this.filePath, record + '\n', 'utf-8');
-      if (event.type === 'step_started') {
-        this.openSteps.set(event.step, this.clock.nowMs());
-      } else if (event.type === 'parallel_started') {
-        this.openGroups.set(event.step, this.clock.nowMs());
-      } else if (startedAtMs !== undefined && step !== undefined) {
-        openIntervals.delete(step);
+      if (event.type === 'step_started' && intervalKey !== undefined) {
+        this.openSteps.set(intervalKey, this.clock.nowMs());
+      } else if (event.type === 'parallel_started' && intervalKey !== undefined) {
+        this.openGroups.set(intervalKey, this.clock.nowMs());
+      } else if (event.type === 'group_member_step' && event.phase === 'result') {
+        const settlementKey = this.intervalKey(event.member, event.executionContext);
+        if (settlementKey !== undefined && this.openSteps.has(settlementKey)) {
+          this.settledSteps.set(settlementKey, this.clock.nowMs());
+        }
+      } else if (startedAtMs !== undefined && intervalKey !== undefined) {
+        openIntervals.delete(intervalKey);
+        if (closesStep) this.settledSteps.delete(intervalKey);
       }
       if (lifecycleKey !== undefined && lifecycleNow !== undefined) {
         if (lifecycle?.phase === 'settled' || lifecycle?.phase === 'exhausted') {
@@ -155,6 +229,14 @@ export class EventPersister {
     } catch (err) {
       throw new EventPersistError(this.filePath, err);
     }
+  }
+
+  private intervalKey(legacyStep: string, executionContext: unknown): string | undefined {
+    return resolveExecutionIdentity({
+      scope: this.executionScope,
+      legacyStep,
+      executionContext,
+    })?.correlationKey;
   }
 }
 
@@ -185,11 +267,27 @@ class ForwardingEventEmitter extends ConductorEventEmitter {
 
   override async emit(event: ConductorEvent): Promise<void> {
     await super.emit(event);
-    const forwarded: ConductorEvent = { ...event };
+    // Forward an independent event envelope.  In particular, a configured
+    // member's nested subject is execution identity, not listener-local
+    // decoration: the daemon-wide metrics projection must receive it intact.
+    const forwarded = cloneForwardedEvent(event);
     forwardedFromFeature.add(forwarded);
     if (this.slug) forwardedFeature.set(forwarded, this.slug);
     await this.globalEvents.emit(forwarded);
   }
+}
+
+function cloneForwardedEvent(event: ConductorEvent): ConductorEvent {
+  if (!('executionContext' in event) || event.executionContext === undefined) {
+    return { ...event };
+  }
+  return {
+    ...event,
+    executionContext: {
+      ...event.executionContext,
+      subject: { ...event.executionContext.subject },
+    },
+  };
 }
 
 export async function withFeatureEventPersistence<T>(input: {
@@ -232,6 +330,10 @@ export function startDaemonEventPersistence(
   log: (message: string) => void = () => {},
 ): { stop: () => void } {
   const persister = new EventPersister(join(mainRoot, '.daemon', 'events.jsonl'), events);
+  // A full daemon ledger remains unavailable after a write failure. Boundary
+  // sampling continues so other listeners can run, but repeating the same
+  // write error for every sample would turn one outage into log noise.
+  let loggedMemorySampleFailure = false;
   const handler: EventHandler = (event) => {
     if (isForwardedFromFeature(event)) return;
     try {
@@ -239,6 +341,8 @@ export function startDaemonEventPersistence(
       // would duplicate subscriptions. The direct method is runtime-private only and preserves its schema.
       (persister as unknown as { persist(event: ConductorEvent): void }).persist(event);
     } catch (error) {
+      if (event.type === 'daemon_memory_sample' && loggedMemorySampleFailure) return;
+      if (event.type === 'daemon_memory_sample') loggedMemorySampleFailure = true;
       log(`[daemon] event persistence failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   };

@@ -243,8 +243,12 @@ cat .worktrees/<slug>/.pipeline/HALT.class
 ```
 
 It names the logical `step`, `phase: preparing`, attempt id, elapsed milliseconds, and recovery
-count. The timeout applies only before a provider process starts: candidate resolution, session
-setup, or self-host preparation did not complete within
+count. Self-host dispatches waiting for root-mutation admission are queued outside this deadline;
+the daemon log and event ledger distinguish `queued`, `admitted`, and `cancelled` (operator park).
+Queue time consumes no preparation recovery attempt.
+
+After admission, the timeout applies before a provider process starts. It means candidate resolution,
+session setup, or self-host preparation did not complete within
 `provider_preparation_timeout_minutes`. The first expiration already used the one automatic
 replacement; because this is a `needs-human` HALT, the re-kick sweep will not clear it.
 
@@ -488,6 +492,11 @@ bounded by the `build_progress_halt` block. Defaults: enabled, `attempt_ceiling:
 `dispatch_ceiling: 20`. Hitting the attempt ceiling parks with a distinct reason so you can tell
 "genuinely stuck" apart from "still progressing but out of runway". Key details are in
 [configuration](../reference/configuration.md).
+
+A refunded build retry log line includes a separate allowance fragment, for example
+`progress allowance: attempt 2 of 30`. The fixed retry counter continues to describe the
+reused fixed-budget slot and stays within its own maximum; the allowance fragment tells you
+how much of the independent progress-attempt ceiling the running build has consumed.
 
 A halt awaiting operator action is neither progress-re-kicked nor cleared by rate-limit episode
 recovery; the daemon log names the blocking halt disposition.
@@ -1068,6 +1077,33 @@ If REKICK encounters this refusal before starting git, the HALT begins
 resolver or run `git rebase --continue`; review and rotate the seal as above, then clear the HALT
 and re-queue.
 
+### A rebase never started after an untracked-file collision
+
+**Symptom:** `.pipeline/HALT` begins `rebase did not start — parked for human recovery`. It may
+list `Quarantined files:` and a `Quarantine directory:` under
+`.pipeline/rebase-untracked-quarantine`. No rebase is active; do not run `git rebase --continue`.
+
+**Diagnosis:** Git refused to begin because an untracked worktree path would be overwritten. For
+that exact refusal, the daemon confirms that each named path is still untracked, moves the confirmed
+files into the quarantine directory without overwriting an earlier entry, and retries once. The HALT
+means the retry or another pre-start check still could not proceed.
+
+**Recovery:** Park the feature before changing its worktree, then inspect the halted marker and any
+quarantined content. Preserve or restore only content that is still needed; do not put a colliding
+file back at its original path before the next rebase can succeed.
+
+```bash
+ai-conductor daemon park <slug>
+cd .worktrees/<slug>
+cat .pipeline/HALT
+find .pipeline/rebase-untracked-quarantine -type f -print
+git status
+```
+
+After resolving the stated refusal, return to the main checkout, clear both halt files, and unpark
+using [the resume procedure](#clear-a-halt-and-let-the-feature-resume). The next daemon dispatch
+re-queues the feature; it does not continue a rebase.
+
 ### The completed rebase halted for missing feature content
 
 **Symptom:** `.pipeline/HALT` is `needs-human` and begins `rebase completed — parked for human
@@ -1153,6 +1189,26 @@ If `HALT.class` is `over-scope`, do not clear the body unchanged. Edit the fence
 deciding as `pending`. An accept clears that criterion; a refusal records the decision but keeps
 the halt active as “refused — rework required.”
 
+Keep the offered criterion and summary unchanged, including when a revision refers to an older
+report number or wording. Only the decision and rationale are editable.
+
+For a durable PRD-widening recovery, keep every unaffected decision and refusal in place. The
+halt body names the affected source, case, decision, or artifact and one of these actions:
+
+- `malformed-history`: restore the original widening history from a known-good copy, then resume.
+- `unsupported-history`: preserve the history and upgrade to a conductor version that supports it.
+- `missing-operator`: configure the machine owner and resubmit the explicit decision.
+- `persistence-failed`: resolve the store or lease failure and verify the durable records.
+- `invalid-provider-result`: retry only once the selected provider supports the required native schema.
+- `stale-relation`: retain the decision and rerun reconciliation against the current report.
+- `context-overflow`: the halt and event name the dimension, actual size, and limit; reduce the cited source input without pruning history.
+- `projection-failed`: repair the named stored evidence or verdict renderer without re-deciding valid authority.
+- `uncertain-relation`: review the preserved original and current evidence, then submit a new explicit decision if desired.
+
+Version-2 `accepted-widenings.json` preserves valid legacy attributed evidence in its original
+order. A refusal is also preserved: revise it only through its offered explicit revision entry,
+never by reusing an old accepted clear or deleting history.
+
 Then clear by **renaming** the edited body to `.pipeline/HALT.cleared` — never `rm -f` it. The
 next prd_audit lap harvests your decisions from `HALT.cleared` and from nowhere else, so deleting
 the body silently discards every decision you just authored and the feature re-halts with the
@@ -1206,7 +1262,9 @@ credential just re-parks and burns the timeout again.
 
 ### A rate-limit episode is in progress
 
-Do nothing. The wait is deliberate and does not consume the retry budget. If you must stop the
+Do nothing. The wait is deliberate and does not consume the retry budget. A Claude notice such as
+`You've hit your weekly limit · resets 9pm (America/New_York)` waits until its stated reset (up to
+one day); session and usage-limit notices retain the hourly re-probe cap. If you must stop the
 daemon during an episode, see
 [emergency stop a running feature](emergency-stop-a-running-feature.md) — and note that halts
 raised during the episode will not be auto-recovered by the replacement process.
@@ -1262,6 +1320,31 @@ scope fault: address any retained test-quality finding through its normal dispos
 **Verification:** the next review either contains a complete candidate resolution or renders the
 operator's reduced-coverage decision. A valid finding from the original result is still listed and still
 blocks unless independently repaired or accepted.
+
+### build_review halted on a projection-oversized rubric
+
+**Symptom:** `.pipeline/HALT` names `projection-oversized`, the rubric, and usually both the measured
+and configured byte limits. The matching `build_review_rubric_infrastructure_failure` event carries
+`measuredBytes` and `limitBytes` when both values were available.
+
+**Diagnosis:** the canonical UTF-8 projection exceeded that rubric's positive-integer
+`max_projection_bytes` limit. The engine does not dispatch the reviewer, does not retry the same
+snapshot, and does not consume the shared mechanical-fault allowance.
+
+**Recovery:** first decide whether a larger configured limit is appropriate for the feature's review
+corpus. If it is, change `build_review.rubrics.<rubric>.max_projection_bytes` through the approved
+configuration path and resume. Otherwise, after explicitly accepting reduced coverage, record it for
+the named current lap and rubric, then clear the halt:
+
+```bash
+ai-conductor build-review record-reduced-coverage --feature <slug> --lap <lap> \
+  --rubric <rubric> --rationale "<why this rubric's coverage is being reduced>"
+```
+
+**Verification:** the command accepts the named current `projection-oversized` fault without requiring
+the mechanical-fault allowance to be exhausted. After the resume procedure, the next aggregate either
+uses the changed limit or records the reduced-coverage decision; any independent semantic finding still
+blocks normally.
 
 ### build_review halted on an exhausted mechanical fault allowance
 

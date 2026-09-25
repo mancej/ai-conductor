@@ -90,8 +90,9 @@ current authority. The engine does not make every title in a changed marked file
 file can be selected for conservative counterfactual execution without making unchanged sibling tests
 quality targets.
 
-An enabled rubric with no established targets or concrete candidates is a valid empty-scope PASS: it does
-not dispatch the reviewer or counterfactual preflight. This preserves production-only refactors and pure
+Enabled `testQuality` with no established targets or concrete candidates is a valid empty-scope PASS: it does
+not dispatch its reviewer or counterfactual preflight. An enabled `security` rubric still reviews the diff
+and participates in the joined verdict. This preserves production-only refactors and pure
 moves/renames as non-coverage work; the aggregate suite and CI remain responsible for broad regression
 execution. For each concrete candidate, the normal reviewer returns one source-bound scope resolution:
 `resolved`, `out-of-scope`, or `indeterminate`. An indeterminate candidate preserves any otherwise valid
@@ -130,6 +131,12 @@ that capture is taken **once** per retained PR and persisted to
 a daemon re-dispatch — reuses it instead of re-reading a body the prose author has already replaced.
 Dispatching `release-disposition` discards the capture, so a kickback that rewrites the disposition
 never has its superseded block restored over the new one.
+
+Before FINISH begins publication, it also checks every configured custom step that occurs earlier in
+the resolved flow and declares both `enforcement: gating` and a `completion_artifact`. Each such step
+must be `done` and have a fresh regular-file marker for the current run. A blocked publication names
+all unsatisfied custom step keys; advisory and structural custom steps, steps without a completion
+marker, and steps after FINISH are not FINISH publication prerequisites.
 
 Both configured gates read the **retained SHIP PR**, which the engine adopts at SHIP-phase entry. If
 that PR is a reused `needs-remediation` halt placeholder, the engine makes it presentable whenever

@@ -169,6 +169,15 @@ export const AUXILIARY_MODEL_TABLE_ROWS: readonly AuxiliaryModelTableRow[] = [
     why: 'Judges whether criterion-bound changed tests are insensitive to the behavior they claim to cover; preflight is evidence, never a verdict.',
   },
   {
+    name: 'build-review-security',
+    executionPath: 'engine-managed auxiliary rubric',
+    claudeModel: RESOLVED_RUBRIC_POLICY,
+    claudeEffort: RESOLVED_RUBRIC_POLICY,
+    codexModel: RESOLVED_RUBRIC_POLICY,
+    codexEffort: RESOLVED_RUBRIC_POLICY,
+    why: 'Judges the whole feature diff for concrete, changed-hunk-anchored security defects in the closed security vocabulary.',
+  },
+  {
     name: 'coverage-binding',
     executionPath: 'engine-managed auxiliary judge',
     claudeModel: RESOLVED_COVERAGE_BINDING_POLICY,
@@ -218,9 +227,9 @@ const EXTRA_MODEL_TABLE_ROW_INPUTS: Array<
   {
     name: 'evaluator',
     claudeModel:
-      'sonnet (value objects, pure functions, config, infra) / opus (concurrency, state mutation, security, auth, finance)',
+      'sonnet (default) / fable (concurrency, state mutation, security, auth, money)',
     claudeEffort: '',
-    why: 'Right-sized by batch content.',
+    why: 'A single risk-domain criterion protects higher-stakes batches from weaker evaluation.',
   },
   {
     name: 'code-review',

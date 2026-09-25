@@ -38,7 +38,15 @@ export function makeFakeGh(state: FakeGhState) {
         throw err;
       }
       const issues = state.issuesByRepo[repo] ?? [];
-      return { stdout: JSON.stringify(issues.map((i) => ({ number: i.number, title: i.title, body: i.body, labels: (i.labels ?? []).map((l) => ({ name: l })) }))) };
+      const limitIndex = args.indexOf('--limit');
+      const limit = limitIndex >= 0 ? Number(args[limitIndex + 1]) : 30;
+      return { stdout: JSON.stringify(issues.slice(0, limit).map((i) => ({ number: i.number, title: i.title, body: i.body, labels: (i.labels ?? []).map((l) => ({ name: l })) }))) };
+    }
+    // Write-back authorization re-reads the target issue's assignees. This
+    // general-purpose success fake represents an issue exclusively assigned
+    // to the test operator; refusal cases use their dedicated ownership fake.
+    if (args[0] === 'issue' && args[1] === 'view' && args.includes('assignees')) {
+      return { stdout: JSON.stringify({ assignees: [{ login: 'alice' }] }) };
     }
     if (args[0] === 'issue' && args[1] === 'comment') {
       state.comments.push({ ref: refFromArgs(args), body: bodyFromArgs(args) });

@@ -1,4 +1,6 @@
 // Covers: task:10
+import { createHash } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
 
 import { parseBuildReviewLapId } from '../../src/engine/build-review-domain.js';
@@ -7,6 +9,8 @@ import {
   canonicalJson,
   deriveBuildReviewRubricProjections,
   deriveChangedFileReferences,
+  buildReviewRubricPromptView,
+  isTestQualityProjection,
   projectionDigest,
   type BuildReviewProjectionSource,
   type TestQualityProjection,
@@ -23,6 +27,10 @@ import { analyzeBuildReviewTestScope } from '../../src/engine/build-review-test-
 
 const lapId = parseBuildReviewLapId('lap-1')!;
 
+function contentHash(content: string): string {
+  return `sha256:${createHash('sha256').update(content).digest('hex')}`;
+}
+
 const FIXTURE_DIFF = [
   'diff --git a/src/a.ts b/src/a.ts',
   'index 1111111..2222222 100644',
@@ -31,6 +39,28 @@ const FIXTURE_DIFF = [
   '@@ -1,2 +1,3 @@',
   ' context',
   '+embedded-diff-body-line',
+  '',
+].join('\n');
+
+const THREE_FILE_DIFF = [
+  'diff --git a/src/a.ts b/src/a.ts',
+  '--- a/src/a.ts',
+  '+++ b/src/a.ts',
+  '@@ -1 +1 @@',
+  '-export const stale = true;',
+  '+export const current = true;',
+  'diff --git a/src/b.ts b/src/b.ts',
+  'new file mode 100644',
+  '--- /dev/null',
+  '+++ b/src/b.ts',
+  '@@ -0,0 +1 @@',
+  '+export const added = true;',
+  'diff --git a/src/c.ts b/src/c.ts',
+  'deleted file mode 100644',
+  '--- a/src/c.ts',
+  '+++ /dev/null',
+  '@@ -1 +0,0 @@',
+  '-export const removed = true;',
   '',
 ].join('\n');
 
@@ -155,8 +185,7 @@ function scopedSource(overrides: {
     id: 'source:head:src/helper.ts:0:24',
     source: { fileName: 'src/helper.ts', side: 'head' },
     region: { start: 0, end: helperContent.length },
-    content: helperContent,
-    contentHash: `sha256:${helperContent}`,
+    contentHash: contentHash(helperContent),
   }];
 
   return withProof(withSnapshot(source(), {
@@ -168,6 +197,30 @@ function scopedSource(overrides: {
 }
 
 describe('build-review rubric projections', () => {
+  it('derives the whole frozen diff as a sealed security projection', () => {
+    const threeFileSource = withSnapshot(source(), { diff: THREE_FILE_DIFF });
+    const first = deriveBuildReviewRubricProjections(threeFileSource).security;
+    const second = deriveBuildReviewRubricProjections(threeFileSource).security;
+
+    expect(Object.keys(first).sort()).toEqual([
+      'changedFiles', 'contentDigest', 'contractVersion', 'digest', 'headSha', 'lapId',
+      'mergeBase', 'projectionVersion', 'rubric', 'snapshotDigest',
+    ]);
+    expect(first).toMatchObject({ rubric: 'security', changedFiles: deriveChangedFileReferences(THREE_FILE_DIFF) });
+    expect(first.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(second.digest).toBe(first.digest);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(isTestQualityProjection(first)).toBe(false);
+    expect(isTestQualityProjection(deriveBuildReviewRubricProjections(threeFileSource).testQuality)).toBe(true);
+  });
+
+  it('keeps the security projection sealed when the post-exclusion frozen diff is empty', () => {
+    const projection = deriveBuildReviewRubricProjections(withSnapshot(source(), { diff: '' })).security;
+
+    expect(projection.changedFiles).toEqual([]);
+    expect(projection.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+  });
+
   it('projects the frozen v3 test scope compactly and keeps runner selectors separate from review targets', () => {
     const projection = deriveBuildReviewRubricProjections(scopedSource()).testQuality as unknown as Record<string, unknown>;
 
@@ -180,9 +233,25 @@ describe('build-review rubric projections', () => {
         bindings: [{ marker: { reference: { id: '10' } } }],
       }],
       candidates: [{ reasons: ['uncertain-association'] }],
-      evidence: [{ id: 'source:head:src/helper.ts:0:24', content: 'export const helper = 1;' }],
+      evidence: [{ id: 'source:head:src/helper.ts:0:24', contentHash: contentHash('export const helper = 1;') }],
     });
     expect((projection.testScope as { targets: readonly unknown[] }).targets).toHaveLength(1);
+    expect(JSON.stringify((projection.testScope as { evidence: unknown }).evidence)).not.toContain('"content"');
+  });
+
+  it('bounds serialized test-quality projection size by evidence count, not evidence bytes', () => {
+    const regionContent = 'x'.repeat(12 * 1024);
+    const evidence: readonly BuildReviewPinnedScopeEvidence[] = Array.from({ length: 98 }, (_, index) => ({
+      id: `source:head:src/helper-${index}.ts:0:${regionContent.length}`,
+      source: { fileName: `src/helper-${index}.ts`, side: 'head' },
+      region: { start: 0, end: regionContent.length },
+      contentHash: contentHash(regionContent),
+    }));
+    const projection = deriveBuildReviewRubricProjections(withSnapshot(scopedSource(), {
+      testScopeEvidence: evidence,
+    })).testQuality;
+
+    expect(Buffer.byteLength(JSON.stringify(projection), 'utf8')).toBeLessThan(64 * 1024);
   });
 
   it('does not inflate direct review targets when frozen input adds unchanged sibling titles', () => {
@@ -210,11 +279,23 @@ describe('build-review rubric projections', () => {
     expect(deriveBuildReviewRubricProjections(scopedSource({ provenanceStartedAt: '2026-08-16T11:00:00.000Z' })).testQuality.digest).toBe(baseline.digest);
   });
 
+  it('changes the projection digest when only a pinned evidence contentHash changes', () => {
+    const baseline = scopedSource();
+    const evidence = baseline.inputs.sourceSnapshot.testScopeEvidence![0]!;
+    const changedHash = `sha256:${'f'.repeat(64)}`;
+    const changed = withSnapshot(baseline, {
+      testScopeEvidence: [{ ...evidence, contentHash: changedHash }],
+    });
+
+    expect(changed.inputs.sourceSnapshot.testScopeEvidence![0]!.contentHash).toBe(changedHash);
+    expect(digestOf(changed)).not.toBe(digestOf(baseline));
+  });
+
   it('derives the closed test-quality projection by reference, never embedding the raw diff body', () => {
     const projections = deriveBuildReviewRubricProjections(source());
     const projection: TestQualityProjection = projections.testQuality;
 
-    expect(Object.keys(projections)).toEqual(['testQuality']);
+    expect(Object.keys(projections)).toEqual(['testQuality', 'security']);
     expect(Object.keys(projection).sort()).toEqual([
       'changedFiles', 'changedTestSelectors', 'changedTestTitles', 'contentDigest', 'contractVersion', 'digest', 'headSha', 'lapId',
       'mergeBase', 'preflight', 'projectionVersion', 'revertedProductionManifest', 'rubric', 'runnerSelectors', 'snapshotDigest', 'testScope', 'testSuiteProof', 'unresolvedMarkers',
@@ -367,5 +448,52 @@ describe('build-review rubric projections', () => {
       expect(deriveChangedFileReferences('')).toEqual([]);
       expect(deriveChangedFileReferences('just prose\n')).toEqual([]);
     });
+  });
+});
+
+describe('build-review rubric prompt view', () => {
+  const declaration = (start: number, end: number, title: string) => ({
+    kind: 'test', change: 'added', occurrence: 0, modifierChain: [], titleChain: [title],
+    span: { start, end }, argumentsSpan: { start, end }, bodySpan: { start, end },
+  });
+  const evidenceAt = (fileName: string, start: number, end: number) => ({
+    id: `source:head:${fileName}:${start}:${end}`, source: { fileName, side: 'head' },
+    region: { start, end }, startLine: 1, endLine: 2, contentHash: contentHash(`${fileName}:${start}`),
+  });
+  const bloatedSource = () => withSnapshot(source(), {
+    testScope: {
+      targets: [], affectedGroups: [], sharedSources: [],
+      candidates: [{ source: { fileName: 'test/kept.test.ts', side: 'head' }, declaration: declaration(0, 40, 'kept'), reasons: ['file-header-marker'], markers: [], associationChanges: [] }],
+      changedDeclarations: [declaration(0, 40, 'kept'), declaration(50, 90, 'unbound sibling')],
+      notes: [
+        { kind: 'unbound', declaration: declaration(50, 90, 'unbound sibling') },
+        { kind: 'declaration-uncertainty', declaration: declaration(0, 40, 'kept') },
+      ],
+    },
+    // Same offsets in another file must not ride along with the candidate.
+    testScopeEvidence: [evidenceAt('test/kept.test.ts', 0, 40), evidenceAt('test/other.test.ts', 0, 40), evidenceAt('test/kept.test.ts', 50, 90)],
+    changedTestTitles: [{ selector: 'test/kept.test.ts', titleText: 'kept', staticExtractionFallback: false }],
+  });
+
+  it('keeps only candidate-bound scope and hunk ranges in the testQuality prompt', () => {
+    const projection = deriveBuildReviewRubricProjections(bloatedSource()).testQuality;
+    const view = buildReviewRubricPromptView(projection) as Record<string, any>;
+
+    expect(view.testScope.evidence.map((entry: { id: string }) => entry.id)).toEqual(['source:head:test/kept.test.ts:0:40']);
+    expect(view.testScope.notes.map((note: { kind: string }) => note.kind)).toEqual(['declaration-uncertainty']);
+    expect(view.testScope.changedDeclarations).toEqual([]);
+    expect(view.testScope.candidates).toEqual(projection.testScope && (projection.testScope as Record<string, unknown>).candidates);
+    expect(view).not.toHaveProperty('changedTestTitles');
+    expect(view.changedFiles).toEqual([{ path: 'src/a.ts', changeKind: 'modified', hunks: [{ oldStart: 1, oldCount: 2, newStart: 1, newCount: 3 }] }]);
+    expect(view).toMatchObject({ lapId: projection.lapId, snapshotDigest: projection.snapshotDigest, digest: projection.digest, mergeBase: projection.mergeBase, headSha: projection.headSha, preflight: projection.preflight });
+  });
+
+  it('leaves the projection itself, and the security prompt, untouched', () => {
+    const projections = deriveBuildReviewRubricProjections(bloatedSource());
+    const before = JSON.stringify(projections.testQuality);
+    buildReviewRubricPromptView(projections.testQuality);
+
+    expect(JSON.stringify(projections.testQuality)).toBe(before);
+    expect(buildReviewRubricPromptView(projections.security)).toBe(projections.security);
   });
 });

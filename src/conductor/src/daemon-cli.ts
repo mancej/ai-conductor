@@ -7,7 +7,7 @@ import { existsSync } from 'node:fs';
 import { access, mkdir, rm, readFile, writeFile, readlink } from 'node:fs/promises';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { formatRetryReason, formatProgressDelta, displayBuildPosition, formatCommitAge } from './engine/format-retry-line.js';
+import { formatRetryReason, formatProgressDelta, formatRetryCounter, displayBuildPosition, formatCommitAge } from './engine/format-retry-line.js';
 import {
   formatDiagnosticDuration,
   formatFeatureUsageTotal,
@@ -21,13 +21,13 @@ import {
 } from './engine/autoresolve.js';
 import {
   isEligibleForCiFix,
-  runCiFix,
-  buildCiFixHint,
-  productionCiFixRunner,
-  classifyFixError,
-  preflightCiFixInvocation,
-  defaultCiFixProbe,
 } from './engine/ci-fix.js';
+import {
+  ciRepairOutcomeDiagnostic,
+  ciRepairPreDispatchDisposition,
+  classifyCiContextFailure,
+  createDaemonCiFixDispatch,
+} from './engine/daemon-ci-fix.js';
 import {
   resolveRebaseResolutionAttempts,
   resolveDispatchStartTimeoutSeconds,
@@ -57,7 +57,7 @@ import {
 import { ensureInstallFresh, relinkSkillsForSelfBuild } from './engine/install-freshness.js';
 import {
   Conductor,
-  createFinishPresentationRepair,
+  createProvenanceGuardedFinishPresentationRepair,
   type OperatorParkedTermination,
 } from './engine/conductor.js';
 import { createProductionAcceptanceRedExec } from './engine/acceptance-red-runner.js';
@@ -67,8 +67,11 @@ import {
 } from './engine/finish-publication-production.js';
 import { makeProductionGit as makeFinishPublicationGit } from './engine/pr-labels.js';
 import { AuditTrailWriter } from './engine/audit-trail.js';
-import { isForwardedFromFeature, startDaemonEventPersistence, startFeatureEventPersistence } from './engine/event-persister.js';
+import { forwardedFeatureOf, isForwardedFromFeature, startDaemonEventPersistence, startFeatureEventPersistence } from './engine/event-persister.js';
+import { heapDumpOptionsFromConfig, startDaemonMemorySampler } from './engine/daemon-memory.js';
 import { renderedEventTypes } from './engine/event-sinks.js';
+import { resolveExecutionIdentity } from './engine/execution-identity.js';
+import { formatGithubOperationRefusal } from './engine/github-operations.js';
 import { wireDaemonOtel, wireOtelVisualizer } from './engine/otel/wire.js';
 import { resolveOtelConfig, resolveWorkerName } from './engine/otel/otel-config.js';
 import { classifySelfHost, defaultSelfHostDetector } from './engine/self-host/detector.js';
@@ -107,7 +110,11 @@ import { makeIsProcessed, resolveEngineVersion } from './engine/shipped-record.j
 import { resolveHarnessVersion } from './engine/version-report.js';
 import { localWorkSource, type WorkSource } from './engine/daemon-work-source.js';
 import { type GhRunner } from './engine/owner-gate/identity.js';
-import { createGithubTrackerClient, makeProductionGh } from './engine/tracker-client.js';
+import { createGithubTrackerClient, createGuardedGithubOperationRunner, makeProductionGh, runTrackerUrlRead } from './engine/tracker-client.js';
+import { bindMutationToPullRequest } from './engine/ship-draft-pr.js';
+import { createGithubIntakeAuthorization } from './engine/engineer/intake/github-issues.js';
+import { resolveFeatureRemoteMutation } from './engine/remote-git-operations.js';
+import { createDaemonHaltPrOperations } from './engine/daemon-halt-pr-operations.js';
 import { GH_VERSION_FLOOR, probeGhVersion } from './engine/gh-version-floor.js';
 import { makeMachineOwnerResolver } from './engine/owner-gate/machine-identity.js';
 import { readSpecOwnerStamp } from './engine/owner-gate/provenance.js';
@@ -122,7 +129,7 @@ import { createInProcessFeatureExecutor } from './engine/feature-executor.js';
 import { buildWorkOrder, type WorkOrder, type WorkOrderGitRunner } from './engine/work-order.js';
 import { createBlockerResolver } from './engine/blocker-resolver.js';
 import { createGhBlockerRunner } from './engine/gh-blocker-runner.js';
-import { cleanupHaltPresentation, resolveSpecPrUrl } from './engine/pr-labels.js';
+import { cleanupHaltPresentation, parseIssueRef, resolveSpecPrUrl } from './engine/pr-labels.js';
 import { captureEngineIdentity, createStaleEngineChecker } from './engine/engine-identity.js';
 import { initStaleEngineState } from './engine/stale-engine-init.js';
 import {
@@ -171,7 +178,11 @@ import {
   writePersistedBaseSha,
 } from './engine/daemon-sha.js';
 import { scanInheritedState, renderDashboard, type ParkedEntry } from './engine/daemon-dashboard.js';
-import { reconcileParkedFeatures, type ParkClassification } from './engine/park-reconciliation.js';
+import {
+  isReclaimOperationFailure,
+  reconcileParkedFeatures,
+  type ParkClassification,
+} from './engine/park-reconciliation.js';
 import { makeRecordRepairRequester } from './engine/shipment-evidence-cli.js';
 import { writeGatedSnapshot } from './engine/gated-snapshot.js';
 import { announceGatedPr, announceGatedIssue } from './engine/gate-writeback.js';
@@ -861,6 +872,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
   const haltPrSweepCache = new Map<string, PrSweepOutcome>();
   const parkedSweepCache = new Map<string, ParkClassification>();
   const reconcileParkedAutoCleanup = config?.reconcile_parked_auto_cleanup ?? true;
+  const reclaimMergedWorktrees = config?.reclaim_merged_worktrees ?? true;
 
   const log = createDaemonModeLogger({
     formatActivityLine: formatDaemonActivityLine,
@@ -881,17 +893,9 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
   // Logs fetch failures/recovery only on state transitions
   const discoveryLogger = createDiscoveryLogger(log);
 
-  // CF-5/CF-6 (intake #666): run the ci-fix startup preflight exactly once,
-  // before the sweep loop starts, so a broken `claude` fix-invocation surface
-  // (missing binary, bad auth, stale flag) disables ci-fix for this daemon
-  // run instead of crashing or silently retrying a broken invocation on every
-  // PR. Never repeated per-PR — the `ciFix.dispatch` closure only reads the
-  // resulting `ciFixEnabled` flag.
-  const ciFixPreflight = await preflightCiFixInvocation({ probe: defaultCiFixProbe });
-  if (!ciFixPreflight.ok) {
-    ciFixEnabled = false;
-    log(`[ci-fix] startup preflight failed, disabling ci-fix for this run: ${ciFixPreflight.reason}`);
-  }
+  // CI-fix readiness is evaluated by the selected build provider at the
+  // invocation boundary. Do not let a Claude-only startup probe veto a
+  // configured Codex repair path.
 
   // ADR-010: claim the 1-per-repo pidfile so this daemon's liveness is observable
   // (the pidfile under .daemon/ holds our pid) and a second daemon for the same repo
@@ -1114,6 +1118,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
   // Both daemon-only occurrences and forwarded feature events share one bus;
   // the sibling ledger deliberately persists only daemon-origin copies.
   const daemonEventPersistence = startDaemonEventPersistence(projectRoot, events, log);
+  const daemonMemorySampler = startDaemonMemorySampler(events, heapDumpOptionsFromConfig(config));
   const daemonOtel = wireDaemonOtel(config ?? {}, {
     mainRoot: projectRoot,
     project: projectRoot,
@@ -1177,8 +1182,11 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
     // The per-feature Conductor composes self-host authority around this
     // resolved-candidate boundary; keep it present for every daemon context.
     withCandidateSafety: createCandidateSafetyBoundary(),
-    onAttempt: (step, attempt) =>
-      eventTarget.emit({ type: 'provider_attempt', step, ...attempt }),
+    onAttempt: (step, { executionContext, ...attempt }) =>
+      eventTarget.emit({
+        type: 'provider_attempt', step, ...attempt,
+        ...(executionContext ? { executionContext } : {}),
+      }),
     warn: (_message, transition) => eventTarget.emit(transition),
     ...(runtimeLog ? { diagnosticLog: runtimeLog } : {}),
   });
@@ -1339,6 +1347,8 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
     const auditWriter = new AuditTrailWriter(wt.path);
     auditWriter.subscribe(featureEvents);
 
+    const finishPublicationGit = makeFinishPublicationGit();
+    const finishPublicationGh = makeProductionGh();
     const conductor = new Conductor({
       stateFilePath,
       stateStore,
@@ -1357,11 +1367,13 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
         projectRoot: wt.path,
         stateFilePath,
         baseBranch,
-        git: makeFinishPublicationGit(),
-        gh: makeProductionGh(),
-        repairPresentation: createFinishPresentationRepair({
+        git: finishPublicationGit,
+        gh: finishPublicationGh,
+        repairPresentation: createProvenanceGuardedFinishPresentationRepair({
           projectRoot: wt.path,
-          gh: makeProductionGh(),
+          git: finishPublicationGit,
+          gh: finishPublicationGh,
+          baseBranch,
           log: featureLog,
         }),
         observeReleaseReadiness: createProductionReleaseReadinessObserver({
@@ -1459,11 +1471,34 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
     // and idempotent — a gh failure or a halted build (no pr_url) never affects
     // the feature outcome.
     const finalState = await readState(stateFilePath);
+    const implementationPrUrl = finalState.ok ? finalState.value.pr_url : undefined;
     const ghRunner = makeProductionGh();
+    // The resolved context is bound to the feature branch ref; the `Closes`
+    // edit targets the implementation PR, so rebind to it or the owner gate
+    // refuses the edit as `invalid-target` (#2703).
+    const featureMutation = item.sourceRef && implementationPrUrl
+      ? await resolveFeatureRemoteMutation({
+        cwd: wt.path,
+        slug: item.slug,
+        branch: wt.branch,
+        git: (args) => finishPublicationGit(args, { cwd: wt.path }),
+        gh: ghRunner,
+      })
+      : undefined;
+    const closeIssueMutation = featureMutation && implementationPrUrl
+      ? bindMutationToPullRequest(featureMutation, implementationPrUrl)
+      : undefined;
     await closeIssueOnImplementationMerge({
       gh: ghRunner,
+      operations: closeIssueMutation
+        ? createGuardedGithubOperationRunner(ghRunner, {
+          cwd: wt.path,
+          mutation: closeIssueMutation,
+          events: featureEvents,
+        })
+        : undefined,
       sourceRef: item.sourceRef,
-      prUrl: finalState.ok ? finalState.value.pr_url : undefined,
+      prUrl: implementationPrUrl,
       cwd: wt.path,
       slug: item.slug,
       log: featureLog,
@@ -1537,7 +1572,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
         },
       );
       featureLog(`[setup-triage] fix-session dispatched for ${item.slug} (session ${sessionId})`);
-      await stepRunner.resolveSetupFailure({
+      return stepRunner.resolveSetupFailure({
         worktreePath: worktree.path,
         outputTail: error.outputTail ?? '',
         slug: item.slug,
@@ -1574,6 +1609,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
     providerExecution: createProviderExecution,
     beginFeatureRun,
     memoryProvider,
+    events,
     log,
     verbose: config?.daemon_verbose ?? false,
     dispatchStartTimeoutSeconds: resolveDispatchStartTimeoutSeconds(config),
@@ -1678,17 +1714,27 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
   // the resolver returns `{ resolved: false }` and discovery builds NOTHING.
   // ADR-1 naming: `daemonOwner`, never a bare `owner`.
   const ownerGh: GhRunner = makeProductionGh();
-  const tracker = createGithubTrackerClient(ownerGh);
+  const tracker = createGithubTrackerClient(ownerGh, { events });
   const ownerGit = makeGitRunner(projectRoot);
+  // Halt presentation is feature state, never daemon-global state.  Preserve
+  // the read-only sweep transport while deriving a fresh guarded runner from
+  // each PR's committed feature marker for every mutation attempt.
+  const haltPrOperations = createDaemonHaltPrOperations({
+    projectRoot,
+    baseBranch,
+    gh: ownerGh,
+    git: ownerGit,
+    resolveMachineOwner: makeMachineOwnerResolver(ownerGh, projectRoot),
+    events,
+  });
+  const haltPrGit = makeFinishPublicationGit();
 
   // Task 13: Construct ONE priority resolver per daemon run (process-local state,
   // never persisted to disk). The resolver backs the REAL gh CLI runner so cross-repo
   // issue refs are fetched from GitHub (ghIssueLabelReader wraps the runner in
   // parseIssueRef → gh argv → JSON label extraction). Passed to localWorkSource for
   // post-gate ordering and to the dashboard for fallback-mode display.
-  // Wrap ownerGh (GhRunner) to match ExecRunner signature (args only, cwd implicit).
-  const execRunnerWrapper = (args: string[]) => ownerGh(args, { cwd: projectRoot });
-  const priorityResolver = createPriorityResolver(ghIssueLabelReader(execRunnerWrapper), log);
+  const priorityResolver = createPriorityResolver(ghIssueLabelReader(ownerGh, projectRoot), log);
 
   // Task 12 (adr-2026-07-03-gated-snapshot-status-read-model): the daemon
   // directory backing `.daemon/gated.json` — every discovery pass rewrites
@@ -1708,6 +1754,11 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
   // network calls to GitHub.
   const gatedWritebackDeps = {
     cwd: projectRoot,
+    operations: createGuardedGithubOperationRunner(ownerGh, {
+      cwd: projectRoot,
+      intake: createGithubIntakeAuthorization({ gh: ownerGh, cwd: projectRoot }),
+      events,
+    }),
     log,
     warnedSkips: new Set<string>(),
     verbose: config?.daemon_verbose ?? false,
@@ -2153,6 +2204,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
           // Rendering is observational. The daemon sweep below owns cleanup
           // and is the sole consumer of the startup-resolved toggle.
           autoCleanup: false,
+          reclaimMergedWorktrees: false,
           verbose: config?.daemon_verbose ?? false,
           worktreeLifecycle,
         });
@@ -2283,7 +2335,14 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
       // silently no-ops the "ultimate safety net" for halt-PR presentation
       // (daemon.ts guards with ?.()), same failure mode as sweepMergeableLabels below.
       reconcileHaltPrs: async () => {
-        await reconcileHaltPrs({ projectRoot, log, cache: haltPrSweepCache });
+        await reconcileHaltPrs({
+          projectRoot,
+          log,
+          runGh: ownerGh,
+          runGit: haltPrGit,
+          operations: haltPrOperations,
+          cache: haltPrSweepCache,
+        });
       },
       // adr-2026-07-27 Decisions 4 + 6: the sweep only converges if BOTH
       // hand-off seams are supplied here. `requestRecordRepair` is the ST-916
@@ -2292,12 +2351,15 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
       // per-slug watcher disposer (cleanup otherwise leaves a watcher on a
       // deleted worktree). Removing either silently reverts this sweep to a
       // no-op fallback path — the same failure mode as the bindings above.
-      reconcileParkedFeatures: async ({ disposeHaltWatcher }) => {
+      reconcileParkedFeatures: async ({ disposeHaltWatcher, isFeatureInFlight }) => {
         await reconcileParkedFeatures({
           projectRoot,
           log: (message) => log(message, true),
           cache: parkedSweepCache,
           autoCleanup: reconcileParkedAutoCleanup,
+          reclaimMergedWorktrees,
+          isFeatureInFlight,
+          onEvent: (event) => { void events.emit(event); },
           getIssueState: tracker.getIssueState.bind(tracker),
           requestRecordRepair: makeRecordRepairRequester({ cwd: projectRoot, log }),
           disposeHaltWatcher,
@@ -2313,6 +2375,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
         await sweepMergeableLabels({
           projectRoot,
           log,
+          tracker,
           teardownWorktree: deps.teardownWorktree,
           canRemoveWorktree,
           // Task 17: dispatch autoresolve for the first eligible CONFLICTING
@@ -2326,12 +2389,12 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
 
               try {
                 // Fetch the branch name from the PR
-                const prViewResult = await execFile('sh', [
-                  '-c',
-                  `gh pr view "${entry.prUrl}" --json headRefName --jq '.headRefName'`,
-                ], { cwd: entry.repoCwd });
+                const prViewStdout = await runTrackerUrlRead(
+                  makeProductionGh(), entry.repoCwd, 'pull-request', entry.prUrl,
+                  ['pr', 'view', entry.prUrl, '--json', 'headRefName', '--jq', '.headRefName'],
+                );
 
-                const branch = (prViewResult.stdout || '').toString().trim();
+                const branch = (prViewStdout || '').toString().trim();
                 if (!branch) {
                   log(`[autoresolve] empty branch name for ${entry.prUrl}`);
                   return { kind: 'escalated' };
@@ -2369,14 +2432,22 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
                   }
                 };
 
-                // Create a real Tier-2 resolver that dispatches to the /rebase skill
-                // FR-7: wire stepRunner and events for rebase resolution dispatch
-                let attempt = 0;
-                const attemptCap = resolveRebaseResolutionAttempts(config);
-                const resolver: RebaseResolver = async (ctx) => {
+                // Resolution events belong to the feature being refreshed, not
+                // the daemon's aggregate ledger. The forwarding emitter keeps
+                // daemon observers live while persisting the canonical copy in
+                // this feature worktree.
+                const featureScope = startFeatureEventPersistence(
+                  join(projectRoot, '.worktrees', entry.slug), events, entry.slug,
+                );
+                try {
+                  // Create a real Tier-2 resolver that dispatches to the /rebase skill
+                  // FR-7: wire stepRunner and events for rebase resolution dispatch
+                  let attempt = 0;
+                  const attemptCap = resolveRebaseResolutionAttempts(config);
+                  const resolver: RebaseResolver = async (ctx) => {
                   attempt += 1;
                   try {
-                    await events.emit({ type: 'rebase_resolution_attempt', index: attempt, cap: attemptCap });
+                    await featureScope.events.emit({ type: 'rebase_resolution_attempt', index: attempt, cap: attemptCap });
                   } catch {
                     /* best-effort: event emission must not block resolution */
                   }
@@ -2411,10 +2482,10 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
                       reason: err instanceof Error ? err.message : String(err),
                     };
                   }
-                };
+                  };
 
-                // Run the full resolution pipeline
-                const outcome = await resolveConflictingPr(
+                  // Run the full resolution pipeline
+                  const outcome = await resolveConflictingPr(
                   entry,
                   branch,
                   {
@@ -2423,11 +2494,14 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
                     cooldownMinutes: config?.mergeable_autoresolve?.cooldownMinutes ?? 60,
                     attemptCap,
                   },
-                  { runGh: ghRunner, runSuite, resolver, log, isFeatureInFlight: isWorkClaimActive, worktreeLifecycle },
-                );
+                    { runGh: ghRunner, runSuite, resolver, log, isFeatureInFlight: isWorkClaimActive, worktreeLifecycle, events: featureScope.events },
+                  );
 
-                log(`[autoresolve] outcome for ${entry.prUrl}: ${outcome.kind}`);
-                return { kind: outcome.kind };
+                  log(`[autoresolve] outcome for ${entry.prUrl}: ${outcome.kind}`);
+                  return { kind: outcome.kind };
+                } finally {
+                  featureScope.stop();
+                }
               } catch (err: any) {
                 log(`[autoresolve] error resolving ${entry.prUrl}: ${err?.message || err}`);
                 return { kind: 'escalated' };
@@ -2442,36 +2516,31 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
             enabled: config?.ci_watch?.enabled ?? true,
             isEligible: (entry, state) =>
               isEligibleForCiFix(entry, state, config, new Date(), log),
-            dispatch: async (entry) => {
-              if (!ciFixEnabled) {
-                return;
-              }
-              log(`[mergeable-sweep] ci-fix dispatch: ${entry.prUrl} (attempt ${entry.ciFixAttempts})`);
-
-              try {
-                const prViewResult = await execFile('sh', [
-                  '-c',
-                  `gh pr view "${entry.prUrl}" --json headRefName --jq '.headRefName'`,
-                ], { cwd: entry.repoCwd });
-
-                const branch = (prViewResult.stdout || '').toString().trim();
-                if (!branch) {
-                  log(`[ci-fix] empty branch name for ${entry.prUrl}`);
-                  return;
-                }
-
-                const productionGh = makeProductionGh();
-                const ghRunner = async (args: string[]) =>
-                  productionGh(args, { cwd: entry.repoCwd });
-
-                const hint = await buildCiFixHint(ghRunner, entry.repoCwd, entry.prUrl);
-
+            diagnostic: async (entry, state) => {
+              const reason = classifyCiContextFailure(state);
+              await events.emit({ type: 'ci_repair_diagnostic', prUrl: entry.prUrl, slug: entry.slug,
+                stage: 'context', reason, disposition: 'deferred' });
+            },
+            dispatch: async (entry, state) => {
+              if (!ciFixEnabled) return;
+              const dispatchCiFix = createDaemonCiFixDispatch({
+                tracker: createGithubTrackerClient(makeProductionGh()),
+                // Feature-scoped transport: pin gh to the entry's repo so the remote
+                // mutation guard resolves against the feature's repository.
+                gh: (args, opts) => makeProductionGh()(args, { ...opts, cwd: entry.repoCwd }),
+                liveness: { isFeatureInFlight: isWorkClaimActive, worktreeLifecycle, log },
+                log,
+                diagnostic: async ({ stage, reason, provider }) => {
+                  void events.emit({ type: 'ci_repair_diagnostic', prUrl: entry.prUrl, slug: entry.slug,
+                    stage, reason,
+                    disposition: ciRepairPreDispatchDisposition(stage), provider });
+                },
+                createDispatcher: () => ({
                 // Route the ci-fix dispatch through resolveCiFailure (T4):
                 // adapt a real DefaultStepRunner into productionCiFixRunner's
                 // dispatcher seam instead of wiring the bare exec-based
                 // runner directly — mirrors the resolveRebaseConflict /
                 // DefaultStepRunner pattern used for rebase resolution above.
-                const ciFixDispatcher = {
                   resolveCiFailure: async (ctx: { worktreePath: string; hint: string; entry: typeof entry }) => {
                     const sessionId = uuidv4();
                     const providerExecution = createSlugScopedProviderExecution(ctx.entry.slug);
@@ -2495,41 +2564,33 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
                         ),
                       },
                     );
-                    await stepRunner.resolveCiFailure({
+                    return stepRunner.resolveCiFailure({
                       worktreePath: ctx.worktreePath,
                       prUrl: ctx.entry.prUrl,
                       hint: ctx.hint,
                       slug: ctx.entry.slug,
                     });
-                    return { kind: 'changed' as const };
                   },
-                };
-
-                const outcome = await runCiFix(
-                  entry,
-                  branch,
-                  hint,
-                  {
-                    fixRunner: {
-                      run: (opts) => productionCiFixRunner.run({ ...opts, dispatcher: ciFixDispatcher }),
-                    },
-                    liveness: { isFeatureInFlight: isWorkClaimActive, worktreeLifecycle, log },
-                  },
-                  log,
-                );
-
-                log(`[ci-fix] outcome for ${entry.prUrl}: ${outcome.kind}`);
-                if (outcome.kind === 'changed') {
-                  return { kind: 'green-verified' };
-                }
-                return;
-              } catch (err: any) {
-                log(
-                  `[ci-fix] error resolving ${entry.prUrl} [${classifyFixError(err)}]: ${err?.message || err}`,
-                );
-                return;
+                }),
+              });
+              const outcome = await dispatchCiFix(entry, state);
+              if (outcome.kind === 'needs-human') {
+                log(`[ci-fix] setup-only provider exhaustion for ${entry.prUrl}; parking for human recovery`);
               }
+              if (outcome.kind === 'failed' || outcome.kind === 'published') {
+                await events.emit(ciRepairOutcomeDiagnostic(entry, outcome));
+              }
+              return outcome;
             },
+          },
+          operations: (entry) => {
+            const target = parseIssueRef(entry.prUrl);
+            if (!target) return undefined;
+            return haltPrOperations({
+              number: Number(target.number),
+              url: entry.prUrl,
+              headRefName: `feat/daemon-${entry.slug}`,
+            });
           },
         });
       },
@@ -2588,6 +2649,7 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
 
   await subscriber.stop();
   await daemonOtel?.stop();
+  daemonMemorySampler.stop();
   daemonEventPersistence.stop();
   // A finite daemon invocation (including test/CLI bounded runs) has no
   // remaining work for the process-level signal handler to coordinate.
@@ -2623,6 +2685,17 @@ export async function runDaemonMode(opts: DaemonModeOptions): Promise<DaemonResu
 }
 
 /**
+ * Last rendered retention detail per worktree slug, so a sweep that re-emits
+ * the same retained refusal every pass logs it only when it changes.
+ */
+const renderedReclaimRetentions = new Map<string, string>();
+
+/** Test seam: forget which reclaim retentions have already been rendered. */
+export function resetRenderedReclaimRetentions(): void {
+  renderedReclaimRetentions.clear();
+}
+
+/**
  * Render the meaningful inner-loop events to the daemon console. Keeps the
  * signal high: step boundaries, failures/retries, unsatisfied gates, kickbacks,
  * halts/convergence, and rate limits — not the full event firehose.
@@ -2647,9 +2720,26 @@ function buildReviewLapTag(lapId: string): string {
   return lapId;
 }
 
+/** Render a configured branch as its stable parent/member subject, never as a policy step. */
+function renderedExecutionSubject(event: ConductorEvent, legacyStep: string): string {
+  return resolveExecutionIdentity({
+    scope: {
+      featureId: forwardedFeatureOf(event) ?? ('slug' in event && typeof event.slug === 'string' ? event.slug : 'daemon'),
+      runId: 'daemon-renderer',
+    },
+    legacyStep,
+    executionContext: 'executionContext' in event ? event.executionContext : undefined,
+  })?.subjectLabel ?? legacyStep;
+}
+
 function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => void): void {
   const dot = chalk.dim('·');
   switch (event.type) {
+    case 'test_suite_verification':
+      if (event.executionSummary) {
+        log(`${dot} test suite ${event.executionSummary.attemptedEntryCount}/${event.executionSummary.plannedEntryCount}: ${event.executionSummary.entries.map((entry) => `#${entry.index + 1} ${entry.result} (${entry.durationMs}ms)`).join(', ')}`);
+      }
+      break;
     case 'setup_repair': {
       const rejection = event.disposition === 'rejected'
         ? ` (${event.reason}${event.quarantineRef ? `; ${event.quarantineRef}` : ''})`
@@ -2686,6 +2776,9 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
       break;
     case 'remediation_adjudication_completed':
       log(`${dot} build_review adjudication completed (${event.caseIds.length} settled case${event.caseIds.length === 1 ? '' : 's'})`);
+      for (const stop of event.decisionStops ?? []) {
+        log(`${dot} ${chalk.yellow(`build_review decision stop: case ${stop.caseId} needs a ${stop.owner ?? 'consistency'} decision (${stop.sourceIds.length} source${stop.sourceIds.length === 1 ? '' : 's'}) — ${stop.rationale}`)}`);
+      }
       break;
     case 'remediation_case_refuted':
       log(`${dot} build_review refuted remediation case ${event.caseId}`);
@@ -2693,8 +2786,18 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
     case 'build_review_rubric_started':
       log(`${dot}   build_review [${buildReviewLapTag(event.lapId)}] ${event.rubric} started`);
       break;
+    case 'build_review_policy_resolved': {
+      const provenance = event.pluginId === undefined ? event.source : `${event.source}/${event.pluginId}`;
+      const candidate = event.provenance === undefined ? event.provider
+        : `${event.provenance.candidate.provider}/${event.provenance.candidate.model}/${event.provenance.candidate.effort}`;
+      log(`${dot}   build_review [${buildReviewLapTag(event.lapId)}] ${event.rubric} policy resolved: ${candidate} ${provenance}`);
+      break;
+    }
+    case 'build_review_policy_failed':
+      log(`${dot}   build_review [${buildReviewLapTag(event.lapId)}] ${event.rubric} policy ${event.stage} failed: ${event.reason}`);
+      break;
     case 'build_review_cache_hit':
-      log(`${dot}   build_review [${buildReviewLapTag(event.lapId)}] ${event.rubric} cache hit`);
+      log(`${dot}   build_review [${buildReviewLapTag(event.lapId)}] ${event.rubric} cache hit${event.customReuse === undefined ? '' : ` (custom reuse from ${event.customReuse.originalLapId})`}`);
       break;
     case 'build_review_rubric_result':
       log(`${dot}   build_review [${buildReviewLapTag(event.lapId)}] ${event.rubric} ${event.verdict}`);
@@ -2727,8 +2830,14 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
         ? `self-host containment verified: ${event.evidence}`
         : `self-host containment unavailable: ${event.reason}`)}`);
       break;
+    case 'self_host_boundary_fingerprint':
+      log(`${dot} ${chalk.dim(`self-host boundary fingerprint: ${event.surfaces.map((surface) => `${surface.label} ${surface.elapsedMs}ms/${surface.fileCount} files`).join('; ')}`)}`);
+      break;
+    case 'self_host_dispatch_admission':
+      log(`${dot} ${event.step} self-host dispatch ${event.state}${event.state === 'queued' ? ' — waiting for root-mutation admission' : ''}`);
+      break;
     case 'step_started':
-      log(`${dot} ${chalk.cyan('▶')} ${event.step}`);
+      log(`${dot} ${chalk.cyan('▶')} ${renderedExecutionSubject(event, event.step)}`);
       break;
     case 'step_completed':
       {
@@ -2742,7 +2851,7 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
             treeAnnotation = ` (tree ${event.treeBefore.slice(0, 7)}..${event.treeAfter.slice(0, 7)})`;
           }
         }
-        log(`${dot}   ${event.step} ${chalk.green('✓')} ${chalk.green(event.status)}${treeAnnotation}`);
+        log(`${dot}   ${renderedExecutionSubject(event, event.step)} ${chalk.green('✓')} ${chalk.green(event.status)}${treeAnnotation}`);
       }
       break;
     case 'parallel_started':
@@ -2762,12 +2871,15 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
     }
     case 'step_failed':
       log(
-        `${dot} ${chalk.red('✗')} ${chalk.red(`${event.step} failed (try ${event.retryCount}): ${event.error}`)}`,
+        `${dot} ${chalk.red('✗')} ${chalk.red(`${renderedExecutionSubject(event, event.step)} failed (try ${event.retryCount}): ${event.error}`)}`,
       );
+      break;
+    case 'step_interrupted':
+      log(`${dot} ${chalk.yellow('⏸')} ${chalk.yellow(`${renderedExecutionSubject(event, event.step)} interrupted: ${event.reason}`)}`);
       break;
     case 'step_refused':
       log(
-        `${dot} ${chalk.yellow('✋')} ${chalk.yellow(`${event.step} refused (${event.kind}): ${event.reason}`)}`,
+        `${dot} ${chalk.yellow('✋')} ${chalk.yellow(`${renderedExecutionSubject(event, event.step)} refused (${event.kind}): ${event.reason}`)}`,
       );
       break;
     case 'step_status_write_refused':
@@ -2775,10 +2887,13 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
         `${dot} ${chalk.yellow('✋')} ${chalk.yellow(`${event.field} status write refused: ${event.expected} → ${event.requested} (${event.intent})`)}`,
       );
       break;
+    case 'github_operation_refused':
+      log(`${dot} ${chalk.yellow('✋')} ${chalk.yellow(formatGithubOperationRefusal(event))}`);
+      break;
     case 'step_retry': {
       const delta = formatProgressDelta(event.resolvedBefore, event.resolvedAfter);
       const deltaFragment = delta ? ' ' + delta : '';
-      log(`${dot} ${chalk.yellow('↻')} ${event.step} retry (try ${event.attempt}/${event.maxAttempts}: ${formatRetryReason(event.reason)})${deltaFragment}`);
+      log(`${dot} ${chalk.yellow('↻')} ${renderedExecutionSubject(event, event.step)} retry (try ${formatRetryCounter(event.attempt, event.maxAttempts, event.progressAttempt, event.progressAttemptCeiling)}: ${formatRetryReason(event.reason)})${deltaFragment}`);
       break;
     }
     case 'provider_attempt': {
@@ -2786,7 +2901,7 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
         const { lifecycle } = event;
         const phase = lifecycle.phase === 'exhausted' ? 'halted' : lifecycle.phase;
         const reason = lifecycle.reason ? ` — ${lifecycle.reason}` : '';
-        const message = `${event.step} provider ${phase} (attempt ${lifecycle.attemptId}, recovery ${lifecycle.recoveryCount}${reason})`;
+        const message = `${renderedExecutionSubject(event, event.step)} provider ${phase} (attempt ${lifecycle.attemptId}, recovery ${lifecycle.recoveryCount}${reason})`;
         log(
           lifecycle.phase === 'exhausted'
             ? `${dot} ${chalk.red('✋')} ${chalk.red(message)}`
@@ -2797,9 +2912,13 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
       // Which provider actually executed this step. The daemon routes per-step
       // (`llm_provider` top-level + per-step overrides), so without this line an
       // operator has to read process argv to learn whether a step ran under
-      // claude or codex. A non-invoked attempt is a cached availability skip —
-      // no process was dispatched, so there is nothing to attribute.
-      if (!event.invoked) break;
+      // claude or codex. A non-invoked attempt still tells the operator which
+      // provider was skipped and what recovery is available.
+      if (!event.invoked) {
+        const recovery = event.setupRecoveryAction ? `; recovery: ${event.setupRecoveryAction}` : '';
+        log(`${dot}   ${event.step} skipped ${chalk.cyan(event.provider)} (${event.skipReason ?? 'unavailable'}: ${event.reason ?? 'unavailable'}${recovery})`);
+        break;
+      }
       const model = event.model ? chalk.dim(` (${event.model})`) : '';
       const usage = event.tokenUsage;
       const facts: string[] = [];
@@ -2811,7 +2930,7 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
       const detail = facts.length > 0 ? chalk.dim(` — ${facts.join(', ')}`) : '';
       const glyph =
         event.outcome === 'success' ? chalk.green('✓') : chalk.yellow(`✗ ${event.outcome}`);
-      log(`${dot}   ${event.step} via ${chalk.cyan(event.provider)}${model} ${glyph}${detail}`);
+      log(`${dot}   ${renderedExecutionSubject(event, event.step)} via ${chalk.cyan(event.provider)}${model} ${glyph}${detail}`);
       break;
     }
     case 'feature_usage_total':
@@ -2838,10 +2957,29 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
     case 'scratch_cleanup_failed':
       log(`${dot} ${chalk.red('✗')} scratch cleanup failed ${event.path} (${event.repository}/${event.featureSlug}, run ${event.runId}, attempt ${event.attempt}: ${event.reason})`);
       break;
+    case 'worktree_reclaim_reclaimed':
+      renderedReclaimRetentions.delete(event.slug);
+      log(`${dot} ${chalk.green('✓')} worktree reclaimed ${event.slug}${event.branch === undefined ? '' : ` (${[event.branch, event.proof].filter(Boolean).join('; ')})`}`);
+      break;
+    case 'worktree_reclaim_failed': {
+      const detail = [event.branch, event.refusal].filter(Boolean).join('; ');
+      if (isReclaimOperationFailure(event.refusal)) {
+        renderedReclaimRetentions.delete(event.slug);
+        log(`${dot} ${chalk.red('✗')} worktree reclaim failed ${event.slug} (${detail})`);
+        break;
+      }
+      // The helper declined to act and the worktree is intact. The sweep
+      // re-emits this every pass (the event ledger keeps each one); the log
+      // shows it once per slug until its branch or reason changes.
+      if (renderedReclaimRetentions.get(event.slug) === detail) break;
+      renderedReclaimRetentions.set(event.slug, detail);
+      log(`${dot} ${chalk.yellow('↷')} worktree retained ${event.slug} (${detail})`);
+      break;
+    }
     case 'provider_fallback':
       log(
         chalk.bold.yellow(
-          `⚠ PROVIDER FALLBACK: ${event.step} — ${event.failedProvider} unavailable (${event.reason}); trying ${event.nextProvider}`,
+          `⚠ PROVIDER FALLBACK: ${event.step} — ${event.failedProvider} unavailable (${event.reason}${event.recoveryAction ? `; recovery: ${event.recoveryAction}` : ''}); trying ${event.nextProvider}`,
         ),
       );
       break;
@@ -2920,6 +3058,11 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
         `${dot} ${chalk.red('✋')} ${chalk.red(`ci_failed[${event.slug}]: phase=${event.phase} attempts=${event.attempts} checks=[${event.checks.join(',')}]`)}`,
       );
       break;
+    case 'ci_repair_diagnostic':
+      log(
+        `${dot} ${chalk.red('✋')} ${chalk.red(`ci_repair[${event.slug}] PR ${event.prUrl}${event.provider ? ` provider=${event.provider}` : ''}: ${event.stage}/${event.reason} (${event.disposition})`)}`,
+      );
+      break;
     case 'rate_limit':
       log(`${dot} ${chalk.yellow('⏳')} ${chalk.yellow(`${event.reason === 'usage-exhausted' ? 'usage exhausted' : 'rate limited'}: waiting ${event.waitSeconds}s`)}`);
       break;
@@ -2942,9 +3085,13 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
           : `${dot}   ${chalk.green(`FINISH publication: ${event.transition} ✓`)}`,
       );
       break;
-    case 'finish_publication_blocked':
-      log(`${dot} ${chalk.red('✋')} ${chalk.red(`FINISH publication blocked: ${event.condition}`)}`);
+    case 'finish_publication_blocked': {
+      const condition = typeof event.condition === 'string'
+        ? event.condition
+        : `${event.condition.code} (steps: ${event.condition.steps.join(', ')})`;
+      log(`${dot} ${chalk.red('✋')} ${chalk.red(`FINISH publication blocked: ${condition}`)}`);
       break;
+    }
     case 'finish_publication_disposition': {
       const line =
         event.disposition === 'complete'
@@ -2963,6 +3110,10 @@ function renderDaemonEventUnsafe(event: ConductorEvent, log: (msg: string) => vo
       const boundary =
         event.boundary.kind === 'pre-first-unit'
           ? 'before first scheduling unit'
+          : event.boundary.kind === 'attempt'
+            ? event.boundary.member === undefined
+              ? `declined attempt ${event.boundary.attempt} for step ${event.boundary.step}`
+              : `declined attempt ${event.boundary.attempt} for group step ${event.boundary.step} member ${event.boundary.member}`
           : `settled after ${event.boundary.kind} ${event.boundary.name}`;
       log(
         `${dot} ${chalk.cyan('⏸')} ${chalk.cyan(`operator park[${event.featureSlug}]: ${boundary}`)}`,

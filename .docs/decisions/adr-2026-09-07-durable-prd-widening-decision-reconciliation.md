@@ -94,6 +94,61 @@ After approval, amend the older over-scope ADR beside D3/D4/D5/D7/D8 to replace 
 
 The existing mixed-build-review ADR and #2383's suppression/recurrence behavior remain authoritative for build_review. No NC confidence floor, plan task append, cross-gate equivalence, rubric expansion, or combined-budget redesign is introduced. Architecture/plan authoring proceeds against the inspected #2383 head as authorized; BUILD waits for the dependency. Recheck a materially changed dependency diff before land and adapt affected contracts, without reopening unrelated scope.
 
+> **Amended 2026-09-22 by #2384:** D6 introduced the narrowly optional native output-schema contract
+> on `InvokeOptions` and said "No other step's parser is migrated in #2429" and "do not introduce a
+> competing second option". This amendment records the second consumer.
+>
+> **D6.1 — build_review rubric dispatch consumes the same native-schema seam.** Every build_review
+> catalog member's dispatch passes its rubric contract descriptor's JSON Schema through the existing
+> `nativeSchema` invocation option and consumes the provider's terminal structured result, exactly as
+> the PRD-widening reconciliation does. No second option, adapter flag, or scratch-home lifecycle is
+> introduced; Claude's native JSON-schema option and Codex's engine-owned schema file under the
+> invocation scratch directory are reused unchanged, and self-host write containment for the schema
+> file is preserved. Unsupported schema capability, an absent terminal structured result, malformed
+> JSON, and field violations remain named mechanical failures; for build_review they are routed
+> through the mechanical-fault lane of adr-2026-08-18-mechanical-rubric-faults-are-their-own-lane
+> under its closed causes.
+
+> **Amended 2026-09-23 by #2188:** D6 and D6.1 record the first two consumers of the native
+> output contract. This amendment records the third and gives the as-built step bounded,
+> engine-rendered inputs.
+>
+> **D6.2 — `architecture_review_as_built` consumes the same seam, with an engine-rendered input
+> projection.** The as-built step dispatches through the existing `nativeSchema` option on the
+> one-shot skill path with `interactive: false`, and consumes only the terminal structured
+> result. `interactive` is false because the Claude adapter refuses native schemas
+> interactively and the Codex REPL returns plain text. The engine owns a versioned as-built input
+> projection containing:
+>
+> - the changed-file stat and per-file hunks at default context;
+> - the plan's task ids and `Done when` blocks (`parsePlanTaskDoneWhen`);
+> - the sealed story criteria;
+> - the resolved as-built check policy and the approved diagram paths;
+> - pending remediation findings; and
+> - the decision ids and text of the governing APPROVED ADRs.
+>
+> The governing ADRs are those the plan's Architecture Obligation Coverage table cites, together
+> with ADRs added or modified in the feature diff, filtered to APPROVED
+> (adr-2026-08-08-single-adr-approval-parser-three-rungs rung 3). The reviewer may still read
+> code, and any other APPROVED ADR, on demand. The engine also owns a versioned output
+> contract. Its JSON Schema is the single source: the same schema is handed to the provider and
+> rendered as the prompt's shape. No second option, adapter flag, or scratch lifecycle is added.
+> Auth, rate-limit, and model-availability classification runs before any structured-output
+> fault. The as-built section of the skill carries judgement guidance only, and the provider
+> skill-contract audit fails if as-built input recipes or output-format prose return.
+>
+> **D7.1 — As-built input bounds.** D7's named-overflow rule applies to the as-built projection.
+> Its limits are explicit engineering constants, each no smaller than the largest corresponding
+> input in the repository's `.docs/` corpus when BUILD starts. Diff content over its per-file or
+> total cap is not a fault: the projection lists each omitted file with its path and content
+> digest, and the reviewer reads it on demand. A required structured dimension (plan tasks and
+> `Done when` blocks, sealed story criteria, a governing ADR's decisions) that is missing,
+> unreadable, or over its limit is a deterministic fault. It names the dimension, the actual
+> size, and the limit, and halts without retry and without truncation. An empty governing-ADR set
+> is not a fault: the projection states that no ADR is pre-selected, and ADR compliance keeps
+> today's enablement (on whenever APPROVED ADRs exist in the repository), judged against APPROVED
+> ADRs the reviewer reads on demand. An absent diagram set is not a fault and disables diagram
+> drift as today (adr-2026-08-22-as-built-review-runs-always-with-plan-gap decision 1).
 
 ## Consequences
 

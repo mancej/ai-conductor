@@ -113,6 +113,26 @@ results must repeat the lap ID and snapshot digest; a mismatch is an infrastruct
 > to the immutable input digest, the closed-projection principle above, and the cache identity in §7
 > are all unchanged.
 
+> **Amended 2026-09-18 by #2582:** the closed-projection principle above is about *fields*, not
+> *bytes*. It was never a rule that every byte a grader may look at must be inlined in the prompt;
+> #1595 already passes the implementation diff by reference (`changedFiles` hunk ranges with a
+> per-hunk content hash) and instructs the grader to read the referenced content with `git show`
+> and `git diff` at the projection's `mergeBase`/`headSha`. This amendment states that contract
+> explicitly and extends it to test-scope evidence.
+>
+> **D2.1 — A projection field may be a reference, provided its identity is in the digest.** A
+> field is closed when the projection carries the *identity* of what the grader may read — path,
+> side, region, and a content hash bound to the frozen snapshot — and the grader may re-read only
+> what that identity names, at the pinned refs, never the live worktree beyond `headSha` and never
+> a path the projection does not list. Cache invalidation stays mechanically complete because the
+> hash of the referenced bytes participates in the projection digest exactly as inlined bytes
+> would; a changed region changes the digest. Test-scope evidence (`BuildReviewPinnedScopeEvidence`)
+> therefore carries `source`, `region`, `startLine`, `endLine`, and `contentHash`, and no longer
+> carries the region's bytes. The rubric skill text names the re-read seam and the hash the grader
+> must verify against. Inlining bytes for a field whose identity is already in the digest is the
+> defect this amendment removes: on a 155-file diff the inlined regions alone reached ~1.3 MB and
+> every lap failed as `invalid-provider-result` (jstoup111/ai-conductor#2582).
+
 ### 3. Reuse green test evidence and preflight only Tautology's RED side
 
 The preceding `test_suite` gate is the authoritative proof that the current HEAD is green.
@@ -259,6 +279,46 @@ Accepted risk remains visibly different from a raw grader pass.
 Publication reads the authoritative disposition state and deterministically renders its accepted
 risk section into the retained PR and shipped record; it does not ask a grader or finish agent to
 reconstruct acceptance from prose.
+
+> **Amended 2026-09-22 by #2384:** §1 names the engine as the exclusive owner of evidence assembly,
+> result validation, and finding identity, and §2 names one closed versioned projection per rubric.
+> Two dispatch paths grew under that rule — the built-in rubric path and the custom-policy path from
+> adr-2026-09-10-portable-build-review-policy — each rendering its own output shape as prompt prose and
+> each scraping a JSON object out of the provider's final message. This amendment names the single
+> engine-owned surface through which every catalog member is dispatched.
+>
+> **D1.1 — Every catalog member supplies one rubric contract descriptor.** A descriptor carries the
+> member's input projection (version and builder over the frozen source snapshot), its output contract
+> (version, a JSON Schema object, and a parser from the provider's structured result to the provider
+> payload), and its finding-identity canonicalizer. The built-in `testQuality` and `security` members
+> and the custom-policy `custom-v1` member are descriptors on this seam; nothing else about a member
+> is consulted at dispatch. A member without a complete descriptor is an authoring-time contract
+> defect, never a runtime fallback.
+>
+> **D1.2 — One generic dispatch path serves every descriptor.** The coordinator renders the
+> projection, requests the provider's native structured output with the descriptor's JSON Schema,
+> validates the terminal structured result with the descriptor's parser, stamps the envelope, and
+> canonicalizes identity, without branching on member kind after the catalog lookup. The prose-scrape
+> extraction of a JSON object from the provider's output text is retired for build_review; no rubric
+> output is parsed from markdown or free text. The shape shown to the model is rendered from the same
+> JSON Schema the engine validates against, so the advertised and accepted contracts have one source.
+>
+> **D1.3 — The shared dispatch seam is `dispatchRubricContract`.** Operator clarification of D1.2,
+> 2026-09-23. "One generic dispatch path" is satisfied by the single engine function
+> `dispatchRubricContract` in `step-runners.ts`, through which built-in and custom-policy members
+> alike render the descriptor's shape, request native structured output with the descriptor's JSON
+> Schema, and validate the terminal structured result with the descriptor's parser. The build_review
+> coordinator stays keyed to the built-in rubric ids for projection, cache, artifact, and settlement;
+> custom-policy members are routed to `dispatchInstalledBuildReviewPolicy` after the catalog lookup and
+> reach the same `dispatchRubricContract` seam there. That route is the accepted member-kind branch; it
+> does not reintroduce prose scraping or a second output contract.
+>
+> **D2.2 — Output version joins the cache identity.** §7's cache key already carries the rubric
+> contract version and the projection version from the registry descriptor. Those two fields are now
+> read from the member's rubric contract descriptor, and advancing either invalidates deterministically
+> exactly as before. No cached judgement from a prose-scraped dispatch is reused by a native-schema
+> dispatch: the engine identity component changes with the engine dist and the rewritten skill text,
+> which is the accepted cost of this migration.
 
 ## Claim Verification
 

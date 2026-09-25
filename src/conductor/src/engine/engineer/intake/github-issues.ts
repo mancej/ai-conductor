@@ -16,14 +16,27 @@ import type { Envelope, EnvelopeStatus, IntakePort, ReportMeta, ReportOutcome } 
 import type { IntakeSource } from './source.js';
 import type { Ledger } from './ledger.js';
 import { parseSourceRef } from '../issue-ref.js';
-import { createGithubTrackerClient, type TrackerClient } from '../../tracker-client.js';
-import { formatWorkRef, type WorkRef } from '../source-ref.js';
+import {
+  createGithubTrackerClient,
+  DEFAULT_ASSIGNED_ISSUES_LIMIT,
+  runTrackerRead,
+  type GhRunner,
+  type GithubIntakeMutationExecutionContext,
+  type IntakeTrackerClient,
+} from '../../tracker-client.js';
+import { formatWorkRef, parseWorkRef, type WorkRef } from '../source-ref.js';
 import { sanitizeInboundText, type InboundSanitizeResult } from './sanitize-inbound.js';
+import type { GithubIntakeWriteOperationRequest, GithubOperationRunnerRefusal } from '../../github-operations.js';
+import {
+  hasExplicitGithubOperationApproval,
+  requestExplicitGithubOperationApproval,
+  type InteractiveGithubOperationConfirmation,
+} from '../../github-operation-approval.js';
+import { readMachineOwnerConfig } from '../../owner-gate/machine-identity.js';
+import { resolveDaemonOwner, type OwnerResolution } from '../../owner-gate/identity.js';
+export { type GhRunner };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
-/** Shell runner for the `gh` CLI. Mirrors the engineer loop's GhRunner shape. */
-export type GhRunner = (args: string[], opts: { cwd: string }) => Promise<{ stdout: string }>;
 
 /** Minimal registry surface the adapter needs: the list of repos to poll. */
 export interface IntakeRepoRegistry {
@@ -41,6 +54,16 @@ export interface GithubIssuesDeps {
   newId?: () => string;
   /** Log sink; defaults to a no-op. */
   log?: (msg: string) => void;
+  /** Maximum issues requested per repository; defaults above the GitHub CLI's implicit 30. */
+  issueListLimit?: number;
+  /** Missing-path episodes shared by adapters built within one owning process. */
+  missingRegistrationEpisodes?: Set<string>;
+  /** Fresh machine identity resolver; injected to keep authorization deterministic in tests. */
+  resolveActor?: () => Promise<OwnerResolution>;
+  /** Optional interactive, exact-request approval for an otherwise unauthorized intake write. */
+  confirmation?: InteractiveGithubOperationConfirmation;
+  /** Existing guarded intake seam; callers normally use the assignment-backed default below. */
+  intakeAuthorization?: GithubIntakeMutationExecutionContext;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
@@ -58,6 +81,73 @@ export const HANDLED_LABEL = 'engineer:handled';
  * Exported for use by delivery-guard.ts (closed-unmerged reopen semantics).
  */
 export const REOPEN_ATTEMPTS_CAP = 2;
+
+/**
+ * Build the independent pre-spec authorization seam. It re-resolves identity
+ * and reads the target issue's current assignments on every attempted write;
+ * neither a source reference nor an earlier successful write is authority.
+ */
+export function createGithubIntakeAuthorization(deps: {
+  gh: GhRunner;
+  resolveActor?: () => Promise<OwnerResolution>;
+  confirmation?: InteractiveGithubOperationConfirmation;
+  cwd?: string;
+}): GithubIntakeMutationExecutionContext {
+  const resolveActor = deps.resolveActor ?? (async () =>
+    resolveDaemonOwner(await readMachineOwnerConfig(), deps.gh, deps.cwd ?? homedir()));
+
+  async function currentAssignees(
+    request: GithubIntakeWriteOperationRequest,
+    cwd: string,
+  ): Promise<Set<string> | null> {
+    if (request.target.kind !== 'issue') return null;
+    try {
+      const stdout = await runTrackerRead(
+        deps.gh,
+        cwd,
+        'issue.read',
+        request.target.repository,
+        { kind: 'issue', number: request.target.number },
+        ['issue', 'view', String(request.target.number), '-R', request.target.repository, '--json', 'assignees'],
+      );
+      const parsed = JSON.parse(stdout) as { assignees?: unknown };
+      if (!Array.isArray(parsed.assignees)) return null;
+      const normalized = parsed.assignees.map((value) => {
+        const login = value !== null && typeof value === 'object'
+          ? (value as { login?: unknown }).login
+          : undefined;
+        return typeof login === 'string' ? login.trim().toLowerCase() : '';
+      });
+      if (normalized.some((login) => login === '')) return null;
+      return new Set(normalized);
+    } catch {
+      return null;
+    }
+  }
+
+  return {
+    async authorize(request, cwd): Promise<{} | GithubOperationRunnerRefusal> {
+      const identity = await resolveActor();
+      if (!identity.resolved) return { kind: 'refused', reason: 'unresolved-actor' };
+
+      const assignees = await currentAssignees(request, cwd);
+      if (assignees?.size === 1 && assignees.has(identity.id)) return {};
+
+      // An assignment failure/ambiguity never reuses a prior decision. Exact
+      // interactive approval is the sole alternate authority for THIS request.
+      const approvalRequest: GithubIntakeWriteOperationRequest = {
+        ...request,
+        context: { ...request.context, actor: identity.id },
+      };
+      const approval = await requestExplicitGithubOperationApproval(approvalRequest, deps.confirmation);
+      if (approval.kind === 'approved'
+        && hasExplicitGithubOperationApproval(approval.capability, approvalRequest)) {
+        return {};
+      }
+      return { kind: 'refused', reason: 'explicit-authorization-required' };
+    },
+  };
+}
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -82,15 +172,35 @@ function buildText(
   title: string | undefined,
   body: string | undefined,
   workRef: WorkRef,
+  allowEmpty = false,
 ): { text: string; inbound: Pick<InboundSanitizeResult, 'neutralizations' | 'digest'> } | null {
   const t = title ?? '';
   const b = body ?? '';
-  if (t.trim() === '' && b.trim() === '') return null;
+  if (!allowEmpty && t.trim() === '' && b.trim() === '') return null;
   const sanitized = sanitizeInboundText([t, b].filter((s) => s.trim() !== ''), workRef);
   return {
     text: sanitized.text,
     inbound: { neutralizations: sanitized.neutralizations, digest: sanitized.digest },
   };
+}
+
+/**
+ * Read one GitHub issue body through the canonical tracker seam and return only
+ * its adapter-owned sanitized projection. A successfully resolved empty body is
+ * still a result: unlike polling, this caller must distinguish it from a 404.
+ */
+export async function fetchSanitizedIssueBody(
+  gh: GhRunner,
+  sourceRef: string,
+  cwd: string,
+): Promise<{ text: string; inbound: Pick<InboundSanitizeResult, 'neutralizations' | 'digest'> } | null> {
+  const parsed = parseSourceRef(sourceRef);
+  const workRef = parseWorkRef(sourceRef);
+  if (!parsed || !workRef) return null;
+
+  const body = await createGithubTrackerClient(gh).getIssueBody(parsed.repo, parsed.number, cwd);
+  if (body === null) return null;
+  return buildText('', body, workRef, true);
 }
 
 // `parseSourceRef` is shared from ../issue-ref.js so the adapter and the
@@ -115,7 +225,13 @@ export function createGithubIssuesAdapter(deps: GithubIssuesDeps): IntakeSource 
   const now = deps.now ?? (() => new Date().toISOString());
   const newId = deps.newId ?? (() => randomUUID());
   const log = deps.log ?? (() => {});
-  const tracker: TrackerClient = createGithubTrackerClient(gh);
+  const issueListLimit = deps.issueListLimit ?? DEFAULT_ASSIGNED_ISSUES_LIMIT;
+  const intakeAuthorization = deps.intakeAuthorization ?? createGithubIntakeAuthorization({
+    gh,
+    resolveActor: deps.resolveActor,
+    confirmation: deps.confirmation,
+  });
+  const tracker: IntakeTrackerClient = createGithubTrackerClient(gh, { intake: intakeAuthorization });
 
   // Per-instance write-back de-dup: a (sourceRef\0status) that has been posted
   // once in this process is not posted again. Cross-process duplicates cannot
@@ -125,6 +241,10 @@ export function createGithubIssuesAdapter(deps: GithubIssuesDeps): IntakeSource 
   // Map repo name to local path for use as working directory in report() gh calls.
   // Populated during poll(); keyed by the ghRepo or name used in sourceRef.
   const repoPaths = new Map<string, string>();
+
+  // Missing registered paths are reported once per absence episode. A restored
+  // path clears its marker so a later disappearance is visible again.
+  const reportedMissingRegistrations = deps.missingRegistrationEpisodes ?? new Set<string>();
 
   /**
    * Resolve the working directory for a report() gh call. Never falls back to
@@ -189,7 +309,7 @@ export function createGithubIssuesAdapter(deps: GithubIssuesDeps): IntakeSource 
     // Strip the handled label so a human sees it is back in flight; non-fatal.
     try {
       const ghRepo = repo.ghRepo ?? repo.name;
-      await tracker.removeIssueLabel(ghRepo, issue.number, HANDLED_LABEL, repo.path);
+      await tracker.removeIntakeIssueLabel(ghRepo, issue.number, HANDLED_LABEL, repo.path);
     } catch {
       // best-effort — a stuck label must not block re-routing.
     }
@@ -224,16 +344,31 @@ export function createGithubIssuesAdapter(deps: GithubIssuesDeps): IntakeSource 
           log(`github-issues: skipping invalid repository target ${ghRepo}`);
           continue;
         }
+        const registrationKey = `${ghRepo}\0${repo.path}`;
+        if (!existsSync(repo.path)) {
+          if (!reportedMissingRegistrations.has(registrationKey)) {
+            log(`github-issues: skipping ${ghRepo}: missing path ${repo.path}`);
+            reportedMissingRegistrations.add(registrationKey);
+          }
+          continue;
+        }
+        reportedMissingRegistrations.delete(registrationKey);
         repoPaths.set(ghRepo, repo.path);
 
         let issues: RawIssue[];
         try {
-          issues = (await tracker.listAssignedIssues(ghRepo, repo.path)) as RawIssue[];
+          issues = (await tracker.listAssignedIssues(ghRepo, repo.path, issueListLimit)) as RawIssue[];
         } catch (err: unknown) {
           // FR-27: a failing repo (auth/availability) is isolated — log and move on.
           const msg = err instanceof Error ? err.message : String(err);
           log(`github-issues: poll failed for ${ghRepo} — ${msg}`);
           continue;
+        }
+
+        if (issues.length >= issueListLimit) {
+          log(
+            `github-issues: assigned issue listing for ${ghRepo} reached requested maximum ${issueListLimit}; results may be incomplete`,
+          );
         }
 
         for (const issue of issues) {
@@ -311,7 +446,7 @@ export function createGithubIssuesAdapter(deps: GithubIssuesDeps): IntakeSource 
         const body = `Routed to ${meta?.repo ?? '(unresolved)'}`;
         const commentCmd = `gh issue comment ${number} --repo ${repo} --body "${body}"`;
         try {
-          await tracker.commentOnIssue(repo, Number(number), body, repoPath);
+          await tracker.commentOnIntakeIssue(repo, Number(number), body, repoPath);
         } catch (err) {
           return fail(err, [commentCmd]);
         }
@@ -319,21 +454,14 @@ export function createGithubIssuesAdapter(deps: GithubIssuesDeps): IntakeSource 
         const body = `Spec PR opened: ${meta?.prUrl ?? '(unknown)'}`;
         const commentCmd = `gh issue comment ${number} --repo ${repo} --body "${body}"`;
         try {
-          await tracker.commentOnIssue(repo, Number(number), body, repoPath);
+          await tracker.commentOnIntakeIssue(repo, Number(number), body, repoPath);
         } catch (err) {
           return fail(err, [commentCmd]);
         }
 
-        // Ensure the label exists before applying it (auto-create; ignore "already exists").
-        try {
-          await tracker.createLabel(repo, HANDLED_LABEL, repoPath);
-        } catch {
-          // label already present — not an error.
-        }
-
         const labelCmd = `gh api repos/${repo}/issues/${number}/labels -f "labels[]=${HANDLED_LABEL}"`;
         try {
-          await tracker.addIssueLabel(repo, Number(number), HANDLED_LABEL, repoPath);
+          await tracker.addIntakeIssueLabel(repo, Number(number), HANDLED_LABEL, repoPath);
         } catch (err) {
           return fail(err, [labelCmd]);
         }

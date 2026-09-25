@@ -2,11 +2,6 @@ export * from './types/index.js';
 export { wireOtelVisualizer } from './engine/otel/wire.js';
 export { parseArgs, createProgram, detectBuildReviewAcceptCommand, detectBuildReviewFindingsCommand, detectBuildReviewRecordReducedCoverageCommand, detectKickbackBudgetCommand, type CLIOptions } from './cli.js';
 export { runShipmentReconcileAction } from './engine/shipment-reconcile-action.js';
-export { runReleaseMetadataCheckAction } from './engine/release-metadata-check-action.js';
-export { runReleasePrAction } from './engine/release-pr-action.js';
-export { collectReleaseCandidates } from './engine/release-candidates.js';
-export { renderReleaseCandidate, renderReleaseCandidateAudit } from './engine/release-renderer.js';
-export { classifyReleasePublication, runReleasePublisherAction } from './engine/release-publisher-action.js';
 
 import type { RunMode } from './types/index.js';
 import { recoverCommandState, replaceCommandState } from './engine/command-state.js';
@@ -30,11 +25,12 @@ import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdir, readFile } from 'node:fs/promises';
 import { realpathSync, writeSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
 import { execa } from 'execa';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 import { v4 as uuidv4 } from 'uuid';
-import { Conductor, createFinishPresentationRepair } from './engine/conductor.js';
+import { Conductor, createProvenanceGuardedFinishPresentationRepair } from './engine/conductor.js';
 import { createProductionAcceptanceRedExec } from './engine/acceptance-red-runner.js';
 import {
   createProductionFinishPublicationCoordinator,
@@ -117,6 +113,7 @@ import {
   dispatchVersionCommand,
   resolveHarnessVersion,
 } from './engine/version-report.js';
+import { detectUpdateCommand, dispatchUpdateCommand } from './engine/update-cli.js';
 import { renderReport, ReportError } from './engine/report-renderer.js';
 import type { UIRenderer } from "./ui/types.js";
 import type {
@@ -135,6 +132,10 @@ import {
   detectUnknownDaemonSubcommand,
   type DaemonCommandOptions,
 } from './engine/daemon-command.js';
+import {
+  detectDaemonExitWitnessCommand,
+  dispatchDaemonExitWitness,
+} from './engine/daemon-exit-witness.js';
 import { detectRenderCommand, dispatchRender } from './engine/render-cli.js';
 import { detectRateCardCommand, dispatchRateCard } from './engine/rate-card-cli.js';
 import {
@@ -171,6 +172,13 @@ import {
   resolveMainRepoRoot,
 } from './engine/daemon-park-cli.js';
 import { detectTaskCommand, dispatchTaskCommand } from './engine/task-cli.js';
+import { detectGithubOperationCommand, dispatchGithubOperationCommand } from './engine/github-operations-cli.js';
+import { detectGithubBoundaryAuditCommand, dispatchGithubBoundaryAudit } from './engine/github-invocation-audit-cli.js';
+import {
+  formatGithubOperationTarget,
+  type GithubOperationTarget,
+} from './engine/github-operations.js';
+import type { GithubOperationApprovalPrompt } from './engine/github-operation-approval.js';
 import {
   detectScopeCheckCommand,
   loadScopeCheckEnforcement,
@@ -209,7 +217,8 @@ import { makeGitRunner, originDefaultBranch } from './engine/rebase.js';
 import { createBlockerResolver } from './engine/blocker-resolver.js';
 import { runOverlapScan, renderReport as renderOverlapReport } from './engine/overlap-scan.js';
 import { makeProductionGh } from './engine/pr-labels.js';
-import { hasSession, sessionNameForRepo, respawnPane } from './engine/daemon-tmux.js';
+import { buildDaemonExitWitnessCommand, hasSession, sessionNameForRepo, respawnPane } from './engine/daemon-tmux.js';
+import { resolveDaemonForegroundCommand } from './engine/daemon-supervisor-cli.js';
 
 export {
   buildVisualizers,
@@ -302,12 +311,16 @@ export async function buildDaemonModeOptions(
     sessionNameForRepo: typeof sessionNameForRepo;
     hasSession: typeof hasSession;
     respawnPane: typeof respawnPane;
-  } = { sessionNameForRepo, hasSession, respawnPane },
+    resolveDaemonForegroundCommand?: typeof resolveDaemonForegroundCommand;
+    buildDaemonExitWitnessCommand?: typeof buildDaemonExitWitnessCommand;
+  } = { sessionNameForRepo, hasSession, respawnPane, resolveDaemonForegroundCommand, buildDaemonExitWitnessCommand },
 ): Promise<DaemonCommandOptions & { projectRoot: string; triggerSelfRestart?: () => Promise<void> }> {
   const sessionName = deps.sessionNameForRepo(projectRoot);
   const triggerSelfRestart = (await deps.hasSession(sessionName))
     ? async () => {
-        await deps.respawnPane(sessionName);
+        const command = await (deps.resolveDaemonForegroundCommand ?? resolveDaemonForegroundCommand)(projectRoot);
+        const witnessCommand = (deps.buildDaemonExitWitnessCommand ?? buildDaemonExitWitnessCommand)(command, projectRoot);
+        await deps.respawnPane(sessionName, undefined, witnessCommand);
       }
     : undefined;
   return {
@@ -546,6 +559,12 @@ async function main(): Promise<void> {
   // pipeline or daemon handler.
   if (detectVersionCommand(process.argv)) {
     process.exitCode = await dispatchVersionCommand({ moduleDir: __dirname });
+    return;
+  }
+
+  const updateCmd = detectUpdateCommand(process.argv);
+  if (updateCmd) {
+    process.exitCode = await dispatchUpdateCommand(updateCmd);
     return;
   }
 
@@ -828,6 +847,41 @@ async function main(): Promise<void> {
     process.exit(code);
   }
 
+  // `github-boundary-audit` is the production entry of the shipped invocation
+  // audit: read-only, non-interactive, exit 1 on any unguarded site.
+  const githubBoundaryAuditCmd = detectGithubBoundaryAuditCommand(process.argv);
+  if (githubBoundaryAuditCmd) {
+    process.exit(dispatchGithubBoundaryAudit(githubBoundaryAuditCmd));
+  }
+
+  const githubOperationCmd = detectGithubOperationCommand(process.argv);
+  if (githubOperationCmd) {
+    // The CLI is the interactive authority boundary. It displays the exact
+    // decoded request and grants only this one confirmation; non-TTY callers
+    // get the normal explicit-authorization refusal.
+    const confirmation = {
+      mode: 'interactive' as const,
+      confirm: async (prompt: GithubOperationApprovalPrompt): Promise<boolean> => {
+        if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+        const target: GithubOperationTarget = prompt.target;
+        const readline = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          const answer = await readline.question(
+            `Authorize ${prompt.operation} on ${formatGithubOperationTarget(target)}? [y/N] `,
+          );
+          return answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes';
+        } finally {
+          readline.close();
+        }
+      },
+    };
+    process.exitCode = await dispatchGithubOperationCommand(githubOperationCmd, {
+      cwd: process.cwd(),
+      confirmation,
+    });
+    return;
+  }
+
   const scopeCheckCmd = detectScopeCheckCommand(process.argv);
   if (scopeCheckCmd) {
     const projectRoot = process.env.CONDUCT_SCOPE_CHECK_PROJECT_ROOT ?? process.cwd();
@@ -945,6 +999,15 @@ async function main(): Promise<void> {
     }
     const code = await dispatchDaemonPark(daemonParkCmd, { cwd: resolved.root });
     process.exit(code);
+  }
+
+  // The pane foreground invokes this short-lived writer after its daemon child
+  // exits. Handle it before the supervisor/run fallthrough so it never starts
+  // a daemon itself.
+  const daemonExitWitnessCmd = detectDaemonExitWitnessCommand(process.argv);
+  if (daemonExitWitnessCmd) {
+    const projectRoot = await resolveDaemonProjectRoot(process.cwd());
+    process.exit(dispatchDaemonExitWitness(daemonExitWitnessCmd, projectRoot));
   }
 
   // Daemon management verbs (start / stop / restart / connect / debug) route to
@@ -1364,8 +1427,11 @@ async function main(): Promise<void> {
     // BUILD/SHIP StepRunner paths retain this resolved-candidate boundary.
     // Conductor composes self-host authority around it when applicable.
     withCandidateSafety: createCandidateSafetyBoundary(),
-    onAttempt: (step, attempt) =>
-      events.emit({ type: 'provider_attempt', step, ...attempt }),
+    onAttempt: (step, { executionContext, ...attempt }) =>
+      events.emit({
+        type: 'provider_attempt', step, ...attempt,
+        ...(executionContext ? { executionContext } : {}),
+      }),
     warn: (_message, transition) => events.emit(transition),
   };
   const compatibilityRuntime = providerExecution.runtimes.get(
@@ -1476,6 +1542,8 @@ async function main(): Promise<void> {
   const finishPublicationBaseBranch =
     (await originDefaultBranch(makeGitRunner(projectRoot))) ?? 'main';
 
+  const finishPublicationGit = makeProductionGit();
+  const finishPublicationGh = makeProductionGh();
   const conductor = new Conductor({
     stateFilePath,
     stepRunner,
@@ -1496,11 +1564,13 @@ async function main(): Promise<void> {
       projectRoot,
       stateFilePath,
       baseBranch: finishPublicationBaseBranch,
-      git: makeProductionGit(),
-      gh: makeProductionGh(),
-      repairPresentation: createFinishPresentationRepair({
+      git: finishPublicationGit,
+      gh: finishPublicationGh,
+      repairPresentation: createProvenanceGuardedFinishPresentationRepair({
         projectRoot,
-        gh: makeProductionGh(),
+        git: finishPublicationGit,
+        gh: finishPublicationGh,
+        baseBranch: finishPublicationBaseBranch,
       }),
       observeReleaseReadiness: createProductionReleaseReadinessObserver({
         projectRoot,

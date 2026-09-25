@@ -91,6 +91,56 @@ branches. Rejected on cost/benefit, not on correctness.
    deleted; every branch refused is still refused. This is a naming, counting, and record-keeping
    change only. No branch becomes newly deletable.
 
+> **Amended 2026-09-14 by jstoup111/ai-conductor#1510 (spec `reclaim-merged-feature-worktrees-without-depending`):** the candidate set, the branch the
+> proofs key on, and the scope of the record precondition change; the proof set and its strength
+> do not.
+>
+> 6. **The guarded helper's candidate set is the worktree listing, not only the park markers.**
+>    `reconcileParkedFeatures` enumerates every git-registered worktree directly under
+>    `.worktrees/` from `git worktree list --porcelain` and unions it with the operator-parked
+>    slugs. Enumeration produces candidates only: each candidate still enters
+>    `reconcileMergedPark` as exactly one explicit slug, and the helper still re-derives every
+>    proof immediately before the destructive step. A flat directory read is not an enumeration
+>    source — it cannot supply the branch and it misreads nested paths as slugs.
+>
+> 7. **The helper keys its proofs on the worktree's listed branch.** Evidence is gathered for the
+>    branch the listing reports for that worktree, not for a branch whose final path segment
+>    happens to equal the slug. The two deletion proofs — ancestry and merged-PR head identity —
+>    and their equal strength are unchanged.
+>
+> 8. **The shipped-record precondition is scoped by branch kind.** A candidate on a
+>    `feat/daemon-*` branch keeps the record-on-main precondition, because the daemon backlog
+>    dedups dispatch on that record. A candidate on any other branch is reclaimable on the proof
+>    set alone; no record is required or consulted for it, because no dispatch depends on one.
+>    This adds no proof to the set: nothing becomes deletable that both proofs would refuse.
+
+> **Amended 2026-09-21 by jstoup111/ai-conductor#2636 (spec `daemon-reclaim-sweep-deletes-a-worktree-that-holds`):**
+> the reclaim sweep removed an operator worktree holding uncommitted edits, on a freshly created
+> branch whose tip still equalled `origin/main`. The reason logged was `ancestry`. A branch with no
+> commits beyond its base and a fully merged branch are identical under
+> `git merge-base --is-ancestor`, because that test is true exactly when the branch tip is the merge
+> base. This amendment narrows what the set can delete; it adds no proof.
+>
+> 9. **Ancestry alone never authorizes deletion.** An ancestry-proven branch is reclaimable only when
+>    a MERGED pull request's `headRefOid` equals its current tip, or — for a record-gated candidate
+>    under Decision 8 (a `feat/daemon-*` branch or a branchless parked slug) — a shipped record for
+>    the slug is on `origin/main`. Without the applicable corroboration, the helper refuses with
+>    `no-merge-proof` and the candidate is retained. Merged-PR head identity stays sufficient on its
+>    own. A non-daemon candidate is corroborated only by merged-PR head identity and never reads the
+>    shipped-record listing: per operator decision 2026-09-22, Decision 8 governs where the two
+>    clauses meet. The strength of Decision 1 is narrowed, never widened.
+>
+> 10. **A dirty worktree is never removed.** Immediately before the destructive step, and after every
+>     merge proof has passed, the helper runs `git status --porcelain` in the candidate worktree. Any
+>     modified, staged, or untracked path refuses with the new reason `dirty-worktree`, and neither
+>     the worktree nor the branch is deleted. A failed status probe refuses the same way (fail
+>     closed). A candidate with no worktree on disk skips the check.
+>
+> 11. **Every new refusal is observable on the existing spine.** `dirty-worktree` joins
+>     `RefusalReason` and is reported through the existing `worktree_reclaim_failed` event and the
+>     sweep log line, as every other refusal is under Decision 3. No new event type or channel is
+>     added.
+
 ## Consequences
 
 - The governing record matches the code again, and the "one authority" sentence stops being a trap

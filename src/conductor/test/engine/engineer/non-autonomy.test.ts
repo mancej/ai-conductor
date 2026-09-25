@@ -85,10 +85,11 @@ const FORBIDDEN_MODULE_SUFFIXES: string[] = [
 /**
  * Regex patterns that represent forbidden tokens when present in reachable source.
  *
- * Rule 1: 'merge' as a standalone quoted argument — catches the token 'merge'
- *         or "merge" appearing as a separate string in a JS array or template
- *         literal argument list. This is the realistic form used when calling a
- *         runner with ['gh', 'pr', 'merge', ...] or execFile('gh', ['pr', 'merge']).
+ * Rule 1: 'merge' as a quoted argument in a GitHub command — catches the token
+ *         'merge' or "merge" when it appears on the same line as a quoted `gh`
+ *         command token. This is the realistic form used when calling a runner
+ *         with ['gh', 'pr', 'merge', ...] or execFile('gh', ['pr', 'merge']).
+ *         A Git fast-forward is not a GitHub PR merge and is permitted.
  *         It also catches the single-string form 'gh pr merge'.
  *
  * Rule 2: 'pr merge' as a single literal string — e.g. `gh pr merge` as a
@@ -110,12 +111,13 @@ const FORBIDDEN_MODULE_SUFFIXES: string[] = [
  */
 const FORBIDDEN_TOKEN_PATTERNS: Array<{ label: string; re: RegExp }> = [
   {
-    label: "'merge' as a quoted argument token — runner(['gh','pr','merge',...])",
-    // Matches 'merge' or "merge" as a standalone quoted string on a non-comment line.
-    // Catches: ['pr', 'merge', ...], execFile('gh', ['pr', 'merge']), etc.
+    label: "'merge' as a quoted GitHub-command argument — runner(['gh','pr','merge',...])",
+    // Matches a quoted `merge` token when a quoted `gh` token occurs on the same
+    // non-comment line. Catches: ['gh', 'pr', 'merge', ...] and
+    // execFile('gh', ['pr', 'merge']), but not git's permitted fast-forward.
     // Does NOT match 'pr create' or other PR subcommands.
     // The negative lookbehind skips lines that start with optional-whitespace then //
-    re: /(?<!^\s*\/\/.*)['"]merge['"]/m,
+    re: /(?<!^\s*\/\/.*)(?:['"]gh['"][^\n]*['"]merge['"]|['"]merge['"][^\n]*['"]gh['"])/m,
   },
   {
     label: "'pr merge' as a single literal string — shell exec form",
@@ -328,6 +330,12 @@ describe('engineer import graph: structural non-autonomy (FR-10, ADR-005)', () =
     // 'pr create' is not 'pr merge' — pattern 1 must NOT fire.
     expect(FORBIDDEN_TOKEN_PATTERNS[1].re.test(allowedArrayLine)).toBe(false);
 
+    // A local fast-forward updates the daemon checkout; it is not a GitHub PR
+    // merge and must not make the engineer graph fail merely by sharing helpers.
+    const allowedGitFastForward = `await git(['merge', '--ff-only', 'origin/main']);`;
+    expect(FORBIDDEN_TOKEN_PATTERNS[0].re.test(allowedGitFastForward)).toBe(false);
+    expect(FORBIDDEN_TOKEN_PATTERNS[1].re.test(allowedGitFastForward)).toBe(false);
+
     // Also verify the comment-line exemption: a comment explaining the merge
     // guard must not be flagged.
     const commentLine = `  // The engineer MUST NOT call 'merge' on any PR.`;
@@ -472,16 +480,16 @@ describe('engineer self-edit: propose-only PR invariant (FR-10 negative path)', 
     ).toHaveLength(0);
   });
 
-  it('handoff.ts uses only pr create — never pr merge — for ANY target including self', () => {
+  it('handoff.ts creates PRs through the guarded operation — never pr merge — for ANY target including self', () => {
     // Load handoff.ts directly (it is the ONLY sanctioned spec-PR-opening module).
-    // Assert that the ONLY gh subcommand token present is 'create', not 'merge'.
-    // This is the most targeted assertion: even if a self-edit code path were
-    // added to handoff.ts that called 'pr merge', this test fails.
+    // Assert the guarded create operation is present and a merge token is not.
+    // This fails if a self-edit path adds a direct merge or raw-create bypass.
     const handoffTs = join(CONDUCTOR_SRC, 'engine/engineer/handoff.ts');
     const handoffSrc = readFileSync(handoffTs, 'utf-8');
 
-    // 'create' must appear as a runner arg token — it is the sanctioned operation.
-    expect(handoffSrc).toMatch(/['"]create['"]/);
+    // The guarded operation is the sanctioned creation boundary.  A raw
+    // `gh pr create` argv token would bypass ownership authorization.
+    expect(handoffSrc).toMatch(/['"]pull-request\.create['"]/);
 
     // 'merge' must NOT appear as a runner arg token in handoff.ts.
     // We use the same pattern as FORBIDDEN_TOKEN_PATTERNS[0] applied to this file.

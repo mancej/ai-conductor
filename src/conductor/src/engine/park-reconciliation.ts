@@ -7,17 +7,24 @@ import {
 import { GhCapabilityError } from './tracker-client.js';
 import { dispatchDaemonPark } from './daemon-park-cli.js';
 import { access, readFile, rm } from 'node:fs/promises';
-import { basename, join } from 'node:path';
-import { listOperatorParkedSlugs } from './park-marker.js';
+import { basename, dirname, join } from 'node:path';
+import { isOperatorParked, listOperatorParkedSlugs } from './park-marker.js';
 import { parseIntakeSourceRef } from './artifacts.js';
 import { runProjectTeardown } from './worktree-prepare.js';
 import { loadConfig } from './config.js';
 import { resolveTeardownTimeoutSeconds } from './resolved-config.js';
+import { phaseMarkerPath } from './phase-marker.js';
 import type { WorktreeLifecycleQueue } from './worktree.js';
+import type { ConductorEvent, WorktreeReclaimRetainedReason } from '../types/events.js';
+import { runTrackerAmbientRead } from './tracker-client.js';
 
 export interface ReconcileMergedParkOptions {
   projectRoot: string;
   slug: string;
+  /** Registered worktree branch; when present, evidence is scoped to this ref. */
+  branch?: string;
+  /** Internal sweep hand-off: expose the proof kind to the event producer. */
+  emitProof?: boolean;
   runGit?: GitRunner;
   runGh?: GhRunner;
   requestRecordRepair?: (request: { slug: string; prUrl: string }) => Promise<void>;
@@ -32,15 +39,27 @@ export interface ReconcileMergedParkOptions {
   /** Whether project teardown output should be logged. */
   verbose?: boolean;
   worktreeLifecycle?: WorktreeLifecycleQueue;
+  /** Daemon-pool liveness guard; destructive reconciliation always re-checks it. */
+  isFeatureInFlight?: (slug: string) => boolean;
+  /** Clock seam for phase-marker staleness. */
+  now?: () => number;
 }
 
-export interface ReconcileMergedParkOutcome {
+type ReclaimProof = 'ancestry' | 'merged-pr-head';
+
+interface ReconcileMergedParkBaseOutcome {
   slug: string;
   steps: string[];
   refusal?: RefusalReason;
   unmergedCommits?: UnmergedCommitListing;
   deferred?: boolean;
 }
+
+/** A successful branch reconciliation carries its deletion authority; a branchless record reconciliation does not. */
+export type ReconcileMergedParkOutcome = ReconcileMergedParkBaseOutcome & (
+  | { proof: ReclaimProof }
+  | { proof?: never }
+);
 
 export interface UnmergedCommitSummary {
   sha: string;
@@ -54,15 +73,34 @@ export interface UnmergedCommitListing {
 
 export type RefusalReason =
   | 'invalid-slug'
+  | 'in-flight'
   | 'ancestry-check-failed'
   | 'branch-missing'
   | 'no-merge-proof'
   | 'unmerged-commits'
   | 'branch-behind-merged-head'
   | 'record-missing'
+  | 'dirty-worktree'
   | 'worktree-remove-failed'
   | 'branch-delete-failed'
   | 'unpark-failed';
+
+/**
+ * Refusals raised after the helper began a destructive operation that did not
+ * complete. Every other refusal is the helper declining to act — the worktree
+ * is intact and correctly retained (missing or unproven merge evidence, a
+ * dirty checkout, a live run) — and is not an operational failure.
+ */
+const RECLAIM_OPERATION_FAILURES: ReadonlySet<string> = new Set<RefusalReason>([
+  'worktree-remove-failed',
+  'branch-delete-failed',
+  'unpark-failed',
+]);
+
+/** True when a reclaim refusal is an operation that failed, not a retention decision. */
+export function isReclaimOperationFailure(refusal: string): boolean {
+  return RECLAIM_OPERATION_FAILURES.has(refusal);
+}
 
 export type ParkClassification = 'merged' | 'orphan' | 'normal' | 'unclassified';
 
@@ -96,6 +134,14 @@ export interface ReconcileParkedFeaturesOptions {
    * helper so cleanup never leaves a watcher on a worktree it just deleted.
    */
   disposeHaltWatcher?: (slug: string) => void;
+  /** Daemon-pool liveness guard; active worktrees are never reclaimed. */
+  isFeatureInFlight?: (slug: string) => boolean;
+  /** Test seam for the single pass-wide registered-worktree snapshot. */
+  worktreeListing?: () => Promise<RegisteredWorktree[] | null>;
+  /** Resolved reclamation policy; false holds registered, non-parked candidates. */
+  reclaimMergedWorktrees?: boolean;
+  /** Best-effort event-spine sink for one terminal candidate disposition. */
+  onEvent?: (event: ConductorEvent) => void;
   log?: (message: string) => void;
   autoCleanup?: boolean;
   cache?: Map<string, ParkClassification>;
@@ -168,6 +214,15 @@ function isMerged(evidence: MergeEvidence): boolean {
 }
 
 /**
+ * A shipped record is a dispatch-dedup precondition only for parked candidates
+ * and daemon-created feature branches. Other listed branches are authorized by
+ * the merge proofs alone.
+ */
+export function requiresShippedRecord(branch?: string): boolean {
+  return branch === undefined || branch.startsWith('feat/daemon-');
+}
+
+/**
  * Shipped-record stems committed on `origin/main`, or `null` when the base
  * branch itself could not be read.
  *
@@ -230,6 +285,53 @@ async function listBranchesBySlug(
 }
 
 /**
+ * Registered, depth-one feature worktrees and their checked-out branches, or
+ * `null` when Git cannot provide the listing. This deliberately reads once so
+ * a caller can apply one coherent registry snapshot to a whole sweep.
+ */
+export interface RegisteredWorktree {
+  slug: string;
+  branch?: string;
+  /** Nested paths are reported for retention, but never passed to the helper. */
+  reclaimable?: boolean;
+}
+
+export async function listRegisteredWorktrees(
+  runGit: GitRunner,
+  projectRoot: string,
+): Promise<RegisteredWorktree[] | null> {
+  try {
+    const { stdout } = await runGit(['worktree', 'list', '--porcelain'], { cwd: projectRoot });
+    const worktreesRoot = join(projectRoot, '.worktrees');
+    const candidates: RegisteredWorktree[] = [];
+
+    for (const record of stdout.split(/\n\s*\n/)) {
+      const lines = record.split('\n');
+      const worktreeLine = lines.find((line) => line.startsWith('worktree '));
+      const branchLine = lines.find((line) => line.startsWith('branch refs/heads/'));
+      if (!worktreeLine) continue;
+
+      const path = worktreeLine.slice('worktree '.length).trim();
+      const parent = dirname(path);
+      // The root checkout and other worktree roots are not part of this
+      // lifecycle. Nested entries are retained below as invalid-slug, never
+      // handed to the destructive helper.
+      if (parent !== worktreesRoot && !path.startsWith(`${worktreesRoot}/`)) continue;
+
+      candidates.push({
+        slug: parent === worktreesRoot ? basename(path) : path.slice(`${worktreesRoot}/`.length),
+        ...(branchLine === undefined ? {} : { branch: branchLine.slice('branch refs/heads/'.length).trim() }),
+        reclaimable: branchLine !== undefined && parent === worktreesRoot,
+      });
+    }
+
+    return candidates;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * `true` contained in `origin/main`, `false` definitely not, `null` when git
  * could not answer (exit 128: missing ref, unreadable repo, …). Exit 1 — and
  * ONLY exit 1 — means "not an ancestor".
@@ -256,6 +358,9 @@ export type MergedPrHeadDiagnosis =
   | { kind: 'proven' }
   | { kind: 'no-pr' }
   | { kind: 'ahead'; headRefOid: string }
+  /** The branch and the merged head each carry commits the other lacks. */
+  | { kind: 'diverged'; headRefOid: string }
+  /** The branch tip is a strict ancestor of the merged head: deleting drops nothing, but no held proof authorizes it. */
   | { kind: 'behind'; headRefOid: string }
   | { kind: 'capability-unavailable' }
   | { kind: 'indeterminate' };
@@ -287,34 +392,78 @@ export async function proveByMergedPrHead(
   onCapabilityError?: (error: GhCapabilityError) => void,
 ): Promise<MergedPrHeadDiagnosis> {
   try {
-    const { stdout } = await runGh(
-      ['pr', 'list', '--head', ref, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'],
-      { cwd: projectRoot },
-    );
+    const stdout = await runTrackerAmbientRead(runGh, projectRoot, 'ambient.pull-request.read', ['pr', 'list', '--head', ref, '--state', 'merged', '--json', 'headRefOid', '--limit', '1']);
     const prs = JSON.parse(stdout) as Array<{ headRefOid?: unknown }>;
     const headRefOid = prs[0]?.headRefOid;
     if (prs.length === 0) return { kind: 'no-pr' };
     if (typeof headRefOid !== 'string' || headRefOid.trim() === '') return { kind: 'indeterminate' };
-    const { stdout: tip } = await runGit(['rev-parse', ref], { cwd: projectRoot });
+    const { stdout: tipOut } = await runGit(['rev-parse', ref], { cwd: projectRoot });
+    const tip = tipOut.trim();
     const normalizedHeadRefOid = headRefOid.trim();
-    if (tip.trim() === normalizedHeadRefOid) return { kind: 'proven' };
+    if (tip === normalizedHeadRefOid) return { kind: 'proven' };
 
-    await runGit(['cat-file', '-e', `${normalizedHeadRefOid}^{commit}`], { cwd: projectRoot });
     try {
-      await runGit(['merge-base', '--is-ancestor', normalizedHeadRefOid, ref], { cwd: projectRoot });
-      return { kind: 'ahead', headRefOid: normalizedHeadRefOid };
-    } catch (error) {
-      if ((error as { code?: unknown }).code === 1) {
-        return { kind: 'behind', headRefOid: normalizedHeadRefOid };
-      }
-      return { kind: 'indeterminate' };
+      await runGit(['cat-file', '-e', `${normalizedHeadRefOid}^{commit}`], { cwd: projectRoot });
+    } catch {
+      // The merged head was never fetched (for example a suggestion commit
+      // applied on GitHub after the last push). The PR's own commit list still
+      // answers whether the local tip is one of the merged commits, which is
+      // the "behind" diagnosis; anything else stays indeterminate.
+      return (await isTipAMergedPrCommit(runGh, projectRoot, ref, tip))
+        ? { kind: 'behind', headRefOid: normalizedHeadRefOid }
+        : { kind: 'indeterminate' };
     }
+    const headContainedInBranch = await ancestry(runGit, projectRoot, normalizedHeadRefOid, ref);
+    if (headContainedInBranch === true) return { kind: 'ahead', headRefOid: normalizedHeadRefOid };
+    if (headContainedInBranch === null) return { kind: 'indeterminate' };
+    // The merged head is not in the branch. Only a tip that the merged head
+    // contains is merely behind; otherwise the branch holds commits the merge
+    // never saw (a rebased or rewritten PR head), which deleting would drop.
+    const branchContainedInHead = await ancestry(runGit, projectRoot, ref, normalizedHeadRefOid);
+    if (branchContainedInHead === true) return { kind: 'behind', headRefOid: normalizedHeadRefOid };
+    if (branchContainedInHead === false) return { kind: 'diverged', headRefOid: normalizedHeadRefOid };
+    return { kind: 'indeterminate' };
   } catch (error) {
     if (error instanceof GhCapabilityError) {
       onCapabilityError?.(error);
       return { kind: 'capability-unavailable' };
     }
     return { kind: 'indeterminate' };
+  }
+}
+
+/** `merge-base --is-ancestor`: `true`/`false` on exit 0/1, `null` when git could not answer. */
+async function ancestry(
+  runGit: GitRunner,
+  projectRoot: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean | null> {
+  try {
+    await runGit(['merge-base', '--is-ancestor', ancestor, descendant], { cwd: projectRoot });
+    return true;
+  } catch (error) {
+    return (error as { code?: unknown }).code === 1 ? false : null;
+  }
+}
+
+/**
+ * Whether `tip` is one of the commits of the merged PR for `ref`, read from
+ * GitHub. Diagnostic only: it distinguishes `behind` from an unanswerable
+ * probe when the merged head is absent locally, and never grants deletion.
+ */
+async function isTipAMergedPrCommit(
+  runGh: GhRunner,
+  projectRoot: string,
+  ref: string,
+  tip: string,
+): Promise<boolean> {
+  try {
+    const stdout = await runTrackerAmbientRead(runGh, projectRoot, 'ambient.pull-request.read', ['pr', 'list', '--head', ref, '--state', 'merged', '--json', 'commits', '--limit', '1']);
+    const prs = JSON.parse(stdout) as Array<{ commits?: Array<{ oid?: unknown }> }>;
+    return (prs[0]?.commits ?? []).some((commit) => commit.oid === tip);
+  } catch {
+    return false;
   }
 }
 
@@ -391,9 +540,15 @@ async function gatherMergeEvidence(
   projectRoot: string,
   slug: string,
   prefetched?: { shippedStems: string[] | null; branchesBySlug: Map<string, string[]> | null },
+  branch?: string,
 ): Promise<MergeEvidence | null> {
-  const shippedStems =
-    prefetched?.shippedStems ?? (await listShippedStemsOnMain(runGit, projectRoot));
+  // Only record-gated candidates (daemon branches and branchless parked slugs)
+  // consult the shipped-record listing. Any other branch never reads it
+  // (adr-2026-08-01 D8, which governs D9 per operator decision 2026-09-22):
+  // its ancestry is corroborated by merged-PR head identity alone.
+  const shippedStems = requiresShippedRecord(branch)
+    ? prefetched?.shippedStems ?? (await listShippedStemsOnMain(runGit, projectRoot))
+    : [];
   if (shippedStems === null) return null;
   const branchesBySlug =
     prefetched?.branchesBySlug ?? (await listBranchesBySlug(runGit, projectRoot));
@@ -401,7 +556,9 @@ async function gatherMergeEvidence(
 
   const key = undatedStem(slug);
   const shippedRecordOnMain = shippedStems.some((stem) => undatedStem(stem) === key);
-  const branches = branchesBySlug.get(key) ?? [];
+  const branches = branch === undefined
+    ? branchesBySlug.get(key) ?? []
+    : [...branchesBySlug.values()].some((refs) => refs.includes(branch)) ? [branch] : [];
 
   const mergedBranches: string[] = [];
   let ancestryUnavailable = false;
@@ -435,24 +592,100 @@ export async function reconcileParkedFeatures(
     skipped: 0,
   };
   const refusedByReason: Partial<Record<RefusalReason, number>> = {};
+  const retainedByReason: Record<WorktreeReclaimRetainedReason, number> = {
+    detached: 0,
+    'in-flight': 0,
+    'foreign-lifecycle': 0,
+    'invalid-slug': 0,
+    halted: 0,
+    'listing-unavailable': 0,
+    'evidence-unavailable': 0,
+    disabled: 0,
+    'ancestry-check-failed': 0,
+    'branch-missing': 0,
+    'no-merge-proof': 0,
+    'unmerged-commits': 0,
+    'branch-behind-merged-head': 0,
+    'record-missing': 0,
+    'dirty-worktree': 0,
+    'worktree-remove-failed': 0,
+    'branch-delete-failed': 0,
+    'unpark-failed': 0,
+  };
   const runGit = opts.runGit ?? makeProductionGit();
   const parkedSlugs = await listOperatorParkedSlugs(opts.projectRoot);
+  const registeredWorktrees = await (opts.worktreeListing?.() ?? listRegisteredWorktrees(runGit, opts.projectRoot));
+  const candidates = new Map<string, { branch?: string; parked: boolean; reclaimable: boolean }>();
+  for (const slug of parkedSlugs) candidates.set(slug, { parked: true, reclaimable: true });
+  for (const entry of registeredWorktrees ?? []) {
+    const { slug, branch } = entry;
+    const reclaimable = entry.reclaimable ?? true;
+    const existing = candidates.get(slug);
+    candidates.set(slug, {
+      branch,
+      parked: existing?.parked ?? false,
+      reclaimable: (existing?.reclaimable ?? true) && reclaimable,
+    });
+  }
+  const enumeratedCandidates = [...candidates.values()]
+    .filter((candidate) => !candidate.parked).length;
 
-  // Read the base-branch record listing and the local ref listing ONCE for the
-  // whole pass; both are pass-invariant and the sweep runs on every idle tick.
+  // Read pass-invariant evidence once. Only record-gated candidates consult the
+  // shipped-record listing (adr-2026-08-01 D8), so a pass without one never
+  // reads it.
+  const hasRecordGatedCandidate = [...candidates.values()].some((candidate) =>
+    candidate.reclaimable && requiresShippedRecord(candidate.branch),
+  );
   const prefetched = {
-    shippedStems: await listShippedStemsOnMain(runGit, opts.projectRoot),
+    shippedStems: hasRecordGatedCandidate
+      ? await listShippedStemsOnMain(runGit, opts.projectRoot)
+      : [],
     branchesBySlug: await listBranchesBySlug(runGit, opts.projectRoot),
   };
 
-  for (const slug of parkedSlugs) {
+  for (const [slug, candidate] of candidates) {
+    let retainedReason: WorktreeReclaimRetainedReason | undefined;
+    if (registeredWorktrees === null) retainedReason = 'listing-unavailable';
+    // These guards protect every registered candidate, including one that is
+    // also operator-parked. A live dispatch or HALT always wins over cleanup.
+    else if (opts.isFeatureInFlight?.(slug)) retainedReason = 'in-flight';
+    else if (slug.startsWith('engineer-') || slug.startsWith('resolve-')) retainedReason = 'foreign-lifecycle';
+    else if (!candidate.reclaimable || !SINGLE_SLUG.test(slug)) {
+      retainedReason = !candidate.reclaimable && candidate.branch === undefined ? 'detached' : 'invalid-slug';
+    }
+    else {
+      try {
+        await access(join(opts.projectRoot, '.worktrees', slug, '.pipeline', 'HALT'));
+        retainedReason = 'halted';
+      } catch (error) {
+        if ((error as { code?: unknown }).code !== 'ENOENT') retainedReason = 'halted';
+      }
+    }
+    if (!retainedReason) {
+      let markerReadError = false;
+      await isOperatorParked(opts.projectRoot, slug, () => { markerReadError = true; });
+      if (markerReadError) retainedReason = 'halted';
+    }
+
     let classification: ParkClassification;
-    const evidence = await gatherMergeEvidence(runGit, opts.projectRoot, slug, prefetched);
-    if (evidence === null) {
+    if (retainedReason) {
       classification = 'unclassified';
-    } else if (isMerged(evidence)) {
-      classification = 'merged';
+      retainedByReason[retainedReason]++;
     } else {
+      const evidence = await gatherMergeEvidence(
+        runGit,
+        opts.projectRoot,
+        slug,
+        prefetched,
+        candidate.branch,
+      );
+      if (evidence === null) {
+      classification = 'unclassified';
+      retainedReason = 'evidence-unavailable';
+      retainedByReason[retainedReason]++;
+      } else if (isMerged(evidence)) {
+      classification = 'merged';
+      } else {
       const intake = await readFile(join(opts.projectRoot, '.docs', 'intake', `${slug}.md`), 'utf-8')
         .then((content) => content)
         .catch(() => null);
@@ -468,6 +701,7 @@ export async function reconcileParkedFeatures(
           classification = 'unclassified';
         }
       }
+      }
     }
 
     const autoCleanup = opts.autoCleanup ?? true;
@@ -476,13 +710,28 @@ export async function reconcileParkedFeatures(
       classification,
       annotation: classification === 'orphan' ? 'orphan' : classification === 'merged' && !autoCleanup ? 'merged-ready' : undefined,
     });
-    if (classification === 'merged' && autoCleanup) {
+    // Operator-parked candidates retain their established auto-cleanup gate.
+    // Enumerated worktrees are governed by the explicit reclaim gate instead.
+    const reclamationDisabled = candidate.parked
+      ? !autoCleanup
+      : opts.reclaimMergedWorktrees === false;
+    // An operator-parked candidate keeps its pre-change path: only a park
+    // already classified merged reaches the helper, so an ordinary unmerged
+    // park never adds a refusal to the tally (Story 8).
+    const shouldReconcile = candidate.parked ? classification === 'merged' : candidate.branch !== undefined;
+    if (!retainedReason && shouldReconcile && reclamationDisabled) {
+      retainedReason = 'disabled';
+      retainedByReason.disabled++;
+    } else if (!retainedReason && shouldReconcile) {
       // The helper reports its refusal reason for direct/operator invocation.
       // A daemon sweep deliberately suppresses that per-slug chatter; the
       // aggregate below reports the outcome and the operator's next steps.
       const outcome = await reconcileMergedPark({
         ...opts,
         slug,
+        // The porcelain listing is authoritative even when an operator also
+        // parked this candidate: evidence and record policy key off this ref.
+        branch: candidate.branch,
         log: undefined,
         capabilityLog: opts.log,
         teardownLog: opts.log,
@@ -494,33 +743,78 @@ export async function reconcileParkedFeatures(
         teardownTimeoutSeconds: opts.teardownTimeoutSeconds,
         verbose: opts.verbose,
         worktreeLifecycle: opts.worktreeLifecycle,
+        isFeatureInFlight: opts.isFeatureInFlight,
+        emitProof: true,
       });
       if (outcome.refusal === undefined) {
         counts.reconciled++;
+        try {
+          opts.onEvent?.(candidate.branch === undefined
+            ? { type: 'worktree_reclaim_reclaimed', slug }
+            : {
+                type: 'worktree_reclaim_reclaimed',
+                slug,
+                branch: candidate.branch,
+                proof: outcome.proof!,
+              });
+        } catch {
+          // Event persistence must not make this best-effort sweep fail.
+        }
       }
-      else if (outcome.refusal === 'record-missing') counts.deferred++;
       else {
-        counts.refused++;
-        refusedByReason[outcome.refusal] = (refusedByReason[outcome.refusal] ?? 0) + 1;
+        if (outcome.refusal === 'record-missing') counts.deferred++;
+        else {
+          counts.refused++;
+          refusedByReason[outcome.refusal] = (refusedByReason[outcome.refusal] ?? 0) + 1;
+        }
+        // Every helper refusal is a failed reclaim on the spine
+        // (adr-2026-07-29 D9); retention is reserved for candidates the sweep
+        // never handed to the helper.
+        try {
+          opts.onEvent?.({ type: 'worktree_reclaim_failed', slug, branch: candidate.branch, refusal: outcome.refusal });
+        } catch {
+          // Event persistence must not make this best-effort sweep fail.
+        }
+      }
+    }
+    // Every candidate gets a terminal retention event when it did not reach
+    // the helper. A non-merged classification has no deletion proof.
+    if (!retainedReason && !shouldReconcile) {
+      retainedReason = 'no-merge-proof';
+      retainedByReason[retainedReason]++;
+    }
+    if (retainedReason) {
+      try {
+        opts.onEvent?.({ type: 'worktree_reclaim_retained', slug, branch: candidate.branch, reason: retainedReason });
+      } catch {
+        // Event persistence must not make this best-effort sweep fail.
       }
     }
     if (classification === 'orphan') counts.orphaned++;
     else if (classification === 'unclassified') counts.skipped++;
     else counts.parked++;
-    opts.cache?.set(slug, classification);
+    if (candidate.parked) opts.cache?.set(slug, classification);
   }
 
   const refusalSignature = Object.entries(refusedByReason)
     .sort(([leftReason], [rightReason]) => leftReason.localeCompare(rightReason))
     .map(([reason, count]) => `${reason}=${count}`)
     .join(',');
-  const signature = `${counts.reconciled}:${counts.deferred}:${counts.orphaned}:${counts.parked}:${counts.refused}:${counts.skipped}:${refusalSignature}`;
+  const retainedSignature = Object.entries(retainedByReason)
+    .filter(([, count]) => count > 0)
+    .sort(([leftReason], [rightReason]) => leftReason.localeCompare(rightReason))
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(',');
+  const signature = `${counts.reconciled}:${counts.deferred}:${counts.orphaned}:${counts.parked}:${counts.refused}:${counts.skipped}:${enumeratedCandidates}:${retainedSignature}:${refusalSignature}`;
   if (!opts.cache || sweepSummarySignatures.get(opts.cache) !== signature) {
     const refusalReasons = Object.entries(refusedByReason)
       .sort(([leftReason, leftCount], [rightReason, rightCount]) =>
         rightCount - leftCount || leftReason.localeCompare(rightReason));
     const refusalSummary = counts.refused > 0
       ? `; refusals: ${refusalReasons.map(([reason, count]) => `${reason}=${count}`).join(', ')}`
+      : '';
+    const retainedSummary = enumeratedCandidates > 0
+      ? ` candidates=${candidates.size} retained=${Object.values(retainedByReason).reduce((sum, count) => sum + count, 0)}${retainedSignature ? `; retained: ${retainedSignature}` : ''}`
       : '';
     const remainingParked = Math.max(0, counts.parked - counts.reconciled);
     const nextSteps = [
@@ -533,15 +827,45 @@ export async function reconcileParkedFeatures(
       counts.skipped > 0 ? `${counts.skipped} skipped retry when merge/issue evidence is available` : undefined,
     ].filter((step): step is string => step !== undefined);
     const guidance = nextSteps.length > 0 ? `; next: ${nextSteps.join('; ')}` : '; next: no action required';
-    opts.log?.(`[parked-reconciliation] reconciled=${counts.reconciled} deferred=${counts.deferred} orphaned=${counts.orphaned} parked=${counts.parked} refused=${counts.refused} skipped=${counts.skipped}${refusalSummary}${guidance}`);
+    opts.log?.(`[parked-reconciliation] reconciled=${counts.reconciled} deferred=${counts.deferred} orphaned=${counts.orphaned} parked=${counts.parked} refused=${counts.refused} skipped=${counts.skipped}${retainedSummary}${refusalSummary}${guidance}`);
     if (opts.cache) sweepSummarySignatures.set(opts.cache, signature);
   }
   if (opts.cache) {
+    // The cache backs parked-marker reporting. Enumerated worktrees have no
+    // marker lifecycle, so retaining their old classification after removal
+    // would make a later parked sweep report phantom state.
     const live = new Set(parkedSlugs);
     for (const slug of opts.cache.keys()) if (!live.has(slug)) opts.cache.delete(slug);
   }
 
   return { entries, counts, refusedByReason };
+}
+
+/**
+ * A phase marker older than this is left behind by a run that died without
+ * clearing it. Every step dispatch rewrites the marker, so a live run's marker
+ * is never this old; the bound is deliberately far above any single step.
+ */
+export const STALE_PHASE_MARKER_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Whether a worktree's `.pipeline/phase-active` marker still indicates a live
+ * run. Fails closed: an unreadable marker, or one without a parseable
+ * `written:` timestamp, counts as live. Only a marker whose own timestamp is
+ * older than {@link STALE_PHASE_MARKER_MS} is treated as abandoned.
+ */
+async function hasLivePhaseMarker(worktreePath: string, now: number): Promise<boolean> {
+  let content: string;
+  try {
+    content = await readFile(phaseMarkerPath(worktreePath), 'utf-8');
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    return code !== 'ENOENT' && code !== 'ENOTDIR';
+  }
+  const written = /^written:\s*(\S+)\s*$/m.exec(content)?.[1];
+  const writtenAt = written === undefined ? Number.NaN : Date.parse(written);
+  if (Number.isNaN(writtenAt)) return true;
+  return now - writtenAt < STALE_PHASE_MARKER_MS;
 }
 
 /**
@@ -555,16 +879,33 @@ export async function reconcileMergedPark(
     return { slug: opts.slug, steps: [], refusal: 'invalid-slug' };
   }
 
+  // This helper is also called directly by the operator verb, so it must
+  // re-derive liveness instead of relying on the sweep's earlier retention.
+  // A live phase marker is the durable fallback when no daemon predicate is
+  // available to that caller.
+  if (opts.isFeatureInFlight?.(opts.slug)) {
+    return { slug: opts.slug, steps: [], refusal: 'in-flight' };
+  }
+  if (await hasLivePhaseMarker(join(opts.projectRoot, '.worktrees', opts.slug), opts.now?.() ?? Date.now())) {
+    return { slug: opts.slug, steps: [], refusal: 'in-flight' };
+  }
+
   const runGit = opts.runGit ?? makeProductionGit();
 
   // Re-derive the evidence here rather than trusting any caller's or sweep's
   // cached classification (ADR: the helper re-verifies immediately before any
   // destructive step).
-  const evidence = await gatherMergeEvidence(runGit, opts.projectRoot, opts.slug);
+  const evidence = await gatherMergeEvidence(runGit, opts.projectRoot, opts.slug, undefined, opts.branch);
   if (evidence === null) {
     return { slug: opts.slug, steps: [], refusal: 'ancestry-check-failed' };
   }
-  if (!isMerged(evidence)) {
+  if (opts.branch !== undefined && evidence.branches.length === 0) {
+    return { slug: opts.slug, steps: [], refusal: 'branch-missing' };
+  }
+  // A listed branch may be squash- or rebase-merged: neither the record nor
+  // ancestry need exist for it, but merged-PR head identity below can still
+  // prove deletion safe. The parked path retains its historical classifier.
+  if (!isMerged(evidence) && !(opts.branch !== undefined && evidence.branches.length > 0)) {
     return {
       slug: opts.slug,
       steps: [],
@@ -585,10 +926,16 @@ export async function reconcileMergedPark(
   //       current tip as the commit it merged (squash/rebase merge, where (a)
   //       is structurally always false).
   // Neither proof available ⇒ refuse, exactly as before.
-  const unproven = evidence.branches.filter((ref) => !evidence.mergedBranches.includes(ref));
-  if (unproven.length > 0) {
+  let proof: ReclaimProof = 'ancestry';
+  // A shipped record corroborates ancestry. Without one, ancestry must be
+  // corroborated by the merged PR's exact head too; otherwise a branch that
+  // merely happens to be an ancestor can still carry an unreconciled checkout.
+  const branchesRequiringPrProof = evidence.shippedRecordOnMain
+    ? evidence.branches.filter((ref) => !evidence.mergedBranches.includes(ref))
+    : evidence.branches;
+  if (branchesRequiringPrProof.length > 0) {
     const runGh = opts.runGh ?? makeProductionGh();
-    for (const ref of unproven) {
+    for (const ref of branchesRequiringPrProof) {
       const diagnosis = await proveByMergedPrHead(runGit, runGh, opts.projectRoot, ref, (error) => {
         (opts.capabilityLog ?? opts.log)?.(
           `[parked-reconciliation] ${opts.slug}: gh capability unavailable for ${error.field}`,
@@ -596,12 +943,14 @@ export async function reconcileMergedPark(
       });
       switch (diagnosis.kind) {
         case 'proven':
+          proof = 'merged-pr-head';
           continue;
         case 'no-pr':
           return { slug: opts.slug, steps: [], refusal: 'no-merge-proof' };
         case 'capability-unavailable':
           return { slug: opts.slug, steps: [], refusal: 'no-merge-proof' };
-        case 'ahead': {
+        case 'ahead':
+        case 'diverged': {
           const unmergedCommits = await listUnmergedCommits(
             runGit,
             opts.projectRoot,
@@ -615,18 +964,25 @@ export async function reconcileMergedPark(
         case 'behind':
           return { slug: opts.slug, steps: [], refusal: 'branch-behind-merged-head' };
         case 'indeterminate':
-          return { slug: opts.slug, steps: [], refusal: 'ancestry-check-failed' };
+          return {
+            slug: opts.slug,
+            steps: [],
+            refusal: evidence.mergedBranches.includes(ref) ? 'no-merge-proof' : 'ancestry-check-failed',
+          };
       }
     }
   }
 
-  if (!evidence.shippedRecordOnMain) {
+  // Existing parked feature branches remain record-gated. The newly enumerated, non-daemon
+  // branches are independently ancestry-proven and intentionally do not need
+  // a shipped record; daemon setup branches stay record-gated by contract.
+  if (requiresShippedRecord(opts.branch) && !evidence.shippedRecordOnMain) {
     let prUrl: string | undefined;
     for (const head of evidence.branches) {
       try {
-        const { stdout } = await (opts.runGh ?? makeProductionGh())(
+        const stdout = await runTrackerAmbientRead(
+          opts.runGh ?? makeProductionGh(), opts.projectRoot, 'ambient.pull-request.read',
           ['pr', 'list', '--state', 'merged', '--head', head, '--json', 'url', '--limit', '1'],
-          { cwd: opts.projectRoot },
         );
         const prs = JSON.parse(stdout) as Array<{ url?: unknown }>;
         const url = prs[0]?.url;
@@ -644,10 +1000,11 @@ export async function reconcileMergedPark(
     return { slug: opts.slug, steps: [], refusal: 'record-missing', deferred: true };
   }
 
-  // No local-resume check runs here, deliberately. Reaching this line means
-  // `evidence.shippedRecordOnMain` is true — the gate above returns for every
-  // other case — and a shipped record on origin/main is the harness's durable
-  // definition of "the work shipped" (CLAUDE.md rule 4). The per-worktree
+  // No local-resume check runs here, deliberately. A parked candidate reaching
+  // this line has a shipped record on origin/main — the harness's durable
+  // definition of "the work shipped" (CLAUDE.md rule 4). A listed non-daemon
+  // branch instead reached this line through its independently proven merge.
+  // The per-worktree
   // `detectAutoResume` verdict is derived from local `.pipeline/conduct-state.json`
   // and classifies as resumable any worktree missing `feature_status: complete`,
   // which is the normal state for every feature built before that field existed
@@ -658,7 +1015,6 @@ export async function reconcileMergedPark(
 
   const steps: string[] = [];
   const worktreePath = join(opts.projectRoot, '.worktrees', opts.slug);
-  opts.disposeHaltWatcher?.(opts.slug);
 
   let worktreeOnDisk = true;
   try {
@@ -671,18 +1027,45 @@ export async function reconcileMergedPark(
   }
 
   if (worktreeOnDisk) {
+    try {
+      const { stdout } = await runGit(['status', '--porcelain'], { cwd: worktreePath });
+      if (stdout.length > 0) {
+        return { slug: opts.slug, steps, refusal: 'dirty-worktree' };
+      }
+    } catch {
+      return { slug: opts.slug, steps, refusal: 'dirty-worktree' };
+    }
+  }
+
+  opts.disposeHaltWatcher?.(opts.slug);
+
+  if (worktreeOnDisk) {
     const configResult = await loadConfig(opts.projectRoot);
     const timeoutSeconds = opts.teardownTimeoutSeconds ?? resolveTeardownTimeoutSeconds(
       configResult.ok ? configResult.config : undefined,
     );
     await runProjectTeardown(worktreePath, opts.teardownLog ?? opts.log, { timeoutSeconds, verbose: opts.verbose });
+    // D10: the project teardown runs inside the worktree and can write files,
+    // so the probe that authorizes removal must run AFTER it, immediately
+    // before the destructive step. Fail closed on any output or probe failure.
     try {
+      const { stdout } = await runGit(['status', '--porcelain'], { cwd: worktreePath });
+      if (stdout.length > 0) {
+        return { slug: opts.slug, steps, refusal: 'dirty-worktree' };
+      }
+    } catch {
+      return { slug: opts.slug, steps, refusal: 'dirty-worktree' };
+    }
+    try {
+      // D1: no force flag. Plain `worktree remove` still removes gitignored
+      // output (git's clean check never lists ignored paths) and refuses any
+      // modified or untracked path; a refusal is final, never escalated.
       if (opts.worktreeLifecycle) {
         await opts.worktreeLifecycle.run(() =>
-          runGit(['worktree', 'remove', '--force', worktreePath], { cwd: opts.projectRoot }),
+          runGit(['worktree', 'remove', worktreePath], { cwd: opts.projectRoot }),
         );
       } else {
-        await runGit(['worktree', 'remove', '--force', worktreePath], { cwd: opts.projectRoot });
+        await runGit(['worktree', 'remove', worktreePath], { cwd: opts.projectRoot });
       }
     } catch {
       // A removal failure on a path git actually owns is a real failure. A path
@@ -710,11 +1093,11 @@ export async function reconcileMergedPark(
   } else {
     for (const ref of evidence.branches) {
       try {
-        // Force delete. THIS function is the authority that deleting these refs
-        // drops no commit, and one of its two proofs — merged-PR head identity —
-        // is precisely the squash-merge case where git's own `-d` merge check is
-        // permanently false. `-d` would refuse every squash-merged branch here.
-        await runGit(['branch', '-D', ref], { cwd: opts.projectRoot });
+        // Safe delete only (adr-2026-08-01 D1: no force flag exists anywhere).
+        // git's own `-d` merge check refuses a squash-merged branch whose tip
+        // is not an ancestor; that branch is left in place (operator decision
+        // 2026-09-23) and the refusal is reported, never escalated to `-D`.
+        await runGit(['branch', '-d', ref], { cwd: opts.projectRoot });
       } catch {
         return { slug: opts.slug, steps, refusal: 'branch-delete-failed' };
       }
@@ -722,16 +1105,20 @@ export async function reconcileMergedPark(
     steps.push('branch-deleted');
   }
 
-  try {
-    const exitCode = await dispatchDaemonPark(
-      { kind: 'unpark', slug: opts.slug },
-      { cwd: opts.projectRoot, out: opts.log ?? (() => {}) },
-    );
-    if (exitCode !== 0) throw new Error('canonical unpark failed');
-  } catch {
-    return { slug: opts.slug, steps, refusal: 'unpark-failed' };
+  if (await isOperatorParked(opts.projectRoot, opts.slug)) {
+    try {
+      const exitCode = await dispatchDaemonPark(
+        { kind: 'unpark', slug: opts.slug },
+        { cwd: opts.projectRoot, out: opts.log ?? (() => {}) },
+      );
+      if (exitCode !== 0) throw new Error('canonical unpark failed');
+    } catch {
+      return { slug: opts.slug, steps, refusal: 'unpark-failed' };
+    }
+    steps.push('unparked');
   }
-  steps.push('unparked');
 
-  return { slug: opts.slug, steps };
+  return opts.emitProof && opts.branch !== undefined
+    ? { slug: opts.slug, steps, proof }
+    : { slug: opts.slug, steps };
 }

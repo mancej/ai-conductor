@@ -1,4 +1,4 @@
-// Covers: task:5
+// Covers: task:3, task:5
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { classifyRemediationCaseReuse, reconcileRemediationCases } from '../../src/engine/remediation-case-reconciler.js';
-import type { RemediationCaseRecord } from '../../src/engine/remediation-case-store.js';
+import type {
+  RemediationCasePrdWideningRecord,
+  RemediationCaseRecord,
+} from '../../src/engine/remediation-case-store.js';
 import { RemediationCaseStore, remediationCaseStorePath } from '../../src/engine/remediation-case-store.js';
 import type { RemediationCaseGraph } from '../../src/engine/remediation-case-validator.js';
 
@@ -62,6 +65,16 @@ function refuteGraph(caseRow: RemediationCaseGraph['cases'][number]['case'] = RE
   return graph(caseRow, [{ sourceId: 'testQuality:finding-2', outcome: 'refuted', caseRef: caseRow.caseRef }]);
 }
 
+const PRD_WIDENING_CASE: RemediationCasePrdWideningRecord = {
+  id: 'prd-case-1',
+  domain: 'prd_widening',
+  originalSources: [{ sourceId: 'NC-1', snapshot: 'Original widening finding.' }],
+  currentSources: [{ sourceId: 'NC-1', snapshot: 'Reworded widening finding.', recordedAt: RECORDED_AT }],
+  relationships: [{
+    currentSourceId: 'NC-1', kind: 'same-case', caseId: 'prd-case-1', reason: 'The finding concerns the same behavior.',
+  }],
+};
+
 function durableAction(overrides: Partial<RemediationCaseRecord> = {}): RemediationCaseRecord {
   return {
     id: 'case-1', domain: 'build_review', disposition: 'act', priority: 'high', rationale: 'Fix it.', confidence: 'high', resolution: 'open',
@@ -103,9 +116,10 @@ describe('remediation case reconciler', () => {
       // Nothing prior was absent, so no unreferenced case transitioned.
       resolvedAbsentCaseIds: [],
       state: {
-        version: 'v1',
+        version: 'v2',
         feature: FEATURE,
         suppressions: [],
+        prdWideningCases: [],
         cases: [{
           id: 'case-1', domain: 'build_review', disposition: 'act', priority: 'high',
           rationale: ACTION_CASE.rationale, confidence: 'high', resolution: 'open',
@@ -114,6 +128,40 @@ describe('remediation case reconciler', () => {
         }],
       },
     });
+  });
+
+  it('reuses an exact settled custom non-action case without a new identity, but retains history after its policy identity changes', async () => {
+    const projectRoot = await createProjectRoot();
+    const store = new RemediationCaseStore(projectRoot, FEATURE);
+    const exactSource = 'portablePolicy:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    await store.mutate(async (state) => ({
+      value: null,
+      nextState: {
+        ...state,
+        cases: [{
+          id: 'settled-custom', domain: 'build_review', disposition: 'reject', priority: 'low', confidence: 'high',
+          rationale: 'The exact custom finding was rejected.', resolution: 'resolved',
+          sources: [{ sourceId: exactSource, outcome: 'rejected', recordedAt: RECORDED_AT }], effect: { kind: 'none' },
+        }],
+      },
+    }));
+
+    const exact = await reconcileRemediationCases(store, {
+      graph: graph({ ...ACTION_CASE, caseRef: 'exact-custom', disposition: 'reject', effect: { kind: 'none' } }, [
+        { sourceId: exactSource, outcome: 'rejected', caseRef: 'exact-custom' },
+      ]),
+      recordedAt: '2026-08-30T13:00:00.000Z', generateId: () => { throw new Error('exact non-action recurrence must not charge'); },
+    });
+    expect(exact).toMatchObject({ ok: true, caseIdsByRef: new Map([['exact-custom', 'settled-custom']]) });
+
+    const changedPolicy = await reconcileRemediationCases(store, {
+      graph: graph({ ...ACTION_CASE, caseRef: 'changed-custom', disposition: 'reject', effect: { kind: 'none' } }, [
+        { sourceId: 'portablePolicy:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', outcome: 'rejected', caseRef: 'changed-custom' },
+      ]),
+      recordedAt: '2026-08-30T14:00:00.000Z', generateId: generatedIds('changed-custom'),
+    });
+    expect(changedPolicy).toMatchObject({ ok: true, caseIdsByRef: new Map([['changed-custom', 'changed-custom']]) });
+    expect(changedPolicy.ok && changedPolicy.state.cases.map((entry) => entry.id)).toEqual(['settled-custom', 'changed-custom']);
   });
 
   it('appends a later source link to its explicitly bound durable case', async () => {
@@ -164,6 +212,57 @@ describe('remediation case reconciler', () => {
         { sourceId: 'testQuality:finding-2', outcome: 'refuted', recordedAt: '2026-08-30T13:00:00.000Z' },
       ],
     }] } });
+  });
+
+  describe('deferral after an applied action', () => {
+    const DEFER_AFTER_ACT = {
+      caseRef: 'defer-case-1', existingCaseId: 'case-1', disposition: 'defer', priority: 'medium',
+      rationale: 'The repair was applied and the finding is back; the remaining fix contradicts the approved plan.',
+      confidence: 'medium',
+      effect: { kind: 'deferral', title: 'Follow up outside this plan', body: 'The real fix exceeds the Done-when.', exclusionRationale: 'The approved task prescribes the flagged design.' },
+    } as const;
+    const deferGraph = graph(DEFER_AFTER_ACT, [{ sourceId: 'testQuality:finding-1', outcome: 'deferred', caseRef: 'defer-case-1' }]);
+
+    it.each([
+      ['an open applied action', durableAction()],
+      ['a resolved applied action whose finding regressed', durableAction({ resolution: 'resolved' })],
+    ])('admits %s as a reserved deferral on the same case', async (_label, existing) => {
+      const projectRoot = await createProjectRoot();
+      const store = new RemediationCaseStore(projectRoot, FEATURE);
+      await store.mutate(async (state) => ({ value: null, nextState: { ...state, cases: [existing] } }));
+
+      const result = await reconcileRemediationCases(store, {
+        graph: deferGraph,
+        recordedAt: '2026-08-30T13:00:00.000Z',
+        generateId: generatedIds('deferral-effect-1'),
+        attemptedCaseIds: [],
+      });
+
+      expect(result).toMatchObject({ ok: true, state: { cases: [{
+        id: 'case-1', disposition: 'defer', resolution: 'open', priority: 'medium', confidence: 'medium',
+        effect: { id: 'deferral-effect-1', kind: 'deferral', status: 'reserved' },
+        sources: [{ sourceId: 'testQuality:finding-1', outcome: 'deferred', recordedAt: '2026-08-30T13:00:00.000Z' }],
+      }] } });
+      expect(result.ok && result.state.cases[0]).not.toHaveProperty('refutation');
+      expect(result.ok && classifyRemediationCaseReuse(result.state.cases[0]!, new Set(['case-1']))).toBe('reuse');
+    });
+
+    it('still refuses a deferral when the action was never applied', async () => {
+      const projectRoot = await createProjectRoot();
+      const store = new RemediationCaseStore(projectRoot, FEATURE);
+      await store.mutate(async (state) => ({ value: null, nextState: { ...state, cases: [
+        durableAction({ effect: { id: 'effect-1', kind: 'action', status: 'reserved' } }),
+      ] } }));
+
+      const result = await reconcileRemediationCases(store, {
+        graph: deferGraph,
+        recordedAt: '2026-08-30T13:00:00.000Z',
+        generateId: () => 'must-not-be-used',
+        attemptedCaseIds: [],
+      });
+
+      expect(result).toEqual({ ok: false, reason: 'illegal-disposition-transition' });
+    });
   });
 
   it('rewrites an attempted action source in place when its exact id is refuted', async () => {
@@ -243,6 +342,28 @@ describe('remediation case reconciler', () => {
     expect([result, await readFile(remediationCaseStorePath(projectRoot), 'utf8')]).toEqual([
       { ok: false, reason }, before,
     ]);
+  });
+
+  it('retains PRD widening history while reconciling a build-review case', async () => {
+    const projectRoot = await createProjectRoot();
+    const store = new RemediationCaseStore(projectRoot, FEATURE);
+    await store.mutate(async (state) => ({
+      value: undefined,
+      nextState: {
+        version: 'v2', feature: state.feature, cases: state.cases,
+        prdWideningCases: [PRD_WIDENING_CASE], suppressions: state.suppressions ?? [],
+      },
+    }));
+
+    const result = await reconcileRemediationCases(store, {
+      graph: graph(ACTION_CASE), recordedAt: RECORDED_AT, generateId: generatedIds('case-1', 'effect-1'),
+    });
+
+    expect(result).toMatchObject({ ok: true, state: { prdWideningCases: [PRD_WIDENING_CASE] } });
+    await expect(store.read()).resolves.toMatchObject({
+      ok: true,
+      state: { prdWideningCases: [PRD_WIDENING_CASE] },
+    });
   });
 
   it('resolves an absent open action case only after recorded BUILD attempt evidence', async () => {

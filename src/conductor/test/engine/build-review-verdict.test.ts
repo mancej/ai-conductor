@@ -57,6 +57,7 @@ describe('engine/build-review verdict wiring contract', () => {
       reasons: [],
       rubric: {
         testQuality: false,
+        security: false,
       },
     });
   });
@@ -73,6 +74,7 @@ describe('engine/build-review verdict wiring contract', () => {
       findings: { testQuality: ['The changed test does not observe the behavior it claims to cover.'] },
       rubric: {
         testQuality: true,
+        security: false,
       },
     });
   });
@@ -140,7 +142,7 @@ describe('engine/build-review verdict wiring contract', () => {
     const dir = await writeVerdict(verdict);
 
     const validated = validateBuildReviewVerdict(verdict);
-    expect(validated).toEqual({ ok: true, ...verdict });
+    expect(validated).toEqual({ ok: true, ...verdict, rubric: { testQuality: false, security: false } });
     expect(validated).toMatchObject({
       rubric: { testQuality: false },
       findings: {},
@@ -192,6 +194,7 @@ describe('engine/build-review verdict wiring contract', () => {
     const aggregate = {
       ...baseline,
       results: {
+        ...baseline.results,
         testQuality: {
           kind: 'judged',
           rubric: 'completeness',
@@ -243,7 +246,7 @@ describe('engine/build-review verdict wiring contract', () => {
       buildReviewEffectiveResolver: resolver,
     })).resolves.toMatchObject({ done: true });
     expect(resolver).toHaveBeenCalledWith(dir, aggregate, {
-      minConfidence: { testQuality: 0 },
+      minConfidence: { testQuality: 0, security: 0 },
     });
   });
 
@@ -357,7 +360,7 @@ describe('engine/build-review verdict wiring contract', () => {
     };
     const dir = await writeVerdict(verdict);
 
-    expect(validateBuildReviewVerdict(verdict)).toEqual({ ok: true, ...verdict });
+    expect(validateBuildReviewVerdict(verdict)).toEqual({ ok: true, ...verdict, rubric: { testQuality: true, security: false } });
     await expect(checkGateCompletion(dir, 'build_review')).resolves.toMatchObject({
       done: false,
       reason: expect.stringContaining('[testQuality] The changed test does not observe the behavior it claims to cover.'),
@@ -622,6 +625,15 @@ describe('engine/build-review verdict wiring contract', () => {
       const provider: LLMProvider = { invoke: vi.fn(), };
       const runner = new DefaultStepRunner(provider, 'mechanical-write-failure', dir, {
         pipelineDir: join(dir, '.pipeline'),
+        buildReviewEffectiveResolver: async () => ({
+          ok: true as const,
+          feature: { version: 'v1' as const, repository: dir, feature: 'mechanical-write-failure' },
+          effective: {
+            rawVerdict: 'FAIL' as const, verdict: 'FAIL' as const,
+            acceptedFindingIds: [], unresolvedFindingIds: [], suppressedFindingIds: [],
+            skippedRubrics: [], infrastructureFailureRubrics: ['testQuality'], uncoveredInfrastructureFailureRubrics: ['testQuality'],
+          },
+        }),
       });
       const inputs = {
         sourceSnapshot: { headSha: 'mechanical-write-failure', digest: 'sha256:mechanical-write-failure', mergeBase: 'base' },

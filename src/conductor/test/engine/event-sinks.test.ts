@@ -1,6 +1,6 @@
-// Covers: task:1, task:3, task:6, task:8, task:15, task:17
+// Covers: task:1, task:3, task:4, task:6, task:8, task:10, task:15, task:17, task:23
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -23,8 +23,10 @@ const PRE_REFACTOR_PERSISTED_EVENT_TYPES = [
   'step_started',
   'step_completed',
   'step_failed',
+  'step_interrupted',
   'step_refused',
   'step_status_write_refused',
+  'github_operation_refused',
   'provider_attempt',
   'scratch_cleanup_reclaimed',
   'scratch_cleanup_retained',
@@ -126,6 +128,8 @@ const PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES = [
   'rebase_gate_invalidated',
   'build_review_repair_context',
   'build_review_rubric_started',
+  'build_review_policy_resolved',
+  'build_review_policy_failed',
   'build_review_rubric_prompt',
   'build_review_rubric_result',
   'build_review_rubric_skipped',
@@ -153,11 +157,16 @@ const PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES = [
 const PINNED_PERSISTED_EVENT_TYPES = [
   ...ENGINEER_LIFECYCLE_EVENT_TYPES,
   'daemon_backlog_snapshot',
+  'daemon_memory_sample',
+  'daemon_heap_dump_written',
+  'daemon_exited',
   'feature_dispatch_started',
   'feature_dispatch_ended',
   'feature_shipped',
   ...PRE_SETTLE_DECISION_PERSISTED_EVENT_TYPES,
+  'group_member_step',
   ...BUILD_MEMBER_SETTLE_DECISION_EVENT_TYPES,
+  'land_gate_rejected',
   'test_suite_verification',
   'gate_verdict',
   'intake_inbound_sanitized',
@@ -165,6 +174,10 @@ const PINNED_PERSISTED_EVENT_TYPES = [
   // if it reaches .pipeline/events.jsonl — its sibling rebase_gate_invalidated
   // is already persisted, so an unpersisted preservation reads as silence.
   'rebase_gate_preserved',
+  'rebase_citation_residue',
+  'rebase_supersession_verdict',
+  'rebase_untracked_quarantined',
+  'repair_boundary_translated',
   'operator_rewind',
   'setup_repair',
   'project_setup',
@@ -176,19 +189,25 @@ const PINNED_PERSISTED_EVENT_TYPES = [
   'config_deprecated_key',
   'contained_live_checkout_drift',
   'provider_stream_progress',
+  'self_host_dispatch_admission',
   'self_host_containment_verdict',
+  'self_host_boundary_fingerprint',
   'over_scope_decision',
   ...REMEDIATION_CASE_LIFECYCLE_EVENT_TYPES,
   'remediation_case_refuted',
+  'prd_widening_reconciled',
   'build_review_scope_summary',
   'build_review_scope_incomplete',
+  'ci_repair_diagnostic',
+  'worktree_reclaim_reclaimed',
+  'worktree_reclaim_retained',
+  'worktree_reclaim_failed',
 ] satisfies Array<ConductorEvent['type']>;
 
 const NON_PERSISTED_REBASE_LIFECYCLE_EVENT_TYPES = [
   'rebase_noop',
   'rebase_mergeable_skip',
   'rebase_gate_reverified',
-  'rebase_citation_residue',
   'rebase_resolution_attempt',
   'rebase_resolution_succeeded',
   'rebase_resolution_failed',
@@ -210,11 +229,17 @@ const PRE_REFACTOR_AUDITED_EVENT_TYPES = [
   'halt_cleared',
   'operator_rewind',
   'kickback_budget_adjustment_authorized',
+  'build_review_policy_resolved',
+  'build_review_policy_failed',
+  'build_review_cache_hit',
 ] satisfies Array<ConductorEvent['type']>;
 
 const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
+  'test_suite_verification',
   'build_review_cache_discarded',
   'build_review_rubric_started',
+  'build_review_policy_resolved',
+  'build_review_policy_failed',
   'build_review_rubric_result',
   'build_review_rubric_skipped',
   'build_review_cache_hit',
@@ -228,12 +253,16 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   'memory_setup',
   'plan_growth',
   'contained_live_checkout_drift',
+  'self_host_dispatch_admission',
   'self_host_containment_verdict',
+  'self_host_boundary_fingerprint',
   'step_started',
   'step_completed',
   'step_failed',
+  'step_interrupted',
   'step_refused',
   'step_status_write_refused',
+  'github_operation_refused',
   'step_retry',
   'rate_limit',
   'session_reset',
@@ -259,6 +288,7 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   'loop_converged',
   'rebase_conflict_halt',
   'ci_failed',
+  'ci_repair_diagnostic',
   'build_review_base',
   'build_review_scope_incomplete',
   'build_review_stale_mirage_regrade',
@@ -276,6 +306,8 @@ const DAEMON_SWITCH_HANDLED_EVENT_TYPES = [
   'finish_publication_transition',
   'finish_publication_blocked',
   'finish_publication_disposition',
+  'worktree_reclaim_reclaimed',
+  'worktree_reclaim_failed',
   ...REMEDIATION_SEALED_ARTIFACT_REDIRECT_EVENT_TYPES,
 ] satisfies Array<ConductorEvent['type']>;
 
@@ -304,6 +336,43 @@ const deliberatelyNotPersisted = {
   otel: false,
 } satisfies SinkDeclaration;
 void deliberatelyNotPersisted;
+
+// Existing consumers may keep constructing this occurrence without the optional
+// oversize diagnostics.
+const infrastructureFailureWithoutProjectionBytes = {
+  type: 'build_review_rubric_infrastructure_failure',
+  rubric: 'testQuality',
+  lapId: 'lap-current',
+  reason: 'provider-error',
+} satisfies ConductorEvent;
+void infrastructureFailureWithoutProjectionBytes;
+
+// Native-schema faults remain occurrences on the existing infrastructure
+// event.  A structured-result rejection is optional because capability faults
+// have no provider payload to reject.
+const nativeSchemaUnsupportedFault = {
+  type: 'build_review_rubric_infrastructure_failure',
+  rubric: 'testQuality',
+  lapId: 'lap-current',
+  reason: 'native-schema-unsupported',
+  cause: 'native-schema-unsupported',
+} satisfies ConductorEvent;
+const invalidStructuredResultFault = {
+  type: 'build_review_rubric_infrastructure_failure',
+  rubric: 'testQuality',
+  lapId: 'lap-current',
+  reason: 'invalid-structured-result',
+  cause: 'invalid-structured-result',
+  rejection: {
+    kind: 'explained',
+    problems: [{ field: 'findings', required: 'must be an array', detail: 'findings must be an array' }],
+  },
+} satisfies ConductorEvent;
+void [nativeSchemaUnsupportedFault, invalidStructuredResultFault];
+
+// @ts-expect-error -- retained reclamation reasons are a closed union.
+const reclaimRetentionWithUnlistedReason = { type: 'worktree_reclaim_retained', slug: 'feature', reason: 'operator-maybe' } satisfies ConductorEvent;
+void reclaimRetentionWithUnlistedReason;
 
 // @ts-expect-error -- probe-failure progress requires its closed kind and next disposition.
 const probeFailureMissingClosedMetadata = { type: 'credentials_park_progress', provider: 'codex', source: 'cached-login', readiness: 'probe-failed', elapsedSeconds: 3, degradation: 'probe-failure' } satisfies ConductorEvent;
@@ -336,6 +405,37 @@ void [
 ];
 
 describe('event sink subscriptions', () => {
+  it('persists translated repair boundaries without rendering, audit, or OpenTelemetry', () => {
+    const translated = [
+      {
+        type: 'repair_boundary_translated',
+        obligationId: 'repair-direct',
+        from: 'pre-rebase-sha',
+        to: 'post-rebase-sha',
+        rule: 'direct',
+        projectRoot: '/workspace/project',
+      },
+      {
+        type: 'repair_boundary_translated',
+        obligationId: 'repair-successor',
+        from: 'dropped-pre-rebase-sha',
+        to: 'successor-post-rebase-sha',
+        rule: 'successor',
+        projectRoot: '/workspace/project',
+      },
+    ] satisfies ConductorEvent[];
+
+    expect({
+      translated,
+      sink: EVENT_SINKS.repair_boundary_translated,
+      persisted: persistedEventTypes().includes('repair_boundary_translated'),
+    }).toEqual({
+      translated,
+      sink: { render: false, persist: true, audit: false, otel: false },
+      persisted: true,
+    });
+  });
+
   // Covers: task:1
   it('persists, renders, and exports memory setup without widening audit', () => {
     expect({
@@ -385,6 +485,8 @@ describe('event sink subscriptions', () => {
       'step_started',
       'step_completed',
       'step_failed',
+      'step_interrupted',
+      'step_refused',
       'provider_attempt',
       'step_retry',
       'feature_complete',
@@ -392,6 +494,7 @@ describe('event sink subscriptions', () => {
       'build_progress',
       'build_no_progress',
       'pipeline_closeout',
+      'group_member_step',
       'gate_verdict',
       'kickback',
       'loop_halt',
@@ -405,6 +508,8 @@ describe('event sink subscriptions', () => {
       'step_started',
       'step_completed',
       'step_failed',
+      'step_interrupted',
+      'step_refused',
       'provider_attempt',
       'feature_usage_total',
       'feature_cost_snapshot',
@@ -414,6 +519,7 @@ describe('event sink subscriptions', () => {
       'build_progress',
       'build_no_progress',
       'pipeline_closeout',
+      'group_member_step',
       'gate_verdict',
       'kickback',
       'loop_halt',
@@ -435,6 +541,61 @@ describe('event sink subscriptions', () => {
     });
     expect(otelEventTypes()).not.toContain('unattributed_progress');
     expect(otelTracedEventTypes()).not.toContain('unattributed_progress');
+  });
+
+  it('registers daemon memory, heap-dump, and exit occurrences on the persistent event spine', () => {
+    const events = [
+      {
+        type: 'daemon_memory_sample',
+        rss: 100,
+        heapUsed: 80,
+        heapTotal: 90,
+        external: 10,
+        slug: 'feature',
+        step: 'build',
+        boundary: 'started',
+        pid: 123,
+        dispatchSeq: 1,
+      },
+      {
+        type: 'daemon_heap_dump_written',
+        path: '.daemon/heap/dump.heapsnapshot',
+        bytes: 200,
+        rss: 100,
+        pid: 123,
+      },
+      {
+        type: 'daemon_exited',
+        pid: 123,
+        code: null,
+        signal: 'SIGKILL',
+        at: '2026-09-22T00:00:00.000Z',
+      },
+    ] satisfies ConductorEvent[];
+    const daemonEventTypes = [
+      'daemon_memory_sample',
+      'daemon_heap_dump_written',
+      'daemon_exited',
+    ] satisfies Array<ConductorEvent['type']>;
+    const expected = { render: false, persist: true, audit: false, otel: false, otelTrace: false };
+
+    expect({
+      events,
+      sinks: {
+        daemon_memory_sample: EVENT_SINKS.daemon_memory_sample,
+        daemon_heap_dump_written: EVENT_SINKS.daemon_heap_dump_written,
+        daemon_exited: EVENT_SINKS.daemon_exited,
+      },
+      persisted: daemonEventTypes.map((type) => persistedEventTypes().includes(type)),
+    }).toEqual({
+      events,
+      sinks: {
+        daemon_memory_sample: expected,
+        daemon_heap_dump_written: expected,
+        daemon_exited: expected,
+      },
+      persisted: [true, true, true],
+    });
   });
 
   it('declares feature cost snapshots as OpenTelemetry-only ledger projections', () => {
@@ -520,6 +681,55 @@ describe('event sink subscriptions', () => {
       const records = (await readFile(join(projectRoot, '.pipeline', 'events.jsonl'), 'utf8'))
         .trim().split('\n').map((line) => JSON.parse(line));
       expect(records).toEqual([{ ...event, ts: expect.any(String) }]);
+    } finally {
+      persister.stop();
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('persists oversized projections on the existing infrastructure-failure occurrence without a sidecar', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'build-review-oversize-event-sinks-'));
+    const events = new ConductorEventEmitter();
+    const persister = new EventPersister(join(projectRoot, '.pipeline', 'events.jsonl'), events);
+    const event = {
+      type: 'build_review_rubric_infrastructure_failure' as const,
+      rubric: 'testQuality',
+      lapId: 'lap-current',
+      reason: 'projection-oversized',
+      measuredBytes: 1_346_093,
+      limitBytes: 1_048_576,
+    } satisfies ConductorEvent;
+
+    try {
+      persister.start();
+      await events.emit(event);
+      persister.stop();
+
+      const records = (await readFile(join(projectRoot, '.pipeline', 'events.jsonl'), 'utf8'))
+        .trim().split('\n').map((line) => JSON.parse(line));
+      expect(records).toEqual([{ ...event, ts: expect.any(String) }]);
+      expect(await readdir(join(projectRoot, '.pipeline'))).toEqual(['events.jsonl']);
+    } finally {
+      persister.stop();
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('persists native-schema mechanical faults on the existing occurrence without a sidecar', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'build-review-native-schema-event-sinks-'));
+    const events = new ConductorEventEmitter();
+    const persister = new EventPersister(join(projectRoot, '.pipeline', 'events.jsonl'), events);
+    const faultLap = [nativeSchemaUnsupportedFault, invalidStructuredResultFault];
+
+    try {
+      persister.start();
+      for (const event of faultLap) await events.emit(event);
+      persister.stop();
+
+      const records = (await readFile(join(projectRoot, '.pipeline', 'events.jsonl'), 'utf8'))
+        .trim().split('\n').map((line) => JSON.parse(line));
+      expect(records).toEqual(faultLap.map((event) => ({ ...event, ts: expect.any(String) })));
+      expect(await readdir(join(projectRoot, '.pipeline'))).toEqual(['events.jsonl']);
     } finally {
       persister.stop();
       await rm(projectRoot, { recursive: true, force: true });
@@ -877,13 +1087,24 @@ describe('event sink subscriptions', () => {
     });
   });
 
-  it('keeps non-halt lifecycle events out of the persisted set', () => {
+  it('persists reclaim outcomes while rendering only reclaimed and failed worktrees', () => {
+    expect({
+      reclaimed: EVENT_SINKS.worktree_reclaim_reclaimed,
+      retained: EVENT_SINKS.worktree_reclaim_retained,
+      failed: EVENT_SINKS.worktree_reclaim_failed,
+    }).toEqual({
+      reclaimed: { render: true, persist: true, audit: false, otel: false },
+      retained: { render: false, persist: true, audit: false, otel: false },
+      failed: { render: true, persist: true, audit: false, otel: false },
+    });
+  });
+
+  it('keeps non-settlement lifecycle events out of the persisted set', () => {
     const neverPersisted = [
       'loop_converged',
       'build_review_base',
       'pipeline_closeout',
       'retry_decision',
-      'group_member_step',
       ...NON_PERSISTED_REBASE_LIFECYCLE_EVENT_TYPES,
     ] satisfies Array<ConductorEvent['type']>;
 

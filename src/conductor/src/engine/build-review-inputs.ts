@@ -37,6 +37,12 @@ import {
   safeRepoRelativePath,
   type BuildReviewPathChange,
 } from './build-review-scope-source.js';
+import {
+  materializeBuildReviewLap,
+  type BuildReviewLapMaterialization,
+  type BuildReviewMaterializationMember,
+  type BuildReviewMaterializationOptions,
+} from './build-review-materialization.js';
 
 // ── Grader input assembly (build_review) ────────────────────────────────────
 //
@@ -102,6 +108,8 @@ export interface BuildReviewInputs {
 export interface BuildReviewFrozenInputs extends BuildReviewInputs {
   readonly testSuiteProof: FullSuitePassEvidence;
   readonly sourceSnapshot: BuildReviewSourceSnapshot;
+  /** Present only for a lap that includes an enabled custom policy member. */
+  readonly sourceMaterialization?: BuildReviewLapMaterialization;
 }
 
 /** One frozen source view. Rubric branches receive projections of this value, never live reads. */
@@ -134,13 +142,37 @@ export interface BuildReviewSourceSnapshot {
   /** Version of the syntax/binding analysis contract that produced testScope. */
   readonly testScopeAnalysisVersion?: string;
   /**
-   * Region bytes read from the same pinned blobs as `testScope`. Projection
-   * consumes these records directly; it must never refill them from HEAD or
-   * the worktree while deriving its identity.
+   * Region identities read from the same pinned blobs as `testScope`.
+   * Projection consumes these records directly; it must never refill them
+   * from HEAD or the worktree while deriving its identity.
    */
   readonly testScopeEvidence?: readonly BuildReviewPinnedScopeEvidence[];
   /** Machine-readable changed paths from the pinned diff, retaining rename pairs. */
   readonly sourceChanges?: readonly BuildReviewPathChange[];
+}
+
+/**
+ * The commit and content identity a materialized review source must preserve.
+ * This is deliberately smaller than the snapshot: paths into a private source
+ * view are transport details, never review identity.
+ */
+export interface BuildReviewSourceViewIdentity {
+  readonly snapshotDigest: string;
+  readonly contentDigest: string;
+  readonly mergeBase: string;
+  readonly headSha: string;
+}
+
+/** Return the one stable identity shared by all members of a custom lap. */
+export function buildReviewSourceViewIdentity(
+  snapshot: BuildReviewSourceSnapshot,
+): BuildReviewSourceViewIdentity {
+  return Object.freeze({
+    snapshotDigest: snapshot.digest,
+    contentDigest: snapshot.contentDigest,
+    mergeBase: snapshot.mergeBase,
+    headSha: snapshot.headSha,
+  });
 }
 
 /** One executable changed-test selector's declared title evidence. */
@@ -156,10 +188,17 @@ export interface BuildReviewPinnedScopeEvidence {
   readonly id: string;
   readonly source: { readonly fileName: string; readonly side: 'base' | 'head' };
   readonly region: TestDeclarationSpan;
+  /**
+   * The same region as UTF-8 byte offsets into the file at its pinned ref.
+   * `region` is the analyzer's UTF-16 code-unit span and stays the identity
+   * key; a reviewer hashing `git show` output needs byte offsets, and the two
+   * diverge as soon as the file holds a non-ASCII character (#2612).
+   */
+  readonly byteRegion?: TestDeclarationSpan;
   /** One-based source lines for the exact pinned character region. */
   readonly startLine?: number;
   readonly endLine?: number;
-  readonly content: string;
+  /** sha256 of the region's UTF-8 bytes: the bytes at `byteRegion` of the file at its pinned ref. */
   readonly contentHash: string;
 }
 
@@ -190,6 +229,10 @@ export interface BuildReviewInputOptions {
   readonly inspectTestSuite?: () => Promise<FullSuiteInspectionResult>;
   /** Test seam for a parser/analyzer failure; consumer source is never loaded. */
   readonly analyzeTestScope?: (input: BuildReviewTestScopeInput) => BuildReviewTestScope;
+  /** Enabled members for the lap being prepared; omitted preserves legacy built-in preparation. */
+  readonly lapMembers?: readonly BuildReviewMaterializationMember[];
+  /** Private source-view placement, supplied by the review execution owner. */
+  readonly materialization?: BuildReviewMaterializationOptions;
 }
 
 /** The three distinguishable grading-provenance cases (Task 24). */
@@ -458,9 +501,9 @@ function associationSide(kind: 'added' | 'removed'): PinnedScopeSourceSide {
 }
 
 /**
- * Extract every region the typed scope itself can cite, then capture its bytes
- * from the assembly's immutable blob reader. This is intentionally a data
- * copy, not a later source read by projection or a provider.
+ * Extract every region the typed scope itself can cite, then capture its
+ * identity and hash from the assembly's immutable blob reader. This is
+ * intentionally a data copy, not a later source read by projection or a provider.
  */
 async function pinScopeEvidence(
   files: readonly ScopedTestFile[],
@@ -549,13 +592,14 @@ async function pinScopeEvidence(
     const sourceText = sourceRead.value;
     const region = reference.region ?? { start: 0, end: sourceText.length };
     const content = sourceText.slice(region.start, region.end);
+    const byteStart = Buffer.byteLength(sourceText.slice(0, region.start));
     return Object.freeze({
       id: `source:${reference.source.side}:${reference.source.fileName}:${region.start}:${region.end}`,
       source: Object.freeze({ ...reference.source }),
       region: Object.freeze({ ...region }),
+      byteRegion: Object.freeze({ start: byteStart, end: byteStart + Buffer.byteLength(content) }),
       startLine: sourceText.slice(0, region.start).split('\n').length,
       endLine: sourceText.slice(0, Math.max(region.start, region.end - 1)).split('\n').length,
-      content,
       contentHash: `sha256:${createHash('sha256').update(content).digest('hex')}`,
     } satisfies BuildReviewPinnedScopeEvidence);
   }));
@@ -862,6 +906,14 @@ export async function assembleBuildReviewInputs(
     digest: snapshotDigest(snapshotWithoutDigest),
     contentDigest: contentSnapshotDigest(snapshotWithoutDigest),
   });
+  const sourceMaterialization = options.lapMembers === undefined
+    ? undefined
+    : await materializeBuildReviewLap(
+        git,
+        sourceSnapshot,
+        options.lapMembers,
+        options.materialization ?? { projectRoot },
+      );
 
   return {
     diff: diffResult.stdout,
@@ -877,6 +929,7 @@ export async function assembleBuildReviewInputs(
     repairProvenance,
     testSuiteProof: inspection.evidence,
     sourceSnapshot,
+    ...(sourceMaterialization === undefined ? {} : { sourceMaterialization }),
     patchEquivalentExclusion: equivalentExclusion,
   };
 }

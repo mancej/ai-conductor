@@ -26,6 +26,7 @@ import {
 } from '../../../src/engine/engineer-cli.js';
 import { createEngineerWorktree } from '../../../src/engine/engineer/worktree-authoring.js';
 import { createLedger } from '../../../src/engine/engineer/intake/ledger.js';
+import type { HandoffDeps } from '../../../src/engine/engineer/handoff.js';
 
 const execFile = promisify(execFileCb);
 
@@ -108,6 +109,40 @@ async function writeRemoteRegistry(): Promise<void> {
 
 const noOpGit = async () => ({ stdout: '', stderr: '' });
 
+function authorizedPublication(
+  gh: (args: string[], opts: { cwd: string }) => Promise<{ stdout: string }>,
+  branch: string,
+  repository: string,
+  number: number,
+): NonNullable<HandoffDeps['publication']> {
+  const featureMarker = `.docs/intake/${branch.slice('spec/'.length)}.md`;
+  return {
+    repository,
+    remote: {
+      cwd: repoPath,
+      config: async () => ({ stdout: `https://github.com/${repository}.git` }),
+      runRemoteGit: noOpGit,
+      mutation: {
+        provenance: { repository, defaultBranch: 'main', specBranch: branch, featureMarker, publication: 'initial' },
+        dependencies: {
+          resolveMachineOwner: async () => ({ resolved: true as const, id: 'test-owner' }),
+          provenanceDiscovery: { readCommittedRecords: async () => [{ path: featureMarker, content: 'Owner: test-owner\n' }] },
+        },
+      },
+    },
+    operations: {
+      async run(request) {
+        if (request.operation === 'pull-request.create') {
+          const payload = request.payload as { head: string; title: string; body: string };
+          await gh(['pr', 'create', '--head', payload.head, '--title', payload.title, '--body', payload.body], { cwd: repoPath });
+          return { created: { repository, kind: 'pull-request' as const, number } };
+        }
+        return {};
+      },
+    },
+  };
+}
+
 function captureOpts(extra: Partial<DispatchEngineerOpts>): {
   out: string[];
   err: string[];
@@ -147,6 +182,82 @@ afterEach(async () => {
 });
 
 describe('engineer handoff — branch evidence recording on local-commit/pr-skipped (Task 9)', () => {
+  async function handoffThroughRealEnsureRunning(
+    setup: (branch: string) => Promise<void> | void,
+  ): Promise<{ err: string[]; launches: string[]; timeline: string[] }> {
+    const sourceRef = 'o/reclaim#42';
+    const PR_URL = 'https://github.com/o/reclaim/pull/42';
+    await writeRemoteRegistry();
+    const ledger = createLedger(join(engineerDir, 'ledger.json'));
+    await ledger.record({ source: 'github-issues', sourceRef });
+    await ledger.transition('github-issues', sourceRef, 'claimed', {});
+    const worktree = await seedWorktree();
+    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], worktree);
+    await setup(branch);
+    const gh = async (args: string[]) => {
+      if (args[0] === 'pr' && args[1] === 'create') return { stdout: `Opening pull request...\n${PR_URL}\n` };
+      if (args[0] === 'pr' && args[1] === 'edit') return { stdout: '' };
+      return { stdout: JSON.stringify({}) };
+    };
+    const launches: string[] = [];
+    const timeline: string[] = [];
+    const { err, opts } = captureOpts({
+      gh: gh as any,
+      git: noOpGit,
+      handoffPublication: authorizedPublication(gh as any, branch, 'o/reclaim', 42),
+      intakeResolveActor: async () => ({ resolved: true, id: 'test-owner' }),
+      ensureRunningOpts: { launch: () => { launches.push('launch'); timeline.push('launch'); } },
+    });
+    opts.printErr = (message) => { err.push(message); timeline.push(message); };
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: number | NodeJS.Signals) => {
+      if (pid === 42 && signal === 0) {
+        const error = new Error('ESRCH') as NodeJS.ErrnoException;
+        error.code = 'ESRCH';
+        throw error;
+      }
+    }) as typeof process.kill);
+    try {
+      await dispatchEngineer({ kind: 'handoff', project: 'test-proj', branch, worktree, sourceRef }, opts);
+    } finally {
+      kill.mockRestore();
+    }
+    return { err, launches, timeline };
+  }
+
+  it('prints a SIGKILL reclaim witness before the real ensureRunning launch', async () => {
+    const at = '2026-09-23T12:00:00.000Z';
+    const result = await handoffThroughRealEnsureRunning(async () => {
+      await mkdir(join(repoPath, '.daemon'), { recursive: true });
+      await writeFile(join(repoPath, '.daemon', 'daemon.pid'), JSON.stringify({ pid: 42, uuid: 'dead', startedAt: at }));
+      await writeFile(join(repoPath, '.daemon', 'exit-events.jsonl'), `${JSON.stringify({ type: 'daemon_exited', pid: 42, code: null, signal: 'SIGKILL', at })}\n`);
+    });
+
+    expect(result.err).toContain(`reclaiming lock from dead pid 42 (killed by SIGKILL at ${at})`);
+    expect(result.launches).toEqual(['launch']);
+    expect(result.timeline.indexOf(`reclaiming lock from dead pid 42 (killed by SIGKILL at ${at})`))
+      .toBeLessThan(result.timeline.indexOf('launch'));
+  });
+
+  it('prints an unknown exit cause and still launches through the real handoff path', async () => {
+    const result = await handoffThroughRealEnsureRunning(async () => {
+      await mkdir(join(repoPath, '.daemon'), { recursive: true });
+      await writeFile(join(repoPath, '.daemon', 'daemon.pid'), JSON.stringify({ pid: 42, uuid: 'dead', startedAt: '2026-09-23T12:00:00.000Z' }));
+    });
+
+    expect(result.err).toContain('reclaiming lock from dead pid 42 (exit cause unknown)');
+    expect(result.launches).toEqual(['launch']);
+  });
+
+  it('prints an unreadable exit-ledger note and still launches without throwing', async () => {
+    const result = await handoffThroughRealEnsureRunning(async () => {
+      await mkdir(join(repoPath, '.daemon', 'exit-events.jsonl'), { recursive: true });
+      await writeFile(join(repoPath, '.daemon', 'daemon.pid'), JSON.stringify({ pid: 42, uuid: 'dead', startedAt: '2026-09-23T12:00:00.000Z' }));
+    });
+
+    expect(result.err.join('\n')).toContain('(exit ledger unreadable:');
+    expect(result.launches).toEqual(['launch']);
+  });
+
   it('passes the injected git runner through before creating the remote spec PR', async () => {
     await writeRemoteRegistry();
     const worktree = await seedWorktree();
@@ -160,6 +271,7 @@ describe('engineer handoff — branch evidence recording on local-commit/pr-skip
       trace.push({ command: 'gh', args: [...args], cwd: options?.cwd ?? '' });
       return { stdout: 'https://github.com/acme/test-proj/pull/42', stderr: '' };
     };
+    const publication = authorizedPublication(gh as any, branch, 'acme/test-proj', 42);
     const { opts } = captureOpts({
       gh: gh as any,
       ensureRunningLaunch: async () => {},
@@ -167,6 +279,13 @@ describe('engineer handoff — branch evidence recording on local-commit/pr-skip
     const optsWithGit = {
       ...opts,
       git: injectedGit,
+      handoffPublication: {
+        ...publication,
+        remote: {
+          ...publication.remote,
+          runRemoteGit: injectedGit,
+        },
+      },
     } as DispatchEngineerOpts & { git: typeof injectedGit };
 
     await dispatchEngineer({
@@ -177,11 +296,11 @@ describe('engineer handoff — branch evidence recording on local-commit/pr-skip
     }, optsWithGit);
 
     expect(trace).toEqual([
-      { command: 'git', args: ['push', '-u', 'origin', branch], cwd: worktree },
+      { command: 'git', args: ['push', '-u', 'origin', `HEAD:refs/heads/${branch}`], cwd: repoPath },
       {
         command: 'gh',
-        args: ['pr', 'create', '--head', branch, '--fill', '--label', 'spec'],
-        cwd: worktree,
+        args: expect.arrayContaining(['pr', 'create', '--head', branch]),
+        cwd: repoPath,
       },
     ]);
   });
@@ -204,6 +323,7 @@ describe('engineer handoff — branch evidence recording on local-commit/pr-skip
     const { out, err, opts } = captureOpts({
       gh: gh as any,
       git: noOpGit,
+      handoffPublication: authorizedPublication(gh as any, branch, 'acme/test-proj', 42),
       ensureRunningLaunch: async () => {},
     });
 
@@ -378,6 +498,7 @@ describe('engineer handoff — branch evidence recording on local-commit/pr-skip
     const { out, err, opts } = captureOpts({
       gh: gh as any,
       git: noOpGit,
+      handoffPublication: authorizedPublication(gh as any, branch, 'acme/test-proj', 42),
       ensureRunningLaunch: async () => {},
     });
 
@@ -427,6 +548,8 @@ describe('engineer handoff — branch evidence recording on local-commit/pr-skip
     const { out, opts } = captureOpts({
       gh: gh as any,
       git: noOpGit,
+      handoffPublication: authorizedPublication(gh as any, branch, 'o/e', 999),
+      intakeResolveActor: async () => ({ resolved: true, id: 'test-owner' }),
       ensureRunningLaunch: async () => {},
     });
 
@@ -630,6 +753,8 @@ describe('engineer handoff — evidence-write failure handling + pr-opened regre
     const { out, opts } = captureOpts({
       gh: gh as any,
       git: noOpGit,
+      handoffPublication: authorizedPublication(gh as any, branch, 'o/e', 999),
+      intakeResolveActor: async () => ({ resolved: true, id: 'test-owner' }),
       ensureRunningLaunch: async () => {},
     });
 
@@ -697,6 +822,8 @@ describe('engineer handoff — evidence-write failure handling + pr-opened regre
     const { out, err, opts } = captureOpts({
       gh: gh as any,
       git: noOpGit,
+      handoffPublication: authorizedPublication(gh as any, branch, 'o/f', 888),
+      intakeResolveActor: async () => ({ resolved: true, id: 'test-owner' }),
       ensureRunningLaunch: async () => {},
     });
 

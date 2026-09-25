@@ -31,6 +31,7 @@ import {
   detectEngineerCommand,
   dispatchEngineer,
   engineerLaunchArgs,
+  missingRegistrationEpisodes,
   prePollIntake,
   type DispatchEngineerOpts,
 } from '../../../src/engine/engineer-cli.js';
@@ -38,6 +39,7 @@ import { createLedger } from '../../../src/engine/engineer/intake/ledger.js';
 import { createFileQueue } from '../../../src/engine/engineer/intake/queue.js';
 import { parseEnvelope } from '../../../src/engine/engineer/intake/port.js';
 import { createEngineerWorktree } from '../../../src/engine/engineer/worktree-authoring.js';
+import type { HandoffDeps } from '../../../src/engine/engineer/handoff.js';
 
 const execFile = promisify(execFileCb);
 const argv = (...rest: string[]) => ['node', 'conduct-ts', 'engineer', ...rest];
@@ -61,6 +63,9 @@ function makeGh(
       };
     }
     if (args[0] === 'pr' && args[1] === 'create') return { stdout: prUrl };
+    if (args[0] === 'issue' && args[1] === 'view' && args.includes('assignees')) {
+      return { stdout: JSON.stringify({ assignees: [{ login: 'test-owner' }] }) };
+    }
     // Owner-identity resolution (fail-closed slice B): resolve a login.
     if (args[0] === 'api' && args[1] === 'user') return { stdout: 'test-owner\n' };
     // Dependency lookup (blocker-resolver): default to "no blockers" so
@@ -112,6 +117,7 @@ let registryPath: string;
 let engineerDir: string;
 
 beforeEach(async () => {
+  missingRegistrationEpisodes.clear();
   workDir = await mkdtemp(join(tmpdir(), 'cli-launch-intake-'));
   registryPath = join(workDir, 'registry.json');
   engineerDir = join(workDir, 'engineer');
@@ -119,6 +125,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await rm(workDir, { recursive: true, force: true });
+  missingRegistrationEpisodes.clear();
 });
 
 async function writeRegistry(repos: Array<{ name: string; path?: string; remote?: string }>): Promise<void> {
@@ -130,14 +137,56 @@ async function writeRegistry(repos: Array<{ name: string; path?: string; remote?
     status: 'registered',
     registeredAt: '2026-06-27T00:00:00.000Z',
   }));
+  await Promise.all(records.map((record) => mkdir(record.path, { recursive: true })));
   await writeFile(registryPath, JSON.stringify(records, null, 2), 'utf-8');
 }
 
 function baseOpts(extra: Partial<DispatchEngineerOpts>): DispatchEngineerOpts {
-  return { registryPath, engineerDir, print: () => {}, printErr: () => {}, ...extra };
+  return {
+    registryPath,
+    engineerDir,
+    print: () => {},
+    printErr: () => {},
+    intakeResolveActor: async () => ({ resolved: true, id: 'test-owner' }),
+    ...extra,
+  };
 }
 
 const noOpGit = async () => ({ stdout: '', stderr: '' });
+
+function authorizedPublication(
+  gh: (args: string[], opts: { cwd: string }) => Promise<{ stdout: string }>,
+  branch: string,
+  number = 42,
+): NonNullable<HandoffDeps['publication']> {
+  const repository = 'target/repo';
+  const featureMarker = `.docs/intake/${branch.slice('spec/'.length)}.md`;
+  return {
+    repository,
+    remote: {
+      cwd: workDir,
+      config: async () => ({ stdout: `https://github.com/${repository}.git` }),
+      runRemoteGit: noOpGit,
+      mutation: {
+        provenance: { repository, defaultBranch: 'main', specBranch: branch, featureMarker, publication: 'initial' },
+        dependencies: {
+          resolveMachineOwner: async () => ({ resolved: true as const, id: 'test-owner' }),
+          provenanceDiscovery: { readCommittedRecords: async () => [{ path: featureMarker, content: 'Owner: test-owner\n' }] },
+        },
+      },
+    },
+    operations: {
+      async run(request) {
+        if (request.operation === 'pull-request.create') {
+          const payload = request.payload as { head: string; title: string; body: string };
+          await gh(['pr', 'create', '--head', payload.head, '--title', payload.title, '--body', payload.body], { cwd: workDir });
+          return { created: { repository, kind: 'pull-request' as const, number } };
+        }
+        return {};
+      },
+    },
+  };
+}
 
 const envelope = (sourceRef: string, text: string) =>
   parseEnvelope({ id: sourceRef, source: 'github-issues', sourceRef, text, status: 'pending', receivedAt: '2026-06-27T00:00:00.000Z' });
@@ -225,6 +274,20 @@ describe('prePollIntake', () => {
     const { gh } = makeGh({ 'o/a': [{ number: 1, title: 'Idea', body: 'body' }] });
     expect(await prePollIntake({ engineerDir, registryPath, gh, printErr: () => {} })).toBe(1);
     expect(await prePollIntake({ engineerDir, registryPath, gh, printErr: () => {} })).toBe(0);
+  });
+
+  it('reports the same missing registration once across rebuilt adapters in one process', async () => {
+    await writeRegistry([{ name: 'o/a' }]);
+    const missingPath = join(workDir, 'o_a');
+    await rm(missingPath, { recursive: true });
+    const logs: string[] = [];
+    const { gh, calls } = makeGh();
+
+    expect(await prePollIntake({ engineerDir, registryPath, gh, printErr: (message) => logs.push(message) })).toBe(0);
+    expect(await prePollIntake({ engineerDir, registryPath, gh, printErr: (message) => logs.push(message) })).toBe(0);
+
+    expect(logs).toEqual([`github-issues: skipping o/a: missing path ${missingPath}`]);
+    expect(calls.filter(([group, command]) => group === 'issue' && command === 'list')).toHaveLength(0);
   });
 });
 
@@ -379,16 +442,16 @@ describe('write-back via --source-ref', () => {
     await rm(join(wt.worktreePath, '.docs', 'coherence'), { recursive: true, force: true });
     await writeDocsArtifacts(wt.worktreePath, idea);
     const ledger = createLedger(join(engineerDir, 'ledger.json'));
-    await ledger.record({ source: 'github-issues', sourceRef: 'target-repo#7' });
+    await ledger.record({ source: 'github-issues', sourceRef: 'owner/target-repo#7' });
 
     const { gh, calls } = makeGh();
     const code = await dispatchEngineer(
-      { kind: 'land', project: 'target-repo', idea, worktree: wt.worktreePath, sourceRef: 'target-repo#7' },
+      { kind: 'land', project: 'target-repo', idea, worktree: wt.worktreePath, sourceRef: 'owner/target-repo#7' },
       baseOpts({ gh }),
     );
     expect(code).toBe(0);
-    expect(calls).toContainEqual(['issue', 'comment', '7', '-R', 'target-repo', '--body', 'Routed to target-repo']);
-    expect((await ledger.get('github-issues', 'target-repo#7'))?.status).toBe('routed');
+    expect(calls).toContainEqual(['issue', 'comment', '7', '-R', 'owner/target-repo', '--body', 'Routed to target-repo']);
+    expect((await ledger.get('github-issues', 'owner/target-repo#7'))?.status).toBe('routed');
   });
 
   it('handoff --source-ref comments the PR URL, applies the handled label, advances ledger to done', async () => {
@@ -399,7 +462,7 @@ describe('write-back via --source-ref', () => {
     await rm(join(wt.worktreePath, '.docs', 'coherence'), { recursive: true, force: true });
     await writeDocsArtifacts(wt.worktreePath, idea);
     const ledger = createLedger(join(engineerDir, 'ledger.json'));
-    await ledger.record({ source: 'github-issues', sourceRef: 'target-repo#7' });
+    await ledger.record({ source: 'github-issues', sourceRef: 'owner/target-repo#7' });
 
     // Land first to create the spec branch (from the worktree).
     const { gh, calls } = makeGh();
@@ -411,14 +474,19 @@ describe('write-back via --source-ref', () => {
     const branch = JSON.parse(landOut.join('')).branch;
 
     const code = await dispatchEngineer(
-      { kind: 'handoff', project: 'target-repo', branch, worktree: wt.worktreePath, sourceRef: 'target-repo#7' },
-      baseOpts({ gh, git: noOpGit, ensureRunningLaunch: () => {} }),
+      { kind: 'handoff', project: 'target-repo', branch, worktree: wt.worktreePath, sourceRef: 'owner/target-repo#7' },
+      baseOpts({
+        gh,
+        git: noOpGit,
+        handoffPublication: authorizedPublication(gh, branch),
+        ensureRunningLaunch: () => {},
+      }),
     );
     expect(code).toBe(0);
     // Done comment with the PR URL + label applied.
-    expect(calls.some((a) => a[0] === 'issue' && a[1] === 'comment' && a.includes('target-repo') && a.some((s) => /pull\/42/.test(s)))).toBe(true);
+    expect(calls.some((a) => a[0] === 'issue' && a[1] === 'comment' && a.includes('owner/target-repo') && a.some((s) => /pull\/42/.test(s)))).toBe(true);
     expect(calls.some((a) => a[0] === 'api' && a.includes('POST') && a.some((s) => /\/issues\/7\/labels$/.test(s)) && a.includes('labels[]=engineer:handled'))).toBe(true);
-    const entry = await ledger.get('github-issues', 'target-repo#7');
+    const entry = await ledger.get('github-issues', 'owner/target-repo#7');
     expect(entry?.status).toBe('done');
     expect(entry?.prUrl).toMatch(/pull\/42/);
   });

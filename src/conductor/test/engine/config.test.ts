@@ -1,11 +1,16 @@
-// Covers: task:1, task:2, task:2.1, task:3, task:9
+// Covers: task:1, task:2, task:2.1, task:4, task:5, task:9, task:3
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, writeFile, rm, mkdir, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+
+const originalHome = process.env.HOME;
+
 import {
   loadConfig,
+  loadMergedConfig,
   validateConfig,
+  CONFIG_CONSUMER_KEY_SETS,
   DEPRECATED_BUILD_REVIEW_RUBRIC_IDS,
   disabledStepNames,
   customStepEntries,
@@ -13,7 +18,11 @@ import {
   resolveMemoryProvider,
   resolveValidationConcurrency,
 } from '../../src/engine/config.js';
-import { resolveDaemonConcurrency } from '../../src/engine/resolved-config.js';
+import {
+  DEFAULT_TEST_QUALITY_MAX_PROJECTION_BYTES,
+  resolveBuildReviewConfig,
+  resolveDaemonConcurrency,
+} from '../../src/engine/resolved-config.js';
 import * as resolvedConfig from '../../src/engine/resolved-config.js';
 import { PluginRegistry } from '../../src/engine/plugin-registry.js';
 
@@ -26,6 +35,8 @@ describe('config', () => {
   });
 
   afterEach(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
     await rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -571,6 +582,48 @@ steps:
     it('resolveDaemonConcurrency defaults to 1 when daemon_concurrency is absent', () => {
       expect(resolveDaemonConcurrency({})).toBe(1);
     });
+
+    it('accepts daemon_heap_limit_mb 6144 and retains it in the validated config', () => {
+      const result = validateConfig({ daemon_heap_limit_mb: 6144 });
+
+      expect(result).toMatchObject({
+        ok: true,
+        config: { daemon_heap_limit_mb: 6144 },
+      });
+    });
+
+    it('accepts daemon_heap_dump_threshold_mb and daemon_heap_dump_retention and retains them', () => {
+      const result = validateConfig({ daemon_heap_dump_threshold_mb: 2048, daemon_heap_dump_retention: 5 });
+
+      expect(result).toMatchObject({
+        ok: true,
+        config: { daemon_heap_dump_threshold_mb: 2048, daemon_heap_dump_retention: 5 },
+      });
+    });
+
+    it.each([
+      ['daemon_heap_dump_threshold_mb', 0], ['daemon_heap_dump_threshold_mb', 1.5], ['daemon_heap_dump_threshold_mb', 'big'],
+      ['daemon_heap_dump_retention', 0], ['daemon_heap_dump_retention', -2], ['daemon_heap_dump_retention', 2.5],
+    ] as const)('rejects %s %j outside the accepted integer range [1, ∞)', (key, value) => {
+      const result = validateConfig({ [key]: value as never });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error.message).toContain(key);
+      expect(result.error.message).toContain('[1, ∞)');
+    });
+
+    it.each([0, -1, 1.5, 'big'] as const)(
+      'rejects daemon_heap_limit_mb %j outside the accepted integer range [256, ∞)',
+      (daemonHeapLimitMb) => {
+        const result = validateConfig({ daemon_heap_limit_mb: daemonHeapLimitMb as never });
+
+        expect(result.ok).toBe(false);
+        if (result.ok) return;
+        expect(result.error.message).toContain('daemon_heap_limit_mb');
+        expect(result.error.message).toContain('[256, ∞)');
+      },
+    );
 
     it('resolveValidationConcurrency defaults to 4 when absent', () => {
       expect(resolveValidationConcurrency({})).toBe(4);
@@ -1179,6 +1232,241 @@ steps:
   });
 
   describe('test_suite config block', () => {
+    it('loads and preserves ordered command entries without suite names or runner identifiers', async () => {
+      const commands = [
+        { command: 'npm run test:unit' },
+        {
+          command: 'npm run test:integration',
+          working_directory: 'src/conductor',
+          timeout_seconds: 1800,
+        },
+      ];
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  commands:\n    - command: npm run test:unit\n    - command: npm run test:integration\n      working_directory: src/conductor\n      timeout_seconds: 1800\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.test_suite?.commands).toEqual(commands);
+    });
+
+    it.each([
+      [
+        'accepts omitted and finite positive entry timeouts',
+        'test_suite:\n  commands:\n    - command: npm run test:unit\n    - command: npm run test:integration\n      timeout_seconds: 45\n',
+        [
+          { command: 'npm run test:unit' },
+          { command: 'npm run test:integration', timeout_seconds: 45 },
+        ],
+      ],
+      ['rejects a zero entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: 0\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+      ['rejects a negative entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: -1\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+      ['rejects a YAML NaN entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: .nan\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+      ['rejects a YAML positive infinity entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: .inf\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+      ['rejects a YAML negative infinity entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: -.inf\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+      ['rejects a string entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: slow\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+      ['rejects a null entry timeout without default substitution', 'test_suite:\n  commands:\n    - command: npm test\n      timeout_seconds: null\n', /test_suite\.commands\[0\]\.timeout_seconds/],
+    ])('%s', async (_name, yaml, expected) => {
+      await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), yaml);
+
+      const result = await loadConfig(tmpDir);
+
+      if (expected instanceof RegExp) {
+        expect(result.ok ? '' : result.error.message).toMatch(expected);
+        return;
+      }
+      expect(result.ok && result.config.test_suite?.commands).toEqual(expected);
+    });
+
+    it('rejects an absolute working directory in a command entry with its index', () => {
+      const result = validateConfig(
+        {
+          test_suite: {
+            commands: [{ command: 'npm test', working_directory: '/tmp/outside-project' }],
+          },
+        },
+        tmpDir,
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: 'test_suite.commands[0].working_directory must be a relative path within the project root',
+        },
+      });
+    });
+
+    it('rejects a parent escape in a command entry with its index', () => {
+      const result = validateConfig(
+        {
+          test_suite: {
+            commands: [{ command: 'npm test', working_directory: '../outside-project' }],
+          },
+        },
+        tmpDir,
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: 'test_suite.commands[0].working_directory must be a relative path within the project root',
+        },
+      });
+    });
+
+    it('rejects an outward symlink in a command entry with its index', async () => {
+      const outside = await mkdtemp(join(tmpdir(), 'config-outside-'));
+      try {
+        await symlink(outside, join(tmpDir, 'outward-link'));
+
+        const result = validateConfig(
+          {
+            test_suite: {
+              commands: [{ command: 'npm test', working_directory: 'outward-link' }],
+            },
+          },
+          tmpDir,
+        );
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: {
+            type: 'validation_error',
+            message: 'test_suite.commands[0].working_directory must be a relative path within the project root',
+          },
+        });
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ['an empty list', 'test_suite:\n  commands: []\n', /test_suite\.commands/],
+      ['a non-array list', 'test_suite:\n  commands: npm test\n', /test_suite\.commands/],
+      ['a null entry', 'test_suite:\n  commands:\n    - null\n', /test_suite\.commands.*\[0\]/],
+      ['a string entry', 'test_suite:\n  commands:\n    - npm test\n', /test_suite\.commands.*\[0\]/],
+      ['an array entry', 'test_suite:\n  commands:\n    - [npm, test]\n', /test_suite\.commands.*\[0\]/],
+      ['an entry missing command', 'test_suite:\n  commands:\n    - {}\n', /test_suite\.commands.*\[0\].*command/],
+      ['an entry with a blank command', 'test_suite:\n  commands:\n    - command: "   "\n', /test_suite\.commands.*\[0\].*command/],
+      ['an entry with a non-string command', 'test_suite:\n  commands:\n    - command: 42\n', /test_suite\.commands.*\[0\].*command/],
+      ['an entry with an unknown key', 'test_suite:\n  commands:\n    - command: npm test\n      retries: 2\n', /test_suite\.commands.*\[0\].*retries/],
+    ])('rejects commands with %s', async (_name, yaml, message) => {
+      await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), yaml);
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { type: 'validation_error', message: expect.stringMatching(message) },
+      });
+    });
+
+    it('rejects scalar command and commands in the same project declaration', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  command: npm test\n  commands:\n    - command: npm run test:unit\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: expect.stringMatching(/test_suite.*command.*commands|test_suite.*commands.*command/),
+        },
+      });
+    });
+
+    it('rejects scalar command and commands together after ordinary user/project merging', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'config-user-'));
+      try {
+        process.env.HOME = home;
+        await mkdir(join(home, '.ai-conductor'), { recursive: true });
+        await writeFile(
+          join(home, '.ai-conductor', 'config.yml'),
+          'test_suite:\n  commands:\n    - command: npm run test:unit\n',
+        );
+        await writeFile(
+          join(tmpDir, '.ai-conductor', 'config.yml'),
+          'test_suite:\n  command: npm test\n',
+        );
+
+        const result = await loadMergedConfig(tmpDir);
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: {
+            type: 'validation_error',
+            message: expect.stringMatching(/test_suite.*command.*commands|test_suite.*commands.*command/),
+          },
+        });
+      } finally {
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+
+    it('replaces a user command list with the ordered project list without concatenation', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'config-user-'));
+      try {
+        process.env.HOME = home;
+        await mkdir(join(home, '.ai-conductor'), { recursive: true });
+        await writeFile(
+          join(home, '.ai-conductor', 'config.yml'),
+          'test_suite:\n  commands:\n    - command: npm run test:obsolete\n',
+        );
+        await writeFile(
+          join(tmpDir, '.ai-conductor', 'config.yml'),
+          'test_suite:\n  commands:\n    - command: npm run test:unit\n    - command: npm run test:integration\n',
+        );
+
+        const result = await loadMergedConfig(tmpDir);
+
+        expect(result).toMatchObject({
+          ok: true,
+          config: {
+            test_suite: {
+              commands: [
+                { command: 'npm run test:unit' },
+                { command: 'npm run test:integration' },
+              ],
+            },
+          },
+        });
+      } finally {
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      [
+        'a scalar aggregate command',
+        'test_suite:\n  command: npm test\n  scoped_command: npx vitest run {selectors}\n',
+        { command: 'npm test' },
+      ],
+      [
+        'an aggregate command list',
+        'test_suite:\n  commands:\n    - command: npm run test:unit\n  scoped_command: npx vitest run {selectors}\n',
+        { commands: [{ command: 'npm run test:unit' }] },
+      ],
+    ])('loads %s alongside scoped_command', async (_name, yaml, aggregate) => {
+      await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), yaml);
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.test_suite).toMatchObject({
+        ...aggregate,
+        scoped_command: 'npx vitest run {selectors}',
+      });
+    });
+
     it('resolves aggregate verification with an all-none drift budget', async () => {
       await writeFile(
         join(tmpDir, '.ai-conductor', 'config.yml'),
@@ -1439,12 +1727,30 @@ steps:
       expect(result.config.test_suite?.scoped_command).toBe('npx vitest run {selectors}');
     });
 
-    it('accepts a scoped-only test_suite declaration', () => {
-      const result = validateConfig({
-        test_suite: { scoped_command: 'npx vitest run {selectors}' },
-      });
+    it('loads an unchanged scalar-only test_suite declaration', async () => {
+      await writeFile(join(tmpDir, '.ai-conductor', 'config.yml'), 'test_suite:\n  command: npm test\n');
+
+      const result = await loadConfig(tmpDir);
 
       expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.test_suite?.command).toBe('npm test');
+      expect(result.config.test_suite?.commands).toBeUndefined();
+    });
+
+    it('loads an unchanged scoped-only test_suite declaration', async () => {
+      await writeFile(
+        join(tmpDir, '.ai-conductor', 'config.yml'),
+        'test_suite:\n  scoped_command: npx vitest run {selectors}\n',
+      );
+
+      const result = await loadConfig(tmpDir);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.config.test_suite?.scoped_command).toBe('npx vitest run {selectors}');
+      expect(result.config.test_suite?.command).toBeUndefined();
+      expect(result.config.test_suite?.commands).toBeUndefined();
     });
 
     it('rejects a scoped_command template without the selector placeholder', async () => {
@@ -2463,11 +2769,11 @@ steps:
       });
     });
 
-    it('materializes the single test-quality policy and preserves its configured policy', () => {
+    it('materializes every registered rubric policy and preserves its configured policy', () => {
       const defaults = validateConfig({ build_review: {} });
       const configured = validateConfig({
         build_review: {
-          maxParallel: 1,
+          maxParallel: 4,
           rubrics: {
             testQuality: {
               enabled: true,
@@ -2488,15 +2794,16 @@ steps:
       }).toEqual({
         defaults: {
           enabled: true,
-          maxParallel: 1,
+          maxParallel: 4,
           adjudication: { enabled: true },
           rubrics: {
             testQuality: { enabled: false },
+            security: { enabled: false },
           },
         },
         configured: {
           enabled: true,
-          maxParallel: 1,
+          maxParallel: 4,
           adjudication: { enabled: true },
           rubrics: {
             testQuality: {
@@ -2508,9 +2815,57 @@ steps:
               max_retries: 2,
               escalate: true,
             },
+            security: { enabled: false },
           },
         },
       });
+    });
+
+    it.each([
+      [
+        { enabled: 'yes' },
+        'build_review.rubrics.security.enabled must be a boolean',
+      ],
+      [
+        { effort: 'extreme' },
+        'build_review.rubrics.security.effort must be low|medium|high|xhigh|max',
+      ],
+    ])('rejects invalid security rubric policy %#', (security, message) => {
+      expect(validateConfig({ build_review: { rubrics: { security } } })).toEqual({
+        ok: false,
+        error: { type: 'validation_error', message },
+      });
+    });
+
+    it('resolves the shipped projection byte bound when test-quality leaves it unset', () => {
+      expect(resolveBuildReviewConfig({
+        build_review: { rubrics: { testQuality: { enabled: true } } },
+      }).rubrics.testQuality.max_projection_bytes).toBe(DEFAULT_TEST_QUALITY_MAX_PROJECTION_BYTES);
+    });
+
+    it.each([0, -1, 1.5, '1MB'] as const)(
+      'rejects invalid test-quality max_projection_bytes %j',
+      (max_projection_bytes) => {
+        const result = validateConfig({
+          build_review: { rubrics: { testQuality: { max_projection_bytes } } },
+        });
+
+        expect(result).toEqual({
+          ok: false,
+          error: {
+            type: 'validation_error',
+            message: 'build_review.rubrics.testQuality.max_projection_bytes must be a positive integer byte count',
+          },
+        });
+      },
+    );
+
+    it('loads an explicit test-quality max_projection_bytes as a number', () => {
+      const result = validateConfig({
+        build_review: { rubrics: { testQuality: { max_projection_bytes: 1_048_576 } } },
+      });
+
+      expect(result.ok && result.config.build_review?.rubrics?.testQuality?.max_projection_bytes).toBe(1_048_576);
     });
 
     it('keeps retired keys tolerant and treats retired policy as a no-op', () => {
@@ -2570,9 +2925,12 @@ steps:
       }).toEqual({
         build_review: {
           enabled: false,
-          maxParallel: 1,
+          maxParallel: 4,
           adjudication: { enabled: true },
-          rubrics: { testQuality: { enabled: false } },
+          rubrics: {
+            testQuality: { enabled: false },
+            security: { enabled: false },
+          },
         },
         warnings: ['build_review.perTaskFloor is retired and ignored (adr-2026-08-22-build-review-opt-in-rubric-container).'],
         deprecatedKeys: [{
@@ -3071,6 +3429,57 @@ steps:
   });
 
   describe('coverage_binding config field (Task 8)', () => {
+    it('resolves an omitted judge batch size to 8', () => {
+      const result = validateConfig({ coverage_binding: { judge: {} } });
+
+      expect(result).toMatchObject({
+        ok: true,
+        config: { coverage_binding: { judge: { batch_size: 8 } } },
+      });
+    });
+
+    it('preserves a positive judge batch size', () => {
+      const result = validateConfig({ coverage_binding: { judge: { batch_size: 1 } } });
+
+      expect(result).toMatchObject({
+        ok: true,
+        config: { coverage_binding: { judge: { batch_size: 1 } } },
+      });
+    });
+
+    it.each([
+      ['zero', 0],
+      ['a negative number', -3],
+      ['a non-integer', 2.5],
+      ['a string', '8'],
+    ])('rejects batch size %s', (_name, batch_size) => {
+      const result = validateConfig({ coverage_binding: { judge: { batch_size } } });
+
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: 'coverage_binding.judge.batch_size must be a positive integer',
+        },
+      });
+    });
+
+    it('rejects an unknown plural batch-size key', () => {
+      const result = validateConfig({ coverage_binding: { judge: { batch_sizes: 8 } } });
+
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          type: 'validation_error',
+          message: 'Unknown key in coverage_binding.judge: "batch_sizes"',
+        },
+      });
+    });
+
+    it('registers the complete judge key set', () => {
+      expect(CONFIG_CONSUMER_KEY_SETS['coverage_binding.judge']).toEqual(['enabled', 'batch_size']);
+    });
+
     it('resolves the omitted judge to disabled', () => {
       const result = validateConfig({});
       expect(result.ok).toBe(true);

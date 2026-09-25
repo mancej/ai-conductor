@@ -1,14 +1,22 @@
+// Covers: task:8, task:11
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   makeVerdictOutcome,
   makeNoVerdictOutcome,
   makeSkippedOutcome,
+  buildParallelFailureEvents,
   classifyOutcome,
   runWithConcurrency,
-  runGroupBranch,
+  runGroupBranch as runGroupBranchProduction,
   runAuxiliaryGroupBranch,
   runAuxiliaryGroupBranches,
   type BranchOutcome,
+  type BranchExecutorDeps,
+  type GroupBranchAdmission,
+  type GroupBranchAttempt,
+  type GroupBranchLifecycleObserver,
+  type GroupBranchRetry,
+  type GroupBranchSettlement,
   type GroupMember,
   type GroupMemberStepEvent,
   type GroupResult,
@@ -36,6 +44,30 @@ import type {
   InvokeResult,
   LLMProvider,
 } from "../../src/execution/llm-provider.js";
+
+/** Explicit test-only observer for fixtures unrelated to lifecycle assertions. */
+const TEST_LIFECYCLE_OBSERVER: GroupBranchLifecycleObserver = {
+  onAdmitted: () => undefined,
+  onAttempt: () => undefined,
+  onRetry: () => undefined,
+  onSettled: () => undefined,
+};
+
+type TestBranchExecutorDeps = Omit<BranchExecutorDeps, "lifecycleObserver"> & {
+  lifecycleObserver?: GroupBranchLifecycleObserver;
+};
+
+function runGroupBranch(
+  member: GroupMember,
+  state: ConductState,
+  deps: TestBranchExecutorDeps,
+  maxRetries: number,
+): Promise<BranchOutcome> {
+  return runGroupBranchProduction(member, state, {
+    ...deps,
+    lifecycleObserver: deps.lifecycleObserver ?? TEST_LIFECYCLE_OBSERVER,
+  }, maxRetries);
+}
 
 describe("group-core: BranchOutcome constructors", () => {
   it("makeVerdictOutcome builds a kind:'verdict' outcome carrying pass/fail/blocked", () => {
@@ -69,6 +101,10 @@ describe("group-core: BranchOutcome constructors", () => {
 });
 
 describe("group-core: exhaustive classify helper", () => {
+  it("classifies a parked outcome distinctly from no-verdict or aborted", () => {
+    expect(classifyOutcome({ kind: "parked" } as unknown as BranchOutcome)).toBe("parked");
+  });
+
   it("classifies a verdict outcome by its verdict value", () => {
     expect(classifyOutcome(makeVerdictOutcome("pass"))).toBe("verdict:pass");
     expect(classifyOutcome(makeVerdictOutcome("fail"))).toBe("verdict:fail");
@@ -95,10 +131,38 @@ describe("group-core: exhaustive classify helper", () => {
       makeVerdictOutcome("blocked"),
       makeNoVerdictOutcome("reason"),
       makeSkippedOutcome(),
+      { kind: "parked" },
     ];
     for (const outcome of outcomes) {
       expect(() => classifyOutcome(outcome)).not.toThrow();
     }
+  });
+});
+
+describe("group-core: parked join behavior", () => {
+  it("does not emit a parallel failure for a parked member", () => {
+    expect(buildParallelFailureEvents("manual_test", [{
+      name: "parked-member",
+      skill: "manual-test",
+      outcome: { kind: "parked", attempt: 2 },
+    }])).toEqual([]);
+  });
+
+  it("emits a member-attributed parallel failure for a permission denial", () => {
+    expect(buildParallelFailureEvents("manual_test", [{
+      name: "manual_test",
+      skill: "manual-test",
+      outcome: {
+        kind: "permission-denied",
+        provider: "codex",
+        reason: "permission review denied",
+      },
+    }])).toEqual([{
+      type: "parallel_failure",
+      step: "manual_test",
+      branch: "manual_test",
+      error: "branch manual_test failed: permission-denied",
+    }]);
   });
 });
 
@@ -246,6 +310,7 @@ describe("group-core: runAuxiliaryGroupBranch", () => {
   it("dispatches string member IDs through typed policy and outcome callbacks without lifecycle state", async () => {
     const policy: ResolvedBuildReviewRubricPolicy = {
       enabled: true,
+      max_projection_bytes: 1_048_576,
       llm_provider: "claude",
       model: "sonnet",
       effort: "medium",
@@ -283,7 +348,7 @@ describe("group-core: runAuxiliaryGroupBranch", () => {
     const first = deferred<BuildReviewRubricResult>();
     const started: string[] = [];
     const policies: Record<"testQuality", ResolvedBuildReviewRubricPolicy> = {
-      testQuality: { enabled: true, llm_provider: "claude", model: "sonnet", effort: "medium", model_fallback_ladder: ["sonnet", "opus"], max_retries: 2, escalate: false, min_confidence: 0 },
+      testQuality: { enabled: true, max_projection_bytes: 1_048_576, llm_provider: "claude", model: "sonnet", effort: "medium", model_fallback_ladder: ["sonnet", "opus"], max_retries: 2, escalate: false, min_confidence: 0 },
     };
 
     const outcomesPromise = runAuxiliaryGroupBranches(
@@ -755,6 +820,63 @@ describe("group-core: runGroupBranch (per-branch skill dispatch + fresh sessions
     expect(runner.calls[0]!.opts?.resume).toBe(false);
     expect(runner.calls[1]!.opts?.resume).toBe(false);
     expect(classifyOutcome(outcome)).toBe("verdict:pass");
+  });
+
+  it("settles a member as parked when the feature parks before its retry", async () => {
+    const runner = spyRunner([{ success: false, output: "retry" }]);
+    const member: GroupMember = { name: "manual_test", skill: "manual-test", outcome: makeSkippedOutcome() };
+    const outcome = await runGroupBranch(
+      member,
+      fakeState,
+      { stepRunner: runner, operatorParkBoundary: async () => true },
+      3,
+    );
+
+    expect({ outcome, calls: runner.calls.length }).toEqual({
+      outcome: { kind: "parked", attempt: 2 },
+      calls: 1,
+    });
+  });
+
+  it("fails toward parked when the retry park predicate rejects", async () => {
+    const runner = spyRunner([{ success: false, output: "retry" }]);
+    const member: GroupMember = { name: "manual_test", skill: "manual-test", outcome: makeSkippedOutcome() };
+    const boundary = vi.fn(async () => { throw new Error("park state unavailable"); });
+
+    const outcome = await runGroupBranch(
+      member,
+      fakeState,
+      { stepRunner: runner, operatorParkBoundary: boundary },
+      3,
+    );
+
+    expect({ outcome, dispatches: runner.calls.length, boundaryCalls: boundary.mock.calls.length }).toEqual({
+      outcome: { kind: "parked", attempt: 2 },
+      dispatches: 1,
+      boundaryCalls: 1,
+    });
+  });
+
+  it.each([
+    ['rate limit', { success: false, rateLimited: true }],
+    ['stale session', { success: false, sessionExpired: true }],
+  ])('parks after a %s free retry without redispatching the member', async (_name, firstResult) => {
+    const runner = spyRunner([firstResult]);
+    const member: GroupMember = { name: 'manual_test', skill: 'manual-test', outcome: makeSkippedOutcome() };
+    const boundary = vi.fn(async () => true);
+
+    const outcome = await runGroupBranch(
+      member,
+      fakeState,
+      { stepRunner: runner, operatorParkBoundary: boundary },
+      1,
+    );
+
+    expect({ outcome, dispatches: runner.calls.length, boundaryCalls: boundary.mock.calls.length }).toEqual({
+      outcome: { kind: 'parked', attempt: 1 },
+      dispatches: 1,
+      boundaryCalls: 1,
+    });
   });
 
   it("retains ordered observed intervals from unsuccessful scalar attempts followed by success", async () => {
@@ -1317,6 +1439,312 @@ describe("group-core: wall-clock concurrency proof (Task 26)", () => {
     // waiting for it.
     expect(starts[2]).toBeGreaterThan(startTime);
     expect(starts[2]).toBeLessThan(startTime + 3 * t);
+  });
+});
+
+describe("group-core: complete member lifecycle observations (Task 11)", () => {
+  const fakeState = {} as ConductState;
+
+  function member(name = "manual_test"): GroupMember {
+    return { name, skill: name.replaceAll("_", "-"), outcome: makeSkippedOutcome() };
+  }
+
+  it("refuses an omitted lifecycle observer instead of silently running a production branch", async () => {
+    const runner = scriptedRunner([{ success: true }]);
+
+    await expect(runGroupBranchProduction(
+      member(),
+      fakeState,
+      { stepRunner: runner } as unknown as BranchExecutorDeps,
+      1,
+    )).rejects.toThrow("runGroupBranch requires a lifecycleObserver");
+    expect(runner.calls).toEqual([]);
+  });
+
+  function lifecycleRecorder() {
+    const admissions: GroupBranchAdmission[] = [];
+    const attempts: GroupBranchAttempt[] = [];
+    const retries: GroupBranchRetry[] = [];
+    const settlements: GroupBranchSettlement[] = [];
+    const lifecycleObserver: GroupBranchLifecycleObserver = {
+      onAdmitted: (observation) => { admissions.push(observation); },
+      onAttempt: (observation) => { attempts.push(observation); },
+      onRetry: (observation) => { retries.push(observation); },
+      onSettled: (observation) => { settlements.push(observation); },
+    };
+    return {
+      admissions,
+      attempts,
+      retries,
+      settlements,
+      lifecycleObserver,
+    };
+  }
+
+  function scriptedRunner(results: StepRunResult[]) {
+    const calls: Array<{ step: StepName; options?: StepRunOptions }> = [];
+    let index = 0;
+    return {
+      calls,
+      run: async (step: StepName, _state: ConductState, options?: StepRunOptions) => {
+        calls.push({ step, options });
+        return results[index++]!;
+      },
+    };
+  }
+
+  it("observes one admitted execution, actual provider attempt metadata, and settlement for ordinary completion", async () => {
+    const lifecycle = lifecycleRecorder();
+    const executionContext = {
+      executionId: "member-execution-1",
+      subject: { kind: "lifecycle-step" as const, step: "manual_test" as StepName },
+    };
+    const runner = scriptedRunner([{
+      success: true,
+      preferredProvider: "claude",
+      actualProvider: "codex",
+      attempts: [{
+        provider: "claude",
+        preferredProvider: "claude",
+        outcome: "unavailable",
+        invoked: false,
+        reason: "credential unavailable",
+      }, {
+        provider: "codex",
+        preferredProvider: "claude",
+        model: "gpt-5.6",
+        effort: "medium",
+        outcome: "success",
+        invoked: true,
+        fallbackReason: "credential unavailable",
+      }],
+    }]);
+
+    const outcome = await runGroupBranch(
+      member(),
+      fakeState,
+      { stepRunner: runner, lifecycleObserver: lifecycle.lifecycleObserver, executionContext },
+      1,
+    );
+
+    expect(outcome).toEqual({ kind: "verdict", verdict: "pass" });
+    expect(lifecycle.admissions).toHaveLength(1);
+    expect(lifecycle.attempts).toHaveLength(1);
+    expect(lifecycle.settlements).toHaveLength(1);
+    expect(lifecycle.retries).toHaveLength(0);
+    expect(lifecycle.attempts[0]).toMatchObject({
+      attempt: 1,
+      executionContext,
+      result: {
+        actualProvider: "codex",
+        attempts: [
+          { provider: "claude", invoked: false, outcome: "unavailable" },
+          { provider: "codex", invoked: true, outcome: "success", fallbackReason: "credential unavailable" },
+        ],
+      },
+    });
+    expect(runner.calls[0]!.options).toMatchObject({ executionContext });
+    expect(lifecycle.settlements[0]).toMatchObject({ executionContext, outcome: { kind: "verdict", verdict: "pass" } });
+  });
+
+  it("keeps one lifecycle through policy retry success and reports each actual invocation", async () => {
+    const lifecycle = lifecycleRecorder();
+    const runner = scriptedRunner([
+      { success: false, output: "transient", actualProvider: "claude" },
+      { success: true, actualProvider: "codex" },
+    ]);
+
+    await runGroupBranch(
+      member(),
+      fakeState,
+      { stepRunner: runner, lifecycleObserver: lifecycle.lifecycleObserver },
+      2,
+    );
+
+    expect(lifecycle.admissions).toHaveLength(1);
+    expect(lifecycle.attempts).toHaveLength(2);
+    expect(lifecycle.attempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ attempt: 1, result: expect.objectContaining({ actualProvider: "claude" }) }),
+      expect.objectContaining({ attempt: 2, result: expect.objectContaining({ actualProvider: "codex" }) }),
+    ]));
+    expect(lifecycle.retries).toEqual([expect.objectContaining({ attempt: 2 })]);
+    expect(lifecycle.settlements).toEqual([expect.objectContaining({ outcome: { kind: "verdict", verdict: "pass" } })]);
+  });
+
+  it("settles retry exhaustion once and does not count rate-limit recovery as a policy retry", async () => {
+    const lifecycle = lifecycleRecorder();
+    const runner = scriptedRunner([
+      { success: false, output: "rate limited", rateLimited: true },
+      { success: false, output: "first policy failure" },
+      { success: false, output: "final policy failure" },
+    ]);
+
+    const outcome = await runGroupBranch(
+      member(),
+      fakeState,
+      { stepRunner: runner, lifecycleObserver: lifecycle.lifecycleObserver },
+      2,
+    );
+
+    expect(outcome).toMatchObject({ kind: "no-verdict", reason: "final policy failure" });
+    expect(lifecycle.admissions).toHaveLength(1);
+    expect(lifecycle.attempts).toHaveLength(3);
+    expect(lifecycle.retries).toEqual([expect.objectContaining({ attempt: 2 })]);
+    expect(lifecycle.settlements).toEqual([expect.objectContaining({ outcome })]);
+  });
+
+  it("reports thrown work attempts and settles their exhausted outcome exactly once", async () => {
+    const lifecycle = lifecycleRecorder();
+    const runner = {
+      run: async () => { throw new Error("runner exploded"); },
+    };
+
+    const outcome = await runGroupBranch(
+      member(),
+      fakeState,
+      { stepRunner: runner, lifecycleObserver: lifecycle.lifecycleObserver },
+      2,
+    );
+
+    expect(outcome).toEqual({ kind: "no-verdict", reason: "runner exploded" });
+    expect(lifecycle.admissions).toHaveLength(1);
+    expect(lifecycle.attempts).toEqual([
+      expect.objectContaining({ attempt: 1, error: "runner exploded" }),
+      expect.objectContaining({ attempt: 2, error: "runner exploded" }),
+    ]);
+    expect(lifecycle.retries).toEqual([expect.objectContaining({ attempt: 2 })]);
+    expect(lifecycle.settlements).toEqual([expect.objectContaining({ outcome })]);
+  });
+
+  it("settles authentication and permission outcomes without inventing a policy retry", async () => {
+    const authLifecycle = lifecycleRecorder();
+    const permissionLifecycle = lifecycleRecorder();
+
+    await runGroupBranch(
+      member("auth"),
+      fakeState,
+      { stepRunner: scriptedRunner([{ success: false, authFailure: true, actualProvider: "codex" }]), lifecycleObserver: authLifecycle.lifecycleObserver },
+      2,
+    );
+    await runGroupBranch(
+      member("permission"),
+      fakeState,
+      { stepRunner: scriptedRunner([{ success: false, permissionDenied: true, actualProvider: "claude" }]), lifecycleObserver: permissionLifecycle.lifecycleObserver },
+      2,
+    );
+
+    expect(authLifecycle.admissions).toHaveLength(1);
+    expect(authLifecycle.attempts).toEqual([
+      expect.objectContaining({ attempt: 1, result: expect.objectContaining({ authFailure: true, actualProvider: "codex" }) }),
+    ]);
+    expect(authLifecycle.retries).toEqual([]);
+    expect(authLifecycle.settlements).toEqual([expect.objectContaining({
+      outcome: { kind: "no-verdict", reason: "authFailure" },
+    })]);
+    expect(permissionLifecycle.admissions).toHaveLength(1);
+    expect(permissionLifecycle.attempts).toEqual([
+      expect.objectContaining({ attempt: 1, result: expect.objectContaining({ permissionDenied: true, actualProvider: "claude" }) }),
+    ]);
+    expect(permissionLifecycle.retries).toEqual([]);
+    expect(permissionLifecycle.settlements).toEqual([expect.objectContaining({
+      outcome: expect.objectContaining({ kind: "permission-denied", provider: "claude" }),
+    })]);
+  });
+
+  it("keeps absent usage absent while still observing an admitted no-usage completion", async () => {
+    const lifecycle = lifecycleRecorder();
+    const runner = scriptedRunner([{ success: true, actualProvider: "codex" }]);
+
+    await runGroupBranch(
+      member(),
+      fakeState,
+      { stepRunner: runner, lifecycleObserver: lifecycle.lifecycleObserver },
+      1,
+    );
+
+    expect(lifecycle.attempts[0]).toMatchObject({ result: { actualProvider: "codex" } });
+    expect(lifecycle.attempts[0]).not.toMatchObject({ result: { tokenUsage: expect.anything() } });
+    expect(lifecycle.settlements).toHaveLength(1);
+  });
+
+  it("does not observe a branch cancelled before semaphore admission", async () => {
+    let releaseFirst!: () => void;
+    const firstDone = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const controller = new AbortController();
+    const firstLifecycle = lifecycleRecorder();
+    const queuedLifecycle = lifecycleRecorder();
+    const firstRunner = {
+      run: async () => {
+        await firstDone;
+        return { success: true };
+      },
+    };
+    const queuedRunner = scriptedRunner([{ success: true }]);
+
+    const group = runWithConcurrency([
+      () => runGroupBranch(member("first"), fakeState, { stepRunner: firstRunner, lifecycleObserver: firstLifecycle.lifecycleObserver, signal: controller.signal }, 1),
+      () => runGroupBranch(member("queued"), fakeState, { stepRunner: queuedRunner, lifecycleObserver: queuedLifecycle.lifecycleObserver, signal: controller.signal }, 1),
+    ], 1, controller.signal);
+
+    await Promise.resolve();
+    controller.abort();
+    releaseFirst();
+    await group;
+
+    expect(queuedRunner.calls).toHaveLength(0);
+    expect(queuedLifecycle.admissions).toEqual([]);
+    expect(queuedLifecycle.attempts).toEqual([]);
+    expect(queuedLifecycle.settlements).toEqual([]);
+  });
+
+  it("settles an admitted abort once without retrying after a rate-limit wait", async () => {
+    const lifecycle = lifecycleRecorder();
+    const controller = new AbortController();
+    const runner = scriptedRunner([{ success: false, rateLimited: true }]);
+    const episode = {
+      enter: () => undefined,
+      clear: async () => { controller.abort(); },
+    };
+
+    const outcome = await runGroupBranch(
+      member(),
+      fakeState,
+      { stepRunner: runner, lifecycleObserver: lifecycle.lifecycleObserver, rateLimitEpisode: episode, signal: controller.signal },
+      1,
+    );
+
+    expect(outcome).toEqual({ kind: "no-verdict", reason: "aborted" });
+    expect(lifecycle.admissions).toHaveLength(1);
+    expect(lifecycle.attempts).toHaveLength(1);
+    expect(lifecycle.retries).toEqual([]);
+    expect(lifecycle.settlements).toEqual([expect.objectContaining({ outcome })]);
+  });
+
+  it("starts a queued member only when the concurrency cap admits it", async () => {
+    let releaseFirst!: () => void;
+    const firstDone = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const firstLifecycle = lifecycleRecorder();
+    const secondLifecycle = lifecycleRecorder();
+    const firstRunner = {
+      run: async () => {
+        await firstDone;
+        return { success: true };
+      },
+    };
+    const secondRunner = scriptedRunner([{ success: true }]);
+
+    const group = runWithConcurrency([
+      () => runGroupBranch(member("first"), fakeState, { stepRunner: firstRunner, lifecycleObserver: firstLifecycle.lifecycleObserver }, 1),
+      () => runGroupBranch(member("second"), fakeState, { stepRunner: secondRunner, lifecycleObserver: secondLifecycle.lifecycleObserver }, 1),
+    ], 1);
+
+    await Promise.resolve();
+    expect(firstLifecycle.admissions).toHaveLength(1);
+    expect(secondLifecycle.admissions).toHaveLength(0);
+    releaseFirst();
+    await group;
+    expect(secondLifecycle.admissions).toHaveLength(1);
+    expect(secondLifecycle.settlements).toHaveLength(1);
   });
 });
 

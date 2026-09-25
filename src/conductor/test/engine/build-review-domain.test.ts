@@ -1,15 +1,18 @@
-// Covers: task:11
+// Covers: task:3
+// Covers: task:6, task:11
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 
 import {
   BUILD_REVIEW_FINDING_VOCABULARIES,
   buildReviewFindingReferenceContext,
+  diagnoseBuildReviewJudgedResultRejection,
   deriveBuildReviewInfrastructureFailureReason,
   makeBuildReviewDispatchFailure,
   mapBuildReviewCoordinatorFailureReason,
   parseBuildReviewCanonicalPathReference,
   parseBuildReviewCandidateScopeResolutions,
+  parseBuildReviewCustomReviewerPayload,
   parseBuildReviewDispatchFailure,
   parseBuildReviewFindingAnchor,
   parseBuildReviewInfrastructureFailure,
@@ -19,12 +22,16 @@ import {
   parseBuildReviewRubricResult,
   parseBuildReviewSkip,
   renderBuildReviewUnresolvedSkillRemedy,
-  renderBuildReviewJudgedResultShape,
-  renderBuildReviewProviderPayloadShape,
   type BuildReviewInfrastructureFailureReason, describeBuildReviewJudgedResultRejection } from '../../src/engine/build-review-domain.js';
 import { canonicalizeBuildReviewFindingIdentity } from '../../src/engine/build-review-finding-identity.js';
+import { BUILD_REVIEW_CUSTOM_V1_CONTRACT } from '../../src/engine/build-review-policy-resolver.js';
 import { matchesBuildReviewDisposition, type BuildReviewDispositionRecord } from '../../src/engine/build-review-dispositions.js';
-import type { BuildReviewRubricProjection } from '../../src/engine/build-review-projections.js';
+import {
+  buildReviewEffectiveResultDescriptor,
+  parseBuildReviewReviewerPayload,
+  type BuildReviewRubricProjection,
+} from '../../src/engine/build-review-projections.js';
+import type { ResolvedBuildReviewCatalogEntry } from '../../src/engine/resolved-config.js';
 
 const HASH = `sha256:${'a'.repeat(64)}`;
 const locus = { path: 'test/widget.test.ts', contentHash: HASH, display: 'widget persists state' };
@@ -40,11 +47,181 @@ function finding(overrides: Record<string, unknown> = {}): Record<string, unknow
   };
 }
 
+const customCatalogEntry: ResolvedBuildReviewCatalogEntry = {
+  id: 'portablePolicy', kind: 'custom', skill: 'portable-policy',
+  question: 'Does this preserve the portable policy contract?', resources: [],
+  contract: BUILD_REVIEW_CUSTOM_V1_CONTRACT,
+  policy: {
+    enabled: true, max_projection_bytes: 1_048_576, llm_provider: 'codex', model: 'gpt-5.6-sol', effort: 'medium',
+    model_fallback_ladder: [], max_retries: 1, escalate: false, min_confidence: 0,
+  },
+};
+
+function customPayload(
+  findings: readonly unknown[],
+  rest: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { kind: 'custom-findings', version: 'v1', findings, ...rest };
+}
+
+function customFinding(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    concernId: 'portable-policy-gap', summary: 'The changed boundary lacks the required compatibility evidence.',
+    evidenceLocations: ['src/widget.ts:8'],
+    sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: HASH, display: 'public boundary' }],
+    ...overrides,
+  };
+}
+
 function titleHash(text: string): string {
   return `sha256:${createHash('sha256').update(text).digest('hex')}`;
 }
 
 describe('build-review domain', () => {
+  it('keeps the security concern vocabulary closed to the approved ten kinds', () => {
+    expect(BUILD_REVIEW_FINDING_VOCABULARIES.security.concernKinds).toEqual([
+      'committed-secret', 'injection', 'broken-access-control', 'path-traversal',
+      'unsafe-deserialization', 'cryptographic-failure', 'security-misconfiguration',
+      'authentication-failure', 'integrity-failure', 'ssrf',
+    ]);
+  });
+
+  it.each(['scopeResolutions', 'relocationAudit', 'counterfactualSensitivity'])('rejects persisted security evidence field %s', (field) => {
+    const payload = judged([], { rubric: 'security', [field]: field === 'counterfactualSensitivity' ? 'supports' : [] });
+    expect(parseBuildReviewJudgedResult(payload)).toBeUndefined();
+    expect(describeBuildReviewJudgedResultRejection(payload, 'security', { lapId: 'lap-1', snapshotDigest: 'sha256:abc' })).toContain(field);
+  });
+
+  it('round-trips empty scope only as a test-quality skip', () => {
+    const skipped = { kind: 'skipped', rubric: 'testQuality', reason: 'test_quality_empty_scope' };
+    expect(parseBuildReviewSkip(skipped)).toEqual(skipped);
+    expect(parseBuildReviewSkip({ ...skipped, rubric: 'security' })).toBeUndefined();
+  });
+
+  it('accepts security content-region anchors only for a projected changed content region', () => {
+    const anchor = { rubric: 'security', locus: { path: 'src/auth.ts', contentHash: HASH, display: 'request-derived shell command' } };
+    const references = buildReviewFindingReferenceContext({
+      rubric: 'security', changedFiles: [{ path: 'src/auth.ts', changeKind: 'modified', hunks: [
+        { oldStart: 1, oldCount: 1, newStart: 1, newCount: 1, contentHash: HASH },
+        { oldStart: 8, oldCount: 1, newStart: 8, newCount: 1, contentHash: HASH },
+      ] }],
+    } as unknown as BuildReviewRubricProjection);
+
+    expect(parseBuildReviewFindingAnchor(anchor, references)).toEqual(anchor);
+    expect(parseBuildReviewFindingAnchor({ ...anchor, locus: { ...anchor.locus, occurrence: 1 } }, references)).toBeDefined();
+    expect(parseBuildReviewFindingAnchor({ ...anchor, locus: { ...anchor.locus, occurrence: 2 } }, references)).toBeUndefined();
+    expect(parseBuildReviewFindingAnchor({ ...anchor, locus: { ...anchor.locus, contentHash: `sha256:${'b'.repeat(64)}` } }, references)).toBeUndefined();
+  });
+
+  it('rejects coordinate fields from a security content-region anchor', () => {
+    const anchor = { rubric: 'security', locus: { path: 'src/auth.ts', contentHash: HASH, display: 'request-derived shell command', line: 42 } };
+
+    expect(parseBuildReviewFindingAnchor(anchor, { changedTests: [], changedContentRegions: [{ path: 'src/auth.ts', contentHash: HASH, display: 'added command' }], changedPaths: ['src/auth.ts'], planTasks: [] })).toBeUndefined();
+  });
+
+  it('names the content-region grammar when a security anchor has coordinate fields', () => {
+    const expected = { lapId: 'lap-1', snapshotDigest: 'sha256:abc' };
+    const result = {
+      kind: 'judged', rubric: 'security', ...expected, contractVersion: 'v3',
+      findings: [{ concernKind: 'injection', summary: 'Shell command includes request input.', evidenceLocations: ['src/auth.ts:8'], anchor: { rubric: 'security', locus: { path: 'src/auth.ts', contentHash: HASH, display: 'request input', line: 8 } } }],
+    };
+
+    expect(describeBuildReviewJudgedResultRejection(result, 'security', expected, { changedTests: [], changedContentRegions: [{ path: 'src/auth.ts', contentHash: HASH, display: 'added command' }], changedPaths: ['src/auth.ts'], planTasks: [] })).toContain('content-region reference');
+  });
+
+  it('diagnoses an out-of-vocabulary security concern and an anchor outside frozen input', () => {
+    const expected = { lapId: 'lap-1', snapshotDigest: 'sha256:abc' };
+    const result = {
+      kind: 'judged', rubric: 'security', ...expected, contractVersion: 'v3',
+      findings: [{ concernKind: 'other', summary: 'Unrecognized concern.', evidenceLocations: ['src/other.ts:1'], anchor: { rubric: 'security', locus: { path: 'src/other.ts', contentHash: HASH, display: 'other' } } }],
+    };
+
+    const references = { changedTests: [], changedContentRegions: [{ path: 'src/auth.ts', contentHash: HASH, display: 'added command' }], changedPaths: ['src/auth.ts'], planTasks: [] };
+    expect(describeBuildReviewJudgedResultRejection(result, 'security', expected, references)).toContain('one of "committed-secret"');
+    expect(describeBuildReviewJudgedResultRejection({ ...result, findings: [{ ...result.findings[0], concernKind: 'injection' }] }, 'security', expected, references)).toContain('projected changed content region');
+  });
+
+  it('parses the bounded custom finding contract through an effective custom descriptor', () => {
+    const descriptor = buildReviewEffectiveResultDescriptor(customCatalogEntry);
+    const payload = customPayload([customFinding({ confidence: 72 })]);
+
+    expect(descriptor).toEqual({ kind: 'custom', rubric: 'portablePolicy', parser: 'custom-findings-v1' });
+    expect(parseBuildReviewReviewerPayload(payload, descriptor)).toEqual({
+      kind: 'custom-findings', version: 'v1', findings: [{
+        concernId: 'portable-policy-gap', summary: 'The changed boundary lacks the required compatibility evidence.',
+        confidence: 72, evidenceLocations: ['src/widget.ts:8'],
+        sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: HASH, display: 'public boundary' }],
+      }],
+    });
+    expect(parseBuildReviewReviewerPayload(customPayload([customFinding()]), descriptor)).toMatchObject({
+      kind: 'custom-findings', findings: [{ concernId: 'portable-policy-gap' }],
+    });
+    const withoutConfidence = parseBuildReviewCustomReviewerPayload(customPayload([customFinding({ confidence: undefined })]));
+    expect(withoutConfidence).toMatchObject({ kind: 'custom-findings' });
+    if (withoutConfidence?.kind !== 'custom-findings') throw new Error('expected custom findings payload');
+    expect(withoutConfidence.findings[0]).not.toHaveProperty('confidence');
+  });
+
+  it('ignores custom reviewer routing claims and rejects other identity claims and invalid bounded finding values', () => {
+    const descriptor = buildReviewEffectiveResultDescriptor(customCatalogEntry);
+    const valid = customPayload([customFinding()]);
+    for (const field of ['rubric', 'lapId']) {
+      expect(parseBuildReviewReviewerPayload({ ...valid, [field]: 'forged' }, descriptor), field).toEqual(valid);
+    }
+    const forged = ['policy', 'provider', 'verdict', 'caseId', 'effectId', 'disposition'];
+
+    for (const field of forged) {
+      expect(parseBuildReviewReviewerPayload({ ...valid, [field]: 'forged' }, descriptor), field).toBeUndefined();
+    }
+    for (const confidence of [-1, 101, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 'high']) {
+      expect(parseBuildReviewReviewerPayload(customPayload([customFinding({ confidence })]), descriptor), String(confidence)).toBeUndefined();
+    }
+    for (const malformed of [
+      customPayload([customFinding({ concernId: '' })]),
+      customPayload([customFinding({ concernId: 'x'.repeat(129) })]),
+      customPayload([customFinding({ evidenceLocations: [] })]),
+      customPayload([customFinding({ sourceRegions: [] })]),
+      customPayload([customFinding({ sourceRegions: [{ path: '../escape.ts', startLine: 1, endLine: 1, contentHash: HASH, display: 'escape' }] })]),
+      customPayload([customFinding({ unsupported: true })]),
+    ]) {
+      expect(parseBuildReviewReviewerPayload(malformed, descriptor), JSON.stringify(malformed)).toBeUndefined();
+    }
+  });
+
+  it('binds an enabled security built-in member to its own rubric and parser, leaving test-quality and custom members unchanged', () => {
+    const security = buildReviewEffectiveResultDescriptor({ id: 'security', kind: 'builtin', policy: customCatalogEntry.policy });
+    const testQuality = buildReviewEffectiveResultDescriptor({ id: 'testQuality', kind: 'builtin', policy: customCatalogEntry.policy });
+    const securityFinding = {
+      concernKind: 'injection', summary: 'Request input reaches a shell.', evidenceLocations: ['src/auth.ts:8'],
+      anchor: { rubric: 'security', locus: { path: 'src/auth.ts', contentHash: HASH, display: 'request-derived shell command' } },
+    };
+
+    expect(security).toEqual({ kind: 'builtin', rubric: 'security', parser: 'security-v3' });
+    expect(testQuality).toEqual({ kind: 'builtin', rubric: 'testQuality', parser: 'test-quality-v3' });
+    expect(buildReviewEffectiveResultDescriptor(customCatalogEntry)).toEqual({ kind: 'custom', rubric: 'portablePolicy', parser: 'custom-findings-v1' });
+    expect(parseBuildReviewReviewerPayload(judged([securityFinding], { rubric: 'security' }), security)).toMatchObject({
+      kind: 'judged', rubric: 'security', verdict: 'FAIL', findings: [{ concernKind: 'injection' }],
+    });
+    // A payload for one built-in never parses under another built-in's descriptor.
+    expect(parseBuildReviewReviewerPayload(judged([], { rubric: 'security' }), testQuality)).toBeUndefined();
+    expect(parseBuildReviewReviewerPayload(judged([]), security)).toBeUndefined();
+  });
+
+  it('keeps test-quality specialized and custom unsupported payloads distinct from empty findings', () => {
+    const customDescriptor = buildReviewEffectiveResultDescriptor(customCatalogEntry);
+    const builtInDescriptor = buildReviewEffectiveResultDescriptor({
+      id: 'testQuality', kind: 'builtin', policy: customCatalogEntry.policy,
+    });
+    const customEmpty = customPayload([]);
+    const unsupported = { kind: 'unsupported-policy', requirement: 'requires a deployment credential' };
+
+    expect(parseBuildReviewReviewerPayload(customEmpty, customDescriptor)).toMatchObject({ kind: 'custom-findings', findings: [] });
+    expect(parseBuildReviewReviewerPayload(unsupported, customDescriptor)).toEqual(unsupported);
+    expect(parseBuildReviewReviewerPayload(customEmpty, builtInDescriptor)).toBeUndefined();
+    expect(parseBuildReviewReviewerPayload(judged([]), customDescriptor)).toBeUndefined();
+    expect(parseBuildReviewReviewerPayload(judged([]), builtInDescriptor)).toMatchObject({ kind: 'judged', rubric: 'testQuality', verdict: 'PASS' });
+  });
+
   it('retains optional integer confidence and rejects values outside 0 through 100', () => {
     for (const confidence of [0, 72, 100]) {
       expect(parseBuildReviewJudgedResult(judged([finding({ confidence })]))?.findings[0]?.confidence).toBe(confidence);
@@ -170,7 +347,7 @@ describe('build-review domain', () => {
     expect(parseBuildReviewFindingAnchor({ rubric: 'testQuality', locus: { ...target, contentHash: titleHash('unrelated sibling'), display: 'unrelated sibling' } }, references)).toBeUndefined();
   });
 
-  it('names each enumerated contract problem in a rejection so the repair turn can act on it', () => {
+  it('names each enumerated contract problem in a rejection', () => {
     const expected = { lapId: 'lap-1', snapshotDigest: 'sha256:snapshot' };
     const locus = { path: 'test/widget.test.ts', contentHash: `sha256:${'a'.repeat(64)}`, display: 'widget renders' };
     const valid = { concernKind: 'test-insensitive', summary: 'Passes against a stub.', evidenceLocations: ['test/widget.test.ts:3'], anchor: { rubric: 'testQuality', locus } };
@@ -198,15 +375,61 @@ describe('build-review domain', () => {
       'findings[0].anchor.rubric must be "testQuality"',
       'findings[0].anchor.locus must be a content-region reference {"path", "contentHash", "display", "occurrence"?}',
     ].join('; '));
-    expect(describe(envelope([valid]), { changedTests: [], changedTestRegions: [{ ...locus, path: 'test/other.test.ts' }], changedPaths: [], planTasks: [] })).toBe(
+    expect(describe(envelope([valid]), { changedTests: [], changedTestRegions: [{ ...locus, path: 'test/other.test.ts' }], changedContentRegions: [], changedPaths: [], planTasks: [] })).toBe(
       'findings[0].anchor.locus must reference a projected in-scope content region (path, contentHash, and occurrence must match one)',
     );
-    expect(describe(envelope([valid, { ...valid, summary: 'Reworded.' }]))).toBe(
-      'findings must not repeat one concern on one content region (duplicated: "widget renders") — merge equivalent findings',
+    expect(describe(envelope([valid, { ...valid, summary: 'Reworded.' }]))).toMatch(
+      /^findings must not repeat one concern on one content region \(duplicated identity: sha256:[a-f0-9]{64}\) — merge equivalent findings$/,
     );
     // Bounded: six named problems, then a count.
     const many = envelope(Array.from({ length: 8 }, () => ({ summary: 'x' })));
     expect(describe(many)).toMatch(/; and \d+ more problem\(s\)$/);
+  });
+
+  it('diagnoses native structured-result contract violations with only checked fields', () => {
+    const expected = { lapId: 'lap-1', snapshotDigest: 'sha256:abc' };
+    const references = {
+      changedTests: [], changedContentRegions: [], changedPaths: [], planTasks: [],
+      changedTestRegions: [locus],
+    };
+    const diagnose = (value: unknown) => diagnoseBuildReviewJudgedResultRejection(
+      value, 'testQuality', expected, references,
+    );
+
+    const unlistedHash = diagnose(judged([finding({ anchor: { rubric: 'testQuality', locus: { ...locus, contentHash: `sha256:${'b'.repeat(64)}` } } })]));
+    expect(unlistedHash).toMatchObject({
+      kind: 'explained',
+      problems: [{ field: 'findings[0].anchor.locus.contentHash', required: 'must equal a contentHash listed by the projected in-scope content regions' }],
+    });
+
+    const outOfEnum = diagnose(judged([finding({ concernKind: 'invented-kind' })]));
+    expect(outOfEnum).toMatchObject({
+      kind: 'explained',
+      problems: [{ field: 'findings[0].concernKind', required: 'must be one of "test-insensitive" (got "invented-kind")' }],
+    });
+
+    const duplicate = judged([finding(), finding({ summary: 'Same identity, different wording.' })]);
+    const duplicateRejection = diagnose(duplicate);
+    const duplicateIdentity = canonicalizeBuildReviewFindingIdentity({
+      rubric: 'testQuality', contractVersion: 'v3', concernKind: 'test-insensitive', anchor: { rubric: 'testQuality', locus },
+    })!.id;
+    expect(parseBuildReviewJudgedResult(duplicate, references)).toBeUndefined();
+    expect(duplicateRejection).toMatchObject({
+      kind: 'explained',
+      problems: [{ field: 'findings[1].identity', required: `must not duplicate finding identity ${duplicateIdentity}` }],
+    });
+
+    expect(diagnose(JSON.stringify(judged([])))).toEqual({
+      kind: 'explained',
+      problems: [{ field: '$', required: 'must be an object', detail: 'the result is not a single JSON object' }],
+    });
+
+    const unexplained = diagnoseBuildReviewJudgedResultRejection(
+      judged([], { lapId: 'invalid lap id' }), 'testQuality',
+      { lapId: 'invalid lap id', snapshotDigest: 'sha256:abc' }, references,
+    );
+    expect(unexplained).toEqual({ kind: 'unexplained', problems: [] });
+    expect(unexplained.problems).not.toContainEqual(expect.objectContaining({ field: expect.any(String) }));
   });
 
   it('names missing, duplicate, unknown, foreign, and invalid candidate scope resolution authority', () => {
@@ -216,7 +439,7 @@ describe('build-review domain', () => {
     const envelope = (scopeResolutions: unknown) => judged([], { scopeResolutions });
     const describe = (scopeResolutions: unknown) => describeBuildReviewJudgedResultRejection(
       envelope(scopeResolutions), 'testQuality', expected,
-      { changedTests: [], changedTestRegions: [], changedPaths: [], planTasks: [] }, scopeContext,
+      { changedTests: [], changedTestRegions: [], changedContentRegions: [], changedPaths: [], planTasks: [] }, scopeContext,
     );
     const resolved = {
       candidateId: 'bound-target', status: 'resolved', sourceRegion,
@@ -345,42 +568,21 @@ describe('build-review domain', () => {
     const closed: readonly BuildReviewInfrastructureFailureReason[] = [
       'provider-error', 'retry-exhausted', 'missing-artifact', 'malformed-artifact', 'stale-artifact',
       'identity-mismatch', 'preflight-failed', 'artifact-read-failed', 'artifact-write-failed', 'scope-incomplete',
+      'projection-oversized', 'invalid-structured-result', 'native-schema-unsupported',
     ];
 
     expect(mapBuildReviewCoordinatorFailureReason).toMatchObject({
       'no-changed-tests': 'preflight-failed', 'missing-merge-base-file': 'preflight-failed', 'scoped-run-timeout': 'preflight-failed',
       'cache-read-failed': 'artifact-read-failed', 'cache-write-failed': 'artifact-write-failed', 'artifact-write-failed': 'artifact-write-failed',
       'projection-rubric-mismatch': 'malformed-artifact', 'invalid-provider-result': 'malformed-artifact',
+      'projection-oversized': 'projection-oversized', 'invalid-structured-result': 'invalid-structured-result',
+      'native-schema-unsupported': 'native-schema-unsupported',
       'provider-error': 'provider-error', 'missing-settlement': 'missing-artifact',
     });
     for (const [coordinatorReason, infrastructureReason] of Object.entries(mapBuildReviewCoordinatorFailureReason)) {
       expect(closed, coordinatorReason).toContain(infrastructureReason);
       expect(deriveBuildReviewInfrastructureFailureReason({ reason: coordinatorReason as keyof typeof mapBuildReviewCoordinatorFailureReason })).toBe(infrastructureReason);
     }
-  });
-
-  it('renders every test-quality vocabulary member into the dispatch shape with no catch-all', () => {
-    const shape = renderBuildReviewJudgedResultShape('testQuality');
-    const vocabulary = BUILD_REVIEW_FINDING_VOCABULARIES.testQuality;
-
-    expect(vocabulary.concernKinds.length).toBeGreaterThan(0);
-    for (const member of [...vocabulary.members, ...vocabulary.concernKinds]) expect(shape).toContain(member);
-    expect(shape).toContain('rubric: "testQuality"');
-    expect(shape).toContain('contractVersion: "v3"');
-    expect(shape).toContain('contentHash');
-    expect(shape).not.toMatch(/(?:^|[-_"\s])other(?:$|[-_"\s])/);
-    expect([...vocabulary.members, ...vocabulary.concernKinds].some((member) => /(?:^|[-_])other(?:$|[-_])/.test(member))).toBe(false);
-  });
-
-  it('renders the provider payload without engine-stamped envelope identity', () => {
-    const shape = renderBuildReviewProviderPayloadShape('testQuality');
-
-    expect(shape).toContain('findings');
-    expect(shape).toContain('scopeResolutions');
-    expect(shape).toContain('counterfactualSensitivity');
-    expect(shape).not.toContain('lapId');
-    expect(shape).not.toContain('snapshotDigest');
-    expect(shape).not.toContain('contractVersion');
   });
 
   it('round-trips a dispatch-failure report and rejects other shapes', () => {
@@ -494,6 +696,7 @@ describe('build-review domain', () => {
           { path: 'test/widget.test.ts', contentHash: titleHash('widget > persists state'), display: 'widget > persists state' },
           { path: 'test/loader.test.ts', contentHash: titleHash('test/loader.test.ts'), display: 'test/loader.test.ts changed test' },
         ],
+        changedContentRegions: [],
         changedPaths: ['src/widget.ts', 'test/widget.test.ts'],
         planTasks: [],
       });

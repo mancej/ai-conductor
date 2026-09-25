@@ -60,7 +60,7 @@ As a re-dispatched feature, a judged gate that already passed against the curren
 ### Negative Path
 
 - **Given** the same `PASS` verdict but the delta since its baseline **does** include a path in the
-  gate's surface (the feature's own runtime source changed),
+  gate's surface and no valid unchanged-replay authority explains it (the feature contribution changed),
 - **When** completion is re-evaluated,
 - **Then** the verdict is **not** preserved — the gate re-runs.
 
@@ -71,10 +71,20 @@ than it is today.
 
 ### Happy Path
 
-- **Given** a `PASS` verdict authored before this change (no `codeStamp`) — or the kill-switch is off,
+- **Given** a `build_review`, `prd_audit`, or `manual_test` `PASS` verdict authored before this change
+  (no `codeStamp`) — or the kill-switch is off,
 - **When** completion is re-evaluated on re-dispatch,
 - **Then** the code-validity branch does not apply and the existing mtime-freshness behavior governs
   (the verdict is re-run on resume, exactly as today) — no silent preservation of an un-stamped verdict.
+
+### Negative Path
+
+- **Given** an `architecture_review_as_built` artifact with no code stamp or no run-identity stamp — or
+  the kill-switch is off,
+- **When** completion is re-evaluated on re-dispatch,
+- **Then** no mtime comparison decides freshness: identity checking stays in force, only a typed verdict
+  stamped with the current attempt's identity satisfies the gate, and an unstamped or Markdown-only
+  artifact is scored absent and re-runs — no silent preservation of an un-stamped verdict.
 
 ## Story 4 — Fail-closed on an unreachable baseline (#766 orphan guard)
 
@@ -83,7 +93,7 @@ As the gate layer, a verdict whose stamped baseline no longer exists in history 
 ### Happy Path
 
 - **Given** a `PASS` verdict whose `codeStamp` baseline is unreachable (orphaned by a rebase/reset/amend,
-  the #766 hazard),
+  the #766 hazard) and neither valid engine translation nor replay-bound preservation explains it,
 - **When** completion is re-evaluated,
 - **Then** the verdict is **not** preserved (the gate re-runs), and no "uncreditable-undemotable" wedge
   or operator halt is produced.
@@ -111,7 +121,7 @@ As the gate layer, a kickback-to-build that changes code must not let a pre-kick
 
 - **Given** a no-op kickback that changes no code under the gate's surface (e.g. only docs/CHANGELOG),
 - **When** the gate is re-evaluated,
-- **Then** the verdict is preserved — a no-op kickback does not force a needless re-run.
+- **Then** the verdict may be preserved only if no ordinary failure or repair obligation remains outstanding; unchanged code cannot erase a pending repair.
 
 ## Story 6 — The within-dispatch attempt-floor is preserved when a gate DOES re-run
 
@@ -119,11 +129,21 @@ As the gate layer, when a gate is re-run, the judge must still write a fresh ver
 
 ### Happy Path
 
-- **Given** a gate that re-runs (surface changed / no stamp / invalidated) and the judge is dispatched,
+- **Given** a gate other than `architecture_review_as_built` that re-runs (surface changed / no stamp /
+  invalidated) and the judge is dispatched,
 - **When** the judge declines to rewrite its verdict file this attempt,
 - **Then** the existing per-attempt freshness floor (`verdictFreshnessComparand` with its FS tolerance)
   still scores it "no fresh verdict" and loops/kicks back exactly as today — the incident-2026-07-12
   guard is intact.
+
+### Negative Path
+
+- **Given** an `architecture_review_as_built` gate that re-runs and whose dispatch produces no validated
+  structured result this attempt, with the kill-switch on or off,
+- **When** completion is evaluated,
+- **Then** the typed verdict stamped with an earlier attempt's identity is scored absent by run identity
+  rather than by a file mtime floor, and the step reruns within its existing retry budget — the
+  incident-2026-07-12 guard is intact for the as-built gate.
 
 ## Story 7 — `sweepStaleReviewArtifacts` does not delete a still-valid verdict
 

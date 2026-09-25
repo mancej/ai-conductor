@@ -1,4 +1,5 @@
 import type { ComplexityTier, EnforcementLevel, StepName, Phase } from './steps.js';
+import type { BUILD_REVIEW_RUBRIC_IDS } from '../engine/build-review-registry.js';
 
 /**
  * Claude's native reasoning effort levels — set per invocation via
@@ -349,6 +350,7 @@ export interface RetryRoutingConfig {
 export interface CoverageBindingConfig {
   judge?: {
     enabled?: boolean;
+    batch_size?: number;
   };
 }
 
@@ -427,9 +429,17 @@ export interface TestSuiteVerificationConfig {
   drift_budget: Record<TestSuiteDriftCategory, TestSuiteDriftBudgetBound>;
 }
 
+/** A command entry in an ordered aggregate test suite sequence. */
+export interface TestSuiteCommandConfig {
+  command: string;
+  working_directory?: string;
+  timeout_seconds?: number;
+}
+
 /** Project-owned aggregate test operation used by full-suite verification. */
 export interface TestSuiteConfig {
   command?: string;
+  commands?: TestSuiteCommandConfig[];
   scoped_command?: string;
   working_directory?: string;
   timeout_seconds?: number;
@@ -438,7 +448,10 @@ export interface TestSuiteConfig {
   verification?: TestSuiteVerificationConfig;
 }
 
-export type AggregateTestSuiteConfig = TestSuiteConfig & { command: string };
+export type AggregateTestSuiteConfig = TestSuiteConfig & (
+  | { command: string }
+  | { commands: TestSuiteCommandConfig[] }
+);
 
 export interface HarnessConfig {
   harness_version?: string;
@@ -553,6 +566,11 @@ export interface HarnessConfig {
    */
   reconcile_parked_auto_cleanup?: boolean;
   /**
+   * Whether reconciliation reclaims merged registered worktrees automatically.
+   * Absent config resolves to `true` during validation.
+   */
+  reclaim_merged_worktrees?: boolean;
+  /**
    * Attribution audit sample percentage (Task 11): integer percentage [0, 100]
    * of audit events to sample. Out-of-range values are clamped with a startup
    * warning. Absent → defaults to 10.
@@ -589,6 +607,22 @@ export interface HarnessConfig {
    * invalid values rather than silently clamping them.
    */
   daemon_concurrency?: number;
+  /**
+   * Maximum V8 old-space heap size, in megabytes, for the continuous daemon.
+   * Absent → the launcher applies the 4096 MB default. Values must be positive
+   * integers of at least 256 MB; validation rejects invalid values.
+   */
+  daemon_heap_limit_mb?: number;
+  /**
+   * RSS threshold, in megabytes, at which the continuous daemon writes its one
+   * heap snapshot under `.daemon/heap/`. Absent → 3072 MB. Positive integer.
+   */
+  daemon_heap_dump_threshold_mb?: number;
+  /**
+   * Maximum heap snapshots kept under `.daemon/heap/`; the oldest is removed
+   * before a new one is written. Absent → 3. Positive integer.
+   */
+  daemon_heap_dump_retention?: number;
   /**
    * Harness self-host guardrails (adr-2026-06-30-self-host-detection-seam):
    * activation override + per-gate toggles. Absent → auto-detect, all gates on
@@ -681,11 +715,13 @@ export interface MergeableAutoresolveConfig {
 }
 
 /** The closed set of independently-executed build-review rubric branches. */
-export type BuildReviewRubricId = 'testQuality';
+export type BuildReviewRubricId = (typeof BUILD_REVIEW_RUBRIC_IDS)[number];
 
 /** Optional execution overrides for one build-review rubric branch. */
 export interface BuildReviewRubricConfig {
   enabled?: boolean;
+  /** Maximum UTF-8 bytes in this rubric's canonical projection. */
+  max_projection_bytes?: number;
   llm_provider?: ProviderSelection;
   model?: string;
   effort?: EffortLevel;
@@ -695,10 +731,25 @@ export interface BuildReviewRubricConfig {
   min_confidence?: number;
 }
 
+/** A project-declared build-review rubric, identified by its map key. */
+export interface BuildReviewCustomRubricConfig extends BuildReviewRubricConfig {
+  /** Skill invoked to judge this rubric. */
+  skill: string;
+  /** Question supplied to the custom rubric skill. */
+  question: string;
+  /** Optional primary source supplied to the custom rubric skill. */
+  source?: string;
+  /** Optional supplementary resources supplied to the custom rubric skill. */
+  resources?: string[];
+}
+
 /** Per-rubric settings keyed by the closed {@link BuildReviewRubricId} set. */
 export type BuildReviewRubricsConfig = Partial<
   Record<BuildReviewRubricId, BuildReviewRubricConfig>
 >;
+
+/** Project-defined rubric declarations keyed by their stable rubric IDs. */
+export type BuildReviewCustomRubricsConfig = Record<string, BuildReviewCustomRubricConfig>;
 
 /** Default-on compatibility switch for post-join remediation adjudication. */
 export interface BuildReviewAdjudicationConfig {
@@ -708,8 +759,8 @@ export interface BuildReviewAdjudicationConfig {
 
 /**
  * Configuration for the default-on `build_review` judgement gate. Legacy
- * fields retain their tolerant per-key parsing; the rubric execution subtree
- * is a closed policy map.
+ * fields retain their tolerant per-key parsing; built-in rubric execution
+ * remains a closed policy map while projects may add custom rubric declarations.
  */
 export interface BuildReviewConfig {
   /** Enable the build_review gate. Default: true. */
@@ -725,6 +776,8 @@ export interface BuildReviewConfig {
   adjudication?: BuildReviewAdjudicationConfig;
   /** Closed per-rubric enablement and execution-policy overrides. */
   rubrics?: BuildReviewRubricsConfig;
+  /** Project-defined rubric declarations. */
+  custom_rubrics?: BuildReviewCustomRubricsConfig;
 }
 
 /**

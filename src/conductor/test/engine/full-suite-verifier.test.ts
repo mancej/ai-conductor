@@ -12,12 +12,13 @@ import {
   writeFullSuiteEvidence,
   type FullSuitePassEvidence,
 } from '../../src/engine/full-suite-evidence.js';
-import type { FullSuiteExecutionResult } from '../../src/engine/full-suite-executor.js';
+import { executeFullSuite, type FullSuiteExecutionResult } from '../../src/engine/full-suite-executor.js';
 import {
   FullSuiteVerifier,
   probeProcessStartIdentity,
   inspectFullSuiteRecoveryClaim,
   deriveFullSuiteScopedSelection,
+  parseLinuxProcessStartToken,
 } from '../../src/engine/full-suite-verifier.js';
 
 const scratches: string[] = [];
@@ -63,8 +64,9 @@ describe('process start identity portability', () => {
     await expect(probeProcessStartIdentity(123, procRoot))
       .resolves.toEqual({ status: 'MISSING' });
     await mkdir(join(procRoot, '123'));
+    await writeFile(join(procRoot, '123', 'stat'), `123 (worker) S ${Array(18).fill('0').join(' ')} 987654 0\n`);
     await expect(probeProcessStartIdentity(123, procRoot))
-      .resolves.toMatchObject({ status: 'FOUND' });
+      .resolves.toMatchObject({ status: 'FOUND', identity: { token: '987654' } });
   });
 });
 function attestedPassEvidence(projectRoot: string): FullSuitePassEvidence {
@@ -153,6 +155,18 @@ afterEach(async () => {
 });
 
 describe('FullSuiteVerifier', () => {
+  it('uses Linux stat start-time field rather than mutable proc-directory metadata for lock identity', () => {
+    const prefix = '123 (worker name) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18';
+
+    expect({
+      parsed: parseLinuxProcessStartToken(`${prefix} 987654 20 21`),
+      malformed: parseLinuxProcessStartToken('123 worker R 1 2 3'),
+    }).toEqual({
+      parsed: '987654',
+      malformed: null,
+    });
+  });
+
   it('classifies existing recovery claims by liveness and bounded age', async () => {
     const projectRoot = await makeConfiguredProject('full-suite-recovery-claim-classification-');
     const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
@@ -3437,6 +3451,67 @@ describe('FullSuiteVerifier', () => {
     });
   }, 20_000);
 
+  it('re-resolves stale supplied inspections after lock contention before deciding to execute', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'full-suite-verifier-inspected-processes-'));
+    scratches.push(projectRoot);
+    await writeProjectFile(projectRoot, '.gitignore', '.pipeline/\n');
+    await writeProjectFile(
+      projectRoot,
+      '.ai-conductor/config.yml',
+      'test_suite:\n  command: node suite.mjs\n  timeout_seconds: 10\n',
+    );
+    await writeProjectFile(projectRoot, 'src/app.ts', 'export const value = 1;\n');
+    await writeProjectFile(
+      projectRoot,
+      'suite.mjs',
+      [
+        "import { mkdir, writeFile } from 'node:fs/promises';",
+        "import { setTimeout as delay } from 'node:timers/promises';",
+        "await mkdir('.pipeline/launches', { recursive: true });",
+        "await writeFile(`.pipeline/launches/${process.pid}`, 'launched');",
+        'await delay(250);',
+        "console.log('all suites passed');",
+        '',
+      ].join('\n'),
+    );
+    await execa('git', ['init', '-q', '-b', 'main'], { cwd: projectRoot });
+    await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: projectRoot });
+    await execa('git', ['config', 'user.name', 'Test'], { cwd: projectRoot });
+    await execa('git', ['add', '.'], { cwd: projectRoot });
+    await execa('git', ['commit', '-q', '-m', 'fixture'], { cwd: projectRoot });
+
+    const resultPaths = [
+      join(projectRoot, '.pipeline/inspected-caller-1.json'),
+      join(projectRoot, '.pipeline/inspected-caller-2.json'),
+    ];
+    const invoke = (resultPath: string) => execa(
+      process.execPath,
+      [
+        '--import',
+        TSX_LOADER,
+        CONCURRENT_ENSURE_FIXTURE,
+        projectRoot,
+        resultPath,
+        '--with-inspection',
+      ],
+      { cwd: CONDUCTOR_ROOT },
+    );
+    await Promise.all(resultPaths.map(invoke));
+    const results = await Promise.all(resultPaths.map(async (path) =>
+      JSON.parse(await readFile(path, 'utf8')) as { status: string }));
+    const launches = await readdir(join(projectRoot, '.pipeline/launches'));
+
+    expect({
+      statuses: results.map(({ status }) => status).sort(),
+      launches: launches.length,
+      persisted: await readFullSuiteEvidence(projectRoot),
+    }).toMatchObject({
+      statuses: ['EXECUTED', 'REUSED'],
+      launches: 1,
+      persisted: { usable: true, evidence: { outcome: 'PASS' } },
+    });
+  }, 20_000);
+
   it('never displaces a replacement canonical lock during stale recovery', async () => {
     const projectRoot = await makeConfiguredProject('full-suite-lock-replacement-');
     const lockPath = join(projectRoot, '.pipeline/test-suite.lock');
@@ -3739,9 +3814,20 @@ describe('FullSuiteVerifier', () => {
     }));
     await writeFile(claimPath, existingClaim, 'utf8');
     let executions = 0;
+    let inspections = 0;
 
     const result = await new FullSuiteVerifier({
       projectRoot,
+      fingerprint: async () => {
+        inspections += 1;
+        return {
+          ok: false as const,
+          reason: {
+            code: 'git_enumeration_failed',
+            message: 'lock-classification failure must not inspect the suite',
+          },
+        };
+      },
       execute: async () => {
         executions += 1;
         throw new Error('must not execute after a recovery-claim probe failure');
@@ -3759,6 +3845,7 @@ describe('FullSuiteVerifier', () => {
     expect({
       result,
       executions,
+      inspections,
       claim: await readFile(claimPath, 'utf8'),
     }).toEqual({
       result: {
@@ -3767,6 +3854,7 @@ describe('FullSuiteVerifier', () => {
         message: 'Unable to verify full-suite recovery claim liveness: liveness denied',
       },
       executions: 0,
+      inspections: 0,
       claim: existingClaim,
     });
   });
@@ -4080,6 +4168,44 @@ describe('FullSuiteVerifier', () => {
     expect({ result: result.status, executions }).toEqual({
       result: 'EXECUTED',
       executions: 1,
+    });
+  });
+
+  it('writes v5 zero-attempt evidence and names a later missing entry directory before any launch', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'full-suite-list-preflight-'));
+    scratches.push(projectRoot);
+    await mkdir(join(projectRoot, '.ai-conductor'), { recursive: true });
+    await mkdir(join(projectRoot, 'packages/first'), { recursive: true });
+    await writeFile(join(projectRoot, '.ai-conductor/config.yml'), [
+      'test_suite:',
+      '  commands:',
+      '    - command: npm run first',
+      '      working_directory: packages/first',
+      '    - command: npm run later',
+      '      working_directory: packages/missing',
+      '',
+    ].join('\n'));
+    let launches = 0;
+    const result = await new FullSuiteVerifier({
+      projectRoot,
+      fingerprint: async () => ({ ok: true, fingerprint: {
+        digest: 'list-preflight', headSha: 'head', categoryFingerprints: CATEGORY_FINGERPRINTS,
+      } }),
+      execute: async (options) => executeFullSuite({
+        ...options,
+        runner: async () => {
+          launches += 1;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      }),
+    }).ensure();
+    expect({ result, launches }).toMatchObject({
+      result: {
+        status: 'FAILED', reason: 'preflight_failed',
+        message: expect.stringContaining('test_suite.commands[1].working_directory'),
+        evidence: { version: 5, plannedEntryCount: 2, failedEntryIndex: null, entries: [] },
+      },
+      launches: 0,
     });
   });
 });

@@ -1,9 +1,9 @@
-// Covers: task:1, task:2, task:3
+// Covers: task:1, task:2, task:3, task:5, task:16
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { renderReport, ReportError, parseEvents, aggregateHalts, aggregateKickbacks, summarizeKickbacks } from '../../src/engine/report-renderer.js';
+import { renderReport, ReportError, parseEvents, aggregateDurations, aggregateHalts, aggregateKickbacks, aggregateRetryHotspots, summarizeKickbacks } from '../../src/engine/report-renderer.js';
 import { computeTimingRollup } from '../../src/engine/timing-rollup.js';
 import { computeCostRollup } from '../../src/engine/cost-rollup.js';
 import { EventPersister } from '../../src/engine/event-persister.js';
@@ -66,6 +66,38 @@ describe('report-renderer', () => {
   it('renders absent build-review data safely', async () => {
     await writeFile(eventsPath, '', 'utf8');
     expect(renderReport(eventsPath)).toContain('## Build Review Metrics\nNo build-review metrics recorded');
+  });
+
+  it('merges compose-owned land-gate rejections by timestamp and renders their per-gate counts and latest reasons', async () => {
+    await writeFile(eventsPath, makeLines([
+      { event: { type: 'step_started', step: 'build' }, ts: '2026-01-01T00:00:02.000Z' },
+      { event: { type: 'land_gate_rejected', gate: 'stories-not-approved', reason: 'latest stories reason' }, ts: '2026-01-01T00:00:04.000Z' },
+    ]), 'utf8');
+    await writeFile(join(tempDir, 'composer-events.jsonl'), makeLines([
+      { event: { type: 'land_gate_rejected', gate: 'coherence', reason: 'coherence reason' }, ts: '2026-01-01T00:00:01.000Z' },
+      { event: { type: 'land_gate_rejected', gate: 'stories-not-approved', reason: 'older stories reason' }, ts: '2026-01-01T00:00:03.000Z' },
+    ]), 'utf8');
+
+    const report = renderReport(eventsPath);
+
+    expect(report).toMatch(/## Land-Gate Rejections[\s\S]*coherence\s+1\s+coherence reason[\s\S]*stories-not-approved\s+2\s+latest stories reason/);
+    expect(report.indexOf('coherence')).toBeLessThan(report.indexOf('stories-not-approved'));
+  });
+
+  it('leaves existing report sections unchanged when the sibling ledger is missing, empty, or partially malformed', async () => {
+    const primary = makeLines([
+      { event: { type: 'step_completed', step: 'build' }, ts: '2026-01-01T00:00:00.000Z' },
+    ]);
+    await writeFile(eventsPath, primary, 'utf8');
+    const withoutSibling = renderReport(eventsPath);
+
+    await writeFile(join(tempDir, 'composer-events.jsonl'), 'not json\n', 'utf8');
+    expect(renderReport(eventsPath)).toBe(withoutSibling);
+
+    await writeFile(join(tempDir, 'composer-events.jsonl'), `not json\n${makeLines([
+      { event: { type: 'land_gate_rejected', gate: 'coherence', reason: 'recorded' }, ts: '2026-01-01T00:00:01.000Z' },
+    ])}`, 'utf8');
+    expect(renderReport(eventsPath)).toContain('coherence');
   });
 
   it('renders an explicit empty Kickbacks state for an empty ledger', async () => {
@@ -316,6 +348,63 @@ describe('report-renderer', () => {
     expect(report).toContain('5000'); // ms
     expect(report).toContain('stories');
     expect(report).toContain('2500');
+  });
+
+  it('renders a configured member duration from its persisted active interval', async () => {
+    const executionContext = {
+      executionId: 'manual-test-execution',
+      subject: { kind: 'configured-member', parentGroup: 'validation', member: 'manual_test' },
+    };
+    const slowerSiblingContext = {
+      executionId: 'prd-audit-execution',
+      subject: { kind: 'configured-member', parentGroup: 'validation', member: 'prd_audit' },
+    };
+    await writeFile(eventsPath, makeLines([
+      { event: { type: 'step_started', step: 'validation', index: 0, executionContext }, ts: '2026-01-01T00:00:00.000Z' },
+      { event: { type: 'step_started', step: 'validation', index: 0, executionContext: slowerSiblingContext }, ts: '2026-01-01T00:00:00.000Z' },
+      { event: { type: 'step_completed', step: 'validation', status: 'done', executionContext: slowerSiblingContext, activeInterval: { durationMs: 4_000 } }, ts: '2026-01-01T00:00:04.000Z' },
+      { event: { type: 'step_completed', step: 'validation', status: 'done', executionContext, activeInterval: { durationMs: 1_000 } }, ts: '2026-01-01T00:00:05.000Z' },
+    ]), 'utf-8');
+
+    const report = renderReport(eventsPath);
+
+    expect(report).toMatch(/configured:validation\/manual_test\s+1000/);
+    expect(report).not.toMatch(/configured:validation\/manual_test\s+5000/);
+  });
+
+  it('keeps legacy context-free duration rendering on timestamp fallback', async () => {
+    await writeFile(eventsPath, makeLines([
+      { event: { type: 'step_started', step: 'bootstrap', index: 0 }, ts: '2026-01-01T00:00:00.000Z' },
+      { event: { type: 'step_completed', step: 'bootstrap', status: 'done' }, ts: '2026-01-01T00:00:05.000Z' },
+    ]), 'utf-8');
+
+    const report = renderReport(eventsPath);
+
+    expect(report).toMatch(/bootstrap\s+5000/);
+  });
+
+  it('keeps configured members of one parent group distinct in duration and retry aggregates', () => {
+    const member = (executionId: string, name: string) => ({
+      executionId,
+      subject: { kind: 'configured-member', parentGroup: 'explore', member: name },
+    });
+    const events = parseEvents(makeLines([
+      { event: { type: 'step_started', step: 'explore', index: 0, executionContext: member('manual-execution', 'manual_test') }, ts: '2026-01-01T00:00:00.000Z' },
+      { event: { type: 'step_started', step: 'explore', index: 0, executionContext: member('audit-execution', 'prd_audit') }, ts: '2026-01-01T00:00:01.000Z' },
+      { event: { type: 'step_retry', step: 'explore', attempt: 2, maxAttempts: 3, reason: 'manual retry', executionContext: member('manual-execution', 'manual_test') }, ts: '2026-01-01T00:00:02.000Z' },
+      { event: { type: 'step_completed', step: 'explore', status: 'done', executionContext: member('manual-execution', 'manual_test') }, ts: '2026-01-01T00:00:03.000Z' },
+      { event: { type: 'step_retry', step: 'explore', attempt: 2, maxAttempts: 3, reason: 'audit retry', executionContext: member('audit-execution', 'prd_audit') }, ts: '2026-01-01T00:00:04.000Z' },
+      { event: { type: 'step_completed', step: 'explore', status: 'done', executionContext: member('audit-execution', 'prd_audit') }, ts: '2026-01-01T00:00:06.000Z' },
+    ]));
+
+    expect(aggregateDurations(events)).toEqual({
+      'configured:explore/manual_test': 3_000,
+      'configured:explore/prd_audit': 5_000,
+    });
+    expect(aggregateRetryHotspots(events)).toEqual([
+      { step: 'configured:explore/manual_test', count: 1, topReason: 'manual retry' },
+      { step: 'configured:explore/prd_audit', count: 1, topReason: 'audit retry' },
+    ]);
   });
 
   // ─── #647 D3: kickback_outcome discriminator surfaced by aggregateKickbacks ──
@@ -613,5 +702,33 @@ describe('report-renderer', () => {
     expect(report).toMatch(/group-feature\s+group\s+ship-validation/);
     expect(report).toMatch(/early-feature\s+pre-first-unit\s+—/);
     expect(report).not.toMatch(/\b(?:DONE|HALT|ERROR)\b/);
+  });
+
+  it('reports serial and group-member attempt operator park boundaries', async () => {
+    const content = makeLines([
+      {
+        event: {
+          type: 'operator_park_boundary',
+          featureSlug: 'serial-attempt-feature',
+          boundary: { kind: 'attempt', step: 'build', attempt: 2 },
+        },
+        ts: '2026-01-01T00:00:01.000Z',
+      },
+      {
+        event: {
+          type: 'operator_park_boundary',
+          featureSlug: 'member-attempt-feature',
+          boundary: { kind: 'attempt', step: 'ship', attempt: 3, member: 'architecture_review_as_built' },
+        },
+        ts: '2026-01-01T00:00:02.000Z',
+      },
+    ]);
+    await writeFile(eventsPath, content, 'utf-8');
+
+    const report = renderReport(eventsPath);
+
+    expect(report).toMatch(/serial-attempt-feature\s+attempt\s+attempt 2 for step build/);
+    expect(report).toMatch(/member-attempt-feature\s+attempt\s+attempt 3 for group step ship member architecture_review_as_built/);
+    expect(report).not.toContain('No operator park boundaries recorded');
   });
 });

@@ -249,6 +249,9 @@ that exact worktree after PR merge, PR close, cancellation, or deadline expiry, 
 retirement before physical removal. A failed removal remains retryable cleanup debt. It never merges
 and never builds. Use `--permit-inconclusive` only after the operator explicitly accepts that the
 immediate read-only handoff probe cannot prove push authorization.
+The primitive owns its guarded remote publication and GitHub operations. Do not pre-push or invoke
+raw GitHub/Git write commands from either supported host; a refusal or failure keeps the worktree
+for inspection and is not a delivered spec.
 
 ### 6. Deliver, then end the session
 
@@ -291,12 +294,11 @@ Report `✅ Spec delivered for <slug> → <PR url / branch>.` Do not ask for ano
 - [ ] Spec is discovery-build-ready: stories end `Status: Accepted` (no DRAFT) and the plan
       carries a task dependency tree (`**Dependencies:**` lines or a Task Dependency Graph) —
       discovery warn-skips merged specs missing either, permanently until fixed on main
-- [ ] Spec branch pushed to origin BEFORE `handoff` (`git push -u origin spec/<slug>` from the
-      worktree — `gh pr create` fails on an unpushed branch and handoff falls back to a
-      local-commit result that opens no PR)
 - [ ] Spec PR opened to the target repo; nothing built, nothing merged
 - [ ] On success the per-idea worktree was retained for review with its exact commit and deadline; on
       failure it was kept for inspection; a recoverable land refusal was repaired in the same run and
       worktree
 - [ ] `ensureRunning` nudged the target daemon fire-and-forget (no lifecycle ownership)
 - [ ] Sibling repos left byte-for-byte unchanged
+- [ ] `handoff` reported its guarded publication outcome; no host issued a raw remote Git or
+      GitHub write before it.

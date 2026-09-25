@@ -1,3 +1,4 @@
+// Covers: task:1, task:2, task:3, task:4, task:5
 import { describe, expect, it, vi } from 'vitest';
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,6 +8,8 @@ import {
   proveByMergedPrHead,
   reconcileMergedPark,
   reconcileParkedFeatures,
+  requiresShippedRecord,
+  STALE_PHASE_MARKER_MS,
 } from '../../src/engine/park-reconciliation.js';
 import type { GhRunner, GitRunner } from '../../src/engine/pr-labels.js';
 import { GhCapabilityError } from '../../src/engine/tracker-client.js';
@@ -18,6 +21,18 @@ import {
   writeOperatorPark,
 } from '../../src/engine/park-marker.js';
 import { TEARDOWN_SCRIPT } from '../../src/engine/worktree-prepare.js';
+import * as daemonParkCli from '../../src/engine/daemon-park-cli.js';
+
+// Reconciliation normally constructs its GitHub runner at the production
+// boundary. Keep these unit tests isolated while making an unspecified merged
+// PR corroborate the fixture's default branch tip.
+vi.mock('../../src/engine/pr-labels.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/engine/pr-labels.js')>();
+  return {
+    ...actual,
+    makeProductionGh: () => async () => ({ stdout: '[{"headRefOid":"deadbeef"}]' }),
+  };
+});
 
 /**
  * A faithful in-memory stand-in for the four git reads the reconciler makes,
@@ -38,6 +53,8 @@ interface GitWorld {
   merged?: readonly string[];
   /** Merged PR heads that are ancestors of a branch despite the branch being outside origin/main. */
   mergedPrHeads?: readonly string[];
+  /** Branches whose tip is an ancestor of their merged PR head (strictly behind it). */
+  branchesBehindHead?: readonly string[];
   /** Current tip SHA per branch, for `git rev-parse <branch>`. */
   tips?: Readonly<Record<string, string>>;
   /** Lines emitted by `git log --oneline --no-decorate <head>..<ref>`. */
@@ -54,6 +71,12 @@ interface GitWorld {
   registeredWorktrees?: readonly string[];
   /** `git worktree list --porcelain` itself fails. */
   worktreeListUnavailable?: boolean;
+  /** Output of `git status --porcelain` for the candidate worktree. */
+  statusPorcelain?: string;
+  /** Per-worktree porcelain output for one mixed sweep. */
+  statusPorcelainByCwd?: Readonly<Record<string, string>>;
+  /** `git status --porcelain` fails before it can report the worktree state. */
+  statusPorcelainFails?: boolean;
   /** Assertion seam for ordering a real project teardown before git removal. */
   onWorktreeRemove?: () => void | Promise<void>;
 }
@@ -75,7 +98,7 @@ function makeGit(world: GitWorld = {}): {
   const deleteArgv: string[][] = [];
   const events: string[] = [];
 
-  const run = vi.fn<GitRunner>(async (args) => {
+  const run = vi.fn<GitRunner>(async (args, options) => {
     const [verb] = args;
     if (verb === 'ls-tree') {
       if (shipped === 'no-tree' || shipped === 'unavailable') {
@@ -85,7 +108,7 @@ function makeGit(world: GitWorld = {}): {
     }
     if (verb === 'rev-parse') {
       if (args[1] !== '--verify') {
-        const tip = world.tips?.[args[1]];
+        const tip = world.tips === undefined ? 'deadbeef' : world.tips[args[1]];
         if (tip === undefined) throw gitFailure(128, `fatal: bad revision ${args[1]}`);
         return { stdout: `${tip}\n` };
       }
@@ -111,8 +134,13 @@ function makeGit(world: GitWorld = {}): {
         throw gitFailure(128, `fatal: Not a valid object name ${ref}`);
       }
       if (args[3] !== undefined && world.mergedPrHeads?.includes(ref)) return { stdout: '' };
+      if (args[3] !== 'origin/main' && world.branchesBehindHead?.includes(ref)) return { stdout: '' };
       if (merged.includes(ref)) return { stdout: '' };
       throw gitFailure(1, 'not an ancestor');
+    }
+    if (verb === 'status') {
+      if (world.statusPorcelainFails) throw gitFailure(128, 'fatal: unable to read worktree status');
+      return { stdout: world.statusPorcelainByCwd?.[options.cwd] ?? world.statusPorcelain ?? '' };
     }
     if (verb === 'branch') {
       events.push('branch-deleted');
@@ -131,7 +159,11 @@ function makeGit(world: GitWorld = {}): {
         if (world.worktreeListUnavailable) throw gitFailure(128, 'fatal: not a git repository');
         return {
           stdout: (world.registeredWorktrees ?? [])
-            .map((path) => `worktree ${path}\nHEAD deadbeef\n`)
+            .map((path) => {
+              const slug = path.split('/').at(-1);
+              const branch = branches.find((ref) => ref.endsWith(`/${slug}`));
+              return `worktree ${path}\nHEAD deadbeef\n${branch ? `branch refs/heads/${branch}\n` : ''}`;
+            })
             .join('\n'),
         };
       }
@@ -152,49 +184,100 @@ describe('engine/park-reconciliation — proveByMergedPrHead', () => {
   const mergedHead = '1111111111111111111111111111111111111111';
   const branchTip = '2222222222222222222222222222222222222222';
 
-  function probeGit(mergeBaseExit?: 1, catFileFails = false): ReturnType<typeof vi.fn<GitRunner>> {
+  interface Probe {
+    /** `merge-base --is-ancestor <merged head> <branch>` exit code. */
+    headInBranch?: 0 | 1 | 128;
+    /** `merge-base --is-ancestor <branch> <merged head>` exit code. */
+    branchInHead?: 0 | 1 | 128;
+    catFileFails?: boolean;
+  }
+
+  function probeGit(probe: Probe = {}): ReturnType<typeof vi.fn<GitRunner>> {
     return vi.fn<GitRunner>(async (args) => {
       if (args[0] === 'rev-parse') return { stdout: `${branchTip}\n` };
       if (args[0] === 'cat-file') {
-        if (catFileFails) throw gitFailure(128, 'fatal: Not a valid object name');
+        if (probe.catFileFails) throw gitFailure(128, 'fatal: Not a valid object name');
         return { stdout: '' };
       }
       if (args[0] === 'merge-base') {
-        if (mergeBaseExit === 1) throw gitFailure(1, 'not an ancestor');
+        const exit = args[2] === mergedHead ? probe.headInBranch ?? 0 : probe.branchInHead ?? 1;
+        if (exit !== 0) throw gitFailure(exit, 'not an ancestor');
         return { stdout: '' };
       }
       throw new Error(`unexpected git invocation: ${args.join(' ')}`);
     });
   }
 
+  const listHead = ['pr', 'list', '--head', ref, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'];
+  const listCommits = ['pr', 'list', '--head', ref, '--state', 'merged', '--json', 'commits', '--limit', '1'];
+  const revParse = ['rev-parse', ref];
+  const catFile = ['cat-file', '-e', `${mergedHead}^{commit}`];
+  const headInBranch = ['merge-base', '--is-ancestor', mergedHead, ref];
+  const branchInHead = ['merge-base', '--is-ancestor', ref, mergedHead];
+  const mergedPr = `[{"headRefOid":"${mergedHead}"}]`;
+
   it.each([
-    { name: 'reports no-pr when no merged PR is found', pr: '[]', git: probeGit(), expected: { kind: 'no-pr' } },
+    { name: 'reports no-pr when no merged PR is found', gh: ['[]'], probe: {}, expected: { kind: 'no-pr' }, gitCalls: [], ghCalls: [listHead] },
     {
       name: 'proves a branch whose tip exactly matches the merged PR head',
-      pr: `[{"headRefOid":"${branchTip}"}]`,
-      git: probeGit(),
+      gh: [`[{"headRefOid":"${branchTip}"}]`],
+      probe: {},
       expected: { kind: 'proven' },
+      gitCalls: [revParse],
+      ghCalls: [listHead],
     },
     {
-      name: 'reports ahead after the merged PR head is guarded and is an ancestor of the branch',
-      pr: `[{"headRefOid":"${mergedHead}"}]`,
-      git: probeGit(),
+      name: 'reports ahead when the merged PR head is an ancestor of the branch',
+      gh: [mergedPr],
+      probe: { headInBranch: 0 },
       expected: { kind: 'ahead', headRefOid: mergedHead },
+      gitCalls: [revParse, catFile, headInBranch],
+      ghCalls: [listHead],
     },
     {
-      name: 'reports behind after the merged PR head is guarded but is not an ancestor of the branch',
-      pr: `[{"headRefOid":"${mergedHead}"}]`,
-      git: probeGit(1),
+      name: 'reports behind when the branch tip is an ancestor of the merged PR head',
+      gh: [mergedPr],
+      probe: { headInBranch: 1, branchInHead: 0 },
       expected: { kind: 'behind', headRefOid: mergedHead },
+      gitCalls: [revParse, catFile, headInBranch, branchInHead],
+      ghCalls: [listHead],
     },
     {
-      name: 'reports indeterminate when the mismatched merged PR head cannot be resolved locally',
-      pr: `[{"headRefOid":"${mergedHead}"}]`,
-      git: probeGit(undefined, true),
-      expected: { kind: 'indeterminate' },
+      name: 'reports diverged, never behind, when neither contains the other',
+      gh: [mergedPr],
+      probe: { headInBranch: 1, branchInHead: 1 },
+      expected: { kind: 'diverged', headRefOid: mergedHead },
+      gitCalls: [revParse, catFile, headInBranch, branchInHead],
+      ghCalls: [listHead],
     },
-  ])('$name', async ({ pr, git, expected }) => {
-    const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: pr });
+    {
+      name: 'reports indeterminate when the reverse ancestry probe cannot answer',
+      gh: [mergedPr],
+      probe: { headInBranch: 1, branchInHead: 128 },
+      expected: { kind: 'indeterminate' },
+      gitCalls: [revParse, catFile, headInBranch, branchInHead],
+      ghCalls: [listHead],
+    },
+    {
+      name: 'reports behind from the merged PR commit list when the merged head is absent locally',
+      gh: [mergedPr, `[{"commits":[{"oid":"${branchTip}"},{"oid":"${mergedHead}"}]}]`],
+      probe: { catFileFails: true },
+      expected: { kind: 'behind', headRefOid: mergedHead },
+      gitCalls: [revParse, catFile],
+      ghCalls: [listHead, listCommits],
+    },
+    {
+      name: 'reports indeterminate when the absent merged head does not list the branch tip',
+      gh: [mergedPr, `[{"commits":[{"oid":"${mergedHead}"}]}]`],
+      probe: { catFileFails: true },
+      expected: { kind: 'indeterminate' },
+      gitCalls: [revParse, catFile],
+      ghCalls: [listHead, listCommits],
+    },
+  ])('$name', async ({ gh, probe, expected, gitCalls, ghCalls }) => {
+    const git = probeGit(probe as Probe);
+    const runGh = vi.fn<GhRunner>();
+    for (const stdout of gh) runGh.mockResolvedValueOnce({ stdout });
 
     const diagnosis = await proveByMergedPrHead(git, runGh, projectRoot, ref);
 
@@ -204,32 +287,23 @@ describe('engine/park-reconciliation — proveByMergedPrHead', () => {
       ghCalls: runGh.mock.calls,
     }).toEqual({
       diagnosis: expected,
-      gitCalls:
-        expected.kind === 'no-pr'
-          ? []
-          : expected.kind === 'proven'
-            ? [['rev-parse', ref]]
-          : expected.kind === 'indeterminate'
-            ? [
-                ['rev-parse', ref],
-                ['cat-file', '-e', `${mergedHead}^{commit}`],
-              ]
-            : [
-                ['rev-parse', ref],
-                ['cat-file', '-e', `${mergedHead}^{commit}`],
-                ['merge-base', '--is-ancestor', mergedHead, ref],
-              ],
-      ghCalls: [
-        [
-          ['pr', 'list', '--head', ref, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'],
-          { cwd: projectRoot },
-        ],
-      ],
+      gitCalls,
+      ghCalls: ghCalls.map((args) => [args, { cwd: projectRoot }]),
     });
   });
 });
 
 describe('engine/park-reconciliation — reconcileMergedPark', () => {
+  it.each([
+    { branch: undefined, expected: true },
+    { branch: 'feat/daemon-example', expected: true },
+    { branch: 'feat/example', expected: false },
+    { branch: 'hotfix/example', expected: false },
+    { branch: 'spec/example', expected: false },
+  ])('requires a shipped record for branch %j only when dispatch depends on it', ({ branch, expected }) => {
+    expect(requiresShippedRecord(branch)).toBe(expected);
+  });
+
   it.each(['*', 'a/b', 'a,b', ''])(
     'refuses invalid single-slug input %j before invoking git',
     async (slug) => {
@@ -247,6 +321,390 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       });
     },
   );
+
+  it.each([
+    { name: 'a modified tracked path', porcelain: ' M tracked.ts\n', file: 'tracked.ts', dirty: true },
+    { name: 'an untracked path', porcelain: '?? untracked.txt\n', file: 'untracked.txt', dirty: true },
+    { name: 'an empty porcelain result for a worktree clean apart from ignored output', porcelain: '', file: 'ignored.log', dirty: false },
+  ])('checks porcelain before reclaiming $name', async ({ porcelain, file, dirty }) => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'porcelain-guard';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run, deleted } = makeGit({
+      branches: [branch],
+      merged: [branch],
+      statusPorcelain: porcelain,
+    });
+    try {
+      await mkdir(worktree, { recursive: true });
+      await writeFile(join(worktree, file), 'retained content\n');
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run });
+      const destructiveCalls = run.mock.calls
+        .map(([args]) => args)
+        .filter((args) => (args[0] === 'worktree' && args[1] === 'remove') || (args[0] === 'branch' && (args[1] === '-d' || args[1] === '-D')));
+
+      expect({
+        outcome,
+        statusCalls: run.mock.calls.filter(([args]) => args[0] === 'status'),
+        destructiveCalls,
+        worktreeRemains: await access(worktree).then(() => true, () => false),
+        fileRemains: await readFile(join(worktree, file), 'utf-8').then(() => true, () => false),
+        branchRemains: !deleted.includes(branch),
+      }).toEqual({
+        outcome: dirty
+          ? { slug, steps: [], refusal: 'dirty-worktree' }
+          : { slug, steps: ['worktree-removed', 'branch-deleted'] },
+        // Clean trees are probed twice: before teardown and again immediately
+        // before removal (D10), since teardown runs inside the worktree.
+        statusCalls: Array.from({ length: dirty ? 1 : 2 }, () => [['status', '--porcelain'], { cwd: worktree }]),
+        destructiveCalls: dirty ? [] : [['worktree', 'remove', worktree], ['branch', '-d', branch]],
+        worktreeRemains: true,
+        fileRemains: true,
+        branchRemains: dirty,
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when the porcelain probe rejects', async () => {
+    const projectRoot = await mkdtemp(join(process.env.AI_CONDUCTOR_TEST_TMP_ROOT ?? tmpdir(), 'park-reconciliation-'));
+    const slug = 'failed-porcelain-probe';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run } = makeGit({ branches: [branch], merged: [branch], statusPorcelainFails: true });
+    try {
+      await mkdir(worktree, { recursive: true });
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run });
+      const destructiveCalls = run.mock.calls
+        .map(([args]) => args)
+        .filter((args) => (args[0] === 'worktree' && args[1] === 'remove') || (args[0] === 'branch' && (args[1] === '-d' || args[1] === '-D')));
+
+      expect({ outcome, destructiveCalls }).toEqual({
+        outcome: { slug, steps: [], refusal: 'dirty-worktree' },
+        destructiveCalls: [],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a staged-only porcelain entry before any removal', async () => {
+    const projectRoot = await mkdtemp(join(process.env.AI_CONDUCTOR_TEST_TMP_ROOT ?? tmpdir(), 'park-reconciliation-'));
+    const slug = 'staged-porcelain';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run } = makeGit({ branches: [branch], merged: [branch], statusPorcelain: 'M  staged.ts\n' });
+    try {
+      await mkdir(worktree, { recursive: true });
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run });
+      const destructiveCalls = run.mock.calls
+        .map(([args]) => args)
+        .filter((args) => (args[0] === 'worktree' && args[1] === 'remove') || (args[0] === 'branch' && (args[1] === '-d' || args[1] === '-D')));
+
+      expect({ outcome, destructiveCalls }).toEqual({
+        outcome: { slug, steps: [], refusal: 'dirty-worktree' },
+        destructiveCalls: [],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('re-probes porcelain after project teardown and refuses when teardown dirtied the worktree', async () => {
+    const projectRoot = await mkdtemp(join(process.env.AI_CONDUCTOR_TEST_TMP_ROOT ?? tmpdir(), 'park-reconciliation-'));
+    const slug = 'teardown-dirties';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const written = join(worktree, 'teardown-output.txt');
+    const base = makeGit({ branches: [branch], merged: [branch] });
+    // Porcelain reflects the real tree: clean until teardown writes its file.
+    const run = vi.fn<GitRunner>(async (args, options) => {
+      if (args[0] === 'status') {
+        return { stdout: (await access(written).then(() => true, () => false)) ? '?? teardown-output.txt\n' : '' };
+      }
+      return base.run(args, options);
+    });
+    try {
+      const teardown = join(worktree, TEARDOWN_SCRIPT);
+      await mkdir(join(worktree, 'bin'), { recursive: true });
+      await writeFile(join(worktree, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
+      await writeFile(teardown, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(written)}, 'teardown\\n');\n`);
+      await chmod(teardown, 0o755);
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run });
+      const gitCalls = run.mock.calls.map(([args]) => args);
+
+      expect({
+        outcome,
+        statusCalls: gitCalls.filter((args) => args[0] === 'status').length,
+        destructiveCalls: gitCalls.filter((args) => (args[0] === 'worktree' && args[1] === 'remove') || args[0] === 'branch'),
+        teardownFileRemains: await access(written).then(() => true, () => false),
+        branchRemains: !base.deleted.includes(branch),
+      }).toEqual({
+        outcome: { slug, steps: [], refusal: 'dirty-worktree' },
+        statusCalls: 2,
+        destructiveCalls: [],
+        teardownFileRemains: true,
+        branchRemains: true,
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: 'an ancestry-proven reclaim', world: { merged: ['hotfix/no-force'], tips: { 'hotfix/no-force': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } }, removeFails: false },
+    { name: 'a squash-merged branch git refuses to safe-delete', world: { tips: { 'hotfix/no-force': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } }, removeFails: false },
+    { name: 'a registered worktree whose safe removal fails', world: { merged: ['hotfix/no-force'], tips: { 'hotfix/no-force': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } }, removeFails: true },
+  ])('never passes a force flag or update-ref to git for $name', async ({ world, removeFails }) => {
+    const projectRoot = await mkdtemp(join(process.env.AI_CONDUCTOR_TEST_TMP_ROOT ?? tmpdir(), 'park-reconciliation-'));
+    const slug = 'no-force';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run } = makeGit({
+      branches: [branch],
+      registeredWorktrees: [worktree],
+      ...(removeFails ? { worktreeRemoveFails: 'fatal: contains modified or untracked files, use --force to delete it' } : {}),
+      ...world,
+    });
+    const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: '[{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]' });
+    try {
+      await mkdir(worktree, { recursive: true });
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run, runGh });
+      const gitCalls = run.mock.calls.map(([args]) => args);
+
+      expect({
+        forceArgv: gitCalls.filter((args) =>
+          args[0] === 'update-ref' || args.some((arg) => arg === '--force' || arg === '-f' || arg === '-D')),
+        removeCalls: gitCalls.filter((args) => args[0] === 'worktree' && args[1] === 'remove'),
+        branchCalls: gitCalls.filter((args) => args[0] === 'branch'),
+        refusal: outcome.refusal,
+      }).toEqual({
+        forceArgv: [],
+        removeCalls: [['worktree', 'remove', worktree]],
+        branchCalls: removeFails ? [] : [['branch', '-d', branch]],
+        refusal: removeFails ? 'worktree-remove-failed' : 'merged' in world ? undefined : 'branch-delete-failed',
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('skips porcelain when a merge-proven parked slug has no worktree on disk', async () => {
+    const projectRoot = await mkdtemp(join(process.env.AI_CONDUCTOR_TEST_TMP_ROOT ?? tmpdir(), 'park-reconciliation-'));
+    const slug = 'absent-worktree';
+    const branch = `hotfix/${slug}`;
+    const { run } = makeGit({ branches: [branch], merged: [branch] });
+    try {
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run });
+
+      expect({
+        outcome,
+        statusCalls: run.mock.calls.filter(([args]) => args[0] === 'status'),
+      }).toEqual({
+        outcome: { slug, steps: ['worktree-removed', 'branch-deleted'] },
+        statusCalls: [],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: 'refuses ancestry without a shipped record or a matching merged PR head',
+      prefix: 'hotfix/',
+      shipped: [],
+      gh: '[]',
+      expected: { steps: [], refusal: 'no-merge-proof' },
+      listingReads: 0,
+    },
+    {
+      name: 'reclaims ancestry corroborated by a matching merged PR head',
+      prefix: 'hotfix/',
+      shipped: [],
+      gh: '[{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]',
+      expected: { steps: ['worktree-removed', 'branch-deleted'], proof: 'merged-pr-head' },
+      listingReads: 0,
+    },
+    {
+      name: 'reclaims daemon-branch ancestry corroborated by a shipped record without a merged PR',
+      prefix: 'feat/daemon-',
+      shipped: ['ancestry-corroboration'],
+      gh: '[]',
+      expected: { steps: ['worktree-removed', 'branch-deleted'], proof: 'ancestry' },
+      listingReads: 1,
+    },
+    {
+      name: 'refuses non-daemon ancestry with a shipped record but no merged PR, never reading the listing',
+      prefix: 'hotfix/',
+      shipped: ['ancestry-corroboration'],
+      gh: '[]',
+      expected: { steps: [], refusal: 'no-merge-proof' },
+      listingReads: 0,
+    },
+  ] as const)('$name', async ({ prefix, shipped, gh, expected, listingReads }) => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'ancestry-corroboration';
+    const branch = `${prefix}${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run } = makeGit({
+      shipped,
+      branches: [branch],
+      merged: [branch],
+      tips: { [branch]: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+    });
+    const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: gh });
+    try {
+      await mkdir(worktree, { recursive: true });
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run, runGh, emitProof: true });
+      const gitCalls = run.mock.calls.map(([args]) => args);
+      const destructiveCalls = gitCalls
+        .filter((args) => (args[0] === 'worktree' && args[1] === 'remove') || (args[0] === 'branch' && (args[1] === '-d' || args[1] === '-D')));
+      const shippedListingReads = gitCalls
+        .filter((args) => args[0] === 'ls-tree' && args.includes('origin/main:.docs/shipped')).length;
+
+      expect({ outcome, destructiveCalls, shippedListingReads }).toEqual({
+        outcome: { slug, ...expected },
+        destructiveCalls: 'refusal' in expected
+          ? []
+          : [['worktree', 'remove', worktree], ['branch', '-d', branch]],
+        shippedListingReads: listingReads,
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: 'the merged PR lookup is unavailable', gh: () => Promise.reject(new Error('gh unavailable')), refusal: 'no-merge-proof' },
+    { name: 'the merged PR head differs from the ancestry-proven tip', gh: async () => ({ stdout: '[{"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]' }), refusal: 'branch-behind-merged-head' },
+  ])('refuses ancestry without deleting when $name', async ({ gh, refusal }) => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'ancestry-refusal';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run } = makeGit({
+      branches: [branch], merged: [branch],
+      tips: { [branch]: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+    });
+    try {
+      await mkdir(worktree, { recursive: true });
+      const outcome = await reconcileMergedPark({ projectRoot, slug, branch, runGit: run, runGh: vi.fn<GhRunner>().mockImplementation(gh) });
+      const destructiveCalls = run.mock.calls
+        .map(([args]) => args)
+        .filter((args) => (args[0] === 'worktree' && args[1] === 'remove') || (args[0] === 'branch' && (args[1] === '-d' || args[1] === '-D')));
+
+      expect({ outcome, destructiveCalls }).toEqual({
+        outcome: { slug, steps: [], refusal },
+        destructiveCalls: [],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an injected in-flight feature before any reconciliation action', async () => {
+    const slug = 'active-feature';
+    const { run, events } = makeGit();
+
+    const outcome = await reconcileMergedPark({
+      projectRoot: '/project',
+      slug,
+      runGit: run,
+      isFeatureInFlight: (candidate) => candidate === slug,
+    });
+
+    expect({ outcome, calls: run.mock.calls, events }).toEqual({
+      outcome: { slug, steps: [], refusal: 'in-flight' },
+      calls: [],
+      events: [],
+    });
+  });
+
+  it('refuses a live phase marker before teardown, removal, deletion, or unpark', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'marker-active';
+    const { run, events } = makeGit();
+    try {
+      await mkdir(join(projectRoot, '.worktrees', slug, '.pipeline'), { recursive: true });
+      await writeFile(join(projectRoot, '.worktrees', slug, '.pipeline', 'phase-active'), 'step: build\n');
+      await writeOperatorPark(projectRoot, slug);
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, runGit: run });
+
+      expect({ outcome, calls: run.mock.calls, events, parked: await isOperatorParked(projectRoot, slug) }).toEqual({
+        outcome: { slug, steps: [], refusal: 'in-flight' },
+        calls: [],
+        events: [],
+        parked: true,
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: 'written an hour ago', ageMs: 60 * 60 * 1000, live: true },
+    { name: 'written just inside the staleness bound', ageMs: STALE_PHASE_MARKER_MS - 1, live: true },
+    { name: 'dated in the future', ageMs: -60 * 60 * 1000, live: true },
+    { name: 'abandoned past the staleness bound', ageMs: STALE_PHASE_MARKER_MS + 1, live: false },
+  ])('treats a phase marker $name as live=$live', async ({ ageMs, live }) => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'marker-aged';
+    const now = Date.parse('2026-09-23T12:00:00.000Z');
+    const { run, deleted } = makeGit({ shipped: [slug], branches: [`spec/${slug}`], merged: [`spec/${slug}`] });
+    try {
+      await mkdir(join(projectRoot, '.worktrees', slug, '.pipeline'), { recursive: true });
+      await writeFile(
+        join(projectRoot, '.worktrees', slug, '.pipeline', 'phase-active'),
+        `step: build_review\nphase: SHIP\nwritten: ${new Date(now - ageMs).toISOString()}\n`,
+      );
+      await writeOperatorPark(projectRoot, slug);
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, runGit: run, now: () => now });
+
+      expect({ outcome, deleted }).toEqual(live
+        ? { outcome: { slug, steps: [], refusal: 'in-flight' }, deleted: [] }
+        : { outcome: { slug, steps: ['worktree-removed', 'branch-deleted', 'unparked'] }, deleted: [`spec/${slug}`] });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a dirty worktree whose abandoned phase marker no longer counts as live', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'marker-aged-dirty';
+    const now = Date.parse('2026-09-23T12:00:00.000Z');
+    const { run, deleted, events } = makeGit({
+      shipped: [slug],
+      branches: [`spec/${slug}`],
+      merged: [`spec/${slug}`],
+      statusPorcelain: '?? uncommitted.ts\n',
+    });
+    try {
+      await mkdir(join(projectRoot, '.worktrees', slug, '.pipeline'), { recursive: true });
+      await writeFile(
+        join(projectRoot, '.worktrees', slug, '.pipeline', 'phase-active'),
+        `step: build\nwritten: ${new Date(now - 2 * STALE_PHASE_MARKER_MS).toISOString()}\n`,
+      );
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, runGit: run, now: () => now });
+
+      expect({ outcome, deleted, events }).toEqual({
+        outcome: { slug, steps: [], refusal: 'dirty-worktree' },
+        deleted: [],
+        events: [],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
 
   it.each([
     {
@@ -332,6 +790,22 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
     }
   });
 
+  it('does not report a deletion proof when a shipped record reconciles a branchless worktree', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'branchless-no-proof';
+    const { run } = makeGit({ shipped: [slug], branches: [] });
+    try {
+      const outcome = await reconcileMergedPark({ projectRoot, slug, runGit: run, emitProof: true });
+
+      expect(outcome).toEqual({
+        slug,
+        steps: ['worktree-removed', 'branch-absent'],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it('refuses cleanup when a record-backed slug still has a branch outside origin/main', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
     const slug = 'raced-after-record';
@@ -378,27 +852,49 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
     {
       name: 'the branch is behind the merged PR head',
       gh: '[{"headRefOid":"1111111111111111111111111111111111111111"}]',
+      branchesBehindHead: ['feat/deletion-gate-map'],
       tips: { 'feat/deletion-gate-map': '2222222222222222222222222222222222222222' },
       expectedOutcome: { steps: [], refusal: 'branch-behind-merged-head' },
     },
     {
+      // A rebased PR head: the local branch keeps pre-rebase commits the merge
+      // never saw, so deleting it would drop them. Never "behind".
+      name: 'the branch diverged from the merged PR head',
+      gh: '[{"headRefOid":"1111111111111111111111111111111111111111"}]',
+      tips: { 'feat/deletion-gate-map': '2222222222222222222222222222222222222222' },
+      unmergedLog: ['2222222 docs: local commit the rebased PR head dropped'],
+      expectedOutcome: {
+        steps: [],
+        refusal: 'unmerged-commits',
+        unmergedCommits: {
+          commits: [{ sha: '2222222', subject: 'docs: local commit the rebased PR head dropped' }],
+          overflow: 0,
+        },
+      },
+    },
+    {
       name: 'the branch tip cannot be resolved locally',
       gh: '[{"headRefOid":"1111111111111111111111111111111111111111"}]',
+      tips: {} as Readonly<Record<string, string>>,
       expectedOutcome: { steps: [], refusal: 'ancestry-check-failed' },
     },
     {
       name: 'the current tip equals the merged PR head',
       gh: '[{"headRefOid":"1111111111111111111111111111111111111111"}]',
       tips: { 'feat/deletion-gate-map': '1111111111111111111111111111111111111111' },
-      expectedOutcome: { steps: ['worktree-removed', 'branch-deleted', 'unparked'] },
+      // Squash merge: the safe `branch -d` refuses a non-ancestor tip and the
+      // helper never escalates to force (adr-2026-08-01 D1), so the branch stays.
+      expectedOutcome: { steps: ['worktree-removed'], refusal: 'branch-delete-failed' },
     },
-  ] as const)('maps deletion-gate diagnosis when $name', async ({ gh, mergedPrHeads, tips, expectedOutcome }) => {
+  ] as const)('maps deletion-gate diagnosis when $name', async ({ gh, mergedPrHeads, branchesBehindHead, unmergedLog, tips, expectedOutcome }) => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
     const slug = 'deletion-gate-map';
     const { run, deleted } = makeGit({
       shipped: [slug],
       branches: [`feat/${slug}`],
       mergedPrHeads,
+      branchesBehindHead,
+      unmergedLog,
       tips,
     });
     const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: gh });
@@ -409,7 +905,7 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
 
       expect({ outcome, deleted, parked: await isOperatorParked(projectRoot, slug) }).toEqual({
         outcome: { slug, ...expectedOutcome },
-        deleted: expectedOutcome.refusal === undefined ? [`feat/${slug}`] : [],
+        deleted: [],
         parked: expectedOutcome.refusal !== undefined,
       });
       if (expectedOutcome.refusal !== 'unmerged-commits') {
@@ -420,7 +916,7 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
     }
   });
 
-  it('deletes a squash-merged branch whose tip matches the merged PR head oid', async () => {
+  it('keeps a squash-merged branch whose tip matches the merged PR head oid rather than force-deleting it', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
     const slug = 'squash-merged';
     const tip = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
@@ -445,18 +941,18 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
         ghCalls: runGh.mock.calls,
         parked: await isOperatorParked(projectRoot, slug),
       }).toEqual({
-        outcome: { slug, steps: ['worktree-removed', 'branch-deleted', 'unparked'] },
-        deleted: [`fix/${slug}`],
-        // Force delete: this function, not git, established that the tip is the
-        // commit the squash merge landed, and `-d` refuses that ref forever.
-        deleteArgv: [['branch', '-D', `fix/${slug}`]],
+        outcome: { slug, steps: ['worktree-removed'], refusal: 'branch-delete-failed' },
+        deleted: [],
+        // Safe delete only: `-d` refuses a squash-merged ref, and the helper
+        // leaves it in place instead of escalating to `-D` (D1: no force flag).
+        deleteArgv: [['branch', '-d', `fix/${slug}`]],
         ghCalls: [
           [
             ['pr', 'list', '--head', `fix/${slug}`, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'],
             { cwd: projectRoot },
           ],
         ],
-        parked: false,
+        parked: true,
       });
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
@@ -647,6 +1143,7 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       shipped: [slug],
       branches: [`feat/${slug}`],
       merged: [],
+      tips: {},
     });
     const runGh = vi.fn<GhRunner>().mockResolvedValue({
       stdout: '[{"headRefOid":"1111111111111111111111111111111111111111"}]',
@@ -682,19 +1179,134 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       gitVerbs: run.mock.calls.map(([args]) => args.slice(0, 2).join(' ')),
       ghCalls: runGh.mock.calls,
     }).toEqual({
-      outcome: { slug: 'recorded', steps: ['worktree-removed', 'branch-deleted', 'unparked'] },
+      outcome: { slug: 'recorded', steps: ['worktree-removed', 'branch-deleted'] },
       gitVerbs: [
         'ls-tree --name-only',
         'for-each-ref --format=%(refname:short)',
         'merge-base --is-ancestor',
-        'branch -D',
+        'branch -d',
       ],
       ghCalls: [],
     });
   });
 
+  it('reclaims a proven feat/daemon branch when its shipped record is present', async () => {
+    const slug = 'daemon-recorded';
+    const branch = `feat/daemon-${slug}`;
+    const { run, deleted } = makeGit({ shipped: [slug], branches: [branch], merged: [branch] });
+
+    const outcome = await reconcileMergedPark({ projectRoot: '/project', slug, branch, runGit: run });
+
+    expect({ outcome, deleted }).toEqual({
+      outcome: { slug, steps: ['worktree-removed', 'branch-deleted'] },
+      deleted: [branch],
+    });
+  });
+
+  it.each([
+    { slug: 'hotfix-without-record', branch: 'hotfix/x' },
+    { slug: 'spec-without-record', branch: 'spec/spec-without-record' },
+  ])('reclaims a proven non-daemon $branch branch without a shipped-record repair', async ({ slug, branch }) => {
+    const { run, deleted } = makeGit({ branches: [branch], merged: [branch] });
+    const requestRecordRepair = vi.fn(async () => {});
+
+    const outcome = await reconcileMergedPark({
+      projectRoot: '/project',
+      slug,
+      branch,
+      runGit: run,
+      requestRecordRepair,
+    });
+
+    expect({ outcome, deleted, repairs: requestRecordRepair.mock.calls }).toEqual({
+      outcome: { slug, steps: ['worktree-removed', 'branch-deleted'] },
+      deleted: [branch],
+      repairs: [],
+    });
+  });
+
+  it('defers a proven feat/daemon branch without a shipped record and requests repair', async () => {
+    const slug = 'daemon-record-missing';
+    const branch = `feat/daemon-${slug}`;
+    const tip = '1111111111111111111111111111111111111111';
+    const { run } = makeGit({ branches: [branch], merged: [branch], tips: { [branch]: tip } });
+    const runGh = vi.fn<GhRunner>(async (args) => ({
+      stdout: args.includes('headRefOid')
+        ? `[{"headRefOid":"${tip}"}]`
+        : '[{"url":"https://example.test/pr/3"}]',
+    }));
+    const requestRecordRepair = vi.fn(async () => {});
+
+    const outcome = await reconcileMergedPark({
+      projectRoot: '/project',
+      slug,
+      branch,
+      runGit: run,
+      runGh,
+      requestRecordRepair,
+    });
+
+    expect({ outcome, repairs: requestRecordRepair.mock.calls }).toEqual({
+      outcome: { slug, steps: [], refusal: 'record-missing', deferred: true },
+      repairs: [[{ slug, prUrl: 'https://example.test/pr/3' }]],
+    });
+  });
+
+  it('refuses an unproven hotfix branch without a shipped record before the record rule', async () => {
+    const slug = 'hotfix-no-proof';
+    const branch = 'hotfix/x';
+    const { run, deleted } = makeGit({ branches: [branch] });
+    const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: '[]' });
+
+    const outcome = await reconcileMergedPark({ projectRoot: '/project', slug, branch, runGit: run, runGh });
+
+    expect({ outcome, deleted }).toEqual({
+      outcome: { slug, steps: [], refusal: 'no-merge-proof' },
+      deleted: [],
+    });
+  });
+
+  it('fails closed when the shipped-record listing is unreadable for a feat/daemon branch', async () => {
+    const slug = 'daemon-unreadable-records';
+    const branch = `feat/daemon-${slug}`;
+    const { run } = makeGit({ shipped: 'unavailable', branches: [branch], merged: [branch] });
+
+    const outcome = await reconcileMergedPark({ projectRoot: '/project', slug, branch, runGit: run });
+
+    expect(outcome).toEqual({ slug, steps: [], refusal: 'ancestry-check-failed' });
+  });
+
+  it('keeps a squash-merged non-daemon branch proven by merged-PR head when the shipped-record listing is unreadable', async () => {
+    const slug = 'hotfix-unreadable-records';
+    const branch = `hotfix/${slug}`;
+    const head = '2222222222222222222222222222222222222222';
+    const { run, deleted } = makeGit({
+      shipped: 'unavailable',
+      branches: [branch],
+      tips: { [branch]: head },
+      mergedPrHeads: [head],
+    });
+    const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: `[{"headRefOid":"${head}"}]` });
+    const requestRecordRepair = vi.fn(async () => {});
+
+    const outcome = await reconcileMergedPark({
+      projectRoot: '/project',
+      slug,
+      branch,
+      runGit: run,
+      runGh,
+      requestRecordRepair,
+    });
+
+    expect({ outcome, deleted, repairs: requestRecordRepair.mock.calls }).toEqual({
+      outcome: { slug, steps: ['worktree-removed'], refusal: 'branch-delete-failed' },
+      deleted: [],
+      repairs: [],
+    });
+  });
+
   it('treats an origin/main without a .docs/shipped tree as no records rather than unavailable', async () => {
-    const { run } = makeGit({ shipped: 'no-tree', branches: ['feat/no-tree'], merged: ['feat/no-tree'] });
+    const { run, deleteArgv, events } = makeGit({ shipped: 'no-tree', branches: ['feat/no-tree'], merged: ['feat/no-tree'] });
     const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: '[]' });
     const log = vi.fn<(message: string) => void>();
 
@@ -706,17 +1318,23 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       log,
     });
 
-    expect({ outcome, logs: log.mock.calls }).toEqual({
-      outcome: { slug: 'no-tree', steps: [], refusal: 'record-missing', deferred: true },
-      logs: [['[parked-reconciliation] no-tree not reconcilable until the record lands']],
+    expect({ outcome, logs: log.mock.calls, deleteArgv, events }).toEqual({
+      outcome: { slug: 'no-tree', steps: [], refusal: 'no-merge-proof' },
+      logs: [],
+      deleteArgv: [],
+      events: [],
     });
   });
 
   it('defers a missing record to the ST-916 repair seam via the resolved branch name', async () => {
-    const { run } = makeGit({ branches: ['spec/missing-record'], merged: ['spec/missing-record'] });
-    const runGh = vi.fn<GhRunner>().mockResolvedValue({
-      stdout: '[{"url":"https://example.test/pr/1060"}]',
-    });
+    const branch = 'spec/missing-record';
+    const tip = '2222222222222222222222222222222222222222';
+    const { run } = makeGit({ branches: [branch], merged: [branch], tips: { [branch]: tip } });
+    const runGh = vi.fn<GhRunner>(async (args) => ({
+      stdout: args.includes('headRefOid')
+        ? `[{"headRefOid":"${tip}"}]`
+        : '[{"url":"https://example.test/pr/1060"}]',
+    }));
     const requestRecordRepair = vi.fn(async () => {});
     const log = vi.fn<(message: string) => void>();
 
@@ -733,7 +1351,11 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       outcome: { slug: 'missing-record', steps: [], refusal: 'record-missing', deferred: true },
       ghCalls: [
         [
-          ['pr', 'list', '--state', 'merged', '--head', 'spec/missing-record', '--json', 'url', '--limit', '1'],
+          ['pr', 'list', '--head', branch, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'],
+          { cwd: '/project' },
+        ],
+        [
+          ['pr', 'list', '--state', 'merged', '--head', branch, '--json', 'url', '--limit', '1'],
           { cwd: '/project' },
         ],
       ],
@@ -742,8 +1364,8 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
     });
   });
 
-  it('defers without repair when a missing record has no merged PR', async () => {
-    const { run } = makeGit({ branches: ['feat/no-merged-pr'], merged: ['feat/no-merged-pr'] });
+  it('refuses without repair when ancestry has neither a shipped record nor merged PR', async () => {
+    const { run, deleteArgv, events } = makeGit({ branches: ['feat/no-merged-pr'], merged: ['feat/no-merged-pr'] });
     const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: '[]' });
     const requestRecordRepair = vi.fn(async () => {});
     const log = vi.fn<(message: string) => void>();
@@ -757,10 +1379,12 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       log,
     });
 
-    expect({ outcome, repairs: requestRecordRepair.mock.calls, logs: log.mock.calls }).toEqual({
-      outcome: { slug: 'no-merged-pr', steps: [], refusal: 'record-missing', deferred: true },
+    expect({ outcome, repairs: requestRecordRepair.mock.calls, logs: log.mock.calls, deleteArgv, events }).toEqual({
+      outcome: { slug: 'no-merged-pr', steps: [], refusal: 'no-merge-proof' },
       repairs: [],
-      logs: [['[parked-reconciliation] no-merged-pr not reconcilable until the record lands']],
+      logs: [],
+      deleteArgv: [],
+      events: [],
     });
   });
 
@@ -816,6 +1440,7 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
       await writeFile(join(worktree, 'leftover.txt'), 'not a git worktree');
       const teardown = join(worktree, TEARDOWN_SCRIPT);
       await mkdir(join(worktree, 'bin'), { recursive: true });
+      await writeFile(join(worktree, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
       await writeFile(teardown, `#!/usr/bin/env node\nrequire('node:fs').appendFileSync(${JSON.stringify(observation)}, 'ran\\n');\n`);
       await chmod(teardown, 0o755);
       await writeOperatorPark(projectRoot, slug);
@@ -857,6 +1482,7 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
     try {
       const teardown = join(worktree, TEARDOWN_SCRIPT);
       await mkdir(join(worktree, 'bin'), { recursive: true });
+      await writeFile(join(worktree, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
       await writeFile(teardown, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(observation)}, 'ran');\n`);
       await chmod(teardown, 0o755);
       await writeOperatorPark(projectRoot, slug);
@@ -961,8 +1587,53 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
 
       const outcome = await reconcileMergedPark({ projectRoot, slug, runGit: run });
 
-      expect(outcome).toEqual({ slug, steps: ['worktree-removed', 'branch-deleted', 'unparked'] });
+      expect(outcome).toEqual({ slug, steps: ['worktree-removed', 'branch-deleted'] });
     } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims an eligible non-parked worktree after project teardown without dispatching unpark', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'non-parked-reclaim';
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const teardownObservation = join(projectRoot, 'teardown-ran');
+    const { run, deleted } = makeGit({
+      shipped: [slug],
+      branches: [`feat/${slug}`],
+      merged: [`feat/${slug}`],
+      onWorktreeRemove: async () => {
+        expect(await access(teardownObservation).then(() => true, () => false)).toBe(true);
+      },
+    });
+    const log = vi.fn<(message: string) => void>();
+    const dispatch = vi.spyOn(daemonParkCli, 'dispatchDaemonPark');
+    try {
+      await mkdir(join(worktree, 'bin'), { recursive: true });
+      await writeFile(join(worktree, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
+      await writeFile(
+        join(worktree, TEARDOWN_SCRIPT),
+        `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(teardownObservation)}, 'ran');\n`,
+      );
+      await chmod(join(worktree, TEARDOWN_SCRIPT), 0o755);
+
+      const outcome = await reconcileMergedPark({ projectRoot, slug, runGit: run, log });
+
+      expect({
+        outcome,
+        deleted,
+        parked: await isOperatorParked(projectRoot, slug),
+        dispatches: dispatch.mock.calls,
+        unparkLogs: log.mock.calls.filter(([message]) => message.includes('was not operator-parked')),
+      }).toEqual({
+        outcome: { slug, steps: ['worktree-removed', 'branch-deleted'] },
+        deleted: [`feat/${slug}`],
+        parked: false,
+        dispatches: [],
+        unparkLogs: [],
+      });
+    } finally {
+      dispatch.mockRestore();
       await rm(projectRoot, { recursive: true, force: true });
     }
   });
@@ -1097,6 +1768,150 @@ describe('engine/park-reconciliation — reconcileMergedPark', () => {
 });
 
 describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
+  it('retains one detached registered worktree without invoking destructive reconciliation', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'detached';
+    const { run, deleted } = makeGit();
+    const events: unknown[] = [];
+    const log = vi.fn<(message: string) => void>();
+    try {
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        log,
+        onEvent: (event) => events.push(event),
+        worktreeListing: async () => [{ slug, reclaimable: false }],
+      });
+
+      expect({
+        entries: result.entries,
+        events,
+        deleted,
+        destructive: run.mock.calls.filter(([args]) =>
+          args[0] === 'branch' || (args[0] === 'worktree' && args[1] === 'remove')),
+        summary: log.mock.calls[0]?.[0],
+      }).toEqual({
+        entries: [{ slug, classification: 'unclassified', annotation: undefined }],
+        events: [{ type: 'worktree_reclaim_retained', slug, branch: undefined, reason: 'detached' }],
+        deleted: [],
+        destructive: [],
+        summary: expect.stringContaining('candidates=1 retained=1'),
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('unions parked and registered candidates once, carries their listed branches, and reports enumeration without a watch registry', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const { run, deleted } = makeGit({
+      branches: ['hotfix/first', 'spec/second', 'fix/third'],
+      merged: ['hotfix/first', 'spec/second', 'fix/third'],
+    });
+    const log = vi.fn<(message: string) => void>();
+    const worktreeListing = vi.fn(async () => [
+      { slug: 'first', branch: 'hotfix/first' },
+      { slug: 'second', branch: 'spec/second' },
+      { slug: 'third', branch: 'fix/third' },
+    ]);
+    try {
+      const result = await reconcileParkedFeatures({ projectRoot, runGit: run, log, worktreeListing });
+
+      expect({
+        entries: result.entries.map(({ slug }) => slug).sort(),
+        deleted: deleted.sort(),
+        listingCalls: worktreeListing.mock.calls.length,
+        logs: log.mock.calls,
+      }).toEqual({
+        entries: ['first', 'second', 'third'],
+        deleted: ['fix/third', 'hotfix/first', 'spec/second'],
+        listingCalls: 1,
+        logs: [[
+          expect.stringContaining('candidates=3 retained=0'),
+        ]],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('deduplicates a parked slug against the registered listing while retaining excluded candidates before cleanup', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const halted = 'halted';
+    const markerReadError = 'marker-read-error';
+    const { run, deleted } = makeGit({
+      shipped: ['bad_slug', 'engineer-run', 'halted', 'in-flight', 'parked-only', 'resolve-run'],
+      branches: [
+        'hotfix/parked-only',
+        'hotfix/shared',
+        'hotfix/in-flight',
+        'hotfix/engineer-run',
+        'hotfix/resolve-run',
+        'hotfix/bad_slug',
+        'hotfix/halted',
+        'hotfix/marker-read-error',
+      ],
+      merged: [
+        'hotfix/parked-only',
+        'hotfix/shared',
+        'hotfix/in-flight',
+        'hotfix/engineer-run',
+        'hotfix/resolve-run',
+        'hotfix/bad_slug',
+        'hotfix/halted',
+        'hotfix/marker-read-error',
+      ],
+    });
+    const log = vi.fn<(message: string) => void>();
+    try {
+      await writeOperatorPark(projectRoot, 'parked-only');
+      await writeOperatorPark(projectRoot, 'shared');
+      await writeOperatorPark(projectRoot, 'in-flight');
+      await writeOperatorPark(projectRoot, halted);
+      await writeOperatorPark(projectRoot, 'engineer-run');
+      await writeOperatorPark(projectRoot, 'resolve-run');
+      await writeOperatorPark(projectRoot, 'bad_slug');
+      await mkdir(join(projectRoot, '.worktrees', halted, '.pipeline'), { recursive: true });
+      await writeFile(join(projectRoot, '.worktrees', halted, '.pipeline', 'HALT'), 'halted\n');
+      // A directory at the marker path makes the marker read fail with EISDIR.
+      // It exercises the same fail-closed path as EACCES without depending on
+      // the test process's effective uid.
+      await mkdir(join(projectRoot, '.daemon', 'parked', markerReadError), { recursive: true });
+
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        log,
+        isFeatureInFlight: (slug) => slug === 'in-flight',
+        worktreeListing: async () => [
+          { slug: 'shared', branch: 'hotfix/shared' },
+          { slug: 'in-flight', branch: 'hotfix/in-flight' },
+          { slug: 'engineer-run', branch: 'hotfix/engineer-run' },
+          { slug: 'resolve-run', branch: 'hotfix/resolve-run' },
+          { slug: 'bad_slug', branch: 'hotfix/bad_slug' },
+          { slug: halted, branch: 'hotfix/halted' },
+          { slug: markerReadError, branch: 'hotfix/marker-read-error' },
+        ],
+      });
+
+      expect({
+        entries: result.entries.map(({ slug }) => slug).sort(),
+        deleted: deleted.sort(),
+        branchDeletes: run.mock.calls.filter(([args]) => args[0] === 'branch').map(([args]) => args[2]),
+        log: log.mock.calls[0]?.[0],
+      }).toEqual({
+        entries: ['bad_slug', 'engineer-run', 'halted', 'in-flight', 'marker-read-error', 'parked-only', 'resolve-run', 'shared'],
+        // A listed ref remains authoritative even if its slug is operator
+        // parked, so `shared` takes the non-daemon record policy.
+        deleted: ['hotfix/parked-only', 'hotfix/shared'],
+        branchDeletes: ['hotfix/parked-only', 'hotfix/shared'],
+        log: expect.stringContaining('retained: foreign-lifecycle=2,halted=2,in-flight=1,invalid-slug=1'),
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it('logs a gh capability diagnostic during the quiet automatic sweep and refuses with no-merge-proof', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
     const slug = 'sweep-gh-capability';
@@ -1300,16 +2115,20 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
         await writeFile(join(intakeDir, `${slug}.md`), intake);
       }
 
+      const events: unknown[] = [];
       const result = await reconcileParkedFeatures({
         projectRoot,
         runGit: run,
         getIssueState,
         autoCleanup: false,
+        onEvent: (event) => events.push(event),
       });
 
       expect({
         entries: result.entries,
-        destructive: run.mock.calls.filter(([args]) => args[0] === 'worktree' || args[0] === 'branch'),
+        destructive: run.mock.calls.filter(([args]) =>
+          args[0] === 'branch' || (args[0] === 'worktree' && args[1] === 'remove')),
+        events,
       }).toEqual({
         entries: [{
           slug,
@@ -1318,6 +2137,12 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
             classification === 'orphan' ? 'orphan' : classification === 'merged' ? 'merged-ready' : undefined,
         }],
         destructive: [],
+        events: [{
+          type: 'worktree_reclaim_retained',
+          slug,
+          branch: undefined,
+          reason: classification === 'merged' ? 'disabled' : 'no-merge-proof',
+        }],
       });
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
@@ -1387,6 +2212,7 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
       shipped: slugs,
       branches: slugs.map((slug) => `feat/${slug}`),
       mergedPrHeads: [unmergedHead],
+      branchesBehindHead: ['feat/behind'],
       tips: Object.fromEntries(slugs.map((slug) => [
         `feat/${slug}`,
         'ffffffffffffffffffffffffffffffffffffffff',
@@ -1463,7 +2289,46 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
     }
   });
 
-  it('keeps a record-missing outcome deferred rather than refused', async () => {
+  it('leaves an ordinary unmerged park with its own registered worktree out of the refusal tally', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'ordinary-registered-park';
+    const branch = `feat/daemon-${slug}`;
+    const { run, deleted } = makeGit({ branches: [branch] });
+    const runGh = vi.fn<GhRunner>().mockResolvedValue({ stdout: '[]' });
+    const log = vi.fn<(message: string) => void>();
+    try {
+      await writeOperatorPark(projectRoot, slug);
+      await mkdir(join(projectRoot, '.docs', 'intake'), { recursive: true });
+      await writeFile(join(projectRoot, '.docs', 'intake', `${slug}.md`), 'Source-Ref: acme/app#42\n');
+
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        runGh,
+        log,
+        getIssueState: async () => 'OPEN',
+        worktreeListing: async () => [{ slug, branch }],
+      });
+
+      expect({ counts: result.counts, refusedByReason: result.refusedByReason, deleted }).toEqual({
+        counts: {
+          reconciled: 0,
+          deferred: 0,
+          orphaned: 0,
+          parked: 1,
+          refused: 0,
+          skipped: 0,
+        },
+        refusedByReason: {},
+        deleted: [],
+      });
+      expect(log.mock.calls[0]?.[0]).toContain('refused=0');
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('counts ancestry without a shipped record or merged PR as refused', async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
     const slug = 'sweep-record-missing';
     const { run } = makeGit({ branches: [`feat/${slug}`], merged: [`feat/${slug}`] });
@@ -1476,13 +2341,13 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
       expect({ counts: result.counts, refusedByReason: result.refusedByReason }).toEqual({
         counts: {
           reconciled: 0,
-          deferred: 1,
+          deferred: 0,
           orphaned: 0,
           parked: 1,
-          refused: 0,
+          refused: 1,
           skipped: 0,
         },
-        refusedByReason: {},
+        refusedByReason: { 'no-merge-proof': 1 },
       });
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
@@ -1511,8 +2376,8 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
         deleted,
       }).toEqual({
         entries: [{ slug, classification: 'merged', annotation: undefined }],
-        counts: { reconciled: 0, deferred: 1, orphaned: 0, parked: 1, refused: 0, skipped: 0 },
-        refusedByReason: {},
+        counts: { reconciled: 0, deferred: 0, orphaned: 0, parked: 1, refused: 1, skipped: 0 },
+        refusedByReason: { 'no-merge-proof': 1 },
         markerRemains: true,
         worktreeRemains: true,
         deleted: [],
@@ -1620,6 +2485,7 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
     const { run } = makeGit({
       shipped: [slug],
       branches: [`feat/${slug}`],
+      branchesBehindHead: [`feat/${slug}`],
       tips: { [`feat/${slug}`]: '2222222222222222222222222222222222222222' },
     });
     const runGh = vi.fn<GhRunner>()
@@ -1690,6 +2556,374 @@ describe('engine/park-reconciliation — reconcileParkedFeatures', () => {
           { slug: mergedSlug, classification: 'merged', annotation: 'merged-ready' },
         ],
         logs: [['[parked-reconciliation] reconciled=0 deferred=0 orphaned=0 parked=1 refused=0 skipped=1; next: 1 parked remains parked; 1 skipped retry when merge/issue evidence is available']],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('retains every candidate when the pass-wide worktree listing is unavailable', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'listing-unavailable';
+    const { run, deleted } = makeGit({ shipped: [slug], branches: [`feat/${slug}`], merged: [`feat/${slug}`] });
+    const events: unknown[] = [];
+    try {
+      await writeOperatorPark(projectRoot, slug);
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        worktreeListing: async () => null,
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ deleted, events, skipped: result.counts.skipped }).toEqual({
+        deleted: [],
+        events: [{ type: 'worktree_reclaim_retained', slug, branch: undefined, reason: 'listing-unavailable' }],
+        skipped: 1,
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('honours the reclaim gate for enumerated worktrees while preserving the terminal event', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'disabled-reclaim';
+    const branch = `hotfix/${slug}`;
+    const { run, deleted } = makeGit({ branches: [branch], merged: [branch] });
+    const events: unknown[] = [];
+    try {
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        reclaimMergedWorktrees: false,
+        worktreeListing: async () => [{ slug, branch }],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ deleted, reconciled: result.counts.reconciled, events }).toEqual({
+        deleted: [],
+        reconciled: 0,
+        events: [{ type: 'worktree_reclaim_retained', slug, branch, reason: 'disabled' }],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps parked cleanup enabled when the enumerated reclaim gate is off', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const parkedSlug = 'gate-off-parked';
+    const enumeratedSlug = 'gate-off-enumerated';
+    const parkedBranch = `feat/${parkedSlug}`;
+    const enumeratedBranch = `hotfix/${enumeratedSlug}`;
+    const { run, deleted } = makeGit({
+      shipped: [parkedSlug],
+      branches: [parkedBranch, enumeratedBranch],
+      merged: [parkedBranch, enumeratedBranch],
+    });
+    const events: unknown[] = [];
+    try {
+      await writeOperatorPark(projectRoot, parkedSlug);
+      await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        reclaimMergedWorktrees: false,
+        worktreeListing: async () => [{ slug: enumeratedSlug, branch: enumeratedBranch }],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ deleted, events }).toEqual({
+        deleted: [parkedBranch],
+        events: [
+          { type: 'worktree_reclaim_reclaimed', slug: parkedSlug },
+          { type: 'worktree_reclaim_retained', slug: enumeratedSlug, branch: enumeratedBranch, reason: 'disabled' },
+        ],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims an enumerated worktree when auto-cleanup is off but its reclaim gate is enabled', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'auto-cleanup-off-enumerated';
+    const branch = `hotfix/${slug}`;
+    const { run, deleted } = makeGit({ branches: [branch], merged: [branch] });
+    try {
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        autoCleanup: false,
+        worktreeListing: async () => [{ slug, branch }],
+      });
+
+      expect({ deleted, reconciled: result.counts.reconciled }).toEqual({
+        deleted: [branch],
+        reconciled: 1,
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('uses independent gates: reclaiming an enumerated worktree while retaining a parked candidate', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const parkedSlug = 'auto-cleanup-off-parked';
+    const enumeratedSlug = 'auto-cleanup-off-enumerated-with-park';
+    const parkedBranch = `feat/${parkedSlug}`;
+    const enumeratedBranch = `hotfix/${enumeratedSlug}`;
+    const { run, deleted } = makeGit({
+      shipped: [parkedSlug],
+      branches: [parkedBranch, enumeratedBranch],
+      merged: [parkedBranch, enumeratedBranch],
+    });
+    const events: unknown[] = [];
+    try {
+      await writeOperatorPark(projectRoot, parkedSlug);
+
+      await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        autoCleanup: false,
+        reclaimMergedWorktrees: true,
+        worktreeListing: async () => [{ slug: enumeratedSlug, branch: enumeratedBranch }],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ deleted, events }).toEqual({
+        deleted: [enumeratedBranch],
+        events: [
+          { type: 'worktree_reclaim_retained', slug: parkedSlug, reason: 'disabled' },
+          { type: 'worktree_reclaim_reclaimed', slug: enumeratedSlug, branch: enumeratedBranch, proof: 'merged-pr-head' },
+        ],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('emits the helper proof and retains unavailable pass-wide evidence', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const squashSlug = 'squash-event';
+    const unavailableSlug = 'evidence-down';
+    const squashBranch = `hotfix/${squashSlug}`;
+    const unavailableBranch = `hotfix/${unavailableSlug}`;
+    const head = '1111111111111111111111111111111111111111';
+    const { run, deleted } = makeGit({
+      branches: [squashBranch],
+      tips: { [squashBranch]: head },
+      mergedPrHeads: [head],
+    });
+    const events: unknown[] = [];
+    try {
+      await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        runGh: async () => ({ stdout: `[{"headRefOid":"${head}"}]` }),
+        worktreeListing: async () => [{ slug: squashSlug, branch: squashBranch }],
+        onEvent: (event) => events.push(event),
+      });
+      expect({ deleted, events }).toEqual({
+        deleted: [],
+        events: [{ type: 'worktree_reclaim_failed', slug: squashSlug, branch: squashBranch, refusal: 'branch-delete-failed' }],
+      });
+
+      const unavailable = makeGit({ refsUnavailable: true });
+      events.length = 0;
+      await reconcileParkedFeatures({
+        projectRoot,
+        runGit: unavailable.run,
+        worktreeListing: async () => [{ slug: unavailableSlug, branch: unavailableBranch }],
+        onEvent: (event) => events.push(event),
+      });
+      expect(events).toEqual([
+        { type: 'worktree_reclaim_retained', slug: unavailableSlug, branch: unavailableBranch, reason: 'evidence-unavailable' },
+      ]);
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a non-daemon squash candidate branch and retains the record-gated candidate when records are unreadable', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'sweep-hotfix-unreadable-records';
+    const branch = `hotfix/${slug}`;
+    const daemonSlug = 'sweep-daemon-unreadable-records';
+    const daemonBranch = `feat/daemon-${daemonSlug}`;
+    const head = '3333333333333333333333333333333333333333';
+    const { run, deleted } = makeGit({
+      shipped: 'unavailable',
+      branches: [branch, daemonBranch],
+      merged: [daemonBranch],
+      tips: { [branch]: head },
+      mergedPrHeads: [head],
+    });
+    const events: unknown[] = [];
+    try {
+      await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        runGh: async () => ({ stdout: `[{"headRefOid":"${head}"}]` }),
+        worktreeListing: async () => [{ slug, branch }, { slug: daemonSlug, branch: daemonBranch }],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ deleted, events }).toEqual({
+        deleted: [],
+        events: [
+          { type: 'worktree_reclaim_failed', slug, branch, refusal: 'branch-delete-failed' },
+          { type: 'worktree_reclaim_retained', slug: daemonSlug, branch: daemonBranch, reason: 'evidence-unavailable' },
+        ],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('retains a nested registered path as invalid-slug without calling the helper', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'feat/nested-worktree';
+    const branch = 'feat/nested-worktree';
+    const { run, deleted } = makeGit({ branches: [branch], merged: [branch] });
+    const events: unknown[] = [];
+    try {
+      await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        worktreeListing: async () => [{ slug, branch, reclaimable: false }],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ deleted, events }).toEqual({
+        deleted: [],
+        events: [{ type: 'worktree_reclaim_retained', slug, branch, reason: 'invalid-slug' }],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('emits reclaim failures for dirty and ancestry-only candidates, while reclaiming only the clean candidate', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const dirtySlug = 'sweep-dirty';
+    const cleanSlug = 'sweep-clean';
+    const ancestryOnlySlug = 'sweep-ancestry-only';
+    const dirtyBranch = `hotfix/${dirtySlug}`;
+    const cleanBranch = `hotfix/${cleanSlug}`;
+    const ancestryOnlyBranch = `hotfix/${ancestryOnlySlug}`;
+    const dirtyWorktree = join(projectRoot, '.worktrees', dirtySlug);
+    const cleanWorktree = join(projectRoot, '.worktrees', cleanSlug);
+    const ancestryOnlyWorktree = join(projectRoot, '.worktrees', ancestryOnlySlug);
+    const tip = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const { run } = makeGit({
+      branches: [dirtyBranch, cleanBranch, ancestryOnlyBranch],
+      merged: [dirtyBranch, cleanBranch, ancestryOnlyBranch],
+      tips: { [dirtyBranch]: tip, [cleanBranch]: tip, [ancestryOnlyBranch]: tip },
+      statusPorcelainByCwd: { [dirtyWorktree]: ' M retained.ts\n' },
+    });
+    const events: unknown[] = [];
+    const runGh = vi.fn<GhRunner>(async (args) => ({
+      stdout: args[3] === dirtyBranch || args[3] === cleanBranch
+        ? `[{"headRefOid":"${tip}"}]`
+        : '[]',
+    }));
+    try {
+      await Promise.all([dirtyWorktree, cleanWorktree, ancestryOnlyWorktree].map((path) => mkdir(path, { recursive: true })));
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        runGh,
+        worktreeListing: async () => [
+          { slug: dirtySlug, branch: dirtyBranch },
+          { slug: cleanSlug, branch: cleanBranch },
+          { slug: ancestryOnlySlug, branch: ancestryOnlyBranch },
+        ],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ counts: result.counts, refusedByReason: result.refusedByReason, events }).toEqual({
+        counts: { reconciled: 1, deferred: 0, orphaned: 0, parked: 3, refused: 2, skipped: 0 },
+        refusedByReason: { 'dirty-worktree': 1, 'no-merge-proof': 1 },
+        events: [
+          { type: 'worktree_reclaim_failed', slug: dirtySlug, branch: dirtyBranch, refusal: 'dirty-worktree' },
+          { type: 'worktree_reclaim_reclaimed', slug: cleanSlug, branch: cleanBranch, proof: 'merged-pr-head' },
+          { type: 'worktree_reclaim_failed', slug: ancestryOnlySlug, branch: ancestryOnlyBranch, refusal: 'no-merge-proof' },
+        ],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('emits every helper refusal as a reclaim failure and never as a retention', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const behindSlug = 'sweep-behind';
+    const recordSlug = 'sweep-record-missing';
+    const behindBranch = `hotfix/${behindSlug}`;
+    const recordBranch = `feat/daemon-${recordSlug}`;
+    const tip = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const otherHead = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const { run } = makeGit({
+      shipped: [],
+      branches: [behindBranch, recordBranch],
+      merged: [behindBranch, recordBranch],
+      tips: { [behindBranch]: tip, [recordBranch]: tip },
+    });
+    const events: unknown[] = [];
+    const runGh = vi.fn<GhRunner>(async (args) => ({
+      stdout: `[{"headRefOid":"${args[3] === behindBranch ? otherHead : tip}"}]`,
+    }));
+    try {
+      await Promise.all([behindSlug, recordSlug].map((slug) => mkdir(join(projectRoot, '.worktrees', slug), { recursive: true })));
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        runGh,
+        worktreeListing: async () => [
+          { slug: behindSlug, branch: behindBranch },
+          { slug: recordSlug, branch: recordBranch },
+        ],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ counts: result.counts, refusedByReason: result.refusedByReason, events }).toEqual({
+        counts: { reconciled: 0, deferred: 1, orphaned: 0, parked: 2, refused: 1, skipped: 0 },
+        refusedByReason: { 'branch-behind-merged-head': 1 },
+        events: [
+          { type: 'worktree_reclaim_failed', slug: behindSlug, branch: behindBranch, refusal: 'branch-behind-merged-head' },
+          { type: 'worktree_reclaim_failed', slug: recordSlug, branch: recordBranch, refusal: 'record-missing' },
+        ],
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('emits one failed event when a proven registered worktree cannot be removed', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'park-reconciliation-'));
+    const slug = 'remove-fails';
+    const branch = `hotfix/${slug}`;
+    const worktree = join(projectRoot, '.worktrees', slug);
+    const { run } = makeGit({
+      branches: [branch],
+      merged: [branch],
+      registeredWorktrees: [worktree],
+      worktreeRemoveFails: 'locked worktree',
+    });
+    const events: unknown[] = [];
+    try {
+      await mkdir(worktree, { recursive: true });
+      const result = await reconcileParkedFeatures({
+        projectRoot,
+        runGit: run,
+        worktreeListing: async () => [{ slug, branch }],
+        onEvent: (event) => events.push(event),
+      });
+
+      expect({ refused: result.counts.refused, events }).toEqual({
+        refused: 1,
+        events: [{ type: 'worktree_reclaim_failed', slug, branch, refusal: 'worktree-remove-failed' }],
       });
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
