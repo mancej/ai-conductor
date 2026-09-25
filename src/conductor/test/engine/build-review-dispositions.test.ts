@@ -1,13 +1,24 @@
+// Covers: task:26
 import { describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { parseBuildReviewLapId } from '../../src/engine/build-review-domain.js';
-import { canonicalizeBuildReviewFindingIdentity } from '../../src/engine/build-review-finding-identity.js';
+import {
+  deriveEffectiveBuildReviewVerdict,
+  deriveEffectiveBuildReviewVerdictWithDispositions,
+  joinBuildReviewRubricOutcomes,
+} from '../../src/engine/build-review-aggregate.js';
+import {
+  canonicalizeBuildReviewFindingIdentity,
+  stampBuildReviewCustomJudgedResult,
+} from '../../src/engine/build-review-finding-identity.js';
+import { renderBuildReviewAcceptedRisk } from '../../src/engine/build-review-accepted-risk.js';
 import {
   BuildReviewDispositionStore,
   matchesBuildReviewDisposition,
+  matchesBuildReviewReducedCoverageDisposition,
   type BuildReviewReducedCoverageDispositionRecord,
   type BuildReviewDispositionFilesystem,
   type BuildReviewDispositionRecord,
@@ -200,6 +211,24 @@ describe('build-review dispositions', () => {
     });
   });
 
+  it('round-trips a stored security reduced-coverage identity', async () => {
+    const filesystem = new MemoryFilesystem();
+    const store = new BuildReviewDispositionStore('/repo', {
+      filesystem, clock: () => Date.parse('2026-09-16T12:00:00.000Z'),
+      lock: lock({ ok: true, handle: { release: async () => ({ ok: true }) } }),
+    });
+
+    await expect(store.appendReducedCoverageIfCurrent({
+      feature, rubric: 'security', reason: 'provider-error', rationale: 'Security provider is unavailable.', operator: 'james',
+    }, async () => true)).resolves.toMatchObject({
+      ok: true, record: { identity: { rubric: 'security', reason: 'provider-error' } },
+    });
+
+    await expect(store.listReducedCoverage(feature)).resolves.toMatchObject({
+      ok: true, records: [expect.objectContaining({ identity: { rubric: 'security', reason: 'provider-error' } })],
+    });
+  });
+
   it('admits scope-incomplete as a closed reduced-coverage cause under the existing lease', async () => {
     const filesystem = new MemoryFilesystem();
     const store = new BuildReviewDispositionStore('/repo', {
@@ -213,6 +242,36 @@ describe('build-review dispositions', () => {
     }, async () => true)).resolves.toMatchObject({
       ok: true, record: { identity: { rubric: 'testQuality', reason: 'scope-incomplete' }, operator: 'james' },
     });
+  });
+
+  it('persists declaration-scoped custom coverage without package or execution identity', async () => {
+    const filesystem = new MemoryFilesystem();
+    const store = new BuildReviewDispositionStore('/repo', {
+      filesystem,
+      lock: lock({ ok: true, handle: { release: async () => ({ ok: true }) } }),
+    });
+    const declaration = {
+      version: 'v1' as const, rubricId: 'portablePolicy', semanticSkill: 'portable-policy',
+      question: 'Does this preserve the portable policy contract?', source: 'project' as const, resources: ['criteria.md'],
+    };
+    const appended = await store.appendReducedCoverageIfCurrent({
+      feature, declaration, reason: 'policy-load-failed', rationale: 'The policy cannot be loaded.', operator: 'james',
+    }, async () => true);
+    const listed = await store.listReducedCoverage(feature);
+    const records = listed.ok ? listed.records : [];
+    const invalid = await store.appendReducedCoverageIfCurrent({
+      feature,
+      declaration: { ...declaration, resources: [''] },
+      reason: 'policy-load-failed', rationale: 'invalid declaration', operator: 'james',
+    }, async () => true);
+
+    expect({
+      appended,
+      invalid,
+      exact: matchesBuildReviewReducedCoverageDisposition(feature, { declaration, reason: 'policy-load-failed' }, records),
+      changedQuestion: matchesBuildReviewReducedCoverageDisposition(feature, { declaration: { ...declaration, question: 'Does this preserve the revised portable policy contract?' }, reason: 'policy-load-failed' }, records),
+      changedReason: matchesBuildReviewReducedCoverageDisposition(feature, { declaration, reason: 'provider-error' }, records),
+    }).toMatchObject({ appended: { ok: true }, invalid: { ok: false, kind: 'invalid' }, exact: true, changedQuestion: false, changedReason: false });
   });
 
   it('refuses blank rationales without writing a reduced-coverage decision', async () => {
@@ -450,5 +509,127 @@ describe('build-review dispositions', () => {
     };
 
     expect(matchesBuildReviewDisposition(feature, reReported, [accepted])).toBe(true);
+  });
+
+  it('preserves a pre-migration v3 testQuality disposition when post-migration summary wording changes', () => {
+    const preMigrationIdentity = canonicalizeBuildReviewFindingIdentity(currentContractFindings[0][1])!;
+    const postMigrationFinding = {
+      concernKind: 'test-insensitive' as const,
+      summary: 'Reworded reviewer prose after descriptor dispatch.',
+      evidenceLocations: ['test/widget.test.ts:12'],
+      anchor: currentContractFindings[0][1].anchor,
+    };
+    const postMigrationIdentity = canonicalizeBuildReviewFindingIdentity({
+      rubric: 'testQuality', contractVersion: 'v3', concernKind: postMigrationFinding.concernKind,
+      anchor: postMigrationFinding.anchor,
+    })!;
+    const accepted: BuildReviewDispositionRecord = {
+      version: 'v1', feature, finding: preMigrationIdentity, sourceLapId: parseBuildReviewLapId('lap-before-migration')!,
+      summary: 'Original reviewer wording before the migration.', rationale: 'accepted risk', operator: 'james', acceptedAt: '2026-08-21T12:00:00.000Z',
+    };
+    const aggregate = joinBuildReviewRubricOutcomes({
+      lapId: parseBuildReviewLapId('lap-after-migration')!, snapshotDigest: 'sha256:snapshot-after-migration',
+      results: {
+        testQuality: {
+          kind: 'judged', rubric: 'testQuality', lapId: parseBuildReviewLapId('lap-after-migration')!, snapshotDigest: 'sha256:snapshot-after-migration',
+          contractVersion: 'v3', findings: [postMigrationFinding], verdict: 'FAIL',
+        },
+        security: {
+          kind: 'judged', rubric: 'security', lapId: parseBuildReviewLapId('lap-after-migration')!, snapshotDigest: 'sha256:snapshot-after-migration',
+          contractVersion: 'v3', findings: [], verdict: 'PASS',
+        },
+      },
+    });
+
+    expect({
+      ids: [preMigrationIdentity.id, postMigrationIdentity.id],
+      canonicalJson: [preMigrationIdentity.canonicalJson, postMigrationIdentity.canonicalJson],
+      matches: matchesBuildReviewDisposition(feature, postMigrationIdentity, [accepted]),
+    }).toEqual({
+      ids: [preMigrationIdentity.id, preMigrationIdentity.id],
+      canonicalJson: [preMigrationIdentity.canonicalJson, preMigrationIdentity.canonicalJson],
+      matches: true,
+    });
+    expect(accepted.finding.canonicalPayload).toMatchObject({ contractVersion: 'v3' });
+    expect(deriveEffectiveBuildReviewVerdict(aggregate, new Set([postMigrationIdentity.id]))).toMatchObject({
+      verdict: 'PASS', acceptedFindingIds: [postMigrationIdentity.id], unresolvedFindingIds: [],
+    });
+    expect(deriveEffectiveBuildReviewVerdictWithDispositions(aggregate, feature, [accepted])).toMatchObject({
+      verdict: 'PASS', acceptedFindingIds: [postMigrationIdentity.id], unresolvedFindingIds: [],
+    });
+  });
+
+  it('persists and matches accepted custom risk only for the exact judged declaration and content', async () => {
+    const judged = stampBuildReviewCustomJudgedResult({
+      kind: 'custom-findings', version: 'v1', findings: [{
+        concernId: 'portable-policy-gap', summary: 'The changed boundary lacks compatibility evidence.',
+        evidenceLocations: ['src/widget.ts:8'],
+        sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+      }],
+    }, {
+      rubric: 'portablePolicy', lapId: 'lap-7',
+      declaration: {
+        version: 'v1', rubricId: 'portablePolicy', semanticSkill: 'portable-policy',
+        question: 'Does this preserve the portable policy contract?', source: 'project', resources: ['criteria.md'],
+      },
+      policy: { version: 'v1', bundleDigest: `sha256:${'b'.repeat(64)}` },
+      candidate: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'medium' },
+      reviewedInput: { version: 'v1', contentDigest: `sha256:${'c'.repeat(64)}` },
+    }, {
+      sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+    })!;
+    const reReported = stampBuildReviewCustomJudgedResult({
+      kind: 'custom-findings', version: 'v1', findings: [{
+        concernId: 'portable-policy-gap', summary: 'Reworded report.', confidence: 99,
+        evidenceLocations: ['src/widget.ts:12'],
+        sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'reworded boundary' }],
+      }],
+    }, { ...judged, lapId: 'lap-8' }, {
+      sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+    })!;
+    const changedContent = stampBuildReviewCustomJudgedResult({
+      kind: 'custom-findings', version: 'v1', findings: [{
+        concernId: 'portable-policy-gap', summary: 'The changed boundary lacks compatibility evidence.',
+        evidenceLocations: ['src/widget.ts:8'],
+        sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+      }],
+    }, {
+      ...judged,
+      lapId: 'lap-8',
+      policy: { version: 'v1', bundleDigest: `sha256:${'d'.repeat(64)}` },
+    }, {
+      sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+    })!;
+    const changedDeclaration = stampBuildReviewCustomJudgedResult({
+      kind: 'custom-findings', version: 'v1', findings: [{
+        concernId: 'portable-policy-gap', summary: 'The changed boundary lacks compatibility evidence.',
+        evidenceLocations: ['src/widget.ts:8'],
+        sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+      }],
+    }, {
+      ...judged,
+      lapId: 'lap-9',
+      declaration: { ...judged.declaration, question: 'Does this preserve the revised portable policy contract?' },
+    }, {
+      sourceRegions: [{ path: 'src/widget.ts', startLine: 8, endLine: 12, contentHash: testContentHash, display: 'public boundary' }],
+    })!;
+    const filesystem = new MemoryFilesystem();
+    const store = new BuildReviewDispositionStore('/repo', {
+      filesystem, lock: lock({ ok: true, handle: { release: async () => ({ ok: true }) } }),
+    });
+
+    const appended = await store.append({
+      feature, finding: judged.findings[0].identity, sourceLapId: parseBuildReviewLapId('lap-7')!,
+      summary: judged.findings[0].summary, rationale: 'accepted risk', operator: 'james',
+    });
+    const listed = await store.list(feature);
+    const records = listed.ok ? listed.records : [];
+
+    expect(appended).toMatchObject({ ok: true, record: { finding: judged.findings[0].identity } });
+    expect(matchesBuildReviewDisposition(feature, judged.findings[0].identity, records)).toBe(true);
+    expect(matchesBuildReviewDisposition(feature, reReported.findings[0].identity, records)).toBe(true);
+    expect(matchesBuildReviewDisposition(feature, changedContent.findings[0].identity, records)).toBe(false);
+    expect(matchesBuildReviewDisposition(feature, changedDeclaration.findings[0].identity, records)).toBe(false);
+    expect(renderBuildReviewAcceptedRisk(records)).toMatchObject({ ok: true, section: expect.stringContaining(judged.findings[0].identity.id) });
   });
 });

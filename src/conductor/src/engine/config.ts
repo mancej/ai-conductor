@@ -30,6 +30,7 @@ import { validateWhenSyntax } from './when-expression.js';
 import type { PluginRegistry } from './plugin-registry.js';
 import { FALLBACK_RETRIES } from './resolved-config.js';
 import type { ConductorEventEmitter } from '../ui/events.js';
+import { BUILD_REVIEW_RUBRIC_IDS } from './build-review-registry.js';
 
 export type ConfigError = {
   type: 'missing' | 'parse_error' | 'version_mismatch' | 'validation_error';
@@ -90,7 +91,16 @@ const ARCHITECTURE_REVIEW_AS_BUILT_DEFAULTS = {
   max_remediation_laps: 1,
   remediation: { enabled: true },
 } as const;
-const BUILD_REVIEW_RUBRIC_IDS = ['testQuality'] as const;
+/** Built-in ids (now including shipped `security`) are reserved from custom declarations. */
+const RESERVED_BUILD_REVIEW_RUBRIC_IDS = new Set<string>(BUILD_REVIEW_RUBRIC_IDS);
+/** Keys accepted on each member of test_suite.commands. */
+export const TEST_SUITE_COMMAND_ENTRY_KEYS = [
+  'command', 'working_directory', 'timeout_seconds',
+] as const;
+const MAX_CUSTOM_BUILD_REVIEW_RUBRICS = 32;
+const CUSTOM_BUILD_REVIEW_RUBRIC_ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const CUSTOM_BUILD_REVIEW_FORBIDDEN_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+const CUSTOM_BUILD_REVIEW_SOURCES = new Set(['project', 'global', 'plugin']);
 /** Accepted config-key universe used by the consumer-registry coverage gate. */
 export const CONFIG_CONSUMER_KEY_SETS = {
   top: [
@@ -98,12 +108,13 @@ export const CONFIG_CONSUMER_KEY_SETS = {
     'markdown_viewer', 'mermaid_renderer', 'assess', 'acceptance_spec_globs', 'test_suite',
     'llm_provider', 'ui_renderer', 'visualizers', 'memory_provider', 'otel', 'build_progress',
     'provider_stream', 'spec_owner', 'owner_gate_cutover', 'attribution_audit_sample_pct',
-    'rebase_resolution_attempts', 'validation_concurrency', 'daemon_concurrency', 'harness_self_host',
+    'rebase_resolution_attempts', 'validation_concurrency', 'daemon_concurrency', 'daemon_heap_limit_mb',
+    'daemon_heap_dump_threshold_mb', 'daemon_heap_dump_retention', 'harness_self_host',
     'model_fallback_ladder', 'auto_restart_on_stale_engine', 'engine_refresh_min_interval_seconds',
     'codex_doctor_timeout_seconds', 'mergeable_autoresolve', 'build_review', 'conflict_check',
     'prd_audit', 'architecture_review_as_built', 'ci_watch', 'build_progress_halt',
     'retry_routing', 'coverage_binding', 'wiring', 'kickback_escalation', 'cumulative_kickback_bound',
-    'gate_code_validity', 'daemon_verbose', 'reconcile_parked_auto_cleanup',
+    'gate_code_validity', 'daemon_verbose', 'reconcile_parked_auto_cleanup', 'reclaim_merged_worktrees',
     'step_heartbeat_stall_minutes', 'stale_claim_window_hours', 'engineer_review_retention_days',
     'provider_preparation_timeout_minutes', 'teardown_timeout_seconds',
     'dispatch_start_timeout_seconds',
@@ -118,8 +129,9 @@ export const CONFIG_CONSUMER_KEY_SETS = {
   'steps.parallel': ['name', 'skill', 'model', 'effort', 'advisory'],
   'steps.by_tier': ['model', 'effort', 'max_retries'],
   'build_review.adjudication': ['enabled'],
-  'build_review.rubrics': ['enabled', 'llm_provider', 'model', 'effort', 'model_fallback_ladder', 'max_retries', 'escalate', 'min_confidence'],
-  build_review: ['enabled', 'perTaskFloor', 'scopeContainmentEnforced', 'maxParallel', 'adjudication', 'rubrics'],
+  'build_review.rubrics': ['enabled', 'max_projection_bytes', 'llm_provider', 'model', 'effort', 'model_fallback_ladder', 'max_retries', 'escalate', 'min_confidence'],
+  'build_review.custom_rubrics': ['skill', 'question', 'source', 'resources', 'enabled', 'llm_provider', 'model', 'effort', 'model_fallback_ladder', 'max_retries', 'escalate', 'min_confidence'],
+  build_review: ['enabled', 'perTaskFloor', 'scopeContainmentEnforced', 'maxParallel', 'adjudication', 'rubrics', 'custom_rubrics'],
   ci_watch: ['enabled', 'cooldownMinutes'],
   kickback_escalation: ['enabled'],
   cumulative_kickback_bound: ['enabled'],
@@ -129,7 +141,8 @@ export const CONFIG_CONSUMER_KEY_SETS = {
   'architecture_review_as_built.remediation': ['enabled'],
   'architecture_review_as_built.checks': ['tiers'],
   assess: ['stale_after_days', 'stale_after_commits'],
-  test_suite: ['command', 'scoped_command', 'working_directory', 'timeout_seconds', 'inputs', 'environment', 'verification'],
+  test_suite: ['command', 'commands', 'scoped_command', 'working_directory', 'timeout_seconds', 'inputs', 'environment', 'verification'],
+  'test_suite.commands[]': TEST_SUITE_COMMAND_ENTRY_KEYS,
   'test_suite.verification': ['mode', 'drift_budget'],
   build_progress: ['poll_seconds', 'quiet_minutes', 'heartbeat_minutes', 'enabled'],
   provider_stream: ['min_interval_ms'],
@@ -137,7 +150,7 @@ export const CONFIG_CONSUMER_KEY_SETS = {
   gate_code_validity: ['enabled'],
   retry_routing: ['enabled'],
   coverage_binding: ['judge'],
-  'coverage_binding.judge': ['enabled'],
+  'coverage_binding.judge': ['enabled', 'batch_size'],
   otel: ['exporter', 'endpoint', 'file', 'protocol', 'headers', 'project_name', 'worker_name', 'attributes'],
   markdown_viewer: ['preset', 'command', 'args', 'mode'],
   mermaid_renderer: ['preset', 'command', 'args', 'mode'],
@@ -159,6 +172,9 @@ const DEPRECATED_BUILD_REVIEW_ADR =
 
 /** Default hard floor for live provider-stream observation emission. */
 export const DEFAULT_PROVIDER_STREAM_MIN_INTERVAL_MS = 5_000;
+
+/** Default V8 old-space heap limit, in megabytes, for the continuous daemon. */
+export const DEFAULT_DAEMON_HEAP_LIMIT_MB = 4096;
 
 function normalizeKeyedBlock(
   blockName: string,
@@ -232,6 +248,17 @@ function validateBuildReviewRubrics(
     if (policy.enabled !== undefined && typeof policy.enabled !== 'boolean') {
       return { type: 'validation_error', message: `${path}.enabled must be a boolean` };
     }
+    if (
+      policy.max_projection_bytes !== undefined &&
+      (typeof policy.max_projection_bytes !== 'number' ||
+        !Number.isInteger(policy.max_projection_bytes) ||
+        policy.max_projection_bytes <= 0)
+    ) {
+      return {
+        type: 'validation_error',
+        message: `${path}.max_projection_bytes must be a positive integer byte count`,
+      };
+    }
     const providerError = validateProviderSelection(policy.llm_provider, `${path}.llm_provider`);
     if (providerError) return providerError;
     if (policy.model !== undefined && typeof policy.model !== 'string') {
@@ -261,6 +288,129 @@ function validateBuildReviewRubrics(
     }
     if (policy.min_confidence !== undefined && (typeof policy.min_confidence !== 'number' || !Number.isInteger(policy.min_confidence) || policy.min_confidence < 0 || policy.min_confidence > 100)) {
       return { type: 'validation_error', message: `${path}.min_confidence must be an integer between 0 and 100` };
+    }
+  }
+  return null;
+}
+
+function validateBuildReviewCustomRubrics(
+  customRubrics: unknown,
+  adjudicationEnabled: boolean,
+): ConfigError | null {
+  if (customRubrics === undefined) return null;
+  if (!isPlainObject(customRubrics)) {
+    return {
+      type: 'validation_error',
+      message: 'build_review.custom_rubrics must be an object',
+    };
+  }
+
+  const declarations = Object.entries(customRubrics);
+  if (declarations.length > MAX_CUSTOM_BUILD_REVIEW_RUBRICS) {
+    return {
+      type: 'validation_error',
+      message: `build_review.custom_rubrics supports at most ${MAX_CUSTOM_BUILD_REVIEW_RUBRICS} declarations`,
+    };
+  }
+
+  const allowedKeys = new Set<string>(CONFIG_CONSUMER_KEY_SETS['build_review.custom_rubrics']);
+  for (const [rubricId, declaration] of declarations) {
+    const path = `build_review.custom_rubrics.${rubricId}`;
+    if (CUSTOM_BUILD_REVIEW_FORBIDDEN_IDS.has(rubricId)) {
+      return { type: 'validation_error', message: `${path} is a forbidden prototype key` };
+    }
+    if (!CUSTOM_BUILD_REVIEW_RUBRIC_ID.test(rubricId)) {
+      return {
+        type: 'validation_error',
+        message: `${path} must be a 1-64 character ASCII letter-leading identifier`,
+      };
+    }
+    if (RESERVED_BUILD_REVIEW_RUBRIC_IDS.has(rubricId)) {
+      return { type: 'validation_error', message: `${path} is a reserved built-in rubric ID` };
+    }
+    if (DEPRECATED_BUILD_REVIEW_RUBRIC_ID_SET.has(rubricId)) {
+      return { type: 'validation_error', message: `${path} is a reserved retired rubric ID` };
+    }
+    if (!isPlainObject(declaration)) {
+      return { type: 'validation_error', message: `${path} must be an object` };
+    }
+    for (const key of Object.keys(declaration)) {
+      if (!allowedKeys.has(key)) {
+        return { type: 'validation_error', message: `Unknown key in ${path}: "${key}"` };
+      }
+    }
+    if (typeof declaration.skill !== 'string' || declaration.skill === '') {
+      return { type: 'validation_error', message: `${path}.skill must be a non-empty string` };
+    }
+    // Custom policy selection accepts a semantic skill reference only. Provider
+    // invocation prefixes and paths would bypass the catalog selection seam.
+    if (!/^[A-Za-z][A-Za-z0-9_-]*(?::[A-Za-z][A-Za-z0-9_-]*)?$/.test(declaration.skill)) {
+      return { type: 'validation_error', message: `${path}.skill must be a semantic skill reference` };
+    }
+    if (typeof declaration.question !== 'string' || declaration.question === '') {
+      return { type: 'validation_error', message: `${path}.question must be a non-empty string` };
+    }
+    if (
+      declaration.source !== undefined
+      && (!CUSTOM_BUILD_REVIEW_SOURCES.has(declaration.source as string))
+    ) {
+      return { type: 'validation_error', message: `${path}.source must be project|global|plugin` };
+    }
+    if (
+      declaration.resources !== undefined
+      && (!Array.isArray(declaration.resources)
+        || declaration.resources.some((resource) => typeof resource !== 'string' || resource === '' ||
+          isAbsolute(resource) || resource.split(/[\\/]/).includes('..')))
+    ) {
+      return {
+        type: 'validation_error',
+        message: `${path}.resources must be an array of non-empty strings`,
+      };
+    }
+    if (declaration.enabled !== undefined && typeof declaration.enabled !== 'boolean') {
+      return { type: 'validation_error', message: `${path}.enabled must be a boolean` };
+    }
+    const providerError = validateProviderSelection(declaration.llm_provider, `${path}.llm_provider`);
+    if (providerError) return providerError;
+    if (declaration.model !== undefined && typeof declaration.model !== 'string') {
+      return { type: 'validation_error', message: `${path}.model must be a string` };
+    }
+    if (declaration.effort !== undefined && !VALID_EFFORTS.has(declaration.effort as EffortLevel)) {
+      return { type: 'validation_error', message: `${path}.effort must be low|medium|high|xhigh|max` };
+    }
+    if (
+      declaration.model_fallback_ladder !== undefined
+      && (!Array.isArray(declaration.model_fallback_ladder)
+        || declaration.model_fallback_ladder.some((model) => typeof model !== 'string' || model === ''))
+    ) {
+      return {
+        type: 'validation_error',
+        message: `${path}.model_fallback_ladder must be an array of non-empty strings`,
+      };
+    }
+    if (declaration.max_retries !== undefined && typeof declaration.max_retries !== 'number') {
+      return { type: 'validation_error', message: `${path}.max_retries must be a number` };
+    }
+    if (declaration.escalate !== undefined && typeof declaration.escalate !== 'boolean') {
+      return { type: 'validation_error', message: `${path}.escalate must be a boolean` };
+    }
+    if (
+      declaration.min_confidence !== undefined
+      && (typeof declaration.min_confidence !== 'number'
+        || !Number.isInteger(declaration.min_confidence)
+        || declaration.min_confidence < 0
+        || declaration.min_confidence > 100)
+    ) {
+      return {
+        type: 'validation_error',
+        message: `${path}.min_confidence must be an integer between 0 and 100`,
+      };
+    }
+    if (declaration.enabled === true && !adjudicationEnabled) {
+      return {
+        type: 'validation_error',
+        message: `${path} cannot be enabled while build_review.adjudication.enabled is false`,
+      };
     }
   }
   return null;
@@ -821,6 +971,16 @@ export function validateConfig(
     }
   }
 
+  // reclaim_merged_worktrees — merged feature worktree reclamation policy.
+  // Absent → enabled by default; malformed values are hard configuration errors.
+  if (obj.reclaim_merged_worktrees !== undefined) {
+    if (typeof obj.reclaim_merged_worktrees !== 'boolean') {
+      return errVal('reclaim_merged_worktrees must be a boolean');
+    }
+  } else if (materializeDefaults) {
+    obj.reclaim_merged_worktrees = true;
+  }
+
   // mergeable_autoresolve
   if (obj.mergeable_autoresolve !== undefined) {
     const err = validateMergeableAutoresolveBlock(obj.mergeable_autoresolve);
@@ -933,6 +1093,28 @@ export function validateConfig(
       obj.daemon_concurrency < 1
     ) {
       return errVal('daemon_concurrency must be an integer in the accepted range [1, ∞)');
+    }
+  }
+
+  // daemon_heap_limit_mb — V8's old-space cap must leave enough room for a
+  // viable daemon while remaining an exact megabyte count for NODE_OPTIONS.
+  if (obj.daemon_heap_limit_mb !== undefined) {
+    if (
+      typeof obj.daemon_heap_limit_mb !== 'number' ||
+      !Number.isFinite(obj.daemon_heap_limit_mb) ||
+      !Number.isInteger(obj.daemon_heap_limit_mb) ||
+      obj.daemon_heap_limit_mb < 256
+    ) {
+      return errVal('daemon_heap_limit_mb must be an integer in the accepted range [256, ∞)');
+    }
+  }
+
+  // daemon_heap_dump_threshold_mb / daemon_heap_dump_retention — the heap
+  // snapshot trigger and the number of snapshots kept under .daemon/heap/.
+  for (const key of ['daemon_heap_dump_threshold_mb', 'daemon_heap_dump_retention'] as const) {
+    const value = obj[key];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) {
+      return errVal(`${key} must be an integer in the accepted range [1, ∞)`);
     }
   }
 
@@ -1167,7 +1349,7 @@ export function validateConfig(
           key,
           isValid: (value: unknown) => {
             if (key === 'enabled' || key === 'scopeContainmentEnforced') return typeof value === 'boolean';
-            if (key === 'adjudication') return true;
+            if (key === 'adjudication' || key === 'custom_rubrics') return true;
             return key === 'perTaskFloor' || key === 'maxParallel' || key === 'rubrics';
           },
         })),
@@ -1193,6 +1375,12 @@ export function validateConfig(
         deprecatedKeys,
       );
       if (rubricError) return { ok: false, error: rubricError };
+      const adjudicationEnabled = (br.adjudication as Record<string, unknown> | undefined)?.enabled !== false;
+      const customRubricError = validateBuildReviewCustomRubrics(
+        br.custom_rubrics,
+        adjudicationEnabled,
+      );
+      if (customRubricError) return { ok: false, error: customRubricError };
       const activeRubricInput = isPlainObject(rubricInput)
         ? Object.fromEntries(
             Object.entries(rubricInput).filter(
@@ -1203,7 +1391,7 @@ export function validateConfig(
       const resolvedBuildReview = {
         ...br,
         enabled: typeof br.enabled === 'boolean' ? br.enabled : true,
-        maxParallel: typeof br.maxParallel === 'number' ? br.maxParallel : 1,
+        maxParallel: typeof br.maxParallel === 'number' ? br.maxParallel : 4,
         adjudication: {
           enabled:
             typeof (br.adjudication as Record<string, unknown> | undefined)?.enabled === 'boolean'
@@ -1230,7 +1418,7 @@ export function validateConfig(
       );
       obj.build_review = {
         enabled: true,
-        maxParallel: 1,
+        maxParallel: 4,
         adjudication: { enabled: true },
         rubrics: Object.fromEntries(BUILD_REVIEW_RUBRIC_IDS.map((rubricId) => [rubricId, { enabled: false }])),
       };
@@ -1238,7 +1426,7 @@ export function validateConfig(
   } else if (obj.build_review === null || materializeDefaults) {
     obj.build_review = {
       enabled: true,
-      maxParallel: 1,
+      maxParallel: 4,
       adjudication: { enabled: true },
       rubrics: Object.fromEntries(BUILD_REVIEW_RUBRIC_IDS.map((rubricId) => [rubricId, { enabled: false }])),
     };
@@ -1737,10 +1925,14 @@ function validateTestSuiteBlock(
     }
   }
 
-  if (raw.command === undefined && raw.scoped_command === undefined) {
+  if (
+    raw.command === undefined &&
+    raw.commands === undefined &&
+    raw.scoped_command === undefined
+  ) {
     return {
       type: 'validation_error',
-      message: 'test_suite.command or test_suite.scoped_command must be configured',
+      message: 'test_suite.command, test_suite.commands, or test_suite.scoped_command must be configured',
     };
   }
 
@@ -1749,6 +1941,67 @@ function validateTestSuiteBlock(
       type: 'validation_error',
       message: 'test_suite.command must be a non-empty string',
     };
+  }
+
+  if (raw.command !== undefined && raw.commands !== undefined) {
+    return {
+      type: 'validation_error',
+      message: 'test_suite.command and test_suite.commands cannot both be configured',
+    };
+  }
+
+  if (raw.commands !== undefined) {
+    if (!Array.isArray(raw.commands) || raw.commands.length === 0) {
+      return {
+        type: 'validation_error',
+        message: 'test_suite.commands must be a non-empty array',
+      };
+    }
+
+    const allowedCommandKeys = new Set<string>(TEST_SUITE_COMMAND_ENTRY_KEYS);
+    for (const [index, entry] of raw.commands.entries()) {
+      if (!isPlainObject(entry)) {
+        return {
+          type: 'validation_error',
+          message: `test_suite.commands[${index}] must be an object`,
+        };
+      }
+
+      for (const key of Object.keys(entry)) {
+        if (!allowedCommandKeys.has(key)) {
+          return {
+            type: 'validation_error',
+            message: `Unknown key in test_suite.commands[${index}]: "${key}"`,
+          };
+        }
+      }
+
+      if (typeof entry.command !== 'string' || entry.command.trim() === '') {
+        return {
+          type: 'validation_error',
+          message: `test_suite.commands[${index}].command must be a non-empty string`,
+        };
+      }
+
+      if (
+        entry.timeout_seconds !== undefined &&
+        (typeof entry.timeout_seconds !== 'number' ||
+          !Number.isFinite(entry.timeout_seconds) ||
+          entry.timeout_seconds <= 0)
+      ) {
+        return {
+          type: 'validation_error',
+          message: `test_suite.commands[${index}].timeout_seconds must be a finite positive number`,
+        };
+      }
+
+      const workingDirectoryError = validateTestSuiteWorkingDirectory(
+        entry.working_directory,
+        projectRoot,
+        `test_suite.commands[${index}].working_directory`,
+      );
+      if (workingDirectoryError) return workingDirectoryError;
+    }
   }
 
   if (raw.scoped_command !== undefined) {
@@ -1766,30 +2019,12 @@ function validateTestSuiteBlock(
     }
   }
 
-  if (raw.working_directory !== undefined) {
-    if (typeof raw.working_directory !== 'string') {
-      return {
-        type: 'validation_error',
-        message: 'test_suite.working_directory must be a relative path within the project root',
-      };
-    }
-    const root = resolvePath(projectRoot ?? '.');
-    const resolvedDirectory = resolvePath(root, raw.working_directory);
-    const relativeDirectory = relative(root, resolvedDirectory);
-    if (
-      isAbsolute(raw.working_directory) ||
-      relativeDirectory === '..' ||
-      relativeDirectory.startsWith(`..${sep}`) ||
-      isAbsolute(relativeDirectory) ||
-      (projectRoot !== undefined &&
-        existingRealPathEscapesRoot(projectRoot, resolvedDirectory))
-    ) {
-      return {
-        type: 'validation_error',
-        message: 'test_suite.working_directory must be a relative path within the project root',
-      };
-    }
-  }
+  const workingDirectoryError = validateTestSuiteWorkingDirectory(
+    raw.working_directory,
+    projectRoot,
+    'test_suite.working_directory',
+  );
+  if (workingDirectoryError) return workingDirectoryError;
 
   if (
     raw.timeout_seconds !== undefined &&
@@ -1826,6 +2061,37 @@ function validateTestSuiteBlock(
     raw.verification = resolveTestSuiteVerification(raw.verification);
   }
 
+  return null;
+}
+
+function validateTestSuiteWorkingDirectory(
+  workingDirectory: unknown,
+  projectRoot: string | undefined,
+  field: string,
+): ConfigError | null {
+  if (workingDirectory === undefined) return null;
+  if (typeof workingDirectory !== 'string') {
+    return {
+      type: 'validation_error',
+      message: `${field} must be a relative path within the project root`,
+    };
+  }
+  const root = resolvePath(projectRoot ?? '.');
+  const resolvedDirectory = resolvePath(root, workingDirectory);
+  const relativeDirectory = relative(root, resolvedDirectory);
+  if (
+    isAbsolute(workingDirectory) ||
+    relativeDirectory === '..' ||
+    relativeDirectory.startsWith(`..${sep}`) ||
+    isAbsolute(relativeDirectory) ||
+    (projectRoot !== undefined &&
+      existingRealPathEscapesRoot(projectRoot, resolvedDirectory))
+  ) {
+    return {
+      type: 'validation_error',
+      message: `${field} must be a relative path within the project root`,
+    };
+  }
   return null;
 }
 
@@ -2238,13 +2504,27 @@ function validateCoverageBindingBlock(raw: unknown): ConfigError | null {
       message: 'coverage_binding.judge.enabled must be a boolean',
     };
   }
+  if (
+    judge.batch_size !== undefined
+    && (typeof judge.batch_size !== 'number' || !Number.isInteger(judge.batch_size) || judge.batch_size <= 0)
+  ) {
+    return {
+      type: 'validation_error',
+      message: 'coverage_binding.judge.batch_size must be a positive integer',
+    };
+  }
   return null;
 }
 
-function resolveCoverageBindingBlock(raw: unknown): { judge: { enabled: boolean } } {
+function resolveCoverageBindingBlock(raw: unknown): { judge: { enabled: boolean; batch_size: number } } {
   const block = isPlainObject(raw) ? raw as Record<string, unknown> : {};
   const judge = isPlainObject(block.judge) ? block.judge as Record<string, unknown> : {};
-  return { judge: { enabled: typeof judge.enabled === 'boolean' ? judge.enabled : false } };
+  return {
+    judge: {
+      enabled: typeof judge.enabled === 'boolean' ? judge.enabled : false,
+      batch_size: typeof judge.batch_size === 'number' ? judge.batch_size : 8,
+    },
+  };
 }
 
 function validateMergeableAutoresolveBlock(raw: unknown): ConfigError | null {

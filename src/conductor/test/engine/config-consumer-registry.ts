@@ -68,6 +68,9 @@ export const configConsumerRegistry: Record<string, ConsumerDeclaration> = {
   rebase_resolution_attempts: consumer(CONDUCTOR),
   validation_concurrency: consumer(CONDUCTOR),
   daemon_concurrency: consumer(DAEMON_CLI),
+  daemon_heap_limit_mb: consumer('src/conductor/src/engine/daemon-tmux.ts'),
+  daemon_heap_dump_threshold_mb: consumer('src/conductor/src/engine/daemon-memory.ts'),
+  daemon_heap_dump_retention: consumer('src/conductor/src/engine/daemon-memory.ts'),
   harness_self_host: consumer(RESOLVED_CONFIG),
   model_fallback_ladder: consumer('src/conductor/src/engine/provider-execution.ts'),
   auto_restart_on_stale_engine: consumer('src/conductor/src/engine/stale-engine-init.ts'),
@@ -88,6 +91,7 @@ export const configConsumerRegistry: Record<string, ConsumerDeclaration> = {
   gate_code_validity: consumer('src/conductor/src/engine/gate-code-validity.ts'),
   daemon_verbose: consumer('src/conductor/src/engine/daemon-deps.ts'),
   reconcile_parked_auto_cleanup: consumer(DAEMON_CLI),
+  reclaim_merged_worktrees: consumer(DAEMON_CLI),
   step_heartbeat_stall_minutes: none('deprecated compatibility no-op; never grants termination authority (#1025)'),
   stale_claim_window_hours: consumer(RESOLVED_CONFIG),
   engineer_review_retention_days: consumer('src/conductor/src/engine/engineer/retention.ts'),
@@ -201,6 +205,7 @@ export const configConsumerRegistry: Record<string, ConsumerDeclaration> = {
   'build_review.adjudication.enabled': consumer(RESOLVED_CONFIG),
   'build_review.rubrics': consumer(RESOLVED_CONFIG),
   'build_review.rubrics.enabled': consumer(RESOLVED_CONFIG),
+  'build_review.rubrics.max_projection_bytes': consumer(RESOLVED_CONFIG),
   'build_review.rubrics.llm_provider': consumer(RESOLVED_CONFIG),
   'build_review.rubrics.model': consumer(RESOLVED_CONFIG),
   'build_review.rubrics.effort': consumer(RESOLVED_CONFIG),
@@ -208,12 +213,26 @@ export const configConsumerRegistry: Record<string, ConsumerDeclaration> = {
   'build_review.rubrics.max_retries': consumer(RESOLVED_CONFIG),
   'build_review.rubrics.escalate': consumer(RESOLVED_CONFIG),
   'build_review.rubrics.min_confidence': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.skill': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.question': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.source': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.resources': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.enabled': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.llm_provider': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.model': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.effort': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.model_fallback_ladder': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.max_retries': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.escalate': consumer(RESOLVED_CONFIG),
+  'build_review.custom_rubrics.min_confidence': consumer(RESOLVED_CONFIG),
 
   // ── coverage_binding ────────────────────────────────────────────────────
   // The step runner consumes the resolved boolean; resolution is the sole
   // reader of the raw nested configuration.
   'coverage_binding.judge': consumer(RESOLVED_CONFIG),
   'coverage_binding.judge.enabled': consumer(RESOLVED_CONFIG),
+  'coverage_binding.judge.batch_size': consumer(RESOLVED_CONFIG),
 
   // ── ci_watch ──────────────────────────────────────────────────────────────
   'ci_watch.enabled': consumer(DAEMON_CLI),
@@ -260,6 +279,10 @@ export const configConsumerRegistry: Record<string, ConsumerDeclaration> = {
   // The verifier resolves the test-suite block before selecting aggregate or
   // scoped execution and applying the configured drift budget.
   'test_suite.verification': consumer(FULL_SUITE_VERIFIER),
+  'test_suite.commands': consumer(FULL_SUITE_EXECUTOR),
+  'test_suite.commands[].command': consumer(FULL_SUITE_EXECUTOR),
+  'test_suite.commands[].working_directory': consumer(FULL_SUITE_EXECUTOR),
+  'test_suite.commands[].timeout_seconds': consumer(FULL_SUITE_EXECUTOR),
   'test_suite.verification.mode': consumer(FULL_SUITE_VERIFIER),
   'test_suite.verification.drift_budget': consumer(FULL_SUITE_VERIFIER),
 

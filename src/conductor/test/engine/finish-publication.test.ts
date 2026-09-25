@@ -1,4 +1,4 @@
-// Covers: task:7
+// Covers: task:5, task:7
 import { describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,8 @@ import { HALT_PR_BANNER_SENTINEL, type GhRunner, type GitRunner } from '../../sr
 import { ensureShipReady, rehabilitateHaltPr } from '../../src/engine/halt-pr-rehabilitation.js';
 import { createProductionFinishPublicationCoordinator } from '../../src/engine/finish-publication-production.js';
 import { HUMAN_REQUIRED_REASONS } from '../../src/engine/finish-publication.js';
+import type { GithubOperationRunner } from '../../src/engine/github-operations.js';
+import type { OpenShipDraftPrDeps } from '../../src/engine/ship-draft-pr.js';
 import type { ConductState, StepName } from '../../src/types/index.js';
 import { Conductor } from '../test-conductor.js';
 import { ConductorEventEmitter } from '../../src/ui/events.js';
@@ -107,6 +109,8 @@ async function nonRetryablePublicationReason(reason: string) {
 }
 
 type ObservationState = 'present' | 'missing' | 'stale' | 'malformed' | 'unavailable';
+type ImplementationEvidenceObservation =
+  import('../../src/engine/finish-publication.js').ImplementationEvidenceObservation;
 type PushObservationState = 'pushed' | 'unpushed' | 'stale' | 'malformed' | 'unavailable';
 type PublicationSnapshot = import('../../src/engine/finish-publication.js').PublicationSnapshot;
 type PublicationTransition = import('../../src/engine/finish-publication.js').PublicationTransition;
@@ -184,14 +188,7 @@ interface AdvanceFinishPublicationInput {
     recordOutcome?: (request: FinishOutcomeRecordRequest) => Promise<void>;
     createShippedRecord?: () => Promise<void>;
     repairPresentation?: () => Promise<void>;
-    establishPr?: {
-      gh: GhRunner;
-      git: GitRunner;
-      cwd: string;
-      branch: string;
-      baseBranch: string;
-      featureDesc?: string;
-    };
+    establishPr?: OpenShipDraftPrDeps;
   };
 }
 
@@ -223,7 +220,7 @@ type AdvanceFinishPublication = (
 
 interface PublicationObservationPorts {
   filesystem: {
-    observeImplementationEvidence(): Promise<ObservationState>;
+    observeImplementationEvidence(): Promise<ImplementationEvidenceObservation>;
     observeShipEvidence(): Promise<ObservationState>;
     observeOutcomeRecord(): Promise<ObservationState>;
   };
@@ -260,6 +257,15 @@ async function observePublicationSnapshot(input: ObservePublicationSnapshotInput
     throw new Error('expected export "observePublicationSnapshot" to be a function (not yet implemented)');
   }
   return observer(input);
+}
+
+async function preflightFinishPublication(snapshot: PublicationSnapshot) {
+  const mod = (await import(FINISH_PUBLICATION_MODULE)) as Record<string, unknown>;
+  const preflight = mod.preflightFinishPublication;
+  if (typeof preflight !== 'function') {
+    throw new Error('expected export "preflightFinishPublication" to be a function (not yet implemented)');
+  }
+  return preflight(snapshot);
 }
 
 async function resolveInteractivePublicationIntent(choice: unknown) {
@@ -329,7 +335,7 @@ function readyPublicationSnapshot(
 }
 
 function observerPorts(overrides: Partial<{
-  implementationEvidence: ObservationState;
+  implementationEvidence: ImplementationEvidenceObservation;
   shipEvidence: ObservationState;
   outcomeRecord: ObservationState;
   branchPushed: PushObservationState;
@@ -339,7 +345,7 @@ function observerPorts(overrides: Partial<{
 }> = {}): PublicationObservationPorts {
   return {
     filesystem: {
-      observeImplementationEvidence: async () => overrides.implementationEvidence ?? 'present',
+      observeImplementationEvidence: async () => overrides.implementationEvidence ?? { state: 'present' },
       observeShipEvidence: async () => overrides.shipEvidence ?? 'present',
       observeOutcomeRecord: async () => overrides.outcomeRecord ?? 'present',
     },
@@ -378,6 +384,7 @@ function observationInput(ports: PublicationObservationPorts): ObservePublicatio
 function draftPrFakes(ghHandler: (args: string[]) => { stdout: string } | Error) {
   const gitCalls: string[][] = [];
   const ghCalls: string[][] = [];
+  let createdUrl: string | undefined;
   const git: GitRunner = async (args) => {
     gitCalls.push([...args]);
     if (args[0] === 'rev-list') return { stdout: '1\n' };
@@ -385,9 +392,20 @@ function draftPrFakes(ghHandler: (args: string[]) => { stdout: string } | Error)
   };
   const gh: GhRunner = async (args) => {
     ghCalls.push([...args]);
+    if (args[0] === 'pr' && args[1] === 'view' && createdUrl) {
+      return { stdout: JSON.stringify({ state: 'OPEN', url: createdUrl }) };
+    }
     const result = ghHandler(args);
     if (result instanceof Error) throw result;
+    if (args[0] === 'pr' && args[1] === 'create') createdUrl = result.stdout.trim();
     return result;
+  };
+  const operations: GithubOperationRunner = {
+    async run(request) {
+      if (request.operation !== 'pull-request.create') throw new Error(`unexpected operation: ${request.operation}`);
+      await gh(['pr', 'create'], { cwd: '/repo' });
+      return {};
+    },
   };
   return {
     deps: {
@@ -397,9 +415,49 @@ function draftPrFakes(ghHandler: (args: string[]) => { stdout: string } | Error)
       branch: 'feat/widget',
       baseBranch: 'main',
       featureDesc: 'widget',
+      remoteGit: async () => ({
+        kind: 'executed' as const,
+        targets: [{
+          operation: 'remote-ref.push' as const,
+          repository: 'acme/widget',
+          kind: 'remote-ref' as const,
+          ref: 'refs/heads/feat/widget',
+        }],
+      }),
+      operations,
     },
     gitCalls,
     ghCalls,
+  };
+}
+
+/** Simulate the guarded operation adapter while keeping PR state in the fake GitHub boundary. */
+function guardedPresentationOperations(gh: GhRunner): GithubOperationRunner {
+  return {
+    async run(request) {
+      if (request.target.kind !== 'pull-request') throw new Error('expected pull-request operation');
+      const prUrl = `https://github.com/${request.target.repository}/pull/${request.target.number}`;
+      switch (request.operation) {
+        case 'pull-request.ready':
+          await gh(['pr', 'ready', String(request.target.number)], { cwd: '/repo' });
+          return {};
+        case 'pull-request.label.remove':
+          await gh(['api', '--method', 'DELETE'], { cwd: '/repo' });
+          return {};
+        case 'pull-request.edit': {
+          const body = request.payload && 'body' in request.payload ? request.payload.body : undefined;
+          const title = request.payload && 'title' in request.payload ? request.payload.title : undefined;
+          await gh([
+            'pr', 'edit', prUrl,
+            ...(typeof body === 'string' ? ['--body', body] : []),
+            ...(typeof title === 'string' ? ['--title', title] : []),
+          ], { cwd: '/repo' });
+          return {};
+        }
+        default:
+          throw new Error(`unexpected operation: ${request.operation}`);
+      }
+    },
   };
 }
 
@@ -776,8 +834,16 @@ describe('FINISH publication disposition routing', () => {
     ],
     [
       'implementation invalid',
-      { kind: 'implementation_invalid', evidence: 'build-review FAIL: finish-publication.ts' },
-      { kind: 'retry_build', evidence: 'build-review FAIL: finish-publication.ts' },
+      {
+        kind: 'implementation_invalid',
+        evidence: 'build-review FAIL: finish-publication.ts',
+        unsatisfiedMembers: ['build_review'],
+      },
+      {
+        kind: 'retry_build',
+        evidence: 'build-review FAIL: finish-publication.ts',
+        unsatisfiedMembers: ['build_review'],
+      },
     ],
     [
       'contradictory disposition',
@@ -1017,9 +1083,12 @@ describe('FINISH publication disposition routing', () => {
       'SHIP evidence could not be determined; restore its observer before FINISH can continue.',
     ],
   ] as const)('halts evidence-invalid condition %s with its unresolved observation', async (code, message, nextAction, reason) => {
+    const condition = code === 'implementation_evidence_invalid'
+      ? { code, message, nextAction, unsatisfiedMembers: ['build_review'] }
+      : { code, message, nextAction };
     const result = await routeFinishPublicationDisposition({
       kind: 'publication_retry',
-      condition: { code, message, nextAction },
+      condition,
     });
     expect(result).toEqual({ kind: 'halt', reason });
     expect(result.kind === 'halt' && result.reason).not.toContain('dedicated BUILD routing rule');
@@ -1029,10 +1098,10 @@ describe('FINISH publication disposition routing', () => {
     const evidence = 'build-review FAIL: src/engine/finish-publication.ts:497';
 
     await expect(
-      routeFinishPublicationDisposition({ kind: 'implementation_invalid', evidence }),
-    ).resolves.toEqual({ kind: 'retry_build', evidence });
+      routeFinishPublicationDisposition({ kind: 'implementation_invalid', evidence, unsatisfiedMembers: ['build_review'] }),
+    ).resolves.toEqual({ kind: 'retry_build', evidence, unsatisfiedMembers: ['build_review'] });
     await expect(
-      routeFinishPublicationDisposition({ kind: 'implementation_invalid', evidence: '   ' }),
+      routeFinishPublicationDisposition({ kind: 'implementation_invalid', evidence: '   ', unsatisfiedMembers: ['build_review'] }),
     ).resolves.toMatchObject({ kind: 'halt' });
   });
 
@@ -1144,7 +1213,7 @@ describe('observePublicationSnapshot', () => {
   });
 
   it.each([
-    ['missing', { implementationEvidence: 'missing' }, { implementationEvidence: 'invalid' }],
+    ['missing', { implementationEvidence: { state: 'missing', unsatisfiedMembers: ['build_review'] } }, { implementationEvidence: 'invalid' }],
     ['stale', { releaseReadiness: 'stale' }, { releaseReadiness: 'invalid' }],
     ['malformed', { shippedRecord: 'malformed' }, { shippedRecord: 'invalid' }],
     ['unpushed', { branchPushed: 'unpushed' }, { branchPushed: 'missing' }],
@@ -1753,6 +1822,38 @@ describe('resolveUnattendedPublicationIntent', () => {
 });
 
 describe('advanceFinishPublication preflight', () => {
+  it.each([
+    ['build review only', ['build_review']],
+    ['test suite only', ['test_suite']],
+    ['both implementation members in evaluation order', ['build_review', 'test_suite']],
+  ] as const)('carries the typed unsatisfied members for %s', async (_caseName, unsatisfiedMembers) => {
+    const snapshot = readyPublicationSnapshot({
+      implementationEvidence: 'invalid',
+      unsatisfiedImplementationEvidenceMembers: unsatisfiedMembers,
+    });
+
+    await expect(preflightFinishPublication(snapshot)).resolves.toEqual({
+      kind: 'blocked',
+      condition: {
+        code: 'implementation_evidence_invalid',
+        message: 'Implementation evidence is invalid. Re-run the BUILD verification, then retry FINISH.',
+        nextAction: 'rerun_build_verification',
+        unsatisfiedMembers,
+      },
+    });
+
+    const result = await advanceFinishPublication({
+      observe: async () => snapshot,
+      effects: { dispatchJudgment: async () => ({ kind: 'accepted' }) },
+    });
+
+    expect(result).toEqual({
+      kind: 'implementation_invalid',
+      evidence: 'implementation_evidence_invalid: Implementation evidence is invalid. Re-run the BUILD verification, then retry FINISH.',
+      unsatisfiedMembers,
+    });
+  });
+
   it('reaches the judgment boundary once when observed publication, SHIP, and release readiness are valid', async () => {
     let prose: Extract<PublicationSnapshot['pr'], { identity: 'one' }>['prose'] = 'stale';
     const dispatchJudgment = vi.fn(async () => {
@@ -2089,6 +2190,21 @@ describe('advanceFinishPublication concurrent mutation reconciliation', () => {
     switch (transition) {
       case 'establish_pr': {
         snapshot = readyPublicationSnapshot({ pr: { identity: 'none' }, branchPushed: 'missing' });
+        const gh: GhRunner = async (args) => {
+          if (args[1] === 'view') {
+            if (snapshot.pr.identity === 'one') {
+              return { stdout: JSON.stringify({ state: 'OPEN', url: snapshot.pr.url }) };
+            }
+            throw new Error('not found');
+          }
+          if (args[1] === 'create') {
+            await mutate(() => {
+              snapshot = readyPublicationSnapshot();
+            });
+            return { stdout: 'https://github.com/acme/widget/pull/1172\n' };
+          }
+          return { stdout: '' };
+        };
         effects.establishPr = {
           cwd: '/repo',
           branch: 'feat/widget',
@@ -2097,15 +2213,22 @@ describe('advanceFinishPublication concurrent mutation reconciliation', () => {
             if (args[0] === 'rev-list') return { stdout: '1\n' };
             return { stdout: '' };
           },
-          gh: async (args) => {
-            if (args[1] === 'view') throw new Error('not found');
-            if (args[1] === 'create') {
-              await mutate(() => {
-                snapshot = readyPublicationSnapshot();
-              });
-              return { stdout: 'https://github.com/acme/widget/pull/1172\n' };
-            }
-            return { stdout: '' };
+          gh,
+          remoteGit: async () => ({
+            kind: 'executed',
+            targets: [{
+              operation: 'remote-ref.push',
+              repository: 'acme/widget',
+              kind: 'remote-ref',
+              ref: 'refs/heads/feat/widget',
+            }],
+          }),
+          operations: {
+            async run(request) {
+              if (request.operation !== 'pull-request.create') throw new Error(`unexpected operation: ${request.operation}`);
+              await gh(['pr', 'create'], { cwd: '/repo' });
+              return {};
+            },
           },
         };
         break;
@@ -2791,6 +2914,7 @@ describe('advanceFinishPublication accepted PR presentation', () => {
         cwd: '/repo',
         prUrl: 'https://github.com/acme/widget/pull/1172',
         sourceRef: null,
+        operations: guardedPresentationOperations(github.gh),
       });
       ready = github.isReady();
     });
@@ -2815,7 +2939,14 @@ describe('advanceFinishPublication accepted PR presentation', () => {
       pr: { identity: 'one', url: 'https://github.com/acme/widget/pull/1172', prose: 'accepted', ready },
     }));
     const repairPresentation = vi.fn(async () => {
-      await ensureShipReady(github.gh, '/repo', 'https://github.com/acme/widget/pull/1172', undefined, async () => {});
+      await ensureShipReady(
+        github.gh,
+        '/repo',
+        'https://github.com/acme/widget/pull/1172',
+        undefined,
+        async () => {},
+        guardedPresentationOperations(github.gh),
+      );
       ready = github.isReady();
     });
 

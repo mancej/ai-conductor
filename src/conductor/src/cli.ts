@@ -323,6 +323,31 @@ export async function userConfigSetCommand(
     return 1;
   }
 
+  if (cmd.path === 'spec_owner') {
+    if (!cmd.value.trim()) {
+      write('spec_owner must be non-empty\n');
+      return 1;
+    }
+    const prospectiveValidation = validateConfig(
+      { spec_owner: cmd.value },
+      undefined,
+      { materializeDefaults: false },
+    );
+    if (!prospectiveValidation.ok) {
+      write(`${prospectiveValidation.error.message}\n`);
+      return 1;
+    }
+    config.spec_owner = cmd.value;
+    try {
+      await writeUserConfig(config);
+      return 0;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      write(`Unable to write user config at ${userConfigPath()}: ${reason}\n`);
+      return 1;
+    }
+  }
+
   const [section, key, ...rest] = cmd.path.split('.');
   if (section !== 'conductor' || !key || rest.length > 0) {
     write(`Unsupported user config path: ${cmd.path}\n`);
@@ -557,6 +582,12 @@ export function createProgram(): Command {
     .command('version')
     .description('Print the harness version and the pinned engine build, then exit');
 
+  // Dispatched in index.ts before normal CLI bootstrapping.
+  program
+    .command('update [args...]')
+    .allowUnknownOption()
+    .description('Update the harness checkout');
+
   // Registry subcommands (Phase 9.2). These are NON-INTERACTIVE: they run to
   // completion and exit, rather than entering the interactive pipeline. The
   // actual dispatch happens in index.ts (detectRegistryCommand) before the
@@ -584,7 +615,11 @@ export function createProgram(): Command {
     .description('Manage project- and user-scoped harness configuration');
   config
     .command('init')
-    .description('Create project-scoped .ai-conductor/config.yml from the template if absent');
+    .description('Create project-scoped .ai-conductor/config.yml from the template if absent')
+    .option('--test-suite-mode <mode>', 'Test-suite verification mode: aggregate or scoped')
+    .option('--test-suite-drift-budget <preset>', 'Test-suite drift-budget preset: strict or tolerant')
+    .option('--test-suite-command <command>', 'Aggregate test command recorded in the project config')
+    .option('--test-suite-scoped-command <command>', 'Selected-test command recorded for scoped verification');
   config
     .command('read <path>')
     .description('Print a value from effective configuration: project-over-user when a project config exists, user configuration otherwise');
@@ -789,6 +824,14 @@ export function createProgram(): Command {
   daemon
     .command('unpark <slug>')
     .description('Resume dispatch and re-kick for this feature');
+  // Pane foreground wrappers invoke this short-lived writer after their daemon
+  // child exits. index.ts dispatches it before Commander boots; declaring it
+  // here keeps the daemon help surface synchronized with that dispatcher.
+  daemon
+    .command('exit-witness')
+    .description('Record a daemon child exit status for supervisor recovery')
+    .requiredOption('--pid <pid>', 'Exited daemon process ID')
+    .requiredOption('--status <status>', 'Exited daemon process status');
   daemon
     .command('reclaim-worktree <slug>')
     .description('Remove exactly one named, quiescent retained feature worktree');

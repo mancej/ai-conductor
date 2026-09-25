@@ -31,6 +31,7 @@ export type RemediationCaseReconciliationRejection =
   | 'illegal-disposition-transition'
   | 'refutation-repeat'
   | 'illegal-source-link'
+  | 'decision-stop-pending'
   | 'id-generation-failed'
   | 'id-collision';
 
@@ -78,7 +79,7 @@ function isDurableId(value: string): boolean {
 }
 
 function effectFor(caseRow: RemediationCaseRow, id: string | undefined): RemediationCaseEffect {
-  if (caseRow.disposition === 'reject') return { kind: 'none' };
+  if (caseRow.disposition === 'reject' || caseRow.disposition === 'escalate') return { kind: 'none' };
   return caseRow.disposition === 'act'
     ? { id: id!, kind: 'action', status: 'reserved' }
     : { id: id!, kind: 'deferral', status: 'reserved' };
@@ -101,7 +102,13 @@ function convergedCaseFor(
   claimed: ReadonlySet<string>,
 ): RemediationCaseRecord | undefined {
   return state.cases.find((record) => {
-    if (claimed.has(record.id) || record.resolution !== 'open') return false;
+    // A completed non-action case is a mechanically settled recurrence when
+    // its engine-owned source identities and outcomes match exactly.  This is
+    // intentionally narrower than semantic equivalence: a policy digest is
+    // inside a custom finding id, so a policy update cannot reuse this row.
+    const settledNonAction = record.resolution === 'resolved' && record.disposition !== 'act' &&
+      (record.effect.kind === 'none' || record.effect.status === 'applied');
+    if (claimed.has(record.id) || (record.resolution !== 'open' && !settledNonAction)) return false;
     if (record.disposition !== proposed.case.disposition) return false;
     if (record.sources.length !== proposed.sources.length) return false;
     return proposed.sources.every((source) =>
@@ -156,7 +163,9 @@ function reconcileState(
       if (typeof caseId !== 'string' || caseId === 'id-generation-failed' || caseId === 'id-collision') {
         return { ok: false, reason: caseId };
       }
-      const effectId = caseRow.disposition === 'reject' ? undefined : takeId(input.generateId, usedIds);
+      const effectId = caseRow.disposition === 'reject' || caseRow.disposition === 'escalate'
+        ? undefined
+        : takeId(input.generateId, usedIds);
       if (effectId === 'id-generation-failed' || effectId === 'id-collision') return { ok: false, reason: effectId };
       claimed.add(caseId);
       caseIdsByRef.set(caseRow.caseRef, caseId);
@@ -174,6 +183,7 @@ function reconcileState(
           recordedAt: input.recordedAt,
         })),
         effect: effectFor(caseRow, effectId),
+        ...(caseRow.escalation === undefined ? {} : { escalation: caseRow.escalation }),
       });
       continue;
     }
@@ -190,8 +200,17 @@ function reconcileState(
       && attemptedIds.has(existing.id)
       && existing.effect.kind === 'action'
       && existing.effect.status === 'applied';
+    // An applied action whose finding comes back may be conclusively deferred:
+    // the repair was tried, and the judge has found the remaining fix outside
+    // the approved plan. Without this lane the only transitions off an applied
+    // action are refutation or another action, and a legitimate follow-up
+    // halted the feature as an illegal transition.
+    const admitsDeferral = caseRow.disposition === 'defer'
+      && existing.disposition === 'act'
+      && existing.effect.kind === 'action'
+      && existing.effect.status === 'applied';
     if (caseRow.disposition === 'refute' && existing.refutation) return { ok: false, reason: 'refutation-repeat' };
-    if (existing.disposition !== caseRow.disposition && !admitsRefutation) return { ok: false, reason: 'illegal-disposition-transition' };
+    if (existing.disposition !== caseRow.disposition && !admitsRefutation && !admitsDeferral) return { ok: false, reason: 'illegal-disposition-transition' };
     referencedExisting.add(existingCaseId);
     claimed.add(existingCaseId);
     caseIdsByRef.set(caseRow.caseRef, existingCaseId);
@@ -204,9 +223,10 @@ function reconcileState(
         // lap. Preserve the source identity while changing its durable
         // outcome; adding a second link would violate the store's unique
         // source-id invariant.
-        if (admitsRefutation && historical.outcome === 'acted' && source.outcome === 'refuted') {
+        if ((admitsRefutation && historical.outcome === 'acted' && source.outcome === 'refuted')
+          || (admitsDeferral && historical.outcome === 'acted' && source.outcome === 'deferred')) {
           appendedSources = appendedSources.map((link) => link.sourceId === source.sourceId
-            ? { ...link, outcome: 'refuted', recordedAt: input.recordedAt }
+            ? { ...link, outcome: source.outcome, recordedAt: input.recordedAt }
             : link);
           continue;
         }
@@ -229,9 +249,38 @@ function reconcileState(
         effect: caseRow.effect.kind === 'none' ? { kind: 'none' } : { id: effectId!, kind: 'deferral', status: 'reserved' },
         refutation: caseRow.refutation!,
       });
+    } else if (admitsDeferral) {
+      const effectId = takeId(input.generateId, usedIds);
+      if (effectId === 'id-generation-failed' || effectId === 'id-collision') return { ok: false, reason: effectId };
+      // The deferral effect is reserved like a fresh deferral's: the effect
+      // stage files the follow-up and settles the case, so the row reopens
+      // until that lands instead of claiming a filed issue it does not have.
+      replacements.set(existingCaseId, {
+        ...existing,
+        disposition: 'defer',
+        priority: caseRow.priority,
+        rationale: caseRow.rationale,
+        confidence: caseRow.confidence,
+        resolution: 'open',
+        sources: appendedSources,
+        effect: { id: effectId, kind: 'deferral', status: 'reserved' },
+      });
     } else if (appendedSources.length !== existing.sources.length) {
       replacements.set(existingCaseId, { ...existing, sources: appendedSources });
     }
+  }
+
+  // An empty graph is restart/no-current-source settlement, not evidence that
+  // an owner changed the approved baseline. Unlike ordinary non-action
+  // history, a durable decision stop cannot be retired by that absence: doing
+  // so would let the caller turn an unresolved current-outcome gap into PASS.
+  // A later non-empty admitted graph remains the explicit re-evaluation lane.
+  if (
+    input.resolveAbsentOpenNonActionCases
+    && input.graph.sourceOutcomes.length === 0
+    && state.cases.some((record) => record.resolution === 'open' && record.disposition === 'escalate')
+  ) {
+    return { ok: false, reason: 'decision-stop-pending' };
   }
 
   let changed = additions.length > 0 || replacements.size > 0;

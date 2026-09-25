@@ -11,12 +11,20 @@ Markdown skills directly.
 ## Requirements
 
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) v2.0+ and/or [Codex](https://github.com/openai/codex)
-- Git, and [GitHub CLI](https://cli.github.com/) 2.73.0 or later, authenticated (`gh auth login`)
+- `curl` for the one-line installer (or Git for a manual clone), and [GitHub CLI](https://cli.github.com/) 2.73.0 or later, authenticated (`gh auth login`)
 - Node.js 26.7.0 (minimum Node 26; the engine pins 26.7.0 via `asdf`), npm, tmux, and `python3` with PyYAML
 - A project to work on — Rails + PostgreSQL has full tech-context support; other stacks work with the
   generic skills
 
 ## Install
+
+```bash
+curl -fsSL https://jstoup111.github.io/ai-conductor/install.sh | sh
+```
+
+This installs the `stable` channel into `~/.ai-conductor/harness` and runs `./bin/install` there. Pass options after `sh -s --`, for example `... | sh -s -- --channel main --providers claude,codex`. Re-running it updates an existing install through `bin/update`.
+
+To install from a manual clone instead:
 
 ```bash
 git clone --branch stable --single-branch git@github.com:jstoup111/ai-conductor.git
@@ -64,7 +72,9 @@ At finish, its committed shipped record retains the current Cost and Time totals
 unchanged record skips a duplicate commit.
 
 Each dispatch sets up shared project memory and reports its placement in the daemon log and, when
-enabled, OpenTelemetry. See [per-dispatch setup](docs/guides/running-the-daemon.md#per-dispatch-hook).
+enabled, OpenTelemetry. Build-review rubric and coverage-binding provider attempts retain their
+owning step’s execution identity for trace attribution. See
+[per-dispatch setup](docs/guides/running-the-daemon.md#per-dispatch-hook).
 
 ```bash
 ai-conductor compose --idea "add a CSV export"
@@ -80,6 +90,12 @@ ai-conductor inline --interactive "add a CSV export"
 
 `ai-conductor inline --auto` is deprecated; use the daemon for unattended work. The `inline` token is
 required for foreground runs — the bare form `ai-conductor "<feature>"` is rejected.
+
+Self-host dispatches wait for root-refresh admission before starting their provider preparation timeout.
+Queued work resumes automatically when the earlier dispatch releases the root.
+
+Daemon-managed sessions can run `ai-conductor task start` and `task done` for task attribution;
+completion remains gate-owned. See [task commands](docs/reference/cli.md#ai-conductor-task).
 
 The harness runs on Claude Code and Codex. Select the host with the `llm_provider` config key; an ordered
 array such as `[claude, codex]` acts as a fallback ladder. See
@@ -114,6 +130,9 @@ that is what frees your head for the next design problem while this one builds.
 
 CI repair agents commit fixes from CI diagnostics; the daemon owns repair test execution and publishes
 only after the configured verifier passes. Missing test configuration blocks publication.
+If final validation itself crashes, the daemon retries that validator only within its configured attempt
+budget. It never publishes until fresh passing validation evidence exists, and an exhausted retry budget
+halts the feature for operator recovery.
 
 **The ADRs are the asset.** Every ADR is a durable architectural decision with its reasoning attached,
 committed to the repo and read by machinery: the composer plans the next feature against them, and the
@@ -156,6 +175,9 @@ review kickback laps are tuning telemetry, not your signal.
 
 **It got stuck.** Run `/daemon-triage` from a Claude Code or Codex session in the project. It gathers
 the evidence and routes you to the right [runbook](docs/runbooks/index.md).
+
+PRD scope approvals retain their original evidence when reviewer wording changes. To revise a refusal,
+edit only the offered decision and rationale; see [scope-halt recovery](docs/runbooks/stalled-or-stuck-feature.md#over_scope-decision-halt).
 
 [FAQ](docs/guides/faq.md) has the short answers to everything above.
 

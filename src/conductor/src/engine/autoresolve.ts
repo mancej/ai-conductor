@@ -13,11 +13,14 @@ import type { PrMergeState } from './pr-labels.js';
 import {
   type GhRunner as PrLabelsGhRunner,
   makeProductionGh,
+  guardedPrRunner,
   removeLabel,
   addLabel,
   upsertComment,
+  postSupersessionAudit,
   NEEDS_REMEDIATION_MARKER,
 } from './pr-labels.js';
+import type { ConductorEventEmitter } from '../ui/events.js';
 import {
   resolveRebaseConflicts,
   type RebaseOutcome,
@@ -39,8 +42,19 @@ import { join } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { prepareWorktree as defaultPrepareWorktree } from './worktree-prepare.js';
+import { executeRemoteGit, resolveFeatureRemoteMutation } from './remote-git-operations.js';
+import { createGuardedGithubOperationRunner, type GithubMutationExecutionContext } from './tracker-client.js';
+import type { GithubOperationEventEmitter, GithubOperationRunner } from './github-operations.js';
+import { isTestPath } from './gate-invalidation.js';
 
 const execFile = promisify(execFileCb);
+
+/**
+ * Classifies a conflict set for resolution routing.
+ */
+export function classifyConflictScope(conflicts: string[]): 'test-only' | 'mixed' {
+  return conflicts.length > 0 && conflicts.every(isTestPath) ? 'test-only' : 'mixed';
+}
 
 /**
  * Read-only feature-run activity predicate injected by the daemon pool.
@@ -417,6 +431,7 @@ export async function runTier2(
   remaining: string[],
   cap: number,
   resolver: RebaseResolver,
+  scope: 'test-only' | 'mixed' = 'mixed',
 ): Promise<RebaseOutcome> {
   // FR-7: cap=0 disables resolution entirely — return the conflict unchanged
   if (cap <= 0) {
@@ -436,7 +451,9 @@ export async function runTier2(
 
   // Delegate to resolveRebaseConflicts with the bounded cap
   // This will retry up to `cap` times until success or the resolver explicitly gives up
-  return resolveRebaseConflicts(git, projectRoot, conflictOutcome, resolver, cap);
+  return resolveRebaseConflicts(git, projectRoot, conflictOutcome, resolver, cap, {
+    supersessionJudgement: scope === 'test-only',
+  });
 }
 
 /**
@@ -459,14 +476,22 @@ export async function runTier2(
  * @param subjectsBefore  Commit subjects of the feature, captured BEFORE rebase started
  * @returns               { ok: true } if all guards pass, or { ok: false, guard, reason } on failure
  */
+export type ExcusedAcceptanceGuardCommit = {
+  sha: string;
+  subject: string;
+  reason: 'declared-superseded-test-only';
+  paths: string[];
+};
+
 export type AcceptanceGuardResult =
-  | { ok: true }
+  | { ok: true; excused: ExcusedAcceptanceGuardCommit[] }
   | { ok: false; guard: string; reason: string };
 
 export async function runAcceptanceGuards(
   git: GitRunner,
   baseRef: string,
   subjectsBefore: string[],
+  declaredSuperseded?: string[],
 ): Promise<AcceptanceGuardResult> {
   // Determine the project root from the git runner by asking git where it is.
   // This allows the function to work with git runners bound to any directory.
@@ -494,7 +519,7 @@ export async function runAcceptanceGuards(
   }
 
   // Guard 3: all feature commits (by subject) must be preserved
-  const preserved = await featureCommitsPreserved(git, baseRef, subjectsBefore);
+  const preserved = await featureCommitsPreserved(git, baseRef, subjectsBefore, declaredSuperseded);
   if (preserved.kind === 'rejected') {
     return {
       ok: false,
@@ -503,7 +528,48 @@ export async function runAcceptanceGuards(
     };
   }
 
-  return { ok: true };
+  const excused = await Promise.all((preserved.excused ?? []).map(async ({ sha, subject }) => {
+    const listing = await git(['show', '--format=', '--name-only', sha]);
+    return {
+      sha,
+      subject,
+      reason: 'declared-superseded-test-only' as const,
+      paths: listing.stdout.split('\n').map((path) => path.trim()).filter(Boolean),
+    };
+  }));
+  return { ok: true, excused };
+}
+
+/** Persist the audit residue for the excusals a successful guard explicitly allowed. */
+export async function emitExcusedRebaseCitationResidue(
+  events: ConductorEventEmitter | undefined,
+  excused: ReadonlyArray<{ sha: string; reason: string }>,
+): Promise<void> {
+  if (excused.length === 0) return;
+  await events?.emit({
+    type: 'rebase_citation_residue',
+    residue: excused.map(({ sha, reason }) => ({
+      sha,
+      citingTaskIds: [],
+      citingObligationIds: [],
+      reason,
+    })),
+  });
+}
+
+export function validateResolutionVerdict(
+  verdict: unknown,
+  opts: { scope: 'test-only' | 'mixed'; replayedShas: string[] },
+): { ok: true; verdict: import('./rebase.js').ResolutionVerdict } | { ok: false; reason: string } {
+  const bad = (reason: string) => ({ ok: false as const, reason: `malformed verdict: ${reason}` });
+  if (!verdict || typeof verdict !== 'object') return bad('missing verdict');
+  const value = verdict as Record<string, unknown>;
+  if (value.choice !== 'superseded' && value.choice !== 'merged' && value.choice !== 'source') return bad('unknown choice');
+  if (typeof value.rationale !== 'string' || value.rationale.trim() === '') return bad('missing rationale');
+  if (!Array.isArray(value.superseded) || !value.superseded.every((sha) => typeof sha === 'string')) return bad('invalid superseded');
+  if (opts.scope === 'mixed' && value.superseded.length > 0) return bad('superseded commits require test-only scope');
+  if (value.superseded.some((sha) => !opts.replayedShas.includes(sha))) return bad('superseded commit was not replayed');
+  return { ok: true, verdict: value as unknown as import('./rebase.js').ResolutionVerdict };
 }
 
 /**
@@ -657,6 +723,12 @@ export type PushRefreshedResult =
   | { pushed: true }
   | { pushed: false; reason: string };
 
+export interface PushRefreshedRemoteOptions {
+  readonly remoteGit?: typeof executeRemoteGit;
+  readonly mutation?: GithubMutationExecutionContext;
+  readonly events?: GithubOperationEventEmitter;
+}
+
 /**
  * Push the refreshed branch with lease protection.
  *
@@ -684,22 +756,35 @@ export async function pushRefreshedBranch(
   git: GitRunner,
   branch: string,
   logger?: (msg: string) => void,
+  remote: PushRefreshedRemoteOptions = {},
 ): Promise<PushRefreshedResult> {
   const log = logger ?? console.log;
 
   // Resolution runs in a detached worktree, so publish its rebased HEAD rather
   // than the stale named branch ref. The lease still prevents unseen overwrites.
-  const pushResult = await git(['push', 'origin', `HEAD:${branch}`, '--force-with-lease']);
+  const destination = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
+  const pushResult = await (remote.remoteGit ?? executeRemoteGit)(
+    ['push', 'origin', `HEAD:${destination}`, '--force-with-lease'],
+    {
+      cwd: '.',
+      config: async (args) => ({ stdout: (await git(args)).stdout }),
+      runRemoteGit: async (args) => {
+        const result = await git(args);
+        if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
+        return { stdout: result.stdout };
+      },
+      mutation: remote.mutation,
+      events: remote.events,
+    },
+  );
 
-  // Check if the push succeeded
-  if (pushResult.exitCode === 0) {
+  if (pushResult.kind === 'executed') {
     log(`pushRefreshedBranch: refreshed (${branch} pushed with lease)`);
     return { pushed: true };
   }
 
   // Failure: lease rejected (concurrent push detected) or other error
-  const stderr = pushResult.stderr || '';
-  const stdout = pushResult.stdout || '';
+  const stderr = pushResult.kind === 'failed' ? pushResult.error : '';
   let reason = 'push failed';
 
   // Detect lease rejection (typical error message from git)
@@ -707,8 +792,6 @@ export async function pushRefreshedBranch(
     reason = `lease push rejected (stale remote ref or concurrent change): ${stderr.slice(0, 100)}`;
   } else if (stderr) {
     reason = `push error: ${stderr.slice(0, 100)}`;
-  } else if (stdout) {
-    reason = `push output: ${stdout.slice(0, 100)}`;
   }
 
   log(`pushRefreshedBranch failed: ${reason}`);
@@ -745,6 +828,10 @@ export interface PublishResolutionOptions {
    * instead of attempting the lease push.
    */
   earlierFailure?: EarlierStageFailure;
+  /** Guarded remote-write context for the lease publication. */
+  remoteGit?: typeof executeRemoteGit;
+  remoteMutation?: GithubMutationExecutionContext;
+  events?: GithubOperationEventEmitter;
 }
 
 /**
@@ -787,6 +874,7 @@ export async function publishResolution(
     opts.git,
     opts.branch,
     log,
+    { remoteGit: opts.remoteGit, mutation: opts.remoteMutation, events: opts.events },
   );
 
   if (!pushResult.pushed) {
@@ -802,7 +890,8 @@ export async function publishResolution(
   // injected `log`) and never rolls back the push or triggers escalation.
   // The next tick's normal label pass reconciles the label if this fails.
   const runGh = opts.gh.runGh ?? makeProductionGh();
-  await addLabel(runGh, opts.gh.cwd, opts.prUrl, 'mergeable', log);
+  const prRunner = opts.gh.operations ? guardedPrRunner(runGh, opts.gh.operations) : runGh;
+  await addLabel(prRunner, opts.gh.cwd, opts.prUrl, 'mergeable', log);
 
   logOutcome(log, opts.prUrl, 'lease-push', 'refreshed');
   return { published: true };
@@ -814,6 +903,8 @@ export async function publishResolution(
 export interface EscalateOpts {
   /** Injectable gh runner (defaults to the production factory). */
   runGh?: PrLabelsGhRunner;
+  /** Guarded mutation runner; raw gh remains available only for comment lookup. */
+  operations?: GithubOperationRunner;
   /** cwd for gh calls (typically the primary project root). */
   cwd: string;
   /** Optional log callback. All errors are logged here, never thrown. */
@@ -851,11 +942,12 @@ export async function escalate(
   opts: EscalateOpts,
 ): Promise<void> {
   const runGh = opts.runGh ?? makeProductionGh();
+  const prRunner = opts.operations ? guardedPrRunner(runGh, opts.operations) : runGh;
   const { cwd, log } = opts;
 
   // Step 1 + 2: labels (best-effort; removeLabel/addLabel never throw).
-  await removeLabel(runGh, cwd, prUrl, 'mergeable', log);
-  await addLabel(runGh, cwd, prUrl, 'needs-remediation', log);
+  await removeLabel(prRunner, cwd, prUrl, 'mergeable', log);
+  await addLabel(prRunner, cwd, prUrl, 'needs-remediation', log);
 
   // Step 3: marker-tagged comment (best-effort; upsertComment never throws).
   const commentBody = [
@@ -865,7 +957,31 @@ export async function escalate(
     `**Reason:** ${reason}`,
   ].join('\n');
 
-  await upsertComment(runGh, cwd, prUrl, NEEDS_REMEDIATION_MARKER, commentBody, log);
+  await upsertComment(prRunner, cwd, prUrl, NEEDS_REMEDIATION_MARKER, commentBody, log);
+}
+
+/**
+ * Fold every accepted attempt's verdict into the single record published on
+ * the event spine and the PR audit comment (adr-2026-07-04 D1). The superseded
+ * list is the accumulated declaration set the preservation guards consumed, so
+ * a commit excused by an earlier attempt is never omitted from the audit.
+ */
+export function combineAcceptedVerdicts(
+  verdicts: readonly import('./rebase.js').ResolutionVerdict[],
+  accumulatedSuperseded: readonly string[],
+): import('./rebase.js').ResolutionVerdict | undefined {
+  if (verdicts.length === 0) return undefined;
+  const last = verdicts[verdicts.length - 1];
+  const rationales = [...new Set(verdicts.map((v) => v.rationale.trim()).filter(Boolean))];
+  return {
+    // A single attempt keeps its own choice; across attempts any declared
+    // drop makes the combined judgement a supersession.
+    choice: verdicts.length > 1 && accumulatedSuperseded.length > 0 ? 'superseded' : last.choice,
+    rationale: rationales.length === 1
+      ? rationales[0]
+      : rationales.map((r, i) => `(${i + 1}) ${r}`).join(' '),
+    superseded: [...accumulatedSuperseded],
+  };
 }
 
 /**
@@ -909,14 +1025,40 @@ export async function resolveConflictingPr(
     /** Re-check active daemon ownership at each resolution-worktree removal. */
     isFeatureInFlight?: IsFeatureInFlight;
     worktreeLifecycle?: WorktreeLifecycleQueue;
+    /** Test seam for a scoped, already-authorized PR mutation runner. */
+    operations?: GithubOperationRunner;
+    /** Test seam for local-Git lease behavior; production uses the guarded adapter. */
+    remoteGit?: typeof executeRemoteGit;
+    /** Existing event spine for remote-Git refusal and supersession telemetry. */
+    events?: ConductorEventEmitter;
+    /** Injectable preservation guard boundary for resolution-flow tests. */
+    runAcceptanceGuards?: typeof runAcceptanceGuards;
   },
-): Promise<{ kind: 'refreshed' | 'escalated' }> {
+): Promise<{ kind: 'refreshed' | 'escalated' | 'setup-stop' }> {
   const { prUrl, slug, repoCwd } = entry;
   const { log } = deps;
 
   return withResolveWorktree(slug, branch, repoCwd, async (worktreePath) => {
     // Initialize a git runner for the worktree
     const git = makeGitRunner(worktreePath);
+    const remoteMutation = await resolveFeatureRemoteMutation({
+      cwd: worktreePath,
+      slug,
+      branch,
+      git: async (args) => {
+        const result = await git(args);
+        if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || 'git read failed');
+        return { stdout: result.stdout };
+      },
+      gh: deps.runGh,
+    });
+    // Reads stay on the injected gh transport; every mutation reauthorizes via
+    // the typed runner. A missing provenance context is intentionally refused.
+    const operations = deps.operations ?? createGuardedGithubOperationRunner(deps.runGh, {
+      cwd: repoCwd,
+      mutation: remoteMutation,
+      events: deps.events,
+    });
 
     // Determine the base to rebase onto
     const baseResolved = await resolveBase(git, 'main');
@@ -928,6 +1070,56 @@ export async function resolveConflictingPr(
       subjR.exitCode === 0
         ? subjR.stdout.split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
         : [];
+    const shaR = await git(['log', '--format=%H', `${baseRef}..HEAD`]);
+    const replayedShas = shaR.exitCode === 0
+      ? shaR.stdout.split('\n').map((sha) => sha.trim()).filter(Boolean)
+      : [];
+    // Every accepted attempt's verdict is kept: the shared loop's FR-9 check
+    // and the acceptance guards consume the accumulated declarations, so the
+    // D1 audit surfaces must name that same accumulated set.
+    const acceptedVerdicts: import('./rebase.js').ResolutionVerdict[] = [];
+    const declaredSuperseded = new Set<string>();
+    let verdictFailure: string | undefined;
+    const capturingResolver: RebaseResolver = async (ctx) => {
+      const result = await deps.resolver(ctx);
+      if (!result.resolved) return result;
+
+      const scope = classifyConflictScope(ctx.conflicts);
+      // The parser deliberately accepts bare success for strict callers. In
+      // the narrowly-enabled judgement path, however, a verdict is the
+      // authority for any declared drop and is therefore mandatory.
+      if (ctx.supersessionJudgement && result.verdict === undefined) {
+        verdictFailure ??= 'malformed verdict: missing verdict';
+        // Prevent the shared loop from reaching its preservation guard with
+        // unauthorised success. The caller translates this to tier2-verdict.
+        return { resolved: false, reason: verdictFailure };
+      }
+      if (result.verdict !== undefined) {
+        // Strict callers do not have the sweep's judgement exception. An
+        // unsolicited empty verdict must not become audit or event evidence;
+        // a declared drop remains the existing mixed-scope rejection.
+        if (!ctx.supersessionJudgement) {
+          if (Array.isArray(result.verdict.superseded) && result.verdict.superseded.length > 0) {
+            const checked = validateResolutionVerdict(result.verdict, { scope, replayedShas });
+            verdictFailure ??= checked.ok
+              ? 'malformed verdict: superseded commits require test-only scope'
+              : checked.reason;
+            return { resolved: false, reason: verdictFailure };
+          }
+          log(`${prUrl}: supersession verdict ignored because the exception is not in force`);
+          return { resolved: true };
+        }
+        const checked = validateResolutionVerdict(result.verdict, { scope, replayedShas });
+        if (!checked.ok) {
+          verdictFailure ??= checked.reason;
+          return { resolved: false, reason: verdictFailure };
+        } else {
+          acceptedVerdicts.push(checked.verdict);
+          for (const sha of checked.verdict.superseded) declaredSuperseded.add(sha);
+        }
+      }
+      return result;
+    };
 
     // Start the rebase; this will fail with conflicts if base and feature diverged
     const rebaseAttempt = await git(['rebase', '--autostash', baseRef]);
@@ -941,6 +1133,7 @@ export async function resolveConflictingPr(
         log(`${prUrl}: rebase failed without conflicts; escalating`);
         await escalate(prUrl, 'rebase-error', rebaseAttempt.stderr.trim(), {
           runGh: deps.runGh,
+          operations,
           cwd: repoCwd,
           log,
         });
@@ -957,44 +1150,89 @@ export async function resolveConflictingPr(
       // Stage 2: Assistant dispatch for remaining conflicts
       let tier2Outcome: RebaseOutcome | null = null;
       if (tier1Result.remaining.length > 0) {
+        const conflictScope = classifyConflictScope(tier1Result.remaining);
         tier2Outcome = await runTier2(
           git,
           worktreePath,
           baseRef,
           tier1Result.remaining,
           config.attemptCap,
-          deps.resolver,
+          capturingResolver,
+          conflictScope,
         );
         log(`${prUrl}: tier2 outcome: ${tier2Outcome.kind}`);
+
+        // The resolver wrapper converts malformed successful results to a
+        // stopped loop so validation remains before every guard and push.
+        if (verdictFailure !== undefined) {
+          await escalate(prUrl, 'tier2-verdict', verdictFailure, {
+            runGh: deps.runGh,
+            operations,
+            cwd: repoCwd,
+            log,
+          });
+          logOutcome(log, prUrl, 'tier2-verdict', 'escalated');
+          return { kind: 'escalated' };
+        }
 
         // If tier2 failed (unresolved conflicts), escalate immediately
         if (tier2Outcome.kind === 'conflict_halt') {
           const reason = tier2Outcome.reason || 'could not resolve remaining conflicts';
-          await escalate(prUrl, 'tier2-resolve', reason, {
+          // Only the judgement (test-only) path names the acceptance-guards
+          // stage, for a completed rebase the post-completion guards rejected
+          // (S3.3: an undeclared drop). A strict-path completed-rebase halt
+          // keeps tier2-resolve — relabelling it was refused as out of scope
+          // (NC.1).
+          const stage = conflictScope === 'test-only' && tier2Outcome.resumeShape === 'completed-rebase'
+            ? 'acceptance-guards'
+            : 'tier2-resolve';
+          await escalate(prUrl, stage, reason, {
             runGh: deps.runGh,
+            operations,
             cwd: repoCwd,
             log,
           });
-          logOutcome(log, prUrl, 'tier2-resolve', 'escalated');
+          logOutcome(log, prUrl, stage, 'escalated');
           return { kind: 'escalated' };
+        }
+        if (tier2Outcome.kind === 'setup_stop') {
+          logOutcome(log, prUrl, 'tier2-setup', 'setup-stop');
+          return { kind: 'setup-stop' };
         }
       }
 
     }
 
-    // Work-preservation guards: verify the rebase succeeded correctly
-    const guardsResult = await runAcceptanceGuards(git, baseRef, subjectsBefore);
+    if (verdictFailure !== undefined) {
+      await escalate(prUrl, 'tier2-verdict', verdictFailure, {
+        runGh: deps.runGh,
+        operations,
+        cwd: repoCwd,
+        log,
+      });
+      logOutcome(log, prUrl, 'tier2-verdict', 'escalated');
+      return { kind: 'escalated' };
+    }
+
+    // Work-preservation guards: verify the rebase succeeded correctly.
+    const acceptanceGuards = deps.runAcceptanceGuards ?? runAcceptanceGuards;
+    const guardsResult = acceptedVerdicts.length === 0
+      ? await acceptanceGuards(git, baseRef, subjectsBefore)
+      : await acceptanceGuards(git, baseRef, subjectsBefore, [...declaredSuperseded]);
     if (!guardsResult.ok) {
       const reason = `${guardsResult.guard}: ${guardsResult.reason}`;
       log(`${prUrl}: acceptance guard failed: ${reason}`);
       await escalate(prUrl, 'acceptance-guards', reason, {
         runGh: deps.runGh,
+        operations,
         cwd: repoCwd,
         log,
       });
       logOutcome(log, prUrl, 'acceptance-guards', 'escalated');
       return { kind: 'escalated' };
     }
+
+    await emitExcusedRebaseCitationResidue(deps.events, guardsResult.excused);
 
     // Suite gate: full test suite must pass
     // Use the injected runSuite function which may be a real suite runner or test stub
@@ -1007,6 +1245,7 @@ export async function resolveConflictingPr(
       log(`${prUrl}: suite gate failed: ${reason}`);
       await escalate(prUrl, 'suite-gate', reason, {
         runGh: deps.runGh,
+        operations,
         cwd: repoCwd,
         log,
       });
@@ -1021,15 +1260,43 @@ export async function resolveConflictingPr(
       prUrl,
       gh: {
         runGh: deps.runGh,
+        operations,
         cwd: repoCwd,
         log,
       },
+      remoteMutation,
+      remoteGit: deps.remoteGit,
+      events: deps.events,
       // No earlierFailure → attempt the lease push
     });
 
     if (!publishResult.published) {
       // Lease push failed — already escalated by publishResolution
       return { kind: 'escalated' };
+    }
+
+    // A comment or subscriber failure is observability-only and cannot undo a
+    // successfully lease-protected publication.
+    const resolutionVerdict = combineAcceptedVerdicts(acceptedVerdicts, [...declaredSuperseded]);
+    if (resolutionVerdict) {
+      // Persist the durable verdict before attempting the best-effort PR
+      // comment. A GitHub comment failure must not hide the published
+      // resolution from event-spine consumers.
+      await deps.events?.emit({
+        type: 'rebase_supersession_verdict',
+        choice: resolutionVerdict.choice,
+        rationale: resolutionVerdict.rationale,
+        superseded: [...resolutionVerdict.superseded],
+        verification: { command: config.suiteCommand, exitCode: 0 },
+      });
+      try {
+        await postSupersessionAudit(guardedPrRunner(deps.runGh, operations), repoCwd, prUrl, {
+          ...resolutionVerdict,
+          suiteCommand: config.suiteCommand,
+        }, log);
+      } catch (err) {
+        log(`${prUrl}: supersession audit comment failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     // Success

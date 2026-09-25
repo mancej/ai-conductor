@@ -1,4 +1,4 @@
-// Covers: task:1, task:3, task:4, task:5
+// Covers: task:1, task:2, task:3, task:4, task:5, task:9, task:11
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, readdir, unlink, utimes, stat } from 'fs/promises';
 import { execFile as execFileCb } from 'child_process';
@@ -65,16 +65,18 @@ import {
   resolveGroupMembership,
   earliestRemediationTarget,
   resolveExistingTaskBindingsForAdmission,
+  recordActivePlanPath,
 } from '../../src/engine/conductor.js';
 import { Conductor } from '../test-conductor.js';
 import type { StepRunner, StepRunResult, StepRunOptions } from '../../src/engine/conductor.js';
-import type { GroupMember } from '../../src/engine/group-core.js';
+import type { GroupBranchLifecycleObserver, GroupMember } from '../../src/engine/group-core.js';
 import { runGroupBranch } from '../../src/engine/group-core.js';
 import type { GitRunner } from '../../src/engine/pr-labels.js';
 import type { GhRunner } from '../../src/engine/owner-gate/identity.js';
 import { writeFile, mkdir, readFile } from 'fs/promises';
 import { createHash } from 'crypto';
 import { createTaskEvidence } from '../../src/engine/task-evidence.js';
+import { validatePlanDoneWhen } from '../../src/engine/plan-done-when.js';
 import { AuditTrailWriter } from '../../src/engine/audit-trail.js';
 import { haltMarkerExists } from '../../src/engine/task-progress.js';
 import { writeVerdict, type GateVerdict } from '../../src/engine/gate-verdicts.js';
@@ -93,6 +95,10 @@ import {
   readKickbackLedger,
   } from '../../src/engine/kickback-ledger.js';
 import { EventPersister } from '../../src/engine/event-persister.js';
+import { CloseoutEventTail } from '../../src/engine/closeout-tail.js';
+import { dispatchTaskCommand } from '../../src/engine/task-cli.js';
+import { MetricsListener } from '../../src/engine/otel/metrics-listener.js';
+import { MetricsRecorder } from '../../src/engine/otel/metrics.js';
 import { computeTimingRollup } from '../../src/engine/timing-rollup.js';
 import { appendTimingSection, renderShippedRecord } from '../../src/engine/shipped-record.js';
 import { deriveEffectiveBuildReviewVerdict, joinBuildReviewRubricOutcomes } from '../../src/engine/build-review-aggregate.js';
@@ -118,6 +124,19 @@ import type {
   InvokeResult,
   LLMProvider,
 } from '../../src/execution/llm-provider.js';
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from '@opentelemetry/sdk-metrics';
+
+const NOOP_GROUP_BRANCH_LIFECYCLE_OBSERVER: GroupBranchLifecycleObserver = {
+  onAdmitted: () => undefined,
+  onAttempt: () => undefined,
+  onRetry: () => undefined,
+  onSettled: () => undefined,
+};
 
 function passingBuildReviewAggregate() {
   const lapId = parseBuildReviewLapId('fixture-lap')!;
@@ -200,6 +219,300 @@ describe('engine/conductor', () => {
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
+  });
+
+  // Covers: task:9
+  it('preserves conductor terminal tiers through the metrics listener before daemon dispatch-end', async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+    });
+    const listener = new MetricsListener(
+      new MetricsRecorder(provider.getMeter('conductor-terminal-tier'), { project: 'project', worker: 'worker' }),
+      undefined,
+      'feature',
+    );
+    listener.start(events);
+    const conductor = new Conductor({ projectRoot: dir, stateFilePath: statePath, stepRunner: createMockStepRunner(), events });
+
+    try {
+      await (conductor as unknown as {
+        completeRun(state: ConductState, doneMarkerBody: string): Promise<void>;
+      }).completeRun({ complexity_tier: 'M' }, 'complete\n');
+      await events.emit({ type: 'feature_dispatch_ended', slug: 'feature', outcome: 'complete', tier: 'L' });
+      (conductor as unknown as { haltState: ConductState }).haltState = { complexity_tier: 'S' };
+      await (conductor as unknown as { emitLoopHalt(reason: string): Promise<void> }).emitLoopHalt('halted');
+      await events.emit({
+        type: 'feature_dispatch_ended', slug: 'feature', outcome: 'halted', haltClass: 'mechanical', step: 'build', tier: 'L',
+      });
+      await provider.forceFlush();
+
+      const outcomes = exporter.getMetrics()
+        .flatMap((batch) => batch.scopeMetrics)
+        .flatMap((scope) => scope.metrics)
+        .filter((metric) => metric.descriptor.name === 'conductor.run.outcomes')
+        .flatMap((metric) => metric.dataPoints as Array<{ attributes: Record<string, unknown> }>)
+        .map((point) => point.attributes);
+      expect(outcomes).toEqual([
+        { outcome: 'complete', tier: 'M', project: 'project', worker: 'worker', feature: 'feature' },
+        { outcome: 'halted', tier: 'S', project: 'project', worker: 'worker', feature: 'feature' },
+      ]);
+    } finally {
+      listener.stop();
+      await provider.shutdown();
+    }
+  });
+
+  // Covers: task:9, rem-as-built-rem-ab2-2
+  it('keeps a plan-gap halt tiered when the centralized halt follows a tail poll', async () => {
+    await mkdir(join(dir, '.pipeline'), { recursive: true });
+    await writeFile(join(dir, 'plan.md'), [
+      '### Task 7: Deliver the bounded behavior',
+      '**Done when:**',
+      '- The approved behavior can be verified without widening the plan.',
+      '',
+    ].join('\n'));
+    await recordActivePlanPath(dir, 'plan.md');
+    await writeState(statePath, { complexity_tier: 'M' });
+    await writeFile(join(dir, '.pipeline', 'task-status.json'), JSON.stringify({
+      tasks: [{ id: '7', name: 'Task 7', status: 'in_progress' }],
+    }));
+    await writeFile(join(dir, '.pipeline', 'current-task'), '7');
+
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+    });
+    const listener = new MetricsListener(
+      new MetricsRecorder(provider.getMeter('conductor-plan-gap-tier'), { project: 'project', worker: 'worker' }),
+      undefined,
+      'feature',
+    );
+    const tail = new CloseoutEventTail({ projectRoot: dir, events });
+    listener.start(events);
+    const buildProvider: StepRunner = {
+      run: async (step) => {
+        expect(step).toBe('build');
+        await expect(dispatchTaskCommand({
+          kind: 'done', id: '7', planGap: { index: 1, reason: 'No approved path.' },
+        }, dir)).resolves.toBe(1);
+        await tail.poll();
+        return { success: false, output: 'plan gap' };
+      },
+    };
+    const conductor = new Conductor({ projectRoot: dir, stateFilePath: statePath, stepRunner: buildProvider, events });
+
+    try {
+      await buildProvider.run('build', { complexity_tier: 'M' });
+      const persistedState = await readState(statePath);
+      if (!persistedState.ok) throw new Error(persistedState.error.message);
+      (conductor as unknown as { haltState: ConductState }).haltState = persistedState.value;
+      await (conductor as unknown as { emitLoopHalt(reason: string): Promise<void> }).emitLoopHalt('centralized halt');
+      await events.emit({
+        type: 'feature_dispatch_ended', slug: 'feature', outcome: 'halted', haltClass: 'plan-gap', step: 'build', tier: 'M',
+      });
+      await provider.forceFlush();
+
+      const outcomes = exporter.getMetrics()
+        .flatMap((batch) => batch.scopeMetrics)
+        .flatMap((scope) => scope.metrics)
+        .filter((metric) => metric.descriptor.name === 'conductor.run.outcomes')
+        .flatMap((metric) => metric.dataPoints as Array<{ attributes: Record<string, unknown> }>)
+        .map((point) => point.attributes);
+      expect(outcomes).toEqual([
+        { outcome: 'halted', tier: 'M', project: 'project', worker: 'worker', feature: 'feature' },
+      ]);
+    } finally {
+      tail.stop();
+      listener.stop();
+      await provider.shutdown();
+    }
+  });
+
+  // Covers: task:9
+  it('omits tier from unresolved completion and an early halt', async () => {
+    const terminalEvents: Array<Extract<ConductorEvent, { type: 'feature_complete' | 'loop_halt' }>> = [];
+    events.on('feature_complete', (event) => { terminalEvents.push(event as (typeof terminalEvents)[number]); });
+    const haltEvents = new ConductorEventEmitter();
+    haltEvents.on('loop_halt', (event) => { terminalEvents.push(event as (typeof terminalEvents)[number]); });
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const provider = new MeterProvider({
+      readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })],
+    });
+    const completionListener = new MetricsListener(
+      new MetricsRecorder(provider.getMeter('conductor-terminal-tier'), { project: 'project', worker: 'worker' }), undefined, 'unresolved-complete',
+    );
+    const haltListener = new MetricsListener(
+      new MetricsRecorder(provider.getMeter('conductor-terminal-tier'), { project: 'project', worker: 'worker' }), undefined, 'early-halt',
+    );
+    completionListener.start(events);
+    haltListener.start(haltEvents);
+    const conductor = new Conductor({ projectRoot: dir, stateFilePath: statePath, stepRunner: createMockStepRunner(), events });
+    const haltConductor = new Conductor({ projectRoot: dir, stateFilePath: statePath, stepRunner: createMockStepRunner(), events: haltEvents });
+
+    try {
+      await (conductor as unknown as {
+        completeRun(state: ConductState, doneMarkerBody: string): Promise<void>;
+      }).completeRun({}, 'complete\n');
+      await (haltConductor as unknown as { emitLoopHalt(reason: string): Promise<void> }).emitLoopHalt('early halt');
+      await provider.forceFlush();
+
+      const outcomes = exporter.getMetrics()
+        .flatMap((batch) => batch.scopeMetrics)
+        .flatMap((scope) => scope.metrics)
+        .filter((metric) => metric.descriptor.name === 'conductor.run.outcomes')
+        .flatMap((metric) => metric.dataPoints as Array<{ attributes: Record<string, unknown> }>)
+        .map((point) => point.attributes);
+      expect({
+        eventTiers: terminalEvents.map((event) => Object.hasOwn(event, 'tier')),
+        outcomes,
+      }).toEqual({
+        eventTiers: [false, false],
+        outcomes: [
+          { outcome: 'complete', project: 'project', worker: 'worker', feature: 'unresolved-complete' },
+          { outcome: 'halted', project: 'project', worker: 'worker', feature: 'early-halt' },
+        ],
+      });
+    } finally {
+      completionListener.stop();
+      haltListener.stop();
+      await provider.shutdown();
+    }
+  });
+
+  // Covers: task:3
+  it.each([
+    { complexityTier: 'S' as const, expectedTier: 'S' as const },
+    { complexityTier: undefined, expectedTier: undefined },
+  ])(
+    'emits feature_usage_total with the raw finish-close tier $expectedTier',
+    async ({ complexityTier, expectedTier }) => {
+      const state: ConductState = {};
+      for (const step of ALL_STEPS) {
+        if (step.name === 'finish') break;
+        state[step.name] = 'done';
+      }
+      Object.assign(state, {
+        ...(complexityTier !== undefined && { complexity_tier: complexityTier }),
+        build_review: 'skipped',
+        manual_test: 'skipped',
+        prd_audit: 'skipped',
+        architecture_review_as_built: 'skipped',
+        rebase: 'skipped',
+      });
+      await writeState(statePath, state);
+      await mkdir(join(dir, '.pipeline'), { recursive: true });
+
+      const usageTotals: Extract<ConductorEvent, { type: 'feature_usage_total' }>[] = [];
+      events.on('feature_usage_total', (event) => {
+        if (event.type === 'feature_usage_total') usageTotals.push(event);
+      });
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner(),
+        events,
+        fromStep: 'finish',
+        mode: 'auto',
+        daemon: true,
+        maxRetries: 1,
+        verifyArtifacts: false,
+      });
+
+      await conductor.run();
+
+      expect(usageTotals).toHaveLength(1);
+      expect(usageTotals[0]?.tier).toBe(expectedTier);
+      if (expectedTier === undefined) {
+        expect(Object.hasOwn(usageTotals[0]!, 'tier')).toBe(false);
+        expect(usageTotals[0]?.tier).not.toBe('L');
+      }
+    },
+  );
+
+  // Covers: task:4
+  it.each([
+    { type: 'step_completed' as const, tier: 'L' as const, event: { status: 'done' as const } },
+    { type: 'step_failed' as const, tier: 'M' as const, event: { error: 'failed', retryCount: 0 } },
+  ])('carries the closing $type tier into its feature cost snapshot', async ({ type, tier, event }) => {
+    await mkdir(join(dir, '.pipeline'), { recursive: true });
+    const persister = new EventPersister(join(dir, '.pipeline/events.jsonl'), events);
+    const snapshots: Extract<ConductorEvent, { type: 'feature_cost_snapshot' }>[] = [];
+    events.on('feature_cost_snapshot', (emitted) => {
+      if (emitted.type === 'feature_cost_snapshot') snapshots.push(emitted);
+    });
+    persister.start();
+
+    try {
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: createMockStepRunner(), events,
+      });
+      const executionEvents = conductor as unknown as {
+        emitExecutionEvent(event: ConductorEvent): Promise<void>;
+      };
+
+      await executionEvents.emitExecutionEvent({ type: 'step_started', step: 'build', index: 0 });
+      await executionEvents.emitExecutionEvent({ type, step: 'build', tier, ...event } as ConductorEvent);
+
+      expect(snapshots).toEqual([expect.objectContaining({ tier })]);
+    } finally {
+      persister.stop();
+    }
+  });
+
+  // Covers: task:4
+  it('omits tier from a cost snapshot when its closing step has no tier', async () => {
+    await mkdir(join(dir, '.pipeline'), { recursive: true });
+    const persister = new EventPersister(join(dir, '.pipeline/events.jsonl'), events);
+    const snapshots: Extract<ConductorEvent, { type: 'feature_cost_snapshot' }>[] = [];
+    events.on('feature_cost_snapshot', (emitted) => {
+      if (emitted.type === 'feature_cost_snapshot') snapshots.push(emitted);
+    });
+    persister.start();
+
+    try {
+      const conductor = new Conductor({
+        projectRoot: dir, stateFilePath: statePath, stepRunner: createMockStepRunner(), events,
+      });
+      const executionEvents = conductor as unknown as {
+        emitExecutionEvent(event: ConductorEvent): Promise<void>;
+      };
+
+      await executionEvents.emitExecutionEvent({ type: 'step_started', step: 'build', index: 0 });
+      await executionEvents.emitExecutionEvent({ type: 'step_completed', step: 'build', status: 'done' });
+
+      expect(Object.hasOwn(snapshots[0]!, 'tier')).toBe(false);
+    } finally {
+      persister.stop();
+    }
+  });
+
+  // Covers: task:4
+  it('suppresses the tiered cost snapshot when the ledger read fails without changing the terminal verdict', async () => {
+    const snapshots: Extract<ConductorEvent, { type: 'feature_cost_snapshot' }>[] = [];
+    const terminals: Extract<ConductorEvent, { type: 'step_completed' }>[] = [];
+    events.on('feature_cost_snapshot', (emitted) => {
+      if (emitted.type === 'feature_cost_snapshot') snapshots.push(emitted);
+    });
+    events.on('step_completed', (emitted) => {
+      if (emitted.type === 'step_completed') terminals.push(emitted);
+    });
+    const conductor = new Conductor({
+      projectRoot: dir, stateFilePath: statePath, stepRunner: createMockStepRunner(), events,
+    });
+    const executionEvents = conductor as unknown as {
+      emitExecutionEvent(event: ConductorEvent): Promise<void>;
+    };
+
+    await executionEvents.emitExecutionEvent({ type: 'step_started', step: 'build', index: 0 });
+    await executionEvents.emitExecutionEvent({
+      type: 'step_completed', step: 'build', status: 'done', tier: 'L',
+    });
+
+    expect({ snapshots, terminals }).toEqual({
+      snapshots: [],
+      terminals: [expect.objectContaining({ status: 'done', tier: 'L' })],
+    });
   });
 
   describe('existing-task remediation admission', () => {
@@ -1212,7 +1525,7 @@ describe('engine/conductor', () => {
     expect(haltReasons).toEqual([
       'build_review cumulative kickback cap exceeded:\n' +
         'Kickback budget (build_review): 6/5 consumed; 0 remaining\n' +
-        'Latest reason: [testQuality] test-insensitive\n[testQuality] test-insensitive\n' +
+        'Latest reason: [testQuality] test-insensitive\n[security] skipped: disabled\n[testQuality] test-insensitive\n[security] skipped: disabled\n' +
         'Adjustment history: unavailable\n' +
         'Mechanical faults: 0',
     ]);
@@ -1276,7 +1589,7 @@ describe('engine/conductor', () => {
     expect(haltReasons).toEqual([
       'build_review cumulative kickback cap exceeded:\n' +
         'Kickback budget (build_review): 6/5 consumed; 0 remaining\n' +
-        'Latest reason: [testQuality] test-insensitive\n[testQuality] test-insensitive\n' +
+        'Latest reason: [testQuality] test-insensitive\n[security] skipped: disabled\n[testQuality] test-insensitive\n[security] skipped: disabled\n' +
         'Adjustment history: unavailable\n' +
         'Mechanical faults: 0',
     ]);
@@ -1534,6 +1847,8 @@ describe('engine/conductor', () => {
         attempt: 1,
         reason: expect.stringContaining('infrastructure'),
       })]);
+      expect(retryEvents[0]).not.toHaveProperty('progressAttempt');
+      expect(retryEvents[0]).not.toHaveProperty('progressAttemptCeiling');
       expect((await readKickbackLedger(dir)).gates.test_suite).toEqual(expect.objectContaining({
         count: 1,
         cumulative: 1,
@@ -1788,9 +2103,9 @@ describe('engine/conductor', () => {
         .map((line) => JSON.parse(line));
       const starts = records.filter((record) => record.type === 'step_started');
       const terminals = records.filter(
-        (record) => record.type === 'step_completed' || record.type === 'step_failed',
+        (record) => record.type === 'step_completed' || record.type === 'step_failed' || record.type === 'step_interrupted',
       );
-      const terminalIndex = records.findIndex((record) => record.type === 'step_failed');
+      const terminalIndex = records.findIndex((record) => record.type === 'step_interrupted');
       const haltIndex = records.findIndex((record) => record.type === 'loop_halt');
 
       expect({ starts: starts.length, terminals: terminals.length, terminalBeforeHalt: terminalIndex < haltIndex }).toEqual({
@@ -2446,10 +2761,39 @@ describe('engine/conductor', () => {
       outcome: { kind: 'skipped' },
     };
 
-    const outcome = await runGroupBranch(member, {}, { stepRunner }, 1);
+    const lifecycleObserver = {
+      onAdmitted: vi.fn(),
+      onAttempt: vi.fn(),
+      onRetry: vi.fn(),
+      onSettled: vi.fn(),
+    } satisfies GroupBranchLifecycleObserver;
+    const executionContext = {
+      executionId: 'validation-manual-test-1',
+      subject: { kind: 'lifecycle-step' as const, step: 'manual_test' as const },
+    };
+    const attribution = { member: 'manual_test', skill: 'manual-test', executionContext };
+
+    const outcome = await runGroupBranch(member, {}, {
+      stepRunner,
+      lifecycleObserver,
+      executionContext,
+    }, 1);
 
     expect((outcome as { observedIntervals?: readonly unknown[] }).observedIntervals?.[0])
       .toBe(observedIntervals[0]);
+    expect(lifecycleObserver.onAdmitted.mock.calls).toEqual([[attribution]]);
+    expect(lifecycleObserver.onAttempt.mock.calls).toEqual([[{
+      ...attribution,
+      attempt: 1,
+      result: { success: true, observedIntervals },
+    }]]);
+    expect(lifecycleObserver.onRetry).not.toHaveBeenCalled();
+    expect(lifecycleObserver.onSettled.mock.calls).toEqual([[{
+      ...attribution,
+      outcome,
+      attempts: [{ ...attribution, attempt: 1, result: { success: true, observedIntervals } }],
+      observedIntervals,
+    }]]);
   });
 
   it('preserves all ordered intervals after a grouped session-expired retry', async () => {
@@ -2472,7 +2816,10 @@ describe('engine/conductor', () => {
       outcome: { kind: 'skipped' },
     };
 
-    const outcome = await runGroupBranch(member, {}, { stepRunner: { run } }, 1);
+    const outcome = await runGroupBranch(member, {}, {
+      stepRunner: { run },
+      lifecycleObserver: NOOP_GROUP_BRANCH_LIFECYCLE_OBSERVER,
+    }, 1);
 
     expect({
       kind: outcome.kind,
@@ -3055,17 +3402,14 @@ describe('engine/conductor', () => {
 
     try {
       const executionEvents = conductor as unknown as {
-        openExecutions: Map<string, { kind: 'step'; step: StepName }>;
+        emitExecutionEvent(event: ConductorEvent): Promise<void>;
         closeOpenExecutions(): Promise<void>;
       };
-      await events.emit({
+      await executionEvents.emitExecutionEvent({
         type: 'step_started',
         step: 'build',
         index: 0,
       });
-      executionEvents.openExecutions = new Map([
-        ['step:build', { kind: 'step', step: 'build' }],
-      ]);
 
       await executionEvents.closeOpenExecutions();
 
@@ -3073,8 +3417,8 @@ describe('engine/conductor', () => {
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line));
-      const terminal = records.find((record) => record.type === 'step_failed');
-      expect(terminal).toMatchObject({ type: 'step_failed', step: 'build' });
+      const terminal = records.find((record) => record.type === 'step_interrupted');
+      expect(terminal).toMatchObject({ type: 'step_interrupted', step: 'build' });
       expect(terminal.activeInterval).toEqual({ startedAtMs: 1_000, durationMs: 25 });
     } finally {
       persister.stop();
@@ -3111,8 +3455,82 @@ describe('engine/conductor', () => {
       expect(records).toEqual([
         expect.objectContaining({ type: 'step_started', step: 'build' }),
         expect.objectContaining({
-          type: 'step_failed',
+          type: 'step_interrupted',
           step: 'build',
+          activeInterval: { startedAtMs: 1_000, durationMs: 25 },
+        }),
+      ]);
+    } finally {
+      persister.stop();
+    }
+  });
+
+  it.each(['step_completed', 'step_failed'] as const)(
+    'does not let %s close a non-validation parallel execution',
+    async (type) => {
+      const conductor = new Conductor({
+        projectRoot: dir,
+        stateFilePath: statePath,
+        stepRunner: createMockStepRunner(),
+        events,
+      });
+      const emit = vi.spyOn(events, 'emit');
+      const executionEvents = conductor as unknown as {
+        emitExecutionEvent(event: ConductorEvent): Promise<void>;
+      };
+      await executionEvents.emitExecutionEvent({ type: 'parallel_started', step: 'build', branches: [] });
+      emit.mockClear();
+      const terminal: ConductorEvent = type === 'step_completed'
+        ? { type, step: 'build', status: 'done' }
+        : { type, step: 'build', error: 'late step failure', retryCount: 0 };
+      await executionEvents.emitExecutionEvent(terminal);
+      expect(emit).not.toHaveBeenCalled();
+
+      await conductor.closeOpenExecutionsForShutdown();
+      expect(emit).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'parallel_failure', step: 'build',
+      }));
+    },
+  );
+
+  it('suppresses a late validation terminal after daemon SIGTERM closed the execution', async () => {
+    const conductor = new Conductor({
+      projectRoot: dir,
+      stateFilePath: statePath,
+      stepRunner: createMockStepRunner(),
+      events,
+    });
+    const timestamps = [1_000, 1_025];
+    const persister = new EventPersister(join(dir, '.pipeline/events.jsonl'), events, {
+      nowMs: () => timestamps.shift()!,
+    });
+    persister.start();
+
+    try {
+      const executionEvents = conductor as unknown as {
+        emitExecutionEvent(event: ConductorEvent): Promise<void>;
+      };
+      await executionEvents.emitExecutionEvent({ type: 'step_started', step: 'prd_audit', index: 0 });
+      await conductor.closeOpenExecutionsForShutdown();
+
+      // A validation member is drained like any other step: its late terminal
+      // must not land as a second terminal for the same execution.
+      await executionEvents.emitExecutionEvent({ type: 'step_completed', step: 'prd_audit', status: 'done' });
+      await executionEvents.emitExecutionEvent({
+        type: 'step_failed', step: 'prd_audit', error: 'late validation failure', retryCount: 0,
+      });
+
+      const records = (await readFile(join(dir, '.pipeline/events.jsonl'), 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      const terminals = records.filter((record) =>
+        record.type === 'step_completed' || record.type === 'step_failed' || record.type === 'step_interrupted',
+      );
+      expect(terminals).toEqual([
+        expect.objectContaining({
+          type: 'step_interrupted',
+          step: 'prd_audit',
           activeInterval: { startedAtMs: 1_000, durationMs: 25 },
         }),
       ]);
@@ -3150,11 +3568,11 @@ describe('engine/conductor', () => {
         .split('\n')
         .map((line) => JSON.parse(line));
       const terminals = records.filter((record) =>
-        record.type === 'step_completed' || record.type === 'step_failed',
+        record.type === 'step_completed' || record.type === 'step_failed' || record.type === 'step_interrupted',
       );
       expect(terminals).toEqual([
         expect.objectContaining({
-          type: 'step_failed',
+          type: 'step_interrupted',
           step: 'build',
           activeInterval: { startedAtMs: 1_000, durationMs: 25 },
         }),
@@ -3203,7 +3621,7 @@ describe('engine/conductor', () => {
         .split('\n')
         .map((line) => JSON.parse(line));
       expect(records).toContainEqual(expect.objectContaining({
-        type: 'step_failed',
+        type: 'step_interrupted',
         step: 'build',
         activeInterval: { startedAtMs: 1_000, durationMs: 25 },
       }));
@@ -4731,7 +5149,7 @@ describe('engine/conductor', () => {
     expect(result.ok && result.value.feature_status).toBeUndefined();
   });
 
-  it('daemon terminal-marker guarantee classifies an unmarked gate exit as needs-human', async () => {
+  it('daemon classifies a gate exit with a reachable pending prerequisite as mechanical', async () => {
     const runner: StepRunner = { run: vi.fn().mockResolvedValue({ success: true }) };
     const conductor = new Conductor({
       stateFilePath: statePath,
@@ -4744,7 +5162,7 @@ describe('engine/conductor', () => {
 
     await conductor.run();
 
-    expect(await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8')).toBe('needs-human');
+    expect(await readFile(join(dir, '.pipeline/HALT.class'), 'utf-8')).toBe('mechanical');
   });
 
   describe('daemon prd-audit gap-aware halting', () => {
@@ -6029,6 +6447,99 @@ describe('engine/conductor', () => {
 
       const evidence = await createTaskEvidence(dir);
       expect(evidence.lastResolvedCount).toBe(CEILING);
+    });
+
+    it.each([false, true])('reports refunded build retries without changing dispatch (selfHost=%s)', async (selfHost) => {
+      await seedToBuild();
+      const tokenPath = join(dir, 'retry-test-token');
+      await writeFile(tokenPath, 'fixture-token');
+      const installedRoot = join(dir, 'installed-harness');
+      await mkdir(installedRoot);
+      const TOTAL = 4;
+      const CEILING = 3;
+      let progress = 0;
+      let buildCalls = 0;
+      const dispatches: Array<{ model?: string; effort?: string }> = [];
+      const retryEvents: Array<Extract<ConductorEvent, { type: 'step_retry' }>> = [];
+
+      const runner: StepRunner = {
+        selfHostRunId: () => 'retry-reporting-fixture',
+        run: vi.fn(async (step: StepName, _state: ConductState, options?: StepRunOptions) => {
+          if (step === 'build') {
+            buildCalls++;
+            dispatches.push({ model: options?.modelOverride, effort: options?.effortOverride });
+            // The first retry consumes a normal fixed-budget slot. Each later
+            // attempt resolves one task, until the existing ceiling halts it.
+            if (buildCalls > 1) {
+              progress++;
+              await writePlanAndStatus(progress, TOTAL);
+            } else {
+              await writePlanAndStatus(0, TOTAL);
+            }
+          }
+          return { success: true };
+        }),
+      };
+      events.on('step_retry', (event) => {
+        if (event.type === 'step_retry') retryEvents.push(event);
+      });
+
+      const conductor = new Conductor({
+        stateFilePath: statePath,
+        stepRunner: runner,
+        events,
+        projectRoot: dir,
+        mode: 'auto',
+        daemon: true,
+        selfHost,
+        selfHostGuardrails: {
+          resolveHarnessRoot: vi.fn().mockResolvedValue(dir),
+          resolveInstalledHarnessRoot: vi.fn().mockResolvedValue({ status: 'ok', root: installedRoot }),
+          relink: vi.fn(),
+          provisionSandbox: vi.fn(async () => ({ configDir: dir, childEnv: () => process.env, teardown: async () => {} })),
+          versionGate: vi.fn().mockResolvedValue({ ok: true }),
+          releaseGate: vi.fn().mockResolvedValue({ ok: true }),
+        } as any,
+        verifyArtifacts: true,
+        maxRetries: 3,
+        fromStep: 'build',
+        config: {
+          harness_self_host: {
+            sandbox_build_env: true,
+            build_auth: { mode: 'daemon-token', token_path: tokenPath },
+          },
+          build_progress_halt: { enabled: true, attempt_ceiling: CEILING, dispatch_ceiling: 20 },
+        } as HarnessConfig,
+      });
+
+      await conductor.run();
+
+      expect(retryEvents).toHaveLength(3);
+      expect(dispatches).toHaveLength(4);
+      if (selfHost) {
+        expect(dispatches).toEqual(Array.from({ length: 4 }, () => ({ model: undefined, effort: undefined })));
+        for (const event of retryEvents) {
+          expect(event).not.toHaveProperty('escalatedModel');
+          expect(event).not.toHaveProperty('escalatedEffort');
+        }
+      }
+      expect(retryEvents.map((event) => ({
+        model: event.escalatedModel, effort: event.escalatedEffort,
+      }))).toEqual(dispatches.slice(1));
+      expect(retryEvents.every((event) => event.attempt <= event.maxAttempts)).toBe(true);
+      expect(retryEvents[0]).toMatchObject({ step: 'build', attempt: 2, maxAttempts: 3 });
+      expect(retryEvents[0]).not.toHaveProperty('progressAttempt');
+      expect(retryEvents[0]).not.toHaveProperty('progressAttemptCeiling');
+      expect(retryEvents.slice(1)).toEqual([
+        expect.objectContaining({
+          step: 'build', attempt: 2, maxAttempts: 3,
+          progressAttempt: 1, progressAttemptCeiling: CEILING,
+        }),
+        expect.objectContaining({
+          step: 'build', attempt: 2, maxAttempts: 3,
+          progressAttempt: 2, progressAttemptCeiling: CEILING,
+        }),
+      ]);
     });
   });
 
@@ -9234,7 +9745,7 @@ describe('engine/conductor', () => {
       '| FR | Verdict | Gap-class | Evidence | Accepted? |\n|--|--|--|--|--|\n| FR-1 | ALIGNED | | evidence.ts:1 | yes |\n';
     const AS_BUILT_APPROVED = '# As-Built Architecture Review\n\nVerdict: APPROVED\n';
 
-    it('a branch that never produces a completion marker (crashed/exhausted retries) halts the group loudly, zero kickback, no remediation.json, no partial join', async () => {
+    it('a branch that never produces a completion marker halts the group without kickback while retaining satisfied siblings', async () => {
       await writeState(statePath, VALIDATION_GROUP_PREREQS);
 
       const runner: StepRunner = {
@@ -9290,11 +9801,11 @@ describe('engine/conductor', () => {
       const result = await readState(statePath);
       expect(result.ok).toBe(true);
       const state = result.ok ? (result.value as Record<string, unknown>) : {};
-      // No member — including the ones that themselves passed — gets marked
-      // done: no partial join on a no-verdict outcome.
-      expect(state.manual_test).not.toBe('done');
-      expect(state.prd_audit).not.toBe('done');
-      expect(state.architecture_review_as_built).not.toBe('done');
+      // The failed member still blocks the group, but satisfied siblings remain
+      // done so a resume does not discard their validated work.
+      expect(state.manual_test).toBe('failed');
+      expect(state.prd_audit).toBe('done');
+      expect(state.architecture_review_as_built).toBe('done');
     });
 
     it('FAIL verdict + a crashed sibling: same halt path, zero kickback events', async () => {
@@ -9337,6 +9848,9 @@ describe('engine/conductor', () => {
         events,
         fromStep: 'manual_test',
         mode: 'auto',
+        // The FAIL-row retention predicate is artifact-aware. Keep this
+        // no-verdict fixture on that production path rather than bypassing it.
+        verifyArtifacts: true,
       });
 
       await conductor.run();
@@ -9346,6 +9860,11 @@ describe('engine/conductor', () => {
 
       expect(kickbacks.length).toBe(0);
       expect(haltCount).toBeGreaterThan(0);
+      const result = await readState(statePath);
+      if (!result.ok) throw result.error;
+      const state = result.value as Record<string, unknown>;
+      // A successful dispatch with FAIL rows is not a satisfied join member.
+      expect([state.manual_test, state.validation__manual_test]).not.toContain('done');
     });
   });
 
@@ -10668,6 +11187,7 @@ describe('engine/conductor', () => {
         {} as ConductState,
         {
           stepRunner,
+          lifecycleObserver: NOOP_GROUP_BRANCH_LIFECYCLE_OBSERVER,
           onMemberEvent: (e) => {
             events.push(e as unknown as (typeof events)[number]);
           },
@@ -10921,7 +11441,7 @@ describe('engine/conductor', () => {
         .split('\n')
         .map((line) => JSON.parse(line));
       expect(records).toContainEqual(expect.objectContaining({
-        type: 'step_failed',
+        type: 'step_interrupted',
         step: 'prd',
         activeInterval: { startedAtMs: 1_000, durationMs: 25 },
       }));
@@ -16550,6 +17070,20 @@ describe('appendRemediationTasks', () => {
     expect(content).not.toContain('### Task rem-test-1:');
   });
 
+  it('separates a bare remediation task from plan content without a final newline', async () => {
+    const planPath = join(dir, 'plan.md');
+    await writeFile(planPath, '# Implementation Plan\n\n## Tasks');
+
+    const result = await appendRemediationTasks(dir, planPath, [
+      { id: 'rem-test-no-final-newline', title: 'Repair the terminal plan boundary' },
+    ]);
+
+    expect(result).toEqual({ success: true, appendedIds: ['rem-test-no-final-newline'] });
+    const content = await readFile(planPath, 'utf-8');
+    expect(content).toContain('## Tasks\n\n### Task rem-test-no-final-newline:');
+    expect(validatePlanDoneWhen(content)).toEqual([]);
+  });
+
   describe('idempotent upsert semantics', () => {
     it('append task with id rem-fr10-1 → exists in plan', async () => {
       const planPath = join(dir, 'plan.md');
@@ -16567,6 +17101,7 @@ describe('appendRemediationTasks', () => {
 
       const content = await readFile(planPath, 'utf-8');
       expect(content).toContain('### Task rem-fr10-1:');
+      expect(validatePlanDoneWhen(content)).toEqual([]);
     });
 
     it('append same id again → still exactly one instance (no duplicate)', async () => {
@@ -16591,6 +17126,7 @@ describe('appendRemediationTasks', () => {
       const content = await readFile(planPath, 'utf-8');
       const matches = content.match(/### Task rem-fr10-1:/g);
       expect(matches).toHaveLength(1); // Exactly one, not two
+      expect(validatePlanDoneWhen(content)).toEqual([]);
     });
 
     it('attempt to append same id with different content → preserved (not mutated)', async () => {
@@ -16626,6 +17162,7 @@ describe('appendRemediationTasks', () => {
       // A suffixed version should be created for the different content
       const hasSuffixedVersion = /### Task rem-fr10-1-[a-f0-9]{6}:.*Different title for rem-fr10-1/.test(content);
       expect(hasSuffixedVersion).toBe(true);
+      expect(validatePlanDoneWhen(content)).toEqual([]);
     });
 
     it('two separate remediations from different gates with same semantic issue → distinct ids (with suffix)', async () => {
@@ -16866,7 +17403,7 @@ describe('post-rebase build closure (Task 11)', () => {
       migrationGrandfather: [],
     }));
 
-    const state = { manual_test: 'skipped' } as ConductState;
+    const state = { build: 'done', manual_test: 'skipped' } as ConductState;
     const git: GitRunner = async (args) => ({
       stdout: args[0] === 'status' ? ' M src/reapplied.ts\n' : '',
     });
@@ -16876,6 +17413,7 @@ describe('post-rebase build closure (Task 11)', () => {
       events,
       projectRoot: dir,
       daemon: true,
+      verifyArtifacts: true,
       git,
     });
     const changed = {
@@ -16893,17 +17431,15 @@ describe('post-rebase build closure (Task 11)', () => {
         await (conductor as any).completionCtx(state),
       );
       await (conductor as any).runRebaseStep(state);
-      const buildVerdict = JSON.parse(
-        await readFile(join(dir, '.pipeline/gates/build.json'), 'utf8'),
-      ) as GateVerdict;
+      const halt = await readFile(join(dir, '.pipeline/HALT'), 'utf8');
 
-      expect({ closure, buildVerdict }).toMatchObject({
+      expect({ closure, halt }).toMatchObject({
         closure: {
           done: false,
           missing: 'uncommitted',
           reason: expect.stringContaining('src/reapplied.ts'),
         },
-        buildVerdict: { satisfied: false },
+        halt: expect.stringContaining('completed BUILD evidence is unavailable after rebase'),
       });
     } finally {
       performRebase.mockReset();
@@ -18198,7 +18734,10 @@ describe('built-in SHIP validation group entry (Decision-1)', () => {
       const grouped = await runGroupBranch(
         { name: 'manual_test', skill: 'manual-test', outcome: { kind: 'skipped' } },
         {} as ConductState,
-        { stepRunner: runner },
+        {
+          stepRunner: runner,
+          lifecycleObserver: NOOP_GROUP_BRANCH_LIFECYCLE_OBSERVER,
+        },
         1,
       );
       const auxiliary = await executeOneShot('build_review', { prompt: 'review', cwd: projectRoot });

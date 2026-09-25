@@ -1,12 +1,12 @@
 // ── Post-rebase delta-aware gate invalidation (ADR
 // .docs/decisions/adr-2026-07-20-post-rebase-delta-aware-invalidation.md) ──
 //
-// This module is currently inert — nothing imports it yet. It will grow
-// `partitionDelta` and `classifyGateInvalidation` in later plan tasks; for
-// now it defines only the path predicates and the gate→surface map they
-// feed.
+// Imported by `conductor.ts`, `rebase.ts`, and `gate-code-validity.ts`.
+// `partitionDelta` and `classifyGateInvalidation` are live; this module also
+// defines the path predicates and gate→surface map they use.
 
 import { isCodeOrTestPath } from './rebase.js';
+import type { ReplayComparison } from './rebase-replay.js';
 
 /**
  * Test-path convention: a path is test-only if it matches
@@ -46,17 +46,24 @@ export type GateSurfaceKind =
   | 'feature-runtime'
   | 'feature-codetest'
   | 'feature-runtime-or-prd-inputs'
+  | 'feature-runtime-or-coverage-inputs'
   | 'all-runtime'
   | 'any-codetest';
 
-const PRD_AUDIT_DOCUMENT_INPUT_PREFIXES = ['.docs/stories/', '.docs/specs/'];
+export const PRD_AUDIT_DOCUMENT_INPUT_PREFIXES = ['.docs/stories/', '.docs/specs/'] as const;
 
-function isPrdAuditDocumentInput(path: string): boolean {
-  return PRD_AUDIT_DOCUMENT_INPUT_PREFIXES.some((prefix) => path.startsWith(prefix));
+// Keep this list aligned with `resolveReviewInputs`: a governing ADR is an
+// active input to coverage/review preservation just like the plan and its
+// stories.  The classifier is the early gate for that resolver, so omitting
+// a prefix here would turn an ADR-only rebase delta into a false noop.
+export const COVERAGE_DOCUMENT_INPUT_PREFIXES = [...PRD_AUDIT_DOCUMENT_INPUT_PREFIXES, '.docs/plans/', '.docs/coherence/', '.docs/decisions/'] as const;
+
+export function isReviewDocumentPath(path: string): boolean {
+  return COVERAGE_DOCUMENT_INPUT_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
 export const GATE_SURFACE: Record<string, GateSurfaceKind> = {
-  coverage_binding: 'feature-runtime-or-prd-inputs',
+  coverage_binding: 'feature-runtime-or-coverage-inputs',
   // Grades THE FEATURE'S OWN diff against its plan (plan-vs-diff
   // completeness), so only the feature's own code or tests can change the
   // grade — a foreign main-side delta leaves that diff, and therefore the
@@ -76,7 +83,10 @@ export const GATE_SURFACE: Record<string, GateSurfaceKind> = {
   // prior PASS even though the runtime delta partition deliberately ignores
   // markdown paths.
   prd_audit: 'feature-runtime-or-prd-inputs',
-  architecture_review_as_built: 'feature-runtime',
+  // The as-built review consumes governing ADRs, plans, coherence and other
+  // declared decision inputs as well as feature runtime.  Keep that input
+  // surface identical to the resolver used to bind replay authority.
+  architecture_review_as_built: 'feature-runtime-or-coverage-inputs',
 };
 
 /**
@@ -131,6 +141,93 @@ export function featureTestPaths(D: string[], F: string[]): string[] {
   return D.filter((path) => isTestPath(path) && featureSet.has(path));
 }
 
+export interface GateSurfaceProjection {
+  matchedPaths: string[];
+  declaredSurface: string[];
+}
+
+/**
+ * A single gate's conservative post-rebase candidate.  Application and event
+ * owners consume this same source instead of reconstructing a second
+ * preserve/invalidate explanation from the paths.
+ */
+export interface ReplayGateCandidate {
+  gate: string;
+  decision: 'preserve' | 'invalidate' | 'skip';
+  source: {
+    surface: GateSurfaceKind;
+    /** The complete post-rebase tree delta, retained for suite/runtime policy. */
+    combinedDelta: string[];
+    /** The feature's code/test contribution, separate from the combined tree. */
+    featureContribution: string[];
+    /** Changed, declared review inputs relevant to this gate. */
+    activeInputs: string[];
+    replay: ReplayComparison['kind'];
+  };
+}
+
+export interface ReplayGateInvalidation {
+  preserved: string[];
+  invalidated: string[];
+  candidates: ReplayGateCandidate[];
+}
+
+/**
+ * The one projection shared by classification and rebase event payloads.
+ * Every `GateSurfaceKind` receives its own matched delta and declared
+ * dependency surface, making a new kind a type error until it is explicit.
+ */
+export function projectGateSurfaces(
+  D: string[],
+  F: string[],
+  documentInputs?: readonly string[],
+): Record<GateSurfaceKind, GateSurfaceProjection> {
+  const { test, featureSrc, foreignSrc } = partitionDelta(D, F);
+  const featureTest = featureTestPaths(D, F);
+  const featureRuntimeSurface = F.filter(isRuntimeSourcePath);
+  const featureCodeTestSurface = F.filter((path) => isRuntimeSourcePath(path) || isTestPath(path));
+  const documents = (prefixes: readonly string[]) => {
+    const declared = documentInputs?.filter((path) => prefixes.some((prefix) => path.startsWith(prefix)));
+    return {
+      matchedPaths: D.filter((path) => prefixes.some((prefix) => path.startsWith(prefix)) && (declared === undefined || declared.includes(path))),
+      // A runtime-only delta does not require resolving document inputs, so
+      // callers deliberately supply an empty list in that case. It means the
+      // delta named no concrete document, not that the gate has no document
+      // dependency; retain the prefix declaration for its event surface.
+      declaredSurface: declared && declared.length > 0 ? declared : [`<${prefixes.join('|')}>`],
+    };
+  };
+  const prdInputs = documents(PRD_AUDIT_DOCUMENT_INPUT_PREFIXES);
+  const coverageInputs = documents(COVERAGE_DOCUMENT_INPUT_PREFIXES);
+
+  return {
+    'feature-runtime': {
+      matchedPaths: featureSrc,
+      declaredSurface: featureRuntimeSurface,
+    },
+    'feature-codetest': {
+      matchedPaths: [...featureSrc, ...featureTest],
+      declaredSurface: featureCodeTestSurface,
+    },
+    'feature-runtime-or-prd-inputs': {
+      matchedPaths: [...featureSrc, ...prdInputs.matchedPaths],
+      declaredSurface: [...featureRuntimeSurface, ...prdInputs.declaredSurface],
+    },
+    'feature-runtime-or-coverage-inputs': {
+      matchedPaths: [...featureSrc, ...coverageInputs.matchedPaths],
+      declaredSurface: [...featureRuntimeSurface, ...coverageInputs.declaredSurface],
+    },
+    'all-runtime': {
+      matchedPaths: [...featureSrc, ...foreignSrc],
+      declaredSurface: ['<all runtime source>'],
+    },
+    'any-codetest': {
+      matchedPaths: [...test, ...featureSrc, ...foreignSrc],
+      declaredSurface: ['<all code or test paths>'],
+    },
+  };
+}
+
 /**
  * Preserve/invalidate decision table for the post-rebase judged tail
  * (ADR-2026-07-20). `D` is the rebase delta (`changedCodePaths`), `F` is the
@@ -159,10 +256,9 @@ export function classifyGateInvalidation(
   D: string[],
   F: string[],
   ranManualTest: boolean,
+  documentInputs?: readonly string[],
 ): { preserved: string[]; invalidated: string[] } {
-  const { test, featureSrc, foreignSrc } = partitionDelta(D, F);
-  const featureTest = featureTestPaths(D, F);
-  const prdAuditDocumentInputs = D.filter(isPrdAuditDocumentInput);
+  const projections = projectGateSurfaces(D, F, documentInputs);
   const preserved: string[] = [];
   const invalidated: string[] = [];
 
@@ -171,27 +267,88 @@ export function classifyGateInvalidation(
       continue;
     }
 
-    let isPreserved: boolean;
-    switch (surface) {
-      case 'feature-runtime':
-        isPreserved = featureSrc.length === 0;
-        break;
-      case 'feature-codetest':
-        isPreserved = featureSrc.length === 0 && featureTest.length === 0;
-        break;
-      case 'feature-runtime-or-prd-inputs':
-        isPreserved = featureSrc.length === 0 && prdAuditDocumentInputs.length === 0;
-        break;
-      case 'all-runtime':
-        isPreserved = featureSrc.length === 0 && foreignSrc.length === 0;
-        break;
-      case 'any-codetest':
-        isPreserved = test.length === 0 && featureSrc.length === 0 && foreignSrc.length === 0;
-        break;
-    }
+    const isPreserved = projections[surface].matchedPaths.length === 0;
 
     (isPreserved ? preserved : invalidated).push(gate);
   }
 
   return { preserved, invalidated };
+}
+
+function isFeatureScopedReview(surface: GateSurfaceKind): boolean {
+  return surface === 'feature-runtime' ||
+    surface === 'feature-codetest' ||
+    surface === 'feature-runtime-or-prd-inputs' ||
+    surface === 'feature-runtime-or-coverage-inputs';
+}
+
+/**
+ * Classify a completed replay while retaining the two inputs the policy must
+ * not conflate.  Exact unchanged replay proof can preserve a feature-scoped
+ * review even when the combined delta overlaps its paths.  It never relaxes
+ * active document inputs, aggregate suite evidence, or whole-runtime manual
+ * verification.  Changed and unproved reconstructions retain the established
+ * path-based conservative result.
+ */
+export function classifyReplayGateInvalidation(
+  D: string[],
+  F: string[],
+  ranManualTest: boolean,
+  replay: ReplayComparison,
+  documentInputs?: readonly string[],
+): ReplayGateInvalidation {
+  const projections = projectGateSurfaces(D, F, documentInputs);
+  const featureSet = new Set(F);
+  const featureContribution = D.filter((path) => featureSet.has(path) &&
+    (isRuntimeSourcePath(path) || isTestPath(path)));
+  const preserved: string[] = [];
+  const invalidated: string[] = [];
+  const candidates: ReplayGateCandidate[] = [];
+
+  for (const [gate, surface] of Object.entries(GATE_SURFACE)) {
+    const projection = projections[surface];
+    const activeInputs = projection.matchedPaths.filter(isReviewDocumentPath);
+    if (gate === 'manual_test' && !ranManualTest) {
+      candidates.push({
+        gate,
+        decision: 'skip',
+        source: {
+          surface,
+          combinedDelta: [...D],
+          featureContribution: [...featureContribution],
+          activeInputs,
+          replay: replay.kind,
+        },
+      });
+      continue;
+    }
+
+    const preserveUnchangedFeatureContribution = replay.kind === 'unchanged' &&
+      isFeatureScopedReview(surface) && activeInputs.length === 0;
+    // Path projection alone cannot prove that the feature replay itself was
+    // retained. If reconstruction is unavailable, a resolution could have
+    // changed any feature-scoped review input outside the observed upstream
+    // delta. Re-open those reviews rather than leaving an unbound PASS for a
+    // later completion/finish reader to reject.
+    const unprovedFeatureScopedReplay = replay.kind === 'unproved' &&
+      isFeatureScopedReview(surface);
+    const decision = !unprovedFeatureScopedReplay &&
+      (preserveUnchangedFeatureContribution || projection.matchedPaths.length === 0)
+      ? 'preserve'
+      : 'invalidate';
+    (decision === 'preserve' ? preserved : invalidated).push(gate);
+    candidates.push({
+      gate,
+      decision,
+      source: {
+        surface,
+        combinedDelta: [...D],
+        featureContribution: [...featureContribution],
+        activeInputs,
+        replay: replay.kind,
+      },
+    });
+  }
+
+  return { preserved, invalidated, candidates };
 }

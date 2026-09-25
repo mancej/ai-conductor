@@ -39,13 +39,29 @@ kicks back to does that.
 **Run when `build_review` fails, or at SHIP when a prior audit BLOCKED — dispatched by the
 conductor on the blocking path.**
 
+## Engine-selected PRD widening reconciliation mode
+
+Use this branch **only when the engine-stamped context declares**
+`mode: "prd-widening-reconciliation"`. It is one bounded equivalence judgment through the
+existing `remediate` dispatch, not a lifecycle step, a new skill, or a BUILD remediation plan.
+
+Judge only the engine-supplied projection. For each current source, decide whether the supplied
+evidence supports the same retained case, a different case, or uncertainty. A same-case judgment
+must name only an existing supplied case and explain the substantive behavioral equivalence; when
+the supplied evidence cannot establish that relation, choose uncertainty rather than guessing from
+summary wording, ordinal, commit, or path similarity. Do not inspect the repository, seek extra
+evidence, or invent a new case, source, decision, or operator authority.
+
+The engine owns the projection, native schema, terminal-result validation, durable IDs, and every
+effect. Do not create BUILD work, amend a plan, write a remediation artifact, or recover a result
+from markdown/prose. For every other mode, including `build_review` `case-v1`/`case-v2` and legacy gap
+planning, skip this branch and follow the existing instructions unchanged.
+
 ## Engine-selected build_review case-v1 mode
 
-Use this branch **only when this engine context is the engine-stamped `build_review` `case-v1`
-context declaring `domain: "build_review"` and `mode: "case-v1"`**. It is one judgement by the
-existing `remediate` skill, not a new skill or a second dispatch. Do not create a skill or dispatch
-another agent. For every other context, including all SHIP and stall remediation, skip this section
-and follow the legacy gap-plan instructions below unchanged.
+Use this branch **only when this engine context is the engine-stamped `build_review` `case-v1` case context declaring `domain: "build_review"` and `mode: "case-v1"` or `"case-v2"`**. It is one judgement by
+the existing `remediate` skill, not a new skill or a second dispatch. Do not create a skill or dispatch another agent. For every other context, including all SHIP and stall remediation, skip this
+section and follow the legacy gap-plan instructions below unchanged.
 
 ### Supplied input — complete or stop
 
@@ -121,6 +137,32 @@ file an intake issue, navigate BUILD, charge a budget, or mutate durable state. 
 approved plan. In this mode the only write is the schema-constrained `.pipeline/remediation.json`
 artifact.
 
+### case-v2 consistency, admission, and decision stops
+
+When the engine stamps `mode: "case-v2"`, write exactly the v1 graph fields plus a top-level
+`consistency` object; its exact top-level keys are `mode`, `domain`, `sourceOutcomes`, `cases`, and
+`consistency`. The `consistency` object is exactly `{ "verdict": "consistent" | "blocked",
+"sourceIds": ["..."], "caseRefs": ["..."], "rationale": "..." }`. It names the implicated
+current sources and canonical case rows, and gives bounded, evidence-grounded rationale. Do not
+drop merge rows: every merged source still cites its canonical case, so the graph retains its
+original source and merge provenance.
+
+For a v2 `act`, every effect task is exactly `{ "title": "...", "admittedTaskIds": ["..."],
+"admissionRationale": "..." }`. `admittedTaskIds` names the existing active-plan tasks that admit
+that repair, and `admissionRationale` explains the approved-scope fit. Never invent a task id or
+append a plan task.
+
+v2 adds `escalate` as both a source outcome and a case disposition. An escalation case has exactly
+the ordinary case fields plus `"escalation": { "owner": "product" | "plan" | "architecture" }`
+and its effect is exactly `{ "kind": "none" }`. Its source rows, case rationale, and consistency
+record are the operator-facing evidence. It creates no action, operator acceptance, tracker effect,
+plan mutation, BUILD navigation, or budget charge. Use `blocked` consistency for an unresolved
+contradiction; a `consistent` verdict still does not authorize work outside the admitted task ids.
+
+The inherited `refute`/`refuted` record is unchanged in v2: keep its existing-case binding,
+high-confidence assertion evidence, and terminal semantics. Do not create a parallel refutation
+shape.
+
 ## Practices
 
 ### 1. Load Input
@@ -152,6 +194,16 @@ Consider **only the blocking gaps or the stall question**. Each gap already carr
 `file:line` evidence — use it; do not re-audit from scratch. A stall question should be
 answered by reasoning over committed artifacts (plan, stories, ADRs, task-status) without
 re-reading source files unless essential.
+
+**Environmental stalls — check first, halt cheaply.** Before any other analysis of a stall
+question, decide whether its cause is the environment rather than the work: a service, container,
+database, network dependency, credential, or tool the build or test gate needs is down, crashing,
+or unreachable. No plan, story, ADR, or code change repairs the machine, so committed artifacts
+cannot answer the question. Route it `halt` with `category: unanswerable` immediately: preserve the
+question verbatim, state in `rationale` that the cause is environmental and name the failing
+dependency as the stall question reports it, and emit `tasks: []`. Do not dispatch
+`remediation-planner`, diagnose the failing dependency, read source, or propose configuration
+changes as a workaround — a turn spent investigating reaches the same halt at far greater cost.
 
 **Remediation context pointers:** When the dispatch context includes `plan contract:` or
 `prior attempts:` pointers, read every referenced file before planning repairs. Treat the
@@ -366,6 +418,7 @@ Headers re-parse via the Task 18 grammar and must include:
 - [ ] Read the blocking gaps from `.pipeline/build-review.json`, `.pipeline/prd-audit.md` (and
       `.pipeline/architecture-review-as-built.md` if present), or the stall-question from
       `.pipeline/build-stall-question.md`
+- [ ] An environmental stall-question was halted `unanswerable` before any planner dispatch or diagnosis
 - [ ] One disposition per blocking gap or stall-question — nothing blocking omitted
 - [ ] HALT used ONLY for `architectural-clarity`, `product-scope`, or (stall-question) `unanswerable`; every other gap/question routed to a step
 - [ ] A gap whose ONLY defect is published PR prose (placeholder/wrong-template body, stale title,

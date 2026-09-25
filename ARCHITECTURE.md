@@ -81,11 +81,12 @@ this section. CI enforces both content drift (the table matches the source) and 
 | remediate | autonomous engine | opus | medium | gpt-5.6-sol | medium | A high-capability model from the selected provider policy guards failure disposition; a false HALT wastes context and wrong routing misroutes rework. MEDIUM effort balances concrete gap routing with the strength of the selected model. |
 | attribution-verify | autonomous engine | opus | high | gpt-5.6-sol | high | Semantic attribution verification of commits against task metadata — validating work ownership, evidence marshalling, and provenance consistency demands deep reasoning about task-to-commit linkages. |
 | build-review-test-quality | engine-managed auxiliary rubric | inherits resolved rubric policy | inherits resolved rubric policy | inherits resolved rubric policy | inherits resolved rubric policy | Judges whether criterion-bound changed tests are insensitive to the behavior they claim to cover; preflight is evidence, never a verdict. |
+| build-review-security | engine-managed auxiliary rubric | inherits resolved rubric policy | inherits resolved rubric policy | inherits resolved rubric policy | inherits resolved rubric policy | Judges the whole feature diff for concrete, changed-hunk-anchored security defects in the closed security vocabulary. |
 | coverage-binding | engine-managed auxiliary judge | inherits resolved coverage-binding policy | inherits resolved coverage-binding policy | inherits resolved coverage-binding policy | inherits resolved coverage-binding policy | Fresh per-claim judgement of whether cited Done when checks assert the criterion; the engine scopes inputs, validates the closed verdict, and owns the gate outcome. |
 | verify-claims | supported-host interactive | inherits caller |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Cross-cutting correctness protocol applied within the invoking skill's context (calibrate claims, gate assumptions) — not a separately dispatched agent, so it runs on the caller's model. |
 | code-removal | supported-host interactive | inherits caller |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Cross-cutting removal discipline applied in the invoking session: preserves survivors while removing obsolete code, without a separately dispatched agent. |
 | domain-reviewer | supported-host interactive | sonnet (<50-line diff), opus (≥50-line diff) |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Right-sized by diff size: Sonnet for focused small diffs, Opus for large changes needing cross-boundary judgment. |
-| evaluator | supported-host interactive | sonnet (value objects, pure functions, config, infra) / opus (concurrency, state mutation, security, auth, finance) |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Right-sized by batch content. |
+| evaluator | supported-host interactive | sonnet (default) / fable (concurrency, state mutation, security, auth, money) |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | A single risk-domain criterion protects higher-stakes batches from weaker evaluation. |
 | code-review | supported-host interactive | opus |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Multi-dimensional analysis (spec, quality, domain). |
 | debugging | supported-host interactive | opus |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Fable guards root-cause analysis; wrong diagnosis produces band-aid fixes. |
 | simplify | supported-host interactive | sonnet |  | inherits model from the Codex session or spawned-agent configuration | inherits effort from the Codex session or spawned-agent configuration | Pattern matching for duplication and complexity — structured checklist work. |
@@ -300,3 +301,34 @@ One daemon per repo, enforced by the pidfile lock at `.daemon/daemon.pid` (stale
 locks self-reclaim) underneath the tmux session. The daemon runs **serially** (one feature at a
 time), so `connect` always shows exactly the feature currently building. A host reboot drops
 tmux sessions; the next `daemon start` (or composer nudge) respawns.
+
+## Repository Layout
+
+- **Skills** (`skills/`) — Each has a `SKILL.md` with YAML frontmatter. One skill, one responsibility.
+- **Agents** (`agents/`) — Prompt templates defining *who* does the work.
+- **Tech-Context** (`tech-context/`) — Stack-specific knowledge loaded by bootstrap.
+- **Templates** (`templates/`) — Project scaffolding including `CLAUDE.md.template`.
+
+
+## Repository Release Mechanics
+
+1. **The bot-owned release PR is maintained on every merge to main, and publication
+   is gated on its provenance.** `.github/workflows/release-pr.yml` collects complete,
+   eligible merged-PR metadata since the latest tag and upserts one `automation/release-pr`
+   PR carrying the rendered `CHANGELOG.md`/`VERSION` candidate and an exhaustive audit.
+   `.github/workflows/release.yml` publishes only when the commit on `main` is that exact
+   PR's merge, with matching audit evidence bound to its head — it ignores ordinary pushes
+   to `main`. There is no manual release script and no feature-branch VERSION edit:
+   the release PR's renderer computes the next `VERSION` by aggregating the highest
+   `Release-Semver` declared across its candidates.
+
+2. **Semver rules** (declared per-PR via `Release-Semver`, aggregated by the release PR):
+   - **MAJOR** — breaking change to skill contracts, `bin/conduct` CLI, or
+     `settings.json` schema.
+   - **MINOR** — new skill, new hook, new gate, additive HARNESS.md rule.
+   - **PATCH** — bug fix, wording, non-behavioral cleanup.
+
+3. **Integrity checks apply to release artifacts too.**
+   `test/test_harness_integrity.sh` validates: `VERSION` is valid semver,
+   `CHANGELOG.md` has a `## [Unreleased]` section, and every `vX.Y.Z` tag has
+   a matching `## [X.Y.Z]` section in `CHANGELOG.md`.

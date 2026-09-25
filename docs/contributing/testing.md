@@ -142,7 +142,7 @@ run prints almost nothing.
 | Linter | Config | Scope | Threshold |
 | --- | --- | --- | --- |
 | ESLint (typescript-eslint, type-aware) | `src/conductor/eslint.config.mjs` | `src/**/*.ts` **and** `test/**/*.ts` | `no-floating-promises`, `await-thenable`, `no-misused-promises` (with `checksVoidReturn.arguments` off) |
-| ShellCheck | `test/lint_shell.sh` | `bin/*` (by shebang), `hooks/**/*.sh`, `test/*.sh`, `.github/scripts/*.sh` | `--severity=error` |
+| ShellCheck | `test/lint_shell.sh` | `bin/**` (by shell shebang), `hooks/**/*.sh`, `test/*.sh`, `.github/scripts/*.sh` | `--severity=error` |
 | lychee | `lychee.toml` | `docs/`, `README.md`, `AGENT_INSTRUCTIONS.md`, `src/conductor/README.md` | internal links only (offline) |
 
 The ESLint rule set is deliberately tiny. `strict: true` already covers the ground a stock preset
@@ -260,8 +260,18 @@ Four files run automatically and exist because each one prevented a real inciden
 
 ### vitest.config.ts — the run-scoped `TMPDIR`
 
-`scripts/run-vitest.mjs` creates one `ai-conductor-vitest-run-*` root inside the real tmpdir and points
-`TMPDIR` at it before loading Vitest. The config module then idempotently reuses that root.
+`scripts/run-vitest.mjs` creates one `ai-conductor-vitest-run-*` root beneath the ignored,
+checkout-local `src/conductor/.vitest-tmp/` directory and points `TMPDIR` at it before loading
+Vitest. The config module then idempotently reuses that root. To select another writable filesystem,
+set `AI_CONDUCTOR_TEST_TMP_BASE` to an absolute path before running the suite:
+
+```bash
+cd src/conductor
+AI_CONDUCTOR_TEST_TMP_BASE=/var/tmp/ai-conductor-tests npm test
+```
+
+An explicitly blank, relative, or NUL-containing override stops startup; the runner does not fall
+back to the system temporary directory.
 
 `os.tmpdir()` reads `TMPDIR` on every call, so all ~1,426 `mkdtemp(join(tmpdir(), '<prefix>-'))` call
 sites across the suite — including ones written later — land inside that root with no test-file changes,
@@ -277,13 +287,14 @@ all depends on is proven rather than assumed.
 
 None of this excuses a fixture from cleaning up after itself — it bounds the damage when one does not.
 
-Before it takes the real-tmpdir baseline, `global-setup.ts` also reaps stale
-`ai-conductor-vitest-run-*` roots left by an interrupted earlier run. Each live root has an owner
-marker refreshed every minute; marked roots are eligible after three hours, while legacy unmarked
-roots wait 24 hours. The sweep retains its own root, live roots, unreadable markers, and every
-non-directory prefixed entry (including symlinks), and reports but does not fail the new run when it
-cannot remove a candidate. This keeps abandoned test artifacts from accumulating without risking a
-live run or a symlink target.
+Before it takes the original-temporary-directory baseline, `global-setup.ts` also reaps stale
+`ai-conductor-vitest-run-*` roots left by an interrupted earlier run from both the original
+temporary directory and the selected storage location. Each live root has an owner marker refreshed
+every minute; marked roots are eligible after three hours, while legacy unmarked roots wait 24
+hours. The sweep retains its own root, live roots, unreadable markers, and every non-directory
+prefixed entry (including symlinks), and reports but does not fail the new run when it cannot remove
+a candidate. This keeps abandoned test artifacts from accumulating without risking a live run or a
+symlink target.
 
 ### setup.ts
 
@@ -306,12 +317,12 @@ kill-switches:
 - Daemon tmux sessions — leaked `cc-daemon-*` sessions are reaped; a killed session fails the run, an
   `indeterminate` one is logged non-fatally.
 - The real engineer signals store — a `test-project`-tagged line that leaked into it throws.
-- The real tmpdir's top-level entries — anything that appeared during the run and is neither the run root
-  nor known concurrent-tooling noise (`self-host-*`, `claude-*`, …) throws `tmpdir-leak-guard: N temp
-  entry/entries leaked into the REAL tmpdir …`. That is a temp dir the `TMPDIR` redirect did not
-  contain: a hardcoded `/tmp`, an `os.tmpdir()` value cached before the redirect, or a subprocess spawned
-  without the inherited env. Fix the call site; widening `IGNORED_TMPDIR_PREFIXES` is only for a genuine
-  false positive from a new concurrent tool.
+- The original temporary directory's top-level entries — anything that appeared during the run
+  and is neither known concurrent-tooling noise (`self-host-*`, `claude-*`, …) throws
+  `tmpdir-leak-guard: N temp entry/entries leaked into the REAL tmpdir …`. That is a temp dir the
+  `TMPDIR` redirect did not contain: a hardcoded `/tmp`, an `os.tmpdir()` value cached before the
+  redirect, or a subprocess spawned without the inherited env. Fix the call site; widening
+  `IGNORED_TMPDIR_PREFIXES` is only for a genuine false positive from a new concurrent tool.
 
 The parked-marker leak guard (#1251) runs last of all, after the tmpdir check, so any more specific
 guard failure still throws first. It resolves the real repository's `.daemon/parked` directory (via
@@ -360,6 +371,11 @@ The same test re-reads `vitest.config.ts` and reports
 is `--bare`, commented out, or annotated `// portability-ok: <reason>`. It also flags `.unref()` under
 `src/engine/**` and hardcoded absolute `/tmp/...` string literals — use `os.tmpdir()`.
 
+**`module-header-caller-claims.test.ts`** scans leading comment blocks in `src/engine/**` for explicit
+no-caller claims (`nothing imports`, `no callers`/`no importers`, inert-module claims, and `nothing`
+calling, using, or invoking a backticked identifier). It fails only when a relative import or symbol
+reference contradicts a claim; truthful claims and matching prose below the leading comment block pass.
+
 ## Smoke tests
 
 Smoke tests are excluded from `npm test` by the two globs in `vitest.config.ts`. Run the complete,
@@ -400,7 +416,7 @@ execute smoke tests.
 
 40 `.sh` files live under `test/`. Only six ever execute:
 
-- `test/test_harness_integrity.sh`, run by CI and by the self-host release gate. See
+- `test/test_harness_integrity.sh`, run by CI and by the BUILD `test_suite` gate. See
   [validation](validation.md).
 - `test/test_ci_detect_docs_only.sh` and `test/test_provider_skill_contracts.sh`, executed by the
   integrity suite as checks 13 and 14.
@@ -445,14 +461,17 @@ from `.ai-conductor/config.yml`:
 
 ```yaml
 test_suite:
-  command: npm test
-  working_directory: src/conductor
+  commands:
+    - command: npm test
+      working_directory: src/conductor
+    - command: test/test_harness_integrity.sh
+      working_directory: .
   timeout_seconds: 1800
 ```
 
-The `--slowTestThreshold=1800000` in the npm script matches that 1800-second budget, suppressing
-slow-test warnings that would otherwise fire on every long run. The ordinary suite is expected to finish
-under five minutes; a healthy run is roughly two to three.
+The entries run in order, so the integrity suite runs only after the conductor suite passes. The
+`--slowTestThreshold=1800000` in the npm script matches that 1800-second budget, suppressing slow-test
+warnings that would otherwise fire on every long run.
 
 For where `test_suite` sits in the flow and what happens when it fails, see
 [steps](../reference/steps.md) and [gates](../explanation/gates.md).

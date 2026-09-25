@@ -50,6 +50,10 @@ describe('engine/worktree-prepare', () => {
 
   async function writeTeardown(body: string, mode = 0o755): Promise<void> {
     await mkdir(join(dir, 'bin'), { recursive: true });
+    // The run-scoped Vitest store is inside src/conductor, whose package is
+    // ESM. Fixtures model consumer projects that previously lived in the OS
+    // temp directory, so declare their intended CommonJS hook semantics.
+    await writeFile(join(dir, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
     const path = join(dir, TEARDOWN_SCRIPT);
     await writeFile(path, body, 'utf-8');
     await chmod(path, mode);
@@ -76,6 +80,7 @@ describe('engine/worktree-prepare', () => {
 
   async function writeDispatchStart(body: string, mode = 0o755): Promise<void> {
     await mkdir(join(dir, 'bin'), { recursive: true });
+    await writeFile(join(dir, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
     const path = join(dir, DISPATCH_START_SCRIPT);
     await writeFile(path, body, 'utf-8');
     await chmod(path, mode);
@@ -476,6 +481,7 @@ setTimeout(() => {}, 600000);
       const observationDir = await mkdtemp(join(tmpdir(), 'teardown-observation-'));
       const observationPath = join(observationDir, 'teardown-saw.json');
       await mkdir(join(dir, 'bin'), { recursive: true });
+      await writeFile(join(dir, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
       await writeFile(
         teardownPath,
         `#!/usr/bin/env node
@@ -509,6 +515,7 @@ fs.writeFileSync(${JSON.stringify(observationPath)}, JSON.stringify({
       const observationPath = join(observationDir, 'teardown-namespace.txt');
       const teardownPath = join(worktreePath, TEARDOWN_SCRIPT);
       await mkdir(join(worktreePath, 'bin'), { recursive: true });
+      await writeFile(join(worktreePath, 'package.json'), '{"type":"commonjs"}\n', 'utf-8');
       await mkdir(join(worktreePath, '.pipeline'), { recursive: true });
       await writeFile(join(worktreePath, '.env'), `${NAMESPACE_VAR}=persisted-state\n`, 'utf-8');
       await writeFile(
@@ -1254,7 +1261,7 @@ require('node:fs').writeFileSync(${JSON.stringify(observationPath)}, process.env
       expect(content).not.toBe(staleCommitMsg);
       expect(content).toBe(COMMIT_MSG_HOOK);
       // Assert hardened version: real id extraction via .map() not Object.keys
-      expect(content).toContain('.map(t => String(t && t.id))');
+      expect(content).toContain('.map((task) => String(task && task.id))');
       expect(content).not.toContain('Object.keys');
     });
 

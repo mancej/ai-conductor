@@ -1,4 +1,5 @@
 import { execa, type Options as ExecaOptions, type ResultPromise } from 'execa';
+import { join } from 'node:path';
 import type {
   LLMProvider,
   InvokeOptions,
@@ -7,6 +8,7 @@ import type {
   SelfHostAuthPreparation,
   TokenUsage,
 } from './llm-provider.js';
+import { reviewAccessRefusal } from './llm-provider.js';
 import {
   epochAnchoredMonotonicClock,
   observeInterval,
@@ -20,7 +22,8 @@ import {
   ProviderStreamAssembler,
 } from './provider-stream.js';
 import { enforceFreshSessionOptions } from './fresh-session.js';
-import { scrubTmuxEnvironment } from './child-environment.js';
+import { buildReviewChildEnvironment, filterReviewChildEnvironment, scrubTmuxEnvironment } from './child-environment.js';
+import { composeReviewLaunchMounts } from '../engine/build-review-containment.js';
 import { withDaemonSessionMarker } from './daemon-session.js';
 import {
   inferRateLimitWaitSeconds,
@@ -28,6 +31,10 @@ import {
   scaleRateLimitDurationSeconds,
 } from './rate-limit-duration.js';
 import { validateSpawnPermit } from '../engine/provider-runtime.js';
+import { wrapForContainment } from '../engine/self-host/live-containment.js';
+
+/** Print-mode sessions must not leave background tasks outstanding (#2599). */
+const FOREGROUND_ONLY_ENV = { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' } as const;
 
 // Task 17: Extended to include session-limit family (observed 2026-07-03 incident)
 // Patterns: "rate limit", "429", "overloaded"
@@ -37,14 +44,17 @@ const RATE_LIMIT_RE = /rate limit|429|overloaded/i;
 // regardless of exit code (similar to OUT_OF_CREDITS_RE) because session-limit
 // can ride on exit=0 as a "soft notice" that the session quota is exhausted.
 // Patterns matched:
-// - "You've hit your session/usage limit" (exact CLI message)
+// - "You've hit your <one-word qualifier> limit" (exact CLI message)
 // - "session/usage limit reached" (variant)
-// - "session/usage limit · resets" (with reset time)
+// - "<one-word qualifier> limit · resets" (with reset time)
+// The qualifier is deliberately one word so "monthly spend limit" does not
+// match here; OUT_OF_CREDITS_RE owns that distinct notice.
 // Precedence: checked BEFORE AUTH_FAILURE_RE so a message like
 // "You've hit your session limit and not logged in" classifies as session-limit,
 // not auth failure. Avoids false positives by requiring context beyond bare
 // "session limit" in prose.
-const SESSION_LIMIT_RE = /you've hit your (?:session|usage) limit|session limit reached|usage limit reached|(?:session|usage) limit\s+·\s+resets/i;
+const SESSION_LIMIT_RE = /you've hit your \S+ limit|session limit reached|usage limit reached|\S+ limit\s+·\s+resets/i;
+const PERIOD_LIMIT_RE = /you've hit your (?!session\b|usage\b)\S+ limit/i;
 const STALE_SESSION_RE = /No conversation found/i;
 // A session-id lock ("already in use" / "session is in use by another
 // process"). Recovers the same way as a stale session — reset to a fresh
@@ -183,7 +193,9 @@ function getDateInTimezone(
  *    - Numbers with an absent or unrecognized unit are treated as minutes, floored at the
  *      existing 300-second default and capped at 3,600 seconds to avoid an hours-long wedge.
  * 2. Time-based with timezone: "resets 3:20pm (America/New_York)"
- *    - Task 18: Extracts timezone, calculates deadline in that timezone, clamps to cap
+ *    - Extracts timezone and calculates its deadline in that timezone.
+ *    - Period-qualified limits use an 86,400-second cap so the next reset is preserved;
+ *      session and usage limits retain the 3,600-second re-probe cap.
  *    - Returns both waitSeconds and an absolute deadline (ms since epoch)
  * 3. Time-based without timezone: "resets at 23:00", "resets 11pm", "resets 3am"
  *    - Calculates wait time as the delta from "now" to the reset time
@@ -198,8 +210,9 @@ export function parseRateLimitWaitSeconds(
   options?: { now?: Date },
 ): ParseRateLimitResult {
   const now = options?.now || new Date();
-
   try {
+    const deadlineCapSeconds = PERIOD_LIMIT_RE.test(output) ? 86400 : 3600;
+
     // Try duration-based patterns first: "retry after N seconds", "retry in N seconds", etc.
     const durationMatch = output.match(new RegExp(
       `(?:retry|try).*(after|in)\\s*([0-9]+)\\s*(${rateLimitDurationUnitAlternation})?\\b`,
@@ -241,6 +254,7 @@ export function parseRateLimitWaitSeconds(
               timeInTz,
               resetHour,
               resetMinute,
+              deadlineCapSeconds,
             );
 
             // Calculate fallback waitSeconds for comparison
@@ -265,6 +279,7 @@ export function parseRateLimitWaitSeconds(
               timeInTz,
               resetHour,
               0,
+              deadlineCapSeconds,
             );
 
             // Calculate fallback waitSeconds
@@ -305,7 +320,7 @@ export function parseRateLimitWaitSeconds(
 
 /**
  * Calculate the absolute deadline (ms since epoch) for a reset time in a specific timezone.
- * Task 18: Handles timezone-aware deadline calculation with clamping.
+ * Handles timezone-aware deadline calculation with a caller-supplied cap.
  *
  * @param now Current UTC time
  * @param timezone Timezone string (e.g., "America/New_York")
@@ -313,7 +328,8 @@ export function parseRateLimitWaitSeconds(
  * @param timeInTz Current time components in the timezone
  * @param resetHour Reset hour in 24-hour format
  * @param resetMinute Reset minute
- * @returns Absolute deadline in ms, clamped to cap (≈3600s); past/negative → default (60s)
+ * @param capSeconds Maximum wait: 86,400 seconds for period-qualified limits and 3,600 otherwise
+ * @returns Absolute deadline in ms, clamped to capSeconds; past/negative → default (60s)
  */
 function calculateDeadlineInTimezone(
   now: Date,
@@ -322,6 +338,7 @@ function calculateDeadlineInTimezone(
   timeInTz: { hours: number; minutes: number; seconds: number },
   resetHour: number,
   resetMinute: number,
+  capSeconds: number,
 ): number {
   // Calculate seconds until reset within the same day in the timezone
   const nowTotalSeconds = timeInTz.hours * 3600 + timeInTz.minutes * 60 + timeInTz.seconds;
@@ -330,19 +347,18 @@ function calculateDeadlineInTimezone(
   const diffSeconds = resetTotalSeconds - nowTotalSeconds;
 
   // Constants
-  const CAP_SECONDS = 3600; // 1 hour max
   const DEFAULT_SECONDS = 60; // 60 seconds for past/negative
 
   let finalWaitSeconds = DEFAULT_SECONDS;
 
   if (diffSeconds > 0) {
     // Reset is in the future today (in the timezone)
-    finalWaitSeconds = Math.min(diffSeconds, CAP_SECONDS);
+    finalWaitSeconds = Math.min(diffSeconds, capSeconds);
   } else if (diffSeconds <= 0) {
     // Reset is in the past today; assume it's tomorrow (midnight rollover)
     const nextDaySeconds = 86400 + diffSeconds; // Add 24 hours, subtract the past offset
     if (nextDaySeconds > 0) {
-      finalWaitSeconds = Math.min(nextDaySeconds, CAP_SECONDS);
+      finalWaitSeconds = Math.min(nextDaySeconds, capSeconds);
     } else {
       // Safeguard: extremely negative, use default
       finalWaitSeconds = DEFAULT_SECONDS;
@@ -533,6 +549,7 @@ type ClaudeSubprocessFactory = (
 export class ClaudeProvider implements LLMProvider {
   readonly supportsSessionResume = false;
   readonly lifecycleCapability = { synchronousSpawnPermit: true } as const;
+  readonly nativeSchemaCapability = { nativeOutputSchema: true } as const;
   private readonly oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
 
   constructor(
@@ -555,15 +572,23 @@ export class ClaudeProvider implements LLMProvider {
 
   private async runClaude(
     args: string[],
-    options: ExecaOptions & Pick<InvokeOptions, 'diagnosticLog' | 'onActivity' | 'onProviderStream' | 'onSpawn' | 'selfHost' | 'spawnPermit'>,
+    options: ExecaOptions & Pick<InvokeOptions, 'diagnosticLog' | 'onActivity' | 'onProviderStream' | 'onSpawn' | 'selfHost' | 'spawnPermit' | 'reviewAccess'>,
   ) {
-    const { diagnosticLog, onActivity, onProviderStream, onSpawn, selfHost, spawnPermit, ...execaOptions } = options;
+    const { diagnosticLog, onActivity, onProviderStream, onSpawn, selfHost, spawnPermit, reviewAccess, ...execaOptions } = options;
     const permit = validateSpawnPermit(spawnPermit);
     if (!permit.permitted) {
       throw new Error(`Claude process spawn denied: ${permit.reason}`);
     }
-    const subprocess = this.subprocessFactory(selfHost?.executable ?? 'claude', args, {
+    const command = { executable: selfHost?.executable ?? 'claude', args, env: execaOptions.env };
+    const launch = reviewAccess?.kind === 'ready'
+      ? wrapForContainment(command, composeReviewLaunchMounts(reviewAccess.profile, command))
+      : command;
+    const subprocess = this.subprocessFactory(launch.executable, launch.args as string[], {
       ...execaOptions,
+      env: launch.env,
+      // D5: the review env is a complete allowlist; execa must not re-merge
+      // the ambient process environment underneath it.
+      ...(reviewAccess?.kind === 'ready' ? { extendEnv: false } : {}),
       // A daemon feature must retain the diagnostic in its scoped/persisted
       // log. Other callers preserve the existing live inherited stdio path.
       stdout: diagnosticLog ? 'pipe' : ['pipe', 'inherit'],
@@ -636,6 +661,19 @@ export class ClaudeProvider implements LLMProvider {
     // enforceFreshSessionOptions for the 2026-08-14 megatoken incident this
     // deterministically prevents.
     options = enforceFreshSessionOptions(options, 'claude');
+    // Claude's native JSON-schema mode is a non-interactive print-mode
+    // capability. A REPL cannot return its terminal result envelope, so never
+    // silently run an unconstrained interactive request.
+    if (options.nativeSchema !== undefined && options.interactive) {
+      return {
+        success: false,
+        output: 'Claude native output schema is unsupported for interactive Claude invocation. Recovery action: dispatch the schema request in non-interactive print mode.',
+        exitCode: 1,
+        nativeSchemaUnsupported: true,
+      };
+    }
+    const accessRefusal = reviewAccessRefusal('claude', options.reviewAccess);
+    if (accessRefusal) return accessRefusal;
     const hasMachineEnvelope = !options.interactive;
     const args = this.buildArgs(options);
 
@@ -665,6 +703,7 @@ export class ClaudeProvider implements LLMProvider {
         onSpawn: options.onSpawn,
         selfHost: options.selfHost,
         spawnPermit: options.spawnPermit,
+        reviewAccess: options.reviewAccess,
       }),
     );
 
@@ -674,6 +713,7 @@ export class ClaudeProvider implements LLMProvider {
       observed.interval,
       options.prompt,
       hasMachineEnvelope,
+      options.nativeSchema !== undefined,
     );
   }
 
@@ -688,6 +728,7 @@ export class ClaudeProvider implements LLMProvider {
     observedInterval: ObservedInterval,
     prompt?: string,
     strictMachineEnvelope = false,
+    requiresNativeSchema = false,
   ): InvokeResult {
     const stdout = (result.stdout ?? '') as string;
     const stderr = (result.stderr ?? '') as string;
@@ -762,6 +803,20 @@ export class ClaudeProvider implements LLMProvider {
       deadline = parseResult.deadline;
     }
 
+    const structuredResult = requiresNativeSchema && exitCode === 0 && terminalResult
+      ? this.terminalStructuredResult(terminalResult)
+      : { kind: 'absent' as const };
+    if (requiresNativeSchema && exitCode === 0 && structuredResult.kind !== 'value') {
+      return {
+        success: false,
+        output: structuredResult.kind === 'malformed'
+          ? 'Claude provider parse failure: terminal result record has malformed structured result JSON.'
+          : 'Claude provider parse failure: terminal result record is missing its structured result.',
+        exitCode,
+        structuredResultFailure: structuredResult.kind === 'absent' ? 'missing' : 'malformed',
+        observedIntervals: [observedInterval],
+      };
+    }
     return {
       // Session-limit and out-of-credits notices ride exit 0 but are not real
       // successes — no work was done and no artifact written. Never report them
@@ -779,7 +834,34 @@ export class ClaudeProvider implements LLMProvider {
       waitSeconds,
       deadline,
       observedIntervals: [observedInterval],
+      ...(structuredResult.kind === 'value' ? { finalStructuredResult: structuredResult.value } : {}),
     };
+  }
+
+  /** Structured output is accepted only from Claude's terminal result record. */
+  private terminalStructuredResult(terminalResult: string):
+    | { kind: 'value'; value: unknown }
+    | { kind: 'absent' }
+    | { kind: 'malformed' } {
+    try {
+      const record = JSON.parse(terminalResult) as Record<string, unknown>;
+      // Claude has used both spellings across stream-json revisions.  Keep the
+      // compatibility at the adapter boundary, never by scanning tool events.
+      const structured = Object.hasOwn(record, 'structured_output')
+        ? record.structured_output
+        : Object.hasOwn(record, 'structuredOutput')
+          ? record.structuredOutput
+          : undefined;
+      if (structured === undefined) return { kind: 'absent' };
+      if (typeof structured !== 'string') return { kind: 'value', value: structured };
+      try {
+        return { kind: 'value', value: JSON.parse(structured) };
+      } catch {
+        return { kind: 'malformed' };
+      }
+    } catch {
+      return { kind: 'malformed' };
+    }
   }
 
   private buildArgs(options: InvokeOptions): string[] {
@@ -809,6 +891,9 @@ export class ClaudeProvider implements LLMProvider {
     // REPL keeps its plain-text interactive terminal contract.
     if (!options.interactive) {
       args.push('--print', '--output-format', 'stream-json', '--verbose');
+      if (options.nativeSchema !== undefined) {
+        args.push('--json-schema', JSON.stringify(options.nativeSchema));
+      }
     }
 
     return args;
@@ -826,14 +911,43 @@ export class ClaudeProvider implements LLMProvider {
    * marker to refuse recursive conductor invocations from inside it (see
    * daemon-session.ts). Boundary enforcement, same pattern as
    * enforceFreshSessionOptions — no config off-switch.
+   *
+   * It also carries CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 (#2599). In print
+   * mode a step that launches background subagents and ends its turn has
+   * them terminated after the CLI's 60s wait ceiling, while the step reports
+   * success on a stale verdict. With background tasks disabled the Agent call
+   * blocks until the subagent returns (still its own context window, and
+   * parallel calls in one message still run concurrently), so nothing is
+   * outstanding when the turn ends. Engine-owned: it overrides the ambient env.
    */
   private buildEnv(options: InvokeOptions): NodeJS.ProcessEnv {
+    const scratch = options.reviewAccess?.kind === 'ready'
+      ? options.reviewAccess.profile.scratch
+      : undefined;
+    if (scratch !== undefined) {
+      // D5: a contained reviewer gets an allowlisted environment, never the
+      // ambient one — tracker/service credentials and host state are withheld.
+      return buildReviewChildEnvironment('claude', {
+        ...process.env,
+        ...filterReviewChildEnvironment('claude', options.selfHost?.env ?? {}),
+      }, withDaemonSessionMarker({
+        HOME: join(scratch, 'home'),
+        CLAUDE_CONFIG_DIR: join(scratch, 'claude-config'),
+        TMPDIR: join(scratch, 'tmp'),
+        XDG_CONFIG_HOME: join(scratch, 'xdg-config'),
+        XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
+        XDG_DATA_HOME: join(scratch, 'xdg-data'),
+        ...(options.effort ? { CLAUDE_CODE_EFFORT_LEVEL: options.effort } : {}),
+        ...FOREGROUND_ONLY_ENV,
+      }));
+    }
     // tmux target variables are scrubbed last so neither the inherited env
     // nor a self-host overlay can hand the child the daemon's own pane.
     return scrubTmuxEnvironment(withDaemonSessionMarker({
       ...process.env,
       ...options.selfHost?.env,
       ...(options.effort ? { CLAUDE_CODE_EFFORT_LEVEL: options.effort } : {}),
+      ...FOREGROUND_ONLY_ENV,
     }));
   }
 }

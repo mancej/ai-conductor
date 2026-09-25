@@ -74,6 +74,8 @@ describe('guardDaemonSessionInvocation', () => {
 
   it('allows exactly the session-sanctioned worker subcommands under the marker', () => {
     for (const sanctioned of [
+      argvFor('task', 'start', 'rem-fr10-1'),
+      argvFor('task', 'done', 'rem-fr10-1'),
       argvFor('scoped-run', 'test/foo.test.ts'),
       argvFor('overlap-scan', '--files', 'a,b'),
       argvFor('plan-protected-targets', '.docs/plans/x.md'),
@@ -83,11 +85,12 @@ describe('guardDaemonSessionInvocation', () => {
       // git-hook-assets.ts — commit-msg records containment from the same
       // daemon-managed maker session that authored the commit.
       argvFor('scope-check', '/worktree/.git/COMMIT_EDITMSG'),
+      // FINISH publication prompts submit PR prose through the guarded operation.
+      argvFor('github-operation', '--request-file', '/tmp/pr-prose-request.json'),
     ]) {
       expect(guardDaemonSessionInvocation(sanctioned, markedEnv())).toEqual({ allowed: true });
     }
     // The sanctioned set is worker commands only — orchestration verbs stay blocked.
-    expect(guardDaemonSessionInvocation(argvFor('task', 'done', 't1'), markedEnv()).allowed).toBe(false);
     expect(guardDaemonSessionInvocation(argvFor('test-suite'), markedEnv()).allowed).toBe(false);
   });
 

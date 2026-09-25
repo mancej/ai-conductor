@@ -222,6 +222,51 @@ hand-authoring prohibition stands. This amends
 sole source shape; `config init` becomes a parameterized instantiation of it rather than a
 byte copy, still deterministic and refuse-to-clobber.
 
+> **Amended 2026-09-14 by #2218 (guided bootstrap setup):** D8's ask-then-record pattern is
+> extended from the two `test_suite.verification` answers to every project-config setting the
+> bootstrap walkthrough asks about. The hand-authoring prohibition, the template as sole source
+> shape, idempotence, and refuse-to-clobber are all unchanged.
+>
+> D9 — `conduct-ts config init` accepts an optional flag per interview-recorded project setting,
+> beginning with the project's real aggregate test command (`test_suite.command`), which today is
+> substituted as the fixed literal `npm test` regardless of the project's stack. Each flag is
+> validated before any write; an absent flag records exactly today's value, so a flagless
+> invocation and the auto-mode invocation remain byte-identical to the current output. The
+> bootstrap skill asks and records through these flags; it never composes the file. No new
+> config key is introduced by this amendment — every substituted key already exists in the
+> consumer registry (adr-2026-08-26-config-key-consumer-registry-and-dead-surface-removal
+> decision 4).
+>
+> **Qualified 2026-09-18 (operator decision, additive to D9).** The D9 text above is retained
+> verbatim as approved; the numbered decision below is added beside it and replaces none of it.
+>
+> **D9.1** — D9's byte-identity clause is read as identity of effective settings: a flagless
+> invocation and the auto-mode invocation yield every key and value unchanged from the current
+> output. The template may gain explanatory comment lines, so the identity is over parsed
+> settings, not file bytes.
+>
+> **Consumer scope 2026-09-18 (operator decision, additive to D8 and D9; daemon-session guard
+> ruling for as-built AB-2 through AB-4).** The guided bootstrap interview is an operator-invoked
+> skill. It runs from the operator's own shell session, which carries no daemon-session marker.
+> The engine-dispatched managed prelude is not a consumer of the config CLI for this feature.
+>
+> **D8.1** — Read ruling. The interview's `config read` calls, including the `spec_owner`
+> identity read, run only from the operator's unmarked shell session. The daemon-session guard's
+> allowlist stays closed to `config`; a marked session's `config read` is refused, and that
+> refusal is the approved behavior, not a reachability defect.
+>
+> **D8.2** — Write ruling. The interview's `config init` flag answers and its
+> `config set spec_owner` call run only from the operator's unmarked shell session. No `config`
+> write is sanctioned from a daemon-managed session, and no guard exemption is added for bootstrap.
+>
+> **D8.3** — Re-run ruling. A re-run of the interview is the same operator-invoked path: its
+> per-key `config read` inspection and its refuse-to-clobber `config init` run from the operator's
+> shell. Declaring the engine-managed prelude an unsupported path for the guided interview is the
+> chosen resolution: the allowlist in `src/conductor/src/execution/daemon-session.ts` is not
+> widened, and no step-scoped exemption or engine-performed write is introduced. The managed
+> prelude's pre-existing auto-mode `config init` call predates this feature (the merge-base skill
+> already invoked it), is unchanged by this amendment, and is out of its scope.
+
 ## Consequences
 
 ### Positive

@@ -11,8 +11,53 @@ import type {
 } from '../execution/llm-provider.js';
 import type { ObservedInterval } from '../execution/observed-interval.js';
 import type { SchedulingUnitRef } from './scheduling-unit.js';
+import type { LandGateRejectionIdentifier } from '../engine/engineer/land-spec.js';
+import type { RefusalReason } from '../engine/park-reconciliation.js';
+import type {
+  GithubOperationName,
+  GithubOperationRefusalReason,
+  GithubOperationTarget,
+} from '../engine/github-operations.js';
+import type {
+  BuildReviewInfrastructureFailureReason,
+  BuildReviewJudgedResultRejection,
+} from '../engine/build-review-domain.js';
 
 export type RecoveryOption = 'retry' | 'interactive' | 'back' | 'skip' | 'quit';
+
+/** Closed reasons why the daemon retained a worktree during reclamation. */
+export type WorktreeReclaimRetainedReason =
+  | 'detached'
+  | 'in-flight'
+  | 'foreign-lifecycle'
+  | 'invalid-slug'
+  | 'halted'
+  | 'listing-unavailable'
+  | 'evidence-unavailable'
+  | 'disabled'
+  | RefusalReason;
+
+/** Closed operator actions for a refused guarded GitHub operation. */
+export type GithubOperationRefusalRemedy =
+  | 'ask-resource-owner'
+  | 'configure-operator-identity'
+  | 'record-feature-ownership'
+  | 'repair-ownership-provenance'
+  | 'retry-provenance-read'
+  | 'correct-operation-target'
+  | 'correct-operation-payload'
+  | 'use-supported-operation'
+  | 'request-explicit-authorization';
+
+/** Secret-safe ownership refusal carried by the canonical event spine. */
+export interface GithubOperationRefusedEvent {
+  type: 'github_operation_refused';
+  operator: string;
+  target: GithubOperationTarget;
+  operation: GithubOperationName;
+  reason: GithubOperationRefusalReason;
+  remedy: GithubOperationRefusalRemedy;
+}
 
 /** Daemon-lifetime backlog dimensions. Kept closed so metric cardinality is bounded. */
 export type BacklogState = 'eligible' | 'waiting' | 'blocked' | 'gated' | 'parked';
@@ -66,13 +111,21 @@ export type FinishPublicationBlocker =
   | 'release_readiness_invalid'
   | 'release_readiness_indeterminate';
 
+/** Custom prerequisite keys are persisted only for release-readiness blockers. */
+export type FinishPublicationBlockedCondition =
+  | FinishPublicationBlocker
+  | {
+      code: Extract<FinishPublicationBlocker, `release_readiness_${string}`>;
+      steps: readonly string[];
+    };
+
 export type FinishPublicationEvent =
   | {
       type: 'finish_publication_transition';
       phase: 'started' | 'completed';
       transition: FinishPublicationTransition;
     }
-  | { type: 'finish_publication_blocked'; condition: FinishPublicationBlocker }
+  | { type: 'finish_publication_blocked'; condition: FinishPublicationBlockedCondition }
   | {
       type: 'finish_publication_disposition';
       disposition: 'retry_finish' | 'retry_build' | 'human_required' | 'complete';
@@ -171,10 +224,31 @@ export interface ProviderLifecycleEventMetadata {
   outcome?: 'completed' | 'failed';
 }
 
+/**
+ * Stable identity for one logical execution. It is intentionally separate
+ * from provider-attempt IDs and from the lifecycle registry's policy step.
+ */
+export interface ExecutionContext {
+  executionId: string;
+  subject: ExecutionSubject;
+}
+
+/** A telemetry subject is either a registered lifecycle step or a configured branch. */
+export type ExecutionSubject =
+  | { kind: 'lifecycle-step'; step: StepName }
+  | { kind: 'configured-member'; parentGroup: string; member: string };
+
+/** Closed, non-textual facts permitted on the CI repair diagnostic bus event. */
+export type CiRepairDiagnosticStage = 'context' | 'log-enrichment' | 'branch' | 'readiness' | 'execution' | 'guard' | 'verification' | 'publication';
+export type CiRepairDiagnosticReason = 'auth' | 'permission' | 'timeout' | 'api' | 'capability' | 'malformed-context' | 'missing-context' | 'missing-branch' | 'log-unavailable' | 'context-truncated' | 'provider-unavailable' | 'readiness-degraded' | 'flag-invalid' | 'spawn-env' | 'unknown' | 'guard-refused' | 'verification-failed' | 'publication-refused' | 'verified-publication';
+export type CiRepairDiagnosticDisposition = 'deferred' | 'degraded' | 'failed' | 'published';
+
 /** One provider candidate result or lifecycle transition within a step attempt. */
 export interface ProviderAttemptEvent {
   type: 'provider_attempt';
   step: StepName;
+  /** Optional so historical event records retain their legacy interpretation. */
+  executionContext?: ExecutionContext;
   provider: string;
   /** Sanitized Codex authentication source; omitted for other providers. */
   authenticationSource?: 'api-key' | 'cached-login';
@@ -189,6 +263,11 @@ export interface ProviderAttemptEvent {
   observedIntervals?: readonly ObservedInterval[];
   reason?: string;
   fallbackReason?: string;
+  /** Present only for an unavailable candidate that was not invoked. */
+  skipReason?: 'setup-unavailable' | 'cached-unavailable';
+  /** Redacted details retained for an explicit setup-unavailable skip. */
+  setupCapability?: string;
+  setupRecoveryAction?: string;
   lifecycle?: ProviderLifecycleEventMetadata;
 }
 
@@ -342,21 +421,57 @@ export type ConductorEvent =
       blocked: Record<DispatchBlockReason, boolean>;
       pollDurationMs: number;
     }
-  | { type: 'feature_dispatch_started'; slug: string; kind: DispatchKind }
+  | {
+      type: 'daemon_memory_sample';
+      rss: number;
+      heapUsed: number;
+      heapTotal: number;
+      external: number;
+      slug: string;
+      step: string;
+      boundary: 'started' | 'completed';
+      pid: number;
+      dispatchSeq: number;
+    }
+  | {
+      type: 'daemon_heap_dump_written';
+      path: string;
+      bytes: number;
+      rss: number;
+      pid: number;
+    }
+  | {
+      type: 'daemon_exited';
+      pid: number;
+      code: number | null;
+      signal: string | null;
+      at: string;
+    }
+  | { type: 'feature_dispatch_started'; slug: string; kind: DispatchKind; tier?: ComplexityTier }
   | {
       type: 'feature_dispatch_ended';
       slug: string;
       outcome: FeatureDispatchOutcome;
+      tier?: ComplexityTier;
       haltClass?: import('../engine/halt-marker.js').HaltDisposition;
       step?: string;
     }
   | {
       type: 'feature_shipped';
       slug: string;
+      tier?: ComplexityTier;
       runStartedAt?: number;
       active: { state: 'exact' | 'partial' | 'unavailable'; activeMs?: number };
     }
   | { type: 'intake_inbound_sanitized'; sourceRef: string; neutralizations: import('../engine/engineer/intake/sanitize-inbound.js').InboundNeutralization[]; digest: string }
+  | {
+      type: 'land_gate_rejected';
+      gate: LandGateRejectionIdentifier;
+      reason: string;
+      project: string;
+      worktreePath: string;
+      sourceRef?: string;
+    }
   | { type: 'operator_rewind'; operator: string; target: string; demoted: string[] }
   | {
       type: 'setup_repair';
@@ -409,6 +524,37 @@ export type ConductorEvent =
       adr: string;
     }
   | { type: 'build_review_rubric_started'; rubric: string; lapId: string }
+  | { type: 'self_host_dispatch_admission'; step: StepName; state: 'queued' | 'admitted' | 'cancelled' }
+  /** Candidate-local installed custom policy selected for a frozen review lap. */
+  | {
+      type: 'build_review_policy_resolved';
+      rubric: string;
+      lapId: string;
+      provider: string;
+      source: 'project' | 'global' | 'plugin';
+      pluginId?: string;
+      bundleDigest: string;
+      /** Bounded identity only; captured policy bytes never enter telemetry. */
+      provenance?: {
+        readonly inputDigest: string;
+        readonly candidate: { readonly provider: string; readonly model: string; readonly effort: string };
+        readonly plugin?: { readonly id: string; readonly version?: string };
+      };
+    }
+  /** Policy discovery, compatibility, containment, or runtime refusal. */
+  | {
+      type: 'build_review_policy_failed';
+      rubric: string;
+      lapId: string;
+      provider: string;
+      stage: 'catalog' | 'capture' | 'preflight' | 'containment' | 'runtime';
+      reason: string;
+      /** The candidate/input are known even when policy content never loaded. */
+      provenance?: {
+        readonly inputDigest: string;
+        readonly candidate: { readonly provider: string; readonly model: string; readonly effort: string };
+      };
+    }
   | {
       /** The self-host dispatch was proven contained, so this concurrent drift is not a dispatch leak. */
       type: 'contained_live_checkout_drift';
@@ -428,11 +574,30 @@ export type ConductorEvent =
       contained: false;
       reason: string;
     }
+  | {
+      /** Per-surface cost for one completed self-host live-boundary fingerprint. */
+      type: 'self_host_boundary_fingerprint';
+      surfaces: readonly { label: string; elapsedMs: number; fileCount: number }[];
+    }
   /** Serialized rubric-prompt size at dispatch — regression visibility for projection bloat. */
   | { type: 'build_review_rubric_prompt'; rubric: string; lapId: string; promptBytes: number }
   | { type: 'build_review_rubric_result'; rubric: string; lapId: string; verdict: 'PASS' | 'FAIL' }
   | { type: 'build_review_rubric_skipped'; rubric: string; lapId: string; reason: string }
-  | { type: 'build_review_cache_hit'; rubric: string; lapId: string }
+  | {
+      type: 'build_review_cache_hit';
+      rubric: string;
+      lapId: string;
+      /** Present only for a custom policy reused from prior judged evidence. */
+      customReuse?: {
+        readonly source: 'project' | 'global' | 'plugin';
+        readonly plugin?: { readonly id: string; readonly version?: string };
+        readonly bundleDigest: string;
+        readonly inputDigest: string;
+        readonly candidate: { readonly provider: string; readonly model: string; readonly effort: string };
+        readonly originalLapId: string;
+        readonly originalSnapshotDigest: string;
+      };
+    }
   /** Frozen scope assessment for one rubric lap; routine detail stays in the shared ledger. */
   | {
       type: 'build_review_scope_summary';
@@ -444,7 +609,23 @@ export type ConductorEvent =
     }
   /** adr-2026-08-21 D5: a cached judgement discarded because the judging engine or rubric skill text changed. */
   | { type: 'build_review_cache_discarded'; rubric: string; lapId: string; reason: 'engine-version-mismatch' | 'skill-digest-mismatch'; cachedEngineStamp?: string; currentEngineStamp: string }
-  | { type: 'build_review_rubric_infrastructure_failure'; rubric: string; lapId: string; reason: string; excerpt?: string }
+  | {
+      type: 'build_review_rubric_infrastructure_failure';
+      rubric: string;
+      lapId: string;
+      reason: string;
+      /**
+       * The closed mechanical-fault cause, when the coordinator has classified
+       * this infrastructure occurrence at the result boundary.
+       */
+      cause?: BuildReviewInfrastructureFailureReason;
+      /** Field-named native structured-result contract rejection, when present. */
+      rejection?: BuildReviewJudgedResultRejection;
+      excerpt?: string;
+      /** Present only when the canonical rubric projection exceeded its configured byte bound. */
+      measuredBytes?: number;
+      limitBytes?: number;
+    }
   /** Valid scope judgment could not resolve a concrete candidate; not a malformed provider result. */
   | {
       type: 'build_review_scope_incomplete';
@@ -503,6 +684,8 @@ export type ConductorEvent =
       lapId: string;
       caseIds: readonly string[];
       effectIds: readonly string[];
+      /** Durable stop evidence, including blocked consistency verdicts. */
+      decisionStops?: readonly { readonly caseId: string; readonly owner?: 'product' | 'plan' | 'architecture'; readonly sourceIds: readonly string[]; readonly rationale: string }[];
     }
   | {
       /** A remediation judgement could not be completed and remains fail-closed. */
@@ -526,6 +709,15 @@ export type ConductorEvent =
       lapId: string;
       caseId: string;
       residualEffectId?: string;
+    }
+  | {
+      /** Durable PRD widening lifecycle occurrence; detail remains in case/decision state. */
+      type: 'prd_widening_reconciled';
+      sourceId: string;
+      caseId?: string;
+      decisionId?: string;
+      outcome: 'offer' | 'imported' | 'recovered' | 'same-case' | 'different' | 'uncertain' | 'reused' | 'rejected';
+      reason?: string;
     }
   | {
       /** One idempotent remediation effect was reserved before execution. */
@@ -565,7 +757,12 @@ export type ConductorEvent =
       reason: 'already-attempted' | 'regressed';
     }
   | { type: 'build_review_stale_aggregate'; storedLapId: string; currentLapId: string }
-  | { type: 'step_started'; step: StepName; index: number }
+  | {
+      type: 'step_started';
+      step: StepName;
+      index: number;
+      executionContext?: ExecutionContext;
+    }
   | {
       /** A hook-owned containment check could not reach a verdict. */
       type: 'containment_check_unresolved';
@@ -600,6 +797,7 @@ export type ConductorEvent =
       /** Build-only tree witnesses; absent on legacy and non-build events. */
       treeBefore?: string | null;
       treeAfter?: string | null;
+      executionContext?: ExecutionContext;
     }
   | {
       type: 'step_failed';
@@ -609,6 +807,14 @@ export type ConductorEvent =
       effort?: EffortLevel;
       tier?: ComplexityTier;
       observedIntervals?: readonly ObservedInterval[];
+      executionContext?: ExecutionContext;
+    }
+  | {
+      /** A started execution was catchably interrupted before work could settle. */
+      type: 'step_interrupted';
+      step: StepName;
+      reason: string;
+      executionContext?: ExecutionContext;
     }
   | {
       /** The step was stopped before its own work could be judged a failure. */
@@ -616,6 +822,8 @@ export type ConductorEvent =
       step: StepName;
       kind: 'seal' | 'needs-human' | 'validation-verdict';
       reason: string;
+      provider?: string;
+      executionContext?: ExecutionContext;
     }
   | {
       /** A domain rule refused a conductor-owned step status write. */
@@ -625,6 +833,7 @@ export type ConductorEvent =
       requested: 'stale';
       intent: string;
     }
+  | GithubOperationRefusedEvent
   | ProviderAttemptEvent
   | ProviderStreamProgressEvent
   | {
@@ -669,6 +878,7 @@ export type ConductorEvent =
        * already recorded.
        */
       type: 'feature_usage_total';
+      tier?: ComplexityTier;
       dispatches: number;
       meteredDispatches: number;
       unmeteredDispatches: number;
@@ -695,6 +905,7 @@ export type ConductorEvent =
        * cost occurrence.
        */
       type: 'feature_cost_snapshot';
+      tier?: ComplexityTier;
       costUsd: number;
       costComplete: boolean;
       byDimension: Array<{
@@ -715,6 +926,7 @@ export type ConductorEvent =
       step: StepName;
       failedProvider: string;
       reason: string;
+      recoveryAction?: string;
       nextProvider: string;
     }
   | {
@@ -734,9 +946,18 @@ export type ConductorEvent =
       model?: string;
       effort?: EffortLevel;
       provider?: string;
+      /** Resolved provider facts from the failed attempt. */
+      actualProvider?: string;
+      preferredProvider?: string;
       tier?: ComplexityTier;
       resolvedBefore?: number;
       resolvedAfter?: number;
+      /**
+       * The consumed progress-attempt allowance for a refunded build retry.
+       * Present together only when that retry reuses its fixed-budget slot.
+       */
+      progressAttempt?: number;
+      progressAttemptCeiling?: number;
       /**
        * #188 retry-as-escalation: the (model, effort) the UPCOMING attempt
        * (`attempt` above) will dispatch at, per the escalation ladder. Absent
@@ -746,6 +967,7 @@ export type ConductorEvent =
        */
       escalatedModel?: string;
       escalatedEffort?: string;
+      executionContext?: ExecutionContext;
     }
   | {
       // #646: rerun-vs-route classification, emitted on every classifier-
@@ -775,7 +997,7 @@ export type ConductorEvent =
   /** A sanitized recovery update; `credentials_park` remains the lifecycle start. */
   | CredentialParkProgressEvent
   | FinishPublicationEvent
-  | { type: 'feature_complete'; prUrl?: string; featureDesc?: string; sessionStartedAt?: number }
+  | { type: 'feature_complete'; prUrl?: string; featureDesc?: string; sessionStartedAt?: number; tier?: ComplexityTier }
   | { type: 'dashboard_refresh' }
   | {
       type: 'protected_artifact_rebaseline';
@@ -1039,6 +1261,8 @@ export type ConductorEvent =
       phase: 'dispatch' | 'result';
       /** Present when phase === 'result': the classified outcome (see classifyOutcome in group-core.ts). */
       outcome?: string;
+      /** Correlates an admitted configured member without registering it as a StepName. */
+      executionContext?: ExecutionContext;
     }
   // ── Gate-driven loop (Phase 5 observability) ──
   | {
@@ -1059,6 +1283,12 @@ export type ConductorEvent =
       };
       /** Optional to preserve parsing of events emitted before verification modes existed. */
       mode?: 'aggregate' | 'scoped';
+      /** Present only for a newly executed ordered aggregate collection. */
+      executionSummary?: {
+        plannedEntryCount: number;
+        attemptedEntryCount: number;
+        entries: Array<{ index: number; result: 'passed' | 'failed'; durationMs: number }>;
+      };
       /** Present only when the inspection made a drift-budget verdict. */
       budgetVerdict?:
         | {
@@ -1131,6 +1361,7 @@ export type ConductorEvent =
       type: 'loop_halt';
       step?: StepName;
       reason: string;
+      tier?: ComplexityTier;
       /** Present when an external BUILD action classifies its own terminal halt. */
       haltClass?: 'plan-gap';
       /**
@@ -1256,13 +1487,41 @@ export type ConductorEvent =
       conflicts: string[];
     }
   | {
+      /** Untracked files were moved aside before retrying a refused rebase. */
+      type: 'rebase_untracked_quarantined';
+      paths: string[];
+      directory: string;
+    }
+  | {
+      /** A persisted repair-obligation boundary was translated after a rebase. */
+      type: 'repair_boundary_translated';
+      obligationId: string;
+      from: string;
+      to: string;
+      rule: 'direct' | 'successor';
+      projectRoot: string;
+    }
+  | {
       /**
        * Residue: pre-image shas cited by evidence but with no patch-id
        * match post-rebase (dropped or content-changed). Surfaced instead of
        * silently repointed — see `writeResidue` in engine/rebase-translate.ts.
        */
       type: 'rebase_citation_residue';
-      residue: Array<{ sha: string; citingTaskIds: string[]; reason: string }>;
+      residue: Array<{
+        sha: string;
+        citingTaskIds: string[];
+        citingObligationIds: string[];
+        reason: string;
+      }>;
+    }
+  | {
+      /** A judged supersession was suite-verified and published. */
+      type: 'rebase_supersession_verdict';
+      choice: 'superseded' | 'merged' | 'source';
+      rationale: string;
+      superseded: string[];
+      verification: { command: string; exitCode: 0 };
     }
   // ── Rebase auto-resolution lifecycle (Phase 9 / rebase-resolution) ──
   | {
@@ -1380,6 +1639,16 @@ export type ConductorEvent =
       attempts: number;
       phase: 'detected' | 'dispatched' | 'exhausted';
     }
+  | {
+      /** Bounded, credential-safe observation from CI-repair preparation or publication. */
+      type: 'ci_repair_diagnostic';
+      prUrl: string;
+      slug: string;
+      stage: CiRepairDiagnosticStage;
+      reason: CiRepairDiagnosticReason;
+      disposition: CiRepairDiagnosticDisposition;
+      provider?: string;
+    }
   // ── Semantic attribution verification (Task 17) ──
   | {
       /**
@@ -1402,4 +1671,29 @@ export type ConductorEvent =
       reason?: string;
       failingTests?: Array<{ name: string; reason: string }>;
       viaException: boolean;
+    }
+  // ── Worktree reclamation lifecycle ──
+  | {
+      type: 'worktree_reclaim_reclaimed';
+      slug: string;
+      branch: string;
+      proof: 'ancestry' | 'merged-pr-head';
+    }
+  | {
+      type: 'worktree_reclaim_reclaimed';
+      slug: string;
+      branch?: never;
+      proof?: never;
+    }
+  | {
+      type: 'worktree_reclaim_retained';
+      slug: string;
+      branch?: string;
+      reason: WorktreeReclaimRetainedReason;
+    }
+  | {
+      type: 'worktree_reclaim_failed';
+      slug: string;
+      branch?: string;
+      refusal: string;
     };

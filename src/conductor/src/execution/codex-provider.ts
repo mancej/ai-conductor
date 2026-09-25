@@ -13,6 +13,7 @@ import type {
   SelfHostAuthPreparation,
   TokenUsage,
 } from './llm-provider.js';
+import { reviewAccessRefusal } from './llm-provider.js';
 import { applyRateCard, loadRateCard, type RateCardLoader } from './rate-card.js';
 import {
   epochAnchoredMonotonicClock,
@@ -21,11 +22,14 @@ import {
 } from './observed-interval.js';
 import { summarizeProviderDiagnostic } from './provider-diagnostics.js';
 import { enforceFreshSessionOptions } from './fresh-session.js';
-import { scrubTmuxEnvironment } from './child-environment.js';
+import { buildReviewChildEnvironment, filterReviewChildEnvironment, scrubTmuxEnvironment } from './child-environment.js';
+import { composeReviewLaunchMounts } from '../engine/build-review-containment.js';
 import { withDaemonSessionMarker } from './daemon-session.js';
 import { rateLimitDurationUnitAlternation, scaleRateLimitDurationSeconds } from './rate-limit-duration.js';
 import { validateSpawnPermit } from '../engine/provider-runtime.js';
+import { writeScratchSchema } from '../engine/self-host/provider-scratch.js';
 import { ProviderStreamAssembler } from './provider-stream.js';
+import { wrapForContainment } from '../engine/self-host/live-containment.js';
 
 // These are deliberately Codex-specific rather than reusing Claude's error
 // vocabulary. The CLIs report different messages for the same failure class.
@@ -225,6 +229,7 @@ function parseWaitSeconds(output: string, fallbackSeconds = 300): number {
 export class CodexProvider implements LLMProvider {
   readonly supportsSessionResume = false;
   readonly lifecycleCapability = { synchronousSpawnPermit: true } as const;
+  readonly nativeSchemaCapability = { nativeOutputSchema: true } as const;
 
   private readonly authentication: SelectedAuthentication;
   private readonly executable: string;
@@ -295,6 +300,8 @@ export class CodexProvider implements LLMProvider {
     // session id, but the invariant is enforced uniformly at every adapter
     // entry so no future arg-building change can resurrect reuse.
     options = enforceFreshSessionOptions(options, 'codex');
+    const accessRefusal = reviewAccessRefusal('codex', options.reviewAccess);
+    if (accessRefusal) return accessRefusal;
     const repl = options.interactive === true;
     const jsonOutput = !repl;
     // A real interactive session leaves authorization to the operator. Auto
@@ -307,18 +314,40 @@ export class CodexProvider implements LLMProvider {
     }
 
     const authentication = this.authentication;
-    const args = [...this.selfHostArgs(options), ...this.buildArgs(options, !repl)];
+    let schemaFile: string | undefined;
+    if (options.nativeSchema !== undefined) {
+      try {
+        schemaFile = await this.writeNativeSchema(options);
+      } catch (error) {
+        return {
+          success: false,
+          output: `Codex native schema setup failed: ${error instanceof Error ? error.message : String(error)}`,
+          exitCode: 1,
+        };
+      }
+    }
+    const command = {
+      executable: options.selfHost?.executable ?? this.executable,
+      args: [...this.selfHostArgs(options), ...this.buildArgs(options, !repl, schemaFile)],
+      env: this.invocationEnv(options, authentication),
+    };
+    const launch = options.reviewAccess?.kind === 'ready'
+      ? wrapForContainment(command, composeReviewLaunchMounts(options.reviewAccess.profile, command))
+      : command;
     let streamedTokenUsage: TokenUsage | undefined;
 
     const { value: result, interval } = await observeInterval(this.intervalClock, async () => {
-      const subprocess = this.spawnCodex(options.selfHost?.executable ?? this.executable, args, {
+      const subprocess = this.spawnCodex(launch.executable, launch.args, {
         reject: false,
         input: this.composePrompt(options),
         stdin: 'pipe',
         stdout: options.diagnosticLog ? 'pipe' : repl ? ['pipe', 'inherit'] : 'pipe',
         stderr: options.diagnosticLog ? 'pipe' : repl ? ['pipe', 'inherit'] : 'pipe',
         cwd: options.cwd,
-        env: this.invocationEnv(options, authentication),
+        env: launch.env,
+        // D5: the review env is a complete allowlist; execa must not re-merge
+        // the ambient process environment underneath it.
+        ...(options.reviewAccess?.kind === 'ready' ? { extendEnv: false } : {}),
       }, {
         ...options,
         onProviderStream: repl ? undefined : options.streamConsumer?.onProviderStream ?? options.onProviderStream,
@@ -338,6 +367,7 @@ export class CodexProvider implements LLMProvider {
       readiness,
       { model: options.model, cwd: options.cwd },
       !repl,
+      options.nativeSchema !== undefined,
     );
     const tokenUsage = !repl && completion.success && completion.tokenUsage === undefined && streamedTokenUsage !== undefined
       ? applyRateCard(
@@ -489,6 +519,7 @@ export class CodexProvider implements LLMProvider {
      */
     pricing?: { model?: string; cwd?: string },
     strictMachineEnvelope = false,
+    requiresNativeSchema = false,
   ): InvokeResult {
     const { source } = authenticationSelection;
     const stdout = (result.stdout ?? '') as string;
@@ -574,6 +605,18 @@ export class CodexProvider implements LLMProvider {
     // recovery classification above loses its precedence.
     const toolProcessCreationFailures = countToolProcessCreationFailures(rawOutput);
 
+    const finalStructuredResult = requiresNativeSchema
+      ? this.terminalStructuredResult(parsedRaw.output)
+      : undefined;
+    if (requiresNativeSchema && exitCode === 0 && finalStructuredResult === undefined) {
+      return {
+        success: false,
+        output: `Codex provider parse failure: terminal result record is missing its structured result. Transcript: ${output}`,
+        exitCode,
+        authentication,
+        structuredResultFailure: 'malformed',
+      };
+    }
     return {
       success: exitCode === 0 && toolProcessCreationFailures === 0,
       output: authFailure
@@ -597,7 +640,28 @@ export class CodexProvider implements LLMProvider {
       sessionExpired: sessionExpired || undefined,
       tokenUsage: parsed.tokenUsage,
       authentication,
+      ...(finalStructuredResult === undefined ? {} : { finalStructuredResult }),
     };
+  }
+
+  private terminalStructuredResult(finalAgentMessage: string): unknown {
+    try {
+      return JSON.parse(finalAgentMessage);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeNativeSchema(options: InvokeOptions): Promise<string> {
+    const homeDir = options.nativeSchemaScratchHome ?? options.selfHost?.env.CODEX_HOME;
+    if (typeof homeDir !== 'string' || homeDir.length === 0) {
+      throw new Error('requested native schema requires an owned Codex scratch home');
+    }
+    return writeScratchSchema({
+      worktreeRoot: options.cwd ?? process.cwd(),
+      homeDir,
+      schema: options.nativeSchema!,
+    });
   }
 
   private readinessFailure(readiness: AuthenticationReadiness): InvokeResult {
@@ -606,6 +670,7 @@ export class CodexProvider implements LLMProvider {
       output: readiness.remediation ?? 'Codex authentication is not ready.',
       exitCode: 1,
       authFailure: true,
+      executionDisposition: 'not-started',
       authentication: readiness,
     };
   }
@@ -929,7 +994,7 @@ export class CodexProvider implements LLMProvider {
     );
   }
 
-  private buildArgs(options: InvokeOptions, unattended: boolean): string[] {
+  private buildArgs(options: InvokeOptions, unattended: boolean, schemaFile?: string): string[] {
     const args = ['exec'];
 
     if (options.model) args.push('--model', options.model);
@@ -959,6 +1024,7 @@ export class CodexProvider implements LLMProvider {
     }
     if (options.cwd) args.push('--cd', options.cwd);
     if (!options.interactive) args.push('--json');
+    if (schemaFile) args.push('--output-schema', schemaFile);
     // An explicit '-' makes stdin prompt delivery unambiguous and avoids argv
     // length limits for large build-review prompts.
     args.push('-');
@@ -967,6 +1033,9 @@ export class CodexProvider implements LLMProvider {
 
   private invocationEnv(options: InvokeOptions, authentication: SelectedAuthentication): NodeJS.ProcessEnv {
     const auth = authentication.apiKey ? { CODEX_API_KEY: authentication.apiKey } : undefined;
+    const scratch = options.reviewAccess?.kind === 'ready'
+      ? options.reviewAccess.profile.scratch
+      : undefined;
     // Every session env carries the daemon-session marker: any Codex session
     // spawned through this adapter is engine-managed, and the ai-conductor
     // entry guard refuses recursive conductor invocations from inside it
@@ -974,8 +1043,27 @@ export class CodexProvider implements LLMProvider {
     // can unset it.
     // tmux target variables are masked in the overlay (execa extends
     // process.env underneath it) so the child cannot resolve the daemon's pane.
+    if (scratch !== undefined) {
+      // D5: a contained reviewer gets an allowlisted environment, never the
+      // ambient one — tracker/service credentials and host state are withheld.
+      return buildReviewChildEnvironment('codex', {
+        ...process.env,
+        ...filterReviewChildEnvironment('codex', options.selfHost?.env ?? {}),
+      }, withDaemonSessionMarker({
+        ...auth,
+        HOME: join(scratch, 'home'),
+        CODEX_HOME: join(scratch, 'codex-home'),
+        TMPDIR: join(scratch, 'tmp'),
+        XDG_CONFIG_HOME: join(scratch, 'xdg-config'),
+        XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
+        XDG_DATA_HOME: join(scratch, 'xdg-data'),
+      }));
+    }
     return scrubTmuxEnvironment(withDaemonSessionMarker(
-      options.selfHost ? { ...options.selfHost.env, ...auth } : auth,
+      {
+        ...(options.selfHost?.env ?? {}),
+        ...auth,
+      },
     ));
   }
 

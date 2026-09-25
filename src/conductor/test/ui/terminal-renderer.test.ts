@@ -1,4 +1,4 @@
-// Covers: task:2, task:3, task:4
+// Covers: task:2, task:3, task:4, task:23
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Writable } from 'node:stream';
 import { TerminalRenderer } from '../../src/ui/terminal-renderer.js';
@@ -8,7 +8,7 @@ import { ALL_STEPS } from '../../src/engine/steps.js';
 import { renderedEventTypes } from '../../src/engine/event-sinks.js';
 
 const DEDICATED_RENDERER_EVENT_TYPES = new Set<ConductorEvent['type']>([
-  'step_started', 'step_completed', 'step_failed', 'step_retry', 'feature_usage_total', 'rate_limit', 'session_reset',
+  'step_started', 'step_completed', 'step_failed', 'step_interrupted', 'step_refused', 'github_operation_refused', 'step_retry', 'feature_usage_total', 'test_suite_verification', 'rate_limit', 'session_reset',
   'credentials_park_progress', 'provider_fallback', 'session_policy', 'when_skip',
   'parallel_started', 'parallel_completed', 'parallel_failure', 'tier_skip', 'config_skip',
   'gate_blocked', 'feature_complete', 'dashboard_refresh', 'checkpoint_reached',
@@ -120,6 +120,20 @@ describe('TerminalRenderer', () => {
     const output = stream.output();
     expect(output).toContain('STEP FAILED: build');
     expect(output).toContain('compile error');
+  });
+
+  it('renders step_retry with its progress allowance', async () => {
+    await renderer.handle({
+      type: 'step_retry',
+      step: 'build',
+      attempt: 2,
+      maxAttempts: 3,
+      reason: 'tasks remain',
+      progressAttempt: 2,
+      progressAttemptCeiling: 30,
+    });
+
+    expect(stream.output()).toContain('2/3 (progress allowance: attempt 2 of 30)');
   });
 
   it('renders provider fallback as a loud warning with complete diagnostics', async () => {

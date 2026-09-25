@@ -452,7 +452,7 @@ authoritative for the SHIP compliance verdict. It never relied on BUILD proof as
 - **Context budget.** This review runs late in a long session and providers with a ~250k-token
   window have compacted mid-review (jstoup111/ai-conductor#2377: peaks of 236k–251k, with the
   reviewer's own reads accounting for 0.85–1.5M characters of output). Treat the window as a budget:
-  - Do NOT re-read `HARNESS.md`, `CLAUDE.md`, or this skill file. They are already in context via
+  - Do NOT re-read the harness rules, `CLAUDE.md`, or this skill file. They are already in context via
     the session-start hook and the skill loader.
   - Read each artifact once. The plan and stories are large; extract the task table, `Done when`
     blocks, and the criteria you are grading, not the whole file twice.
@@ -571,7 +571,9 @@ table mechanically and any other header halts the feature as unparseable, wastin
 lap. `Class` is a closed set: exactly `REMEDIABLE` or `DESIGN`. A `REMEDIABLE` row's
 `Governing clause` must name either an ADR filename stem plus its decision number (`adr-x decision 3`
 or the heading shorthand `adr-x D3` — both resolve), or a task id from
-this feature's own plan; a REMEDIABLE row without a governing clause is malformed. Write the clause
+this feature's own plan; a REMEDIABLE row without a governing clause is malformed. These citations
+name whole decisions: a subsection form such as adr-x D3.2 resolves to decision 3 because its dotted
+tail collapses as the ADR parser does. Write the clause
 as **bare text** — no backticks, no bold — and cite **exactly one** clause per row: the resolver
 matches a single identifier, so `` `adr-x` + Decision 4 `` and `Task 9 and Task 10` are both
 unresolvable and HALT the bounded remediation route. Split a finding that spans two tasks into two

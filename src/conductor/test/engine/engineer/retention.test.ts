@@ -92,15 +92,18 @@ describe('Engineer retained review worktrees', () => {
     return store.record(run.engineerRunId, { kind: 'run_settled', outcome: 'awaiting_spec_merge' });
   }
 
-  it('records logical retirement before exact physical cleanup on PR merge', async () => {
+  it('reads PR state through the tracker boundary and records retirement before exact cleanup', async () => {
     const run = await settledRun();
+    const gh = vi.fn(async () => ({
+      stdout: JSON.stringify({ state: 'MERGED', mergedAt: '2026-09-04T00:00:00.000Z' }),
+    }));
     let retiredBeforeRemoval = false;
     await reconcileEngineerRetainedWorktrees({
       store,
       deps: {
         git: gitRunner,
         now: () => new Date('2026-09-04T00:00:00.000Z'),
-        readPullRequestState: async () => 'merged',
+        gh,
         removeWorktree: async (root, path) => {
           const snapshot = await store.inspectRun(run.engineerRunId);
           retiredBeforeRemoval = snapshot.retirement?.reason === 'spec_merged';
@@ -109,6 +112,10 @@ describe('Engineer retained review worktrees', () => {
       },
     });
 
+    expect(gh).toHaveBeenCalledExactlyOnceWith(
+      ['pr', 'view', 'https://github.com/example/repo/pull/1', '--json', 'state,mergedAt'],
+      { cwd: repoRoot },
+    );
     expect(retiredBeforeRemoval).toBe(true);
     await expect(access(worktreePath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await store.inspectRun(run.engineerRunId)).toMatchObject({

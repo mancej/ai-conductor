@@ -146,6 +146,12 @@ lines are daemon-wide, not feature work. The exact shapes and the slug length bo
 
 ### Build-review rubric progress
 
+Before publication, FINISH rechecks the current validation evidence. If one validator crashes during
+that final recheck, the daemon retries only that validator within its configured attempt budget; already
+passing validation siblings are not repeated. A retry never authorizes publication by itself: FINISH
+publishes only after fresh passing evidence exists. When the budget is exhausted, the feature HALTs and
+the publication coordinator is not invoked.
+
 During `build_review`, the daemon log names each rubric branch and its full lap identifier. This
 lets you distinguish concurrent or retried review laps without reading `.pipeline/events.jsonl`:
 
@@ -160,8 +166,11 @@ lets you distinguish concurrent or retried review laps without reading `.pipelin
 
 `skipped` is not a judged failure. An infrastructure failure is also distinct from a judged `FAIL`;
 it means the rubric could not run. The `raw:` suffix appears only when a deterministic policy changed
-the effective verdict. The optional excerpt, deterministic reason, and unresolved-marker count are
-included only when the event supplies them.
+the effective verdict. A `projection-oversized` infrastructure failure includes measured and limit byte
+counts and halts for an operator without consuming the shared mechanical-fault allowance. The optional
+excerpt, deterministic reason, and unresolved-marker count are included only when the event supplies them.
+
+A rebase that changes the active feature’s stories or PRD reruns its PRD audit and coverage binding. Changes to its plan or coherence carrier rerun coverage binding. Document-only changes leave BUILD and aggregate test proof intact; unrelated features’ documents leave these reviews intact. Rebase events name the input paths responsible for each decision.
 
 ### Protected-artifact rebaselines
 
@@ -231,7 +240,9 @@ necessarily the repo default.
 - **`·   <step> via <provider> (<model>) ✓ — <turns>, <duration>, <cost>`** attributes the completed
   dispatch. `grep ' via '` over the log answers "which provider ran this step" without inspecting
   process argv. A provider skipped from a cached availability result dispatches no process and is
-  not logged; a fallback between providers still prints its own `⚠ PROVIDER FALLBACK` line.
+  not logged. A candidate skipped because required setup is unavailable also dispatches no process,
+  but its fallback prints `⚠ PROVIDER FALLBACK`; the line identifies the unavailable candidate and
+  the next provider.
 - **`· gate <step>: satisfied`** or **`· gate <step>: unsatisfied — <reason>`** states the
   objective gate verdict. A satisfied line may include a reason; neither verdict line uses the
   provider-completion check glyph, so it is distinct from the preceding dispatch attribution.
@@ -496,11 +507,12 @@ An operator park outranks everything: the re-kick sweep checks it first, ahead o
 dedup and the per-SHA guard, and preserves a pending `.pipeline/REKICK` sentinel rather than
 consuming it.
 
-If the feature is already running, the daemon lets the active scheduling unit settle before it
-stops. A serial step reaches its natural status; a parallel group lets every started member settle
-and completes the group join. The daemon persists those outcomes, then blocks the next serial step
-or parallel group and logs the last settled boundary. It does not create a HALT or interrupt work
-inside the active unit. Interactive `conduct` runs are unchanged.
+If the feature is already running, the daemon lets its current provider attempt finish, then declines
+every later attempt, including retries. In a parallel group, each started member may finish its
+current attempt but a parked member does not retry. The daemon records the outcomes and blocks the
+next serial step or parallel group. It does not create a HALT or interrupt a provider call. Interactive
+`conduct` runs are unchanged. The command reports whether work is still running, fully stopped, or
+unknown; see [`daemon park`](../reference/cli.md#daemon-park-and-daemon-unpark) for the exact output.
 
 To release:
 
@@ -541,9 +553,15 @@ A slug counts as `merged` on either of two signals:
 A missing branch, an unreadable `origin/main`, or a git failure yields `unclassified` and no action.
 It never reads as "not merged".
 
+The same sweep also considers every non-detached worktree registered directly under `.worktrees/`.
+It ignores nested worktrees and worktrees outside that directory. A registered candidate is retained
+without attempting removal when it is in flight, belongs to an `engineer-*` or `resolve-*` lifecycle,
+has an unreadable or present `.pipeline/HALT`, has an invalid slug, or the worktree listing cannot be
+read. This scan does not depend on the mergeable-watch registry.
+
 By default ([`reconcile_parked_auto_cleanup`](../reference/configuration.md#reconcile_parked_auto_cleanup)
-is unset or `true`), a `merged` slug with a `.docs/shipped/<slug>.md` record on `origin/main` is
-reconciled automatically: its worktree is removed, any branch for it is deleted, and it is unparked.
+is unset or `true`), a `merged` parked slug with a `.docs/shipped/<slug>.md` record on `origin/main`
+is reconciled automatically: its worktree is removed, any branch for it is deleted, and it is unparked.
 The record on `origin/main` is what settles completion here, so a worktree whose local
 `.pipeline/conduct-state.json` still reads mid-build — the normal state for anything built before
 `feature_status` existed, or for a `finish` that pushed and then died — does not block cleanup.
@@ -561,13 +579,19 @@ drop, by **either** of two proofs:
 
 If neither proof holds for some branch, cleanup is refused and nothing is deleted, even though the
 slug still classifies `merged`. The reason distinguishes no merged-PR proof (`no-merge-proof`),
-commits added after the merged PR head (`unmerged-commits`), a branch that is behind that head
+commits the merged PR head does not contain, whether added after it or left behind by a rebased PR
+head (`unmerged-commits`), a branch whose tip is an ancestor of that head
 (`branch-behind-merged-head`), and evidence that Git or `gh` could not check
 (`ancestry-check-failed`). For `unmerged-commits`, `daemon reconcile-parked` prints up to ten
 `SHA subject` lines and an overflow count, so the operator can inspect what cleanup would drop.
-Once a proof holds, the branch is deleted with `git branch -D`: the reconciler, not git, is the
-authority that no commit is dropped, and git's own `-d` merge check is structurally false forever
-for a squash-merged branch.
+Once a proof holds, the branch is deleted with the safe `git branch -d` only; no force flag is ever
+used. git's own `-d` merge check refuses a squash-merged branch whose tip is not an ancestor of the
+local default branch. That branch is left in place and the refusal is reported as
+`branch-delete-failed`, never escalated to `-D`.
+
+Before any worktree is removed, the reconciler checks `git status --porcelain` inside it, both
+before and after the project teardown runs. Any output, or a status that cannot be read, refuses
+cleanup with `dirty-worktree`, so uncommitted or untracked work in a worktree is never deleted.
 
 Worktree removal tolerates one more real-world shape. Some `.worktrees/<slug>` paths exist on disk
 without ever having been registered as git worktrees, and `git worktree remove` rejects those with
@@ -576,19 +600,30 @@ without ever having been registered as git worktrees, and `git worktree remove` 
 instead of refusing. A removal failure on a path git *does* own — locked, dirty, permissions — still
 refuses with `worktree-remove-failed`, and so does an unreadable worktree listing.
 
-A merged slug with no shipped
-record yet is left parked and,
-when a merged PR can be found, gets an ST-916 record-repair PR requested on its behalf; it
-reconciles on a later tick once the record lands. Set `reconcile_parked_auto_cleanup: false` to
-disable the automatic cleanup step and only classify/annotate, then reconcile explicitly per slug:
+A merged parked slug with no shipped record yet is left parked and, when a merged PR can be found,
+gets an ST-916 record-repair PR requested on its behalf; it reconciles on a later tick once the
+record lands. A registered worktree follows the same proof checks, but a shipped record is required
+only for a `feat/daemon-*` branch; another branch with merge proof can be reclaimed without one.
+
+Set `reconcile_parked_auto_cleanup: false` to disable automatic cleanup only for parked slugs and
+use `reclaim_merged_worktrees: false` to make registered-worktree reclamation report-only. The
+explicit command remains available for a parked slug:
 
 ```bash
 ai-conductor daemon reconcile-parked <slug>
 ```
 
 See [`daemon reconcile-parked`](../reference/cli.md#daemon-reconcile-parked) for its exact output
-and refusal reasons. An `orphan` classification is never auto-reconciled — it needs an operator to
-decide whether to park it, delete it, or resume it manually.
+and refusal reasons. Reclaimed, retained, and failed registered-worktree outcomes are persisted in
+the daemon event ledger as `worktree_reclaim_reclaimed`, `worktree_reclaim_retained`, and
+`worktree_reclaim_failed`. The daemon log renders reclaimed outcomes, and a failed removal,
+branch deletion, or unpark as `✗ worktree reclaim failed`. Any other helper refusal leaves the
+worktree intact and renders as `↷ worktree retained <slug> (<branch>; <reason>)`. It is shown once
+per slug until its branch or reason changes, although the ledger records it on every sweep. A
+worktree whose `.pipeline/phase-active` marker is more than seven days old is treated as abandoned
+rather than in flight; every merge proof and the dirty-worktree check still apply to it. An
+`orphan` classification is never auto-reconciled — it needs an operator to decide whether to park it,
+delete it, or resume it manually.
 
 The cleanup sweep writes one aggregate line when its counts change instead of one line per parked
 slug. It includes `refused=N` and, when nonzero, a per-reason breakdown plus guidance for the
@@ -908,11 +943,12 @@ the rebase — `git merge-tree` proves only that the two trees do not collide, n
 branch's gates were graded against the base that will actually be merged into. A clean result is
 skippable only when both of these also hold:
 
-- **The base has not moved in code.** No code or test path differs between the branch's merge-base
-  and the base ref. If the base gained code after `build_review` graded the diff, `test_suite`
-  proved a tree, or `manual_test` exercised behavior, those verdicts predate it — the engine rebases
-  and lets the existing delta-aware invalidation decide what to re-verify. A docs-only advance
-  changes nothing and still skips.
+- **The base has not moved in code or this feature's active review inputs.** No code or test path,
+  active story, PRD, plan, or coherence carrier differs between the branch's merge-base and the base
+  ref. If the base gained code after `build_review` graded the diff, `test_suite` proved a tree, or
+  `manual_test` exercised behavior, those verdicts predate it. A changed active review input can
+  also change the PRD-audit or coverage-binding result. In either case the engine rebases and lets
+  delta-aware invalidation decide what to re-verify. Unrelated documentation still permits a skip.
 - **The base is not a degraded fallback.** When an `origin` remote exists but its default-branch
   discovery or `git fetch` failed, the engine compares against the LOCAL base branch, which in a
   daemon worktree can be arbitrarily far behind origin — a "clean" verdict against it means nothing,
@@ -1009,18 +1045,20 @@ once; a lock loser never runs it and never touches worktrees.
 Honouring the `REKICK` sentinel always rebases the feature onto the advanced base before any gate
 resumes, even when it is cleanly mergeable. This play-forward path is intentionally different from
 normal finish: the pending gate must observe the advanced base in its worktree.
-When that rebase changes code or test paths, the downstream judged gates — `test_suite`,
-`build_review`, and (when they ran) `manual_test`, `prd_audit`,
-`architecture_review_as_built` — are candidates for re-opening, because their verdicts graded the
-pre-rebase diff. Which ones actually re-open depends on the delta: each judged gate declares the
-surface its verdict depends on, and only a delta that lands inside that surface invalidates it.
+When that rebase changes code, test paths, or an active review input, the downstream judged gates —
+`test_suite`, `build_review`, and (when they ran) `manual_test`, `prd_audit`,
+`coverage_binding`, `architecture_review_as_built` — are candidates for re-opening. Which ones
+actually re-open depends on the delta: each judged gate declares the surface its verdict depends on,
+and only a delta that lands inside that surface invalidates it.
 
 | Gate | Depends on | Re-opened when the rebase delta touches |
 | --- | --- | --- |
 | `test_suite` | the whole tree | any code or test path, anywhere |
 | `manual_test` | all runtime source | any runtime source path, feature-owned or not |
 | `build_review` | the feature's own code and tests | the feature's own source **or** its own test files |
-| `prd_audit`, `architecture_review_as_built` | the feature's own runtime source | the feature's own source |
+| `prd_audit` | the feature's own runtime source, active stories, and PRD | the feature's own source, active story, or active PRD |
+| `coverage_binding` | the feature's own runtime source, active stories, PRD, plan, and coherence carrier | the feature's own source or one of those active review inputs |
+| `architecture_review_as_built` | the feature's own runtime source | the feature's own source |
 
 `build_review` grades the feature's own code and tests — currently only the opt-in `testQuality`
 rubric's judgement of whether a changed test is insensitive to the behavior it claims to cover — so a
@@ -1047,6 +1085,15 @@ carried-over verdict.
 `.pipeline/task-status.json` is not the authority here. Nothing in the engine flips its rows to
 `completed`; the durable record of finished work is the `Task:` trailer on each commit, which is why
 losing or re-seeding that file does not by itself re-open a finished build.
+
+Repair obligations keep a commit boundary for deciding which later `Task:` trailers can settle a
+repair. During the same rebase translation, the daemon rewrites that boundary when its pre-rebase
+commit has a patch-id match. If the boundary's commit was absorbed upstream, it advances only to the
+earliest surviving later commit on the feature's first-parent history, so the eligible evidence range
+can only narrow. Each rewrite is persisted as a `repair_boundary_translated` event with its
+`direct` or `successor` rule. A boundary without a safe successor remains unchanged and is named by
+its obligation id in the `rebase_citation_residue` event and `.pipeline/rebase-residue.json`; the
+ordinary repair-resolution path then continues to refuse that stale boundary rather than guessing.
 
 ### Halt-PR presentation is cleared when the halt resolves
 

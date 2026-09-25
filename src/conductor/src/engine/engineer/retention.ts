@@ -3,7 +3,7 @@ import { access, realpath } from 'node:fs/promises';
 import type { EngineerWorktreeRetirementReason } from '../../types/index.js';
 import type { HarnessConfig } from '../../types/config.js';
 import type { GhRunner } from '../tracker-client.js';
-import { makeProductionGh } from '../tracker-client.js';
+import { createGithubTrackerClient, makeProductionGh } from '../tracker-client.js';
 import type { GitRunner } from '../pr-labels.js';
 import { makeProductionGit } from '../pr-labels.js';
 import { removeEngineerWorktree } from './worktree-authoring.js';
@@ -248,8 +248,7 @@ async function productionPullRequestState(
   repoRoot: string,
   gh: GhRunner,
 ): Promise<EngineerPullRequestState> {
-  const result = await gh(['pr', 'view', prUrl, '--json', 'state,mergedAt'], { cwd: repoRoot });
-  const parsed = JSON.parse(result.stdout) as { state?: unknown; mergedAt?: unknown };
+  const parsed = await createGithubTrackerClient(gh).viewPullRequest(prUrl, repoRoot);
   if (typeof parsed.mergedAt === 'string' && parsed.mergedAt !== '') return 'merged';
   if (parsed.state === 'OPEN') return 'open';
   if (parsed.state === 'CLOSED') return 'closed';

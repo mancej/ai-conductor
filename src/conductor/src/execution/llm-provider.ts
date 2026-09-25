@@ -1,4 +1,6 @@
 import type { ObservedInterval } from './observed-interval.js';
+import type { ProviderSetupExhaustion } from '../engine/provider-setup-failure.js';
+import type { BuildReviewContainmentResult } from '../engine/build-review-containment.js';
 
 export interface TokenUsage {
   /**
@@ -149,6 +151,12 @@ export interface SelfHostInvocation {
   executable: string;
   env: NodeJS.ProcessEnv;
   args: readonly string[];
+  /**
+   * The provider home this preparation replaced in `env`. Installed-policy
+   * discovery reads the operator's global/plugin catalogs from this explicit
+   * mapping only; it is never written to and never inferred after preparation.
+   */
+  originalCatalogHome?: string;
   teardown(): Promise<void>;
 }
 
@@ -165,6 +173,19 @@ export interface SelfHostAuthContext {
 /** Declares that a provider validates lifecycle authority at its spawn boundary. */
 export interface ProviderLifecycleCapability {
   synchronousSpawnPermit: true;
+}
+
+/**
+ * A provider-neutral, engine-owned JSON Schema supplied only when a caller
+ * needs a native constrained terminal response. Adapters own translating this
+ * value to their native CLI/API syntax; the engine never asks a provider to
+ * recover the contract from prose.
+ */
+export type NativeSchemaRequest = Readonly<Record<string, unknown>>;
+
+/** Declares that an adapter can enforce and return a native output schema. */
+export interface ProviderNativeSchemaCapability {
+  nativeOutputSchema: true;
 }
 
 /** The synchronous authority decision made immediately before process creation. */
@@ -186,6 +207,16 @@ export interface InvokeResult {
   success: boolean;
   output: string;
   exitCode: number;
+  /**
+   * The parsed value from the provider's terminal structured-result envelope.
+   * It remains distinct from human-readable `output`; only an engine-owned
+   * schema request authorizes adapters to populate it.
+   */
+  finalStructuredResult?: unknown;
+  /** A native-schema invocation ended without a usable terminal result. */
+  structuredResultFailure?: 'missing' | 'malformed';
+  /** A requested native schema could not be enforced by the selected adapter. */
+  nativeSchemaUnsupported?: true;
   /** Engine-observed provider subprocess intervals, separate from provider-reported usage. */
   observedIntervals?: readonly ObservedInterval[];
   rateLimited?: boolean;
@@ -237,15 +268,55 @@ export interface InvokeResult {
   commandUnresolvedName?: string;
   /** Set by the execution layer when a cached unavailable provider is skipped. */
   providerInvocationSkipped?: boolean;
+  /**
+   * Engine-owned terminal classification for an ordered pass where every
+   * candidate was unavailable during setup before provider invocation.
+   * Provider adapters never construct this result.
+   */
+  providerSetupExhaustion?: ProviderSetupExhaustion;
+  /** Affirmative evidence that this invocation never reached provider execution. */
+  executionDisposition?: 'not-started';
   /** Provider-owned, safe authentication source/readiness metadata. */
   authentication?: AuthenticationReadiness;
   /** Sanitized diagnostic-only safety notices; never an authorization input. */
   safetyDiagnostics?: readonly string[];
 }
 
+/**
+ * A containment result prepared for one custom-policy build-review candidate.
+ * It stays optional so ordinary BUILD and general custom-step invocations
+ * retain their existing writable process contracts.
+ */
+export type BuildReviewAccessProfile = BuildReviewContainmentResult;
+
+/** Convert a rejected review boundary into a non-launching provider result. */
+export function reviewAccessRefusal(
+  provider: 'claude' | 'codex',
+  profile: BuildReviewAccessProfile | undefined,
+): InvokeResult | undefined {
+  if (!profile) return undefined;
+  if (profile.provider !== provider) {
+    return {
+      success: false,
+      output: `Build-review read-only profile is for ${profile.provider}, not ${provider}. Recovery action: prepare containment for ${provider} before review.`,
+      exitCode: 1,
+      providerUnavailable: false,
+    };
+  }
+  if (profile.kind === 'ready') return undefined;
+  return {
+    success: false,
+    output: `Build-review read-only profile is unsupported for ${provider}: ${profile.reason}. Recovery action: ${profile.recovery}.`,
+    exitCode: 1,
+    providerUnavailable: false,
+  };
+}
+
 export interface InvokeOptions {
   prompt: string;
   systemPrompt?: string;
+  /** Optional engine-owned JSON Schema for a native constrained terminal response. */
+  nativeSchema?: NativeSchemaRequest;
   sessionId: string;
   resume: boolean;
   /**
@@ -289,6 +360,16 @@ export interface InvokeOptions {
   diagnosticLog?: (message: string) => void;
   /** Set only for the resolved self-host provider candidate. */
   selfHost?: SelfHostInvocation;
+  /**
+   * Engine-owned, feature-invocation scratch home for a native output schema
+   * when this is not a self-host invocation. Provider execution owns teardown.
+   */
+  nativeSchemaScratchHome?: string;
+  /**
+   * A proved read-only boundary for a custom-policy build-review candidate.
+   * A rejected profile refuses before any provider preparation or model launch.
+   */
+  reviewAccess?: BuildReviewAccessProfile;
   /**
    * Fired on every observed stdout/stderr activity boundary from the spawned
    * provider subprocess (each streamed JSON event line). Used to drive the
@@ -340,6 +421,8 @@ export interface LLMProvider {
    * at its subprocess creation boundary.
    */
   lifecycleCapability?: ProviderLifecycleCapability;
+  /** Declares native output-schema support; absence is an explicit unsupported capability. */
+  nativeSchemaCapability?: ProviderNativeSchemaCapability;
   invoke(options: InvokeOptions): Promise<InvokeResult>;
   /** Optional so legacy and custom providers need not implement auth recovery. */
   readiness?(): Promise<AuthenticationReadiness>;

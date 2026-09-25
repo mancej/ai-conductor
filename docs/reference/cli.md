@@ -55,6 +55,23 @@ spellings must be the whole invocation; `ai-conductor daemon --version` is a dae
 version request. Like every other unsanctioned command it is refused inside a daemon-managed session
 (see [Daemon-session refusal](#daemon-session-refusal)).
 
+## `ai-conductor update`
+
+```bash
+ai-conductor update [args...]
+```
+
+Runs the owning harness checkout's `bin/update` from any working directory. It forwards every argument,
+inherits the terminal, and returns the updater's exit status. Use the same options as
+[`bin/update`](#binupdate), for example:
+
+```bash
+ai-conductor update --set-channel stable
+```
+
+The command exits 1 without starting an updater when it cannot find the harness checkout, its
+`bin/update`, or a checkout `.git` directory. Its diagnostic names the failed path or root.
+
 ## `bin/install`
 
 ```bash
@@ -144,7 +161,7 @@ park`/`unpark`/`restart` and `reseal`), corrupting the run that dispatched them;
 started the session owns all conductor operations for it. The only exceptions are the
 session-sanctioned worker commands the harness's own skills and hooks require a session to run —
 `scoped-run`, `overlap-scan`, `plan-protected-targets`, `manual-test-record`, `closeout-event`, and
-`derive-feedback` — which stay available under the marker. There is no config off-switch;
+`derive-feedback`, `scope-check`, and `task` (`start`/`done`) — which stay available under the marker. There is no config off-switch;
 enforcement lives in `src/conductor/src/execution/daemon-session.ts`.
 
 ## `ai-conductor build-review`
@@ -171,8 +188,9 @@ disposition-store rejection — and records the same reason on the feature's
 terminal, resolved local operator identity, exact current lap, named rubric, and non-empty rationale.
 It derives the closed infrastructure cause from the current review state; callers cannot supply one.
 It records a decision only when that rubric currently has an exhausted mechanical infrastructure
-fault. Judged, skipped, duplicate, unknown-rubric, allowance-remaining, and stale-review requests
-are refused without changing the decision state.
+fault, or a current `projection-oversized` fault (which halts without consuming that allowance).
+Judged, skipped, duplicate, unknown-rubric, allowance-remaining for every other cause, and stale-review
+requests are refused without changing the decision state.
 
 ## `ai-conductor scope-check`
 
@@ -334,7 +352,9 @@ ai-conductor daemon status
 
 Takes no flags. Sweeps the project registry and prints one badge line per repo: state, name, path,
 `pid`, `since`, `version:<engine-version-id>`, pause metadata, the last log line with its mtime, and
-`session:up` or `session:down`. It then prints a `GATED:` section from `.daemon/gated.json`, a
+`session:up` or `session:down`. A row with a dead pane or stale pid also shows its matching witnessed
+exit (`killed by <signal>` or `exited <code>`) when available; every row with a recorded sample shows
+the latest RSS as `mem <MB> at <timestamp>`. It then prints a `GATED:` section from `.daemon/gated.json`, a
 `BLOCKED` section from `.daemon/blocked.json`, and an `attribution agreement: N% (n=…)` line from
 `.daemon/attribution-accuracy.jsonl`; all are skipped for repos whose path is missing.
 
@@ -402,6 +422,17 @@ writes `.daemon/parked/<slug>`. It prints `Parked '<slug>' — it will not be di
 until unparked.` plus `Marked for park: <path>`. An already-parked slug prints `'<slug>' is already
 parked (originally parked at <ts>) — no change.` and exits 0. An unknown slug exits 1.
 
+After writing or confirming the marker, `park` reports the observed work state. A live daemon with
+a current provider attempt prints `Work for '<slug>' is still running: step <step>, attempt
+<attempt>.`; no live daemon or a settled attempt prints `Work for '<slug>' is fully stopped.`; an
+unreadable pidfile or attempt history prints `Running work for '<slug>' is unknown.` The marker is
+still written when the result is unknown.
+
+A park never cancels an attempt already running. It declines later provider attempts, including
+serial and parallel-member retries, without consuming their retry budget. See [emergency stop a
+running feature](../runbooks/emergency-stop-a-running-feature.md) to interrupt a provider call or
+prepare to change git state.
+
 `unpark` resets the no-evidence attempt counter first, then removes the park marker, so a failed reset
 leaves the marker in place for a retry. A slug that was never parked prints `'<slug>' was not
 operator-parked — nothing to do.` and exits 0.
@@ -436,9 +467,12 @@ reconcile '<slug>': <reason>` and exits 1. The refusal reason identifies the pro
 
 - `branch-missing` — no local branch for the slug is available to prove.
 - `no-merge-proof` — the branch is not an ancestor and no merged PR proves its current tip.
-- `unmerged-commits` — the branch has commits beyond the merged PR head. The command prints up to
-  ten `SHA subject` lines after the refusal, followed by `… and M more` when the list is longer.
-- `branch-behind-merged-head` — the local branch tip no longer matches the merged PR head proof.
+- `unmerged-commits` — the branch has commits the merged PR head does not contain, because it
+  advanced past that head or diverged from it (for example, the PR head was rebased after the last
+  local commit). The command prints up to ten `SHA subject` lines after the refusal, followed by
+  `… and M more` when the list is longer.
+- `branch-behind-merged-head` — the local branch tip is an ancestor of the merged PR head. Deleting
+  it would drop nothing, but no held proof authorizes the deletion.
 - `ancestry-check-failed` — Git or merged-PR evidence could not be checked safely.
 
 These refusals leave every branch and worktree in place. If the slug is
@@ -552,7 +586,10 @@ nest a second interactive session, prints guidance to run `/composer` directly, 
 Before each fresh session, and only when no idea came from the CLI, the loop polls GitHub issues into
 the durable inbox and prints `Intake: N issue(s) queued.` for a non-zero N. That poll is skipped
 entirely while a background brain loop is alive. Ordinary poll failures print and never block; a
-corrupt ledger is the exception — it fails closed and exits 1 (see the subcommand table below).
+corrupt ledger is the exception — it fails closed and exits 1 (see the subcommand table below). A
+registered project whose path is absent is skipped without running GitHub; its first skipped poll in
+an absence episode prints `github-issues: skipping <repo>: missing path <path>`. Restore or correct
+the registered path to resume polling it.
 
 After each session exits, the loop prompts `Process another idea in a fresh session? [Y/n]` on a TTY.
 Non-TTY stdin answers no, so the loop never runs unattended. The child's exit code is returned; a spawn
@@ -576,10 +613,10 @@ returns 1.
 | `worktree-cleanup` | `engineer worktree-cleanup --run-id <id> --reason <operator_cleanup\|task_cancelled\|spec_merged\|spec_closed\|retention_expired>` | Validates the exact marker, repository, registered worktree, branch, and commit; records logical retirement first; then removes that one worktree. An externally missing directory is complete only after its stale Git registration is removed or proven absent. Identity-precondition and removal failures persist typed evidence in the inspectable `cleanup` projection with retry timing. Removal debt never creates a second retirement event. | 0 after recording the resulting snapshot; 1 on identity or transition failure |
 | `maintenance` | `engineer maintenance` | Reconciles retained review worktrees across durable Engineer runs. PR merge, PR close, cancellation, and deadline expiry authorize retirement; open PRs remain available. Failed PR-status lookups persist typed evidence and back off before another remote query. | 0 after the sweep; 1 on invalid input or an unrecoverable store error |
 | `projects` | `engineer projects` | Prints the registry as JSON. Read-only. | 0; 1 on unknown flag |
-| `worktree` | `engineer worktree --project <name> --idea "<text>" [--source-ref <ref>] [--body <text>] [--engineer-run-id <id>] [--permit-inconclusive]` | Resolves the project and creates the per-idea git worktree and branch. It validates a supplied run or creates an uncorrelated run, writes `.pipeline/engineer-run.json`, then prints `{kind, engineerRunId, slug, branch, worktreePath, reconcile}`. Inconclusive push authorization blocks authoring unless `--permit-inconclusive` is explicit. With `--source-ref` and no `--body`, it loads the persisted claim body; a missing record degrades to no staging. | 0; 1 on blocked or unpermitted readiness, project/identity resolution, lifecycle persistence, target resolution, or worktree creation error |
+| `worktree` | `engineer worktree --project <name> --idea "<text>" [--source-ref <ref>] [--body <text>] [--engineer-run-id <id>] [--permit-inconclusive]` | Resolves the project and creates the per-idea git worktree and branch. It validates a supplied run or creates an uncorrelated run, writes `.pipeline/engineer-run.json`, then prints `{kind, engineerRunId, slug, branch, worktreePath, reconcile}`. Inconclusive push authorization blocks authoring unless `--permit-inconclusive` is explicit. With `--source-ref` and no `--body`, it loads the persisted claim body or falls back to the referenced GitHub issue. An unreadable source reports a diagnostic without failing worktree creation. | 0; 1 on blocked or unpermitted readiness, project/identity resolution, lifecycle persistence, target resolution, or worktree creation error |
 | `land` | `engineer land --project <name> --idea "<text>" --worktree <path> [--source-ref <ref>]` | Reads machine owner config, performs a fail-fast identity check, then commits the authored spec artifacts in the worktree onto `spec/<slug>`. With `--source-ref`, comments on the issue and advances the ledger to `routed` (advisory, so a `gh` failure never fails the land). A lifecycle reconciliation failure after the commit reports recovery guidance and retains the worktree; repair the durable state and rerun `engineer land` before handoff. | 0, including a warned lifecycle reconciliation failure after commit; 1 on project not found, unresolved identity, or a pre-commit land failure |
-| `handoff` | `engineer handoff --project <name> --branch <branch> --worktree <path> [--source-ref <ref>] [--permit-inconclusive]` | Rechecks owned-run readiness, opens the spec PR with `gh` inside the per-idea worktree, durably records the exact retained commit and review deadline, and leaves the worktree registered. Inconclusive push authorization blocks handoff unless `--permit-inconclusive` is explicit. A blocked readiness result remains on the same authoring run so the exact landed worktree can retry handoff after repair. It prints `{kind:'pr-opened', url}` or `{kind:'local-commit', branch, repoPath, reason}` and starts the target daemon. Legacy unmarked worktrees remain supported and are retained without fabricated lifecycle evidence. With `--source-ref`, it performs the existing issue write-back and mirrors the issue priority labels onto the spec PR; criticality lookup or write failures are advisory. PR-open or readiness failure keeps the worktree. | 0 after delivered handoff, including warned advisory write-back failures; 1 on readiness, project, target, identity, or PR-open failure |
-| `poll` | `engineer poll` | One synchronous sweep of the GitHub issues adapter, enqueuing every returned envelope into the durable inbox. Prints `{kind:'poll', enqueued, sourceRefs}`. No routing, no timer, no detached process; the ledger dedups, so a second poll enqueues nothing new. | 0; 1 on unknown flag |
+| `handoff` | `engineer handoff --project <name> --branch <branch> --worktree <path> [--source-ref <ref>] [--permit-inconclusive]` | Rechecks owned-run readiness, opens the spec PR through guarded remote publication inside the per-idea worktree, durably records the exact retained commit and review deadline, and leaves the worktree registered. Inconclusive push authorization blocks handoff unless `--permit-inconclusive` is explicit. A blocked readiness result remains on the same authoring run so the exact landed worktree can retry handoff after repair. It prints `{kind:'pr-opened', url}` or `{kind:'local-commit', branch, repoPath, reason}` and starts the target daemon. Legacy unmarked worktrees remain supported and are retained without fabricated lifecycle evidence. With `--source-ref`, it performs the existing issue write-back and mirrors the issue priority labels onto the spec PR; criticality lookup or write failures are advisory. Publication refusal, PR-open failure, or readiness failure keeps the worktree. | 0 after delivered handoff, including warned advisory write-back failures; 1 on readiness, project, target, identity, or publication refusal, or PR-open failure |
+| `poll` | `engineer poll` | One synchronous sweep of the GitHub issues adapter, enqueuing every returned envelope into the durable inbox. Registrations whose paths are absent are skipped without a GitHub call. Prints `{kind:'poll', enqueued, sourceRefs}`. No routing, no timer, no detached process; the ledger dedups, so a second poll enqueues nothing new. | 0; 1 on unknown flag |
 | `claim` | `engineer claim` | Claims the oldest unblocked inbox entry. Before selecting work, it reaps stranded `claimed` entries older than `stale_claim_window_hours` (24 hours by default), returns them to pending, and may serve a reaped entry in that same claim. Builds a fresh blocker resolver per call and reads issue labels uncached. Prints `{empty:true}`, `{allBlocked:true, entries:[…]}`, or the claimed envelope. A real claim acks the queue, moves the ledger to `claimed`, and persists a claim record for a later `worktree --source-ref`. | always 0; 1 on unknown flag |
 | `forget` | `compose forget <sourceRef> [--resolved-by <reference>]` | Drops the ledger entry and strips the `engineer:handled` label so `poll` sees the issue again. With `--resolved-by`, it first comments the supplied resolving reference on the originating GitHub issue and closes it; without that explicit flag it never closes the issue. A missing entry is an error when `--resolved-by` is supplied and otherwise reports `{found:false}`. Label removal is best-effort. | 0 on a completed drop; 1 on an unknown flag or a refused/failed resolved-by close |
 | `unclaim` | `engineer unclaim <sourceRef>` | Single-entry maintenance: returns a `claimed` ledger entry without a recorded PR to pending while preserving its original capture time, so it can be claimed again. Missing, non-claimed, or PR-delivered entries report a non-error result and are left unchanged; resolve or forget a delivered entry instead. | 0 for handled or refused entries; 1 on unknown flag |
@@ -691,23 +728,27 @@ inline refusal and exits 1.
 
 ```bash
 ai-conductor config init
-ai-conductor config init [--test-suite-mode <aggregate|scoped>] [--test-suite-drift-budget <strict|tolerant>]
+ai-conductor config init [--test-suite-mode <aggregate|scoped>] [--test-suite-drift-budget <strict|tolerant>] [--test-suite-command <command>] [--test-suite-scoped-command <command>]
 ```
 
 Initializes the current Git repository's `.ai-conductor/config.yml` from
 `templates/project-config.yml.template`. A first run prints the created path and exits 0. If the
 file already exists, it reports that path, preserves the file byte-for-byte, and exits 0.
 
-When either verification option is present, the command records a `test_suite` block in the new
-config. `--test-suite-mode aggregate` is the default; `scoped` also writes a `scoped_command` with
-the required `{selectors}` placeholder. `--test-suite-drift-budget strict` is the default and
-tolerates no drift; `tolerant` permits unlimited `additional_inputs` drift and up to 20 changed
-`source` paths. Supplying one option uses the default for the other. See
+When any verification option is present, the command records a `test_suite` block in the new
+config. `--test-suite-command` records the project's aggregate command as a YAML scalar without
+running it; it must be non-empty and single-line. `--test-suite-mode aggregate` is the default;
+`scoped` also writes a `scoped_command` with the required `{selectors}` placeholder.
+`--test-suite-drift-budget strict` is the default and tolerates no drift; `tolerant` permits
+unlimited `additional_inputs` drift and up to 20 changed `source` paths. Supplying one option uses
+the default for the others. See
 [test_suite configuration](configuration.md#test_suite) for the resulting fields and constraints.
 
 The command exits 1 without writing when the current directory is not a Git repository or when the
 template cannot be resolved or written. Invalid option values exit 1 without creating a config:
-the modes are `aggregate` and `scoped`, and the drift-budget presets are `strict` and `tolerant`.
+the modes are `aggregate` and `scoped`, the drift-budget presets are `strict` and `tolerant`, and
+test commands must be non-empty single lines. An unrecognized `--` option also exits 1 before any
+file is created.
 
 ## `ai-conductor config read` / `ai-conductor config write` / `ai-conductor config set`
 
@@ -715,6 +756,7 @@ the modes are `aggregate` and `scoped`, and the drift-budget presets are `strict
 ai-conductor config read <dotted.path>
 ai-conductor config write <markdown_viewer|mermaid_renderer> <preset> <command> <args> <mode>
 ai-conductor config set conductor.<key> <scalar>
+ai-conductor config set spec_owner <identity>
 ```
 
 `read` resolves the effective configuration at `<dotted.path>`. From a directory with a project
@@ -732,12 +774,14 @@ is a single space-separated argument, split on whitespace — preserving every o
 already in the file. It exits 1 and prints the config path and error to stderr when the existing
 file fails to parse or the write fails (e.g. an unwritable directory).
 
-`set` updates exactly one `conductor` key without replacing other user configuration. Supported
-keys are `update_channel`, `auto_check`, `current_version`, and `last_checked_at`.
+`set` updates exactly one user-scoped setting without replacing other user configuration. Supported
+`conductor` keys are `update_channel`, `auto_check`, `current_version`, and `last_checked_at`.
 `conductor.auto_check` accepts only `true` or `false` and is stored as a YAML boolean; the other
-keys are stored as strings. The command validates both the existing and prospective `conductor:`
-block before writing, so invalid channels, unknown keys, malformed user YAML, and write failures
-exit 1 without changing the file. Use `config read conductor.<key>` to inspect the stored scalar.
+keys are stored as strings. `spec_owner` stores a non-empty operator identity only in
+`~/.ai-conductor/config.yml`; project configuration rejects that key to prevent identity leakage.
+The command validates both the existing and prospective value before writing, so invalid channels,
+empty identities, unknown keys, malformed user YAML, and write failures exit 1 without changing the
+file. Use `config read conductor.<key>` or `config read spec_owner` to inspect the stored scalar.
 
 ## `ai-conductor task`
 
@@ -773,13 +817,13 @@ to /tdd or /pipeline before SHIP.` to stderr and exits 1.
 | Outcome | Output | Exit |
 | --- | --- | --- |
 | Pass | `<status>: full test suite PASS (fingerprint <fp>, duration <n>ms)` on stdout | 0 |
-| Fail | `FAILED: full test suite evidence=<reason>[ freshness=<reason>]. <guidance> Return to /tdd or /pipeline, fix the failure, then rerun ai-conductor test-suite.` on stderr | 1 |
+| Fail | `FAILED: full test suite evidence=<reason>[ freshness=<reason>]. [entry #<n>/<total> failed;] <failure detail> <guidance> Return to /tdd or /pipeline, fix the failure, then rerun ai-conductor test-suite.` on stderr | 1 |
 
 Failure reasons and their guidance:
 
 | Reason | Guidance |
 | --- | --- |
-| `missing_config` | Declare `test_suite.command` in `.ai-conductor/config.yml`. |
+| `missing_config` | Declare `test_suite.command` or `test_suite.commands` in `.ai-conductor/config.yml`. |
 | `invalid_config` | Fix the `test_suite` block in `.ai-conductor/config.yml`. |
 | `invalid_input` | Fix the declared test-suite inputs. |
 | `unlaunchable` | Make the declared aggregate command launchable. |
@@ -791,6 +835,10 @@ Failure reasons and their guidance:
 
 This command is dispatched before every other detector and sets the process exit code rather than
 exiting immediately. It does not appear in `--help`.
+
+For an ordered `test_suite.commands` list, successful entries run in declaration order. The first
+failed entry stops the collection; failure output identifies its ordinal and includes the bounded
+per-entry diagnostic context. Later entries do not run.
 
 ## `ai-conductor scoped-run`
 
@@ -1188,6 +1236,7 @@ These are dispatched by skills, hooks, and the daemon rather than typed by an op
 | `rate-card` | `ai-conductor rate-card refresh [--model <id>]…` · `ai-conductor rate-card show` | Maintains `<project>/.ai-conductor/rate-card.json`, the committed per-model token price card the harness prices dispatches from for providers that report token counts but no cost (codex). `refresh` fetches LiteLLM's public `model_prices_and_context_window.json`, prunes it to the models the provider model policies route to and supported opt-in models (plus any `--model`), and rewrites the card with a fresh `as_of`; commit the result. `--model` is repeatable. `show` prints the committed card. The fetch lives here, never on the dispatch path. `.github/workflows/rate-card-refresh.yml` runs `refresh` daily and opens a bot PR on the `automation/rate-card` branch when the published rates actually change — a run that finds identical rates discards its own `as_of`-only diff and opens nothing. A failed fetch, an unparseable payload, or a payload pricing none of the requested models leaves the committed card byte-for-byte unchanged. | 0 on success; 1 for the usage guide, a failed refresh, or a missing/unreadable card under `show` |
 | `shipment-evidence` | `ai-conductor shipment-evidence --pr <url> [--event <path>]` · `shipment-evidence reconcile --pr <url> --shipped <YYYY-MM-DD>` · `shipment-evidence audit [--report <path>]` | Classifies, repairs, or audits the association between a PR and its shipped record. `audit` is report-only and never writes records. `reconcile` requires `GITHUB_REPOSITORY`. | check: 0 valid or not-applicable association, 1 otherwise. reconcile: 0 unless unresolved. audit: 0. Malformed: 1 |
 | `finish-record` | `ai-conductor finish-record --choice <pr\|keep> [--pr-url <url>] --pipeline-dir <dir>` | Records the finish choice. `--choice pr` requires `--pr-url`; `--choice keep` must not carry one; `discard` is not accepted. `--pipeline-dir` must be an absolute path to an existing directory, checked before any spawn or write. The `pr` path is fail-closed across seven checks — PR binding, upstream push, state readability, branch shape (`spec/<slug>`, `feature/<slug>`, or the daemon's `feat/daemon-<slug>` — a bare `feat/<name>` is refused), slug derivability, `git rev-parse HEAD`, and a valid shipment-evidence verdict. | 0; 1 on any guide or failed check |
+| `github-boundary-audit` | `ai-conductor github-boundary-audit [--root <conductor-root>]` | Read-only static audit of the shipped runtime's GitHub and remote-Git invocation sites. Reports one `file:line:column: message` diagnostic per site that bypasses the guarded operation interface. The integrity suite runs it. | 0 clean; 1 on any finding or unreadable root |
 | `manual-test-record` | `ai-conductor manual-test-record --skip --reason <r> --pipeline-dir <dir>` · `ai-conductor manual-test-record --results <path\|-> --pipeline-dir <dir>` | Appends a `## Attempt N` section to `<pipelineDir>/manual-test-results.md`, atomically. `--results -` reads stdin; an exact `WARN` result cell stamps the attempt with `<!-- manual-test:warning -->`. `--skip` and `--results` are mutually exclusive and one is required. `--pipeline-dir` must be absolute. | 0; 1 on a usage error, an empty results payload, or any read/write error |
 | `derive-feedback` | `ai-conductor derive-feedback --sha <sha> [--plan <path>]` | Read-only advisory check for whether commit `<sha>` carries `Task: <id>` evidence, or touches files declared under a task in the given plan. Prints one JSON line. Never writes task status or the evidence sidecar. | **0 evidenced, 1 not evidenced, 2 usage.** Informational only — the calling hook must not propagate them |
 | `build-auth-status` | `ai-conductor build-auth-status` | Reports the self-host build auth mode and token state as `build-auth-status: mode=<mode> state=<state>[ path=<path>][ (<detail>)]`. Probes the real dispatch auth path when a token is present. | 0 when the mode is not `daemon-token` (`state=api-key`) or the token is `valid`; 1 for `missing`, `unreadable`, `invalid`, or `unverifiable`, each with a remediation message |

@@ -11,7 +11,7 @@
 //   2. END-TO-END: drive the PRODUCTION primitives dispatchEngineer({kind:'worktree'|'land'
 //      |'handoff'}) against a temp git repo. The skills author .docs INSIDE the per-idea
 //      worktree; land commits them on spec/<slug> from the worktree; handoff opens the PR
-//      (injected gh) and removes the worktree on success.
+//      (injected gh) and retains the worktree for review on success.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, readFile, readdir, access } from 'fs/promises';
@@ -124,6 +124,19 @@ function inconclusiveReadinessDeps(root: string) {
       }
       return { exitCode: 1, stdout: '', stderr: `unexpected command: ${command} ${args.join(' ')}` };
     },
+  };
+}
+
+/** Keep real committed provenance reads while faking every remote Git boundary. */
+function handoffGit(worktree: string, retainedCommit: string) {
+  return async (args: string[]) => {
+    if (args[0] === 'rev-parse') return { stdout: retainedCommit };
+    if (args[0] === 'show') return { stdout: await git(args, worktree) };
+    if (args.join(' ') === 'config --get remote.origin.url'
+      || args.join(' ') === 'remote get-url --push origin') {
+      return { stdout: 'https://github.com/acme/target-repo.git\n' };
+    }
+    return { stdout: '' };
   };
 }
 
@@ -611,7 +624,7 @@ describe('dispatchEngineer({kind:"land"})', () => {
 describe('dispatchEngineer({kind:"handoff"})', () => {
   it('gh pr create runs in the worktree, PR reported, worktree retained on success (FR-4/FR-5)', async () => {
     const idea = 'add csv export';
-    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://example.invalid/repo.git')]);
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/test-owner/target-repo.git')]);
     const worktree = await worktreeWithDocs(repoPath, idea);
 
     const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
@@ -629,11 +642,23 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
       if (args[0] === 'pr' && args[1] === 'create') {
         return { stdout: 'https://example.invalid/repo/pull/42' };
       }
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return { stdout: JSON.stringify({ url: 'https://github.com/test-owner/target-repo/pull/42' }) };
+      }
       return { stdout: '' };
     };
     const launchCalls: string[] = [];
     const fakeLaunch = (p: string) => { launchCalls.push(p); };
-    const fakeGit = async () => ({ stdout: '' });
+    // The handoff now resolves the remote target and re-reads the committed
+    // owner marker before its fake transport can publish. Keep those read-only
+    // answers faithful while retaining the injected write boundary below.
+    const fakeGit = async (args: string[]) => {
+      if (args.join(' ') === 'config --get remote.origin.url' || args.join(' ') === 'remote get-url --push origin') {
+        return { stdout: 'https://github.com/test-owner/target-repo.git\n' };
+      }
+      if (args[0] === 'show') return { stdout: 'Owner: test-owner\n' };
+      return { stdout: '' };
+    };
 
     const handoffOut: string[] = [];
     const code = await dispatchEngineer(
@@ -680,7 +705,11 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const { store, run } = await seedMarkedLandedRun({
       repoRoot: repoPath, worktree, idea, branch, engineerDir,
     });
-    const gh = vi.fn(async () => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
+    const gh = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === 'pr' && args[1] === 'view'
+        ? JSON.stringify({ url: 'https://github.com/acme/target-repo/pull/42' })
+        : 'https://github.com/acme/target-repo/pull/42',
+    }));
     const err: string[] = [];
 
     const code = await dispatchEngineer(
@@ -713,15 +742,16 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
         engineerDir,
         gh,
         readinessDeps: inconclusiveReadinessDeps(repoPath),
-        git: async (args) => ({ stdout: args[0] === 'rev-parse' ? retainedCommit : '' }),
+        git: handoffGit(worktree, retainedCommit),
         ensureRunningLaunch: () => undefined,
         print: (s) => retryOut.push(s),
+        printErr: (s) => err.push(s),
       },
-    )).toBe(0);
+    ), err.join('\n')).toBe(0);
     expect(JSON.parse(retryOut.join(''))).toEqual({
       kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
     });
-    expect(gh).toHaveBeenCalledTimes(1);
+    expect(gh.mock.calls.filter(([args]) => args[0] === 'pr' && args[1] === 'create')).toHaveLength(1);
     expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
       state: 'settled',
       readiness: { status: 'inconclusive', permitted: true },
@@ -745,10 +775,13 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     const gh = vi.fn(async (args: string[]) => ({
       stdout: args[0] === 'pr' && args[1] === 'create'
         ? 'https://github.com/acme/target-repo/pull/42'
-        : '',
+        : args[0] === 'pr' && args[1] === 'view'
+          ? JSON.stringify({ url: 'https://github.com/acme/target-repo/pull/42' })
+          : '',
     }));
     const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
     const out: string[] = [];
+    const err: string[] = [];
 
     const code = await dispatchEngineer(
       {
@@ -759,13 +792,14 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
         engineerDir,
         gh,
         readinessDeps: inconclusiveReadinessDeps(repoPath),
-        git: async (args) => ({ stdout: args[0] === 'rev-parse' ? retainedCommit : '' }),
+        git: handoffGit(worktree, retainedCommit),
         ensureRunningLaunch: () => undefined,
         print: (s) => out.push(s),
+        printErr: (s) => err.push(s),
       },
     );
 
-    expect(code).toBe(0);
+    expect(code, err.join('\n')).toBe(0);
     expect(JSON.parse(out.join(''))).toEqual({
       kind: 'pr-opened', url: 'https://github.com/acme/target-repo/pull/42',
     });
@@ -773,7 +807,57 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     expect(await store.inspectRun(run.engineerRunId)).toMatchObject({
       state: 'settled',
       readiness: { status: 'inconclusive', permitted: true },
+      retention: { retainedCommit },
     });
+    expect(await pathExists(worktree)).toBe(true);
+  });
+
+  it('readiness consent cannot turn a guarded publication refusal into a retained success', async () => {
+    const idea = 'refused owned handoff';
+    await writeRegistry([makeRecord(repoPath, 'target-repo', 'https://github.com/acme/target-repo.git')]);
+    const worktree = await worktreeWithDocs(repoPath, idea);
+    const { dispatchEngineer } = await import('../../src/engine/engineer-cli.js');
+    const landOut: string[] = [];
+    expect(await dispatchEngineer(
+      { kind: 'land', project: 'target-repo', idea, worktree },
+      { probeGhVersion: supportedGhVersion, registryPath, print: (s) => landOut.push(s) },
+    )).toBe(0);
+    const branch = JSON.parse(landOut.join('')).branch as string;
+    const { store, run } = await seedMarkedLandedRun({
+      repoRoot: repoPath, worktree, idea, branch, engineerDir,
+    });
+    const retainedCommit = await git(['rev-parse', 'HEAD'], worktree);
+    const remoteGit = handoffGit(worktree, retainedCommit);
+    const gitRunner = vi.fn(async (args: string[]) => args[0] === 'show'
+      ? { stdout: '' } // No committed owner provenance authorizes this publication.
+      : remoteGit(args));
+    const gh = vi.fn(async () => ({ stdout: '' }));
+    const launch = vi.fn();
+    const out: string[] = [];
+    const err: string[] = [];
+
+    const code = await dispatchEngineer(
+      { kind: 'handoff', project: 'target-repo', branch, worktree, permitInconclusive: true },
+      {
+        registryPath, engineerDir, gh, git: gitRunner,
+        probeGhVersion: supportedGhVersion,
+        readinessDeps: inconclusiveReadinessDeps(repoPath),
+        ensureRunningLaunch: launch,
+        print: (s) => out.push(s), printErr: (s) => err.push(s),
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.join('\n')).toContain('publication refused');
+    expect(out).toEqual([]);
+    expect(gh).not.toHaveBeenCalled();
+    expect(gitRunner.mock.calls.some(([args]) => args[0] === 'push')).toBe(false);
+    expect(launch).not.toHaveBeenCalled();
+    expect(await pathExists(worktree)).toBe(true);
+    const snapshot = await store.inspectRun(run.engineerRunId);
+    expect(snapshot.state).toBe('authoring');
+    expect(snapshot.handoff).toBeNull();
+    expect(snapshot.retention).toBeNull();
   });
 
   it('captures the retained commit before creating a remote PR', async () => {
@@ -788,7 +872,7 @@ describe('dispatchEngineer({kind:"handoff"})', () => {
     )).toBe(0);
     const branch = JSON.parse(landOut.join('')).branch as string;
     await seedMarkedLandedRun({ repoRoot: repoPath, worktree, idea, branch, engineerDir });
-    const gh = vi.fn(async () => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
+    const gh = vi.fn(async (_args: string[]) => ({ stdout: 'https://github.com/acme/target-repo/pull/42' }));
     const failingGit = vi.fn(async (args: string[]) => {
       if (args[0] === 'rev-parse') throw new Error('temporary object database failure');
       return { stdout: '' };

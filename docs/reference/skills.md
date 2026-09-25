@@ -6,7 +6,7 @@ nav_order: 7
 
 # Skills
 
-The catalog of all 36 skills: 31 under `skills/` and 5 repository-local ones under `.agents/skills/`.
+The catalog of all 37 skills: 32 under `skills/` and 5 repository-local ones under `.agents/skills/`.
 For each, the frontmatter, the engine step that invokes it, what it reads, what it writes, and whether
 it blocks.
 
@@ -58,7 +58,7 @@ activation boundary: the active lifecycle/caller state that qualifies, plus near
 not. A generic feature, change, plan, review, bug, or question is not sufficient by itself. Explicit
 operator invocation remains available regardless of these implicit-selection boundaries.
 
-The 18 explicit-only shipped skills are `assess`, `bootstrap`, `build-review-test-quality`, `code-review`, `composer`, `conduct`,
+The 19 explicit-only shipped skills are `assess`, `bootstrap`, `build-review-security`, `build-review-test-quality`, `code-review`, `composer`, `conduct`,
 `daemon-triage`, `engineer`, `finish`, `manual-test`, `memory`, `pipeline`, `prd-audit`, `rebase`,
 `remediate`, `pr`, `tdd`, and `writing-system-tests`. The five repository-local skills are also
 explicit-only: `event-spine`, `maintain-documentation`, `release-disposition`, `scope-check`, and
@@ -687,8 +687,9 @@ the aggregate gate. Scoped success alone never satisfies that gate.
   reference; the active plan and any coherence mapping; the matching non-`SUPERSEDED-` PRD when present
   (context, not the key); the implementation, changed tests, and BUILD `Scope:` trailers; operator
   reseal and `Scope:` trailer rationales as immutable `OVER_SCOPE` intent evidence;
-  `.pipeline/accepted-widenings.json` when present — a no-owner finding matching a recorded operator
-  decision reuses that entry's summary verbatim so the decision keeps matching across laps.
+  `.pipeline/accepted-widenings.json` when present — durable operator authority, including immutable
+  original evidence and case/offer references. The engine may apply that authority to later wording
+  only after it records a fresh relation; the auditor does not preserve it by copying a summary.
 - **Outputs** — `.pipeline/prd-audit.md`, overwritten each run; a code-stamp sidecar on the pass path.
 - **Gate role** — blocking. Each finding carries exactly one grade — `PASS`, `FIXABLE`, `PLAN_GAP`, or
   `OVER_SCOPE` — and the report needs exactly one graded verdict row per acceptance criterion. A
@@ -740,9 +741,13 @@ the aggregate gate. Scoped success alone never satisfies that gate.
   list, and the conflicted files.
 - **Outputs** — no file artifact. Its output *is* the contract: the last stdout JSON line, either
   `{"resolved": true}` or `{"resolved": false, "reason": "..."}`, parsed by the step runner.
+  When an engine-dispatched mergeable sweep explicitly enables **Sweep Test-Only Judgement**, a
+  successful result instead includes a verdict with `choice`, `rationale`, and `superseded` replay
+  SHAs. That exception is unavailable to finish-time and re-kick rebase resolution.
 - **Gate role** — blocking through the structural step. An unresolved result or an unsafe hunk retries
-  up to a cap and then HALTs. Non-negotiable prohibitions: never `--abort`, never `--skip`, never
-  `push --force`, never invoke mid-build.
+  up to a cap and then HALTs. Non-negotiable prohibitions: never `--abort`, never `push --force`,
+  never invoke mid-build. `--skip` remains prohibited except for a declared-superseded replayed
+  test-only commit while that sweep-only judgement mode is enabled.
 - **Replay verification** — before editing, the skill captures the replay source commit's and
   upstream's intent as an evidence ledger, and HALTs at the first semantic ambiguity rather than
   guessing. Before `git rebase --continue`, it reviews the complete staged diff (not just the

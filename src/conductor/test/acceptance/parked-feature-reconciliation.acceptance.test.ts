@@ -221,9 +221,14 @@ function fakeGh(handler: (args: string[]) => string | Promise<string>): GhRunner
 
 /** `gh` fake that reports one merged implementation PR for `feature/<slug>`. */
 function ghWithMergedPr(slug: string, prUrl: string): GhRunner {
-  return fakeGh((args) => {
+  return fakeGh(async (args) => {
     if (args[0] === 'pr' && args[1] === 'list') {
-      return JSON.stringify([{ number: 1060, url: prUrl, headRefName: `feature/${slug}` }]);
+      return JSON.stringify([{
+        number: 1060,
+        url: prUrl,
+        headRefName: `feature/${slug}`,
+        headRefOid: await git(['rev-parse', `feature/${slug}`]),
+      }]);
     }
     return '[]';
   });
@@ -247,6 +252,7 @@ async function initRepo(): Promise<void> {
   await git(['config', 'gc.auto', '0']);
   await git(['remote', 'add', 'origin', originDir]);
   await writeFile(join(projectRoot, 'README.md'), 'init\n');
+  await writeFile(join(projectRoot, '.gitignore'), '.pipeline/\n');
   await git(['add', '-A']);
   await git(['commit', '-q', '-m', 'init']);
   await git(['push', '-q', '-u', 'origin', 'main']);
@@ -368,6 +374,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   __resetResolveCacheForTests();
+  vi.unstubAllEnvs();
   // Git may finish packing objects immediately after the final child process
   // exits; retry recursive removal so that teardown race cannot mask the
   // acceptance assertion.
@@ -433,7 +440,12 @@ describe('parked-feature reconciliation acceptance (S2/S3): the sweep reconciles
     // "is not a working tree" rather than a missing-path error.
     await git(['worktree', 'remove', '--force', worktree]);
     await mkdir(worktree, { recursive: true });
+    await execFile('git', ['init', '-q', '-b', 'main'], { cwd: worktree });
+    await execFile('git', ['config', 'user.email', 'test@test.com'], { cwd: worktree });
+    await execFile('git', ['config', 'user.name', 'Test'], { cwd: worktree });
     await writeFile(join(worktree, 'leftover.txt'), 'stale contents\n');
+    await execFile('git', ['add', '-A'], { cwd: worktree });
+    await execFile('git', ['commit', '-q', '-m', 'fixture'], { cwd: worktree });
     expect(await worktreeExists(slug)).toBe(true);
 
     const result = await sweep({
@@ -468,7 +480,7 @@ describe('parked-feature reconciliation acceptance (S2/S3): the sweep reconciles
     expect(await readFile(join(projectRoot, '.daemon', 'parked', slug), 'utf-8')).toBe(markerBefore);
   });
 
-  it('S2 negative (c): ancestry-proven but record MISSING — nothing is deleted, record creation is delegated to the ST-916 seam, marker survives', async () => {
+  it('S2: an ancestry-proven registered non-daemon branch reclaims without a shipped record', async () => {
     const slug = 'merged-without-record';
     await seedParkedFeature(slug, { merged: true, record: false });
 
@@ -482,25 +494,22 @@ describe('parked-feature reconciliation acceptance (S2/S3): the sweep reconciles
       log: (m) => log.push(m),
     });
 
-    expect(await worktreeExists(slug)).toBe(true);
-    expect(await branchExists(slug)).toBe(true);
-    expect(await isOperatorParked(projectRoot, slug)).toBe(true);
+    expect(await worktreeExists(slug)).toBe(false);
+    expect(await branchExists(slug)).toBe(false);
+    expect(await isOperatorParked(projectRoot, slug)).toBe(false);
 
-    expect(requestRecordRepair).toHaveBeenCalledTimes(1);
-    expect(requestRecordRepair).toHaveBeenCalledWith(
-      expect.objectContaining({ slug, prUrl: 'https://example.test/pr/1060' }),
-    );
-    expect(result.counts.deferred).toBe(1);
-    expect(result.counts.reconciled).toBe(0);
+    expect(requestRecordRepair).not.toHaveBeenCalled();
+    expect(result.counts.deferred).toBe(0);
+    expect(result.counts.reconciled).toBe(1);
     expect(log).toEqual([
-      '[parked-reconciliation] reconciled=0 deferred=1 orphaned=0 parked=1 refused=0 skipped=0; next: 1 deferred awaits shipped-record repair; 1 parked remains parked',
+      '[parked-reconciliation] reconciled=1 deferred=0 orphaned=0 parked=1 refused=0 skipped=0; next: no action required',
     ]);
 
     // The sweep never writes a record itself.
     expect(await exists(join(projectRoot, '.docs', 'shipped', `${slug}.md`))).toBe(false);
   });
 
-  it('S2 negative (c2): ancestry-proven, record missing, and NO merged PR resolvable — zero record writes, zero deletions, zero delegation', async () => {
+  it('S2: an ancestry-proven registered non-daemon branch without a merged PR is retained', async () => {
     const slug = 'merged-no-pr-found';
     await seedParkedFeature(slug, { merged: true, record: false });
 
@@ -518,6 +527,8 @@ describe('parked-feature reconciliation acceptance (S2/S3): the sweep reconciles
     expect(await isOperatorParked(projectRoot, slug)).toBe(true);
     expect(await exists(join(projectRoot, '.docs', 'shipped', `${slug}.md`))).toBe(false);
     expect(result.counts.reconciled).toBe(0);
+    expect(result.counts.refused).toBe(1);
+    expect(result.refusedByReason).toEqual({ 'no-merge-proof': 1 });
   });
 
   it('S2 (d): a merged, record-backed park is reconciled even when its .pipeline state still reads in-flight', async () => {
@@ -643,7 +654,7 @@ describe('parked-feature reconciliation acceptance (S2/S3): the sweep reconciles
     expect(log[0]).toContain('skipped retry when merge/issue evidence is available');
   });
 
-  it('S7 negative: with `gh` entirely down, the merged+record-on-main park STILL reconciles (a pure-git fact) and the pass never throws', async () => {
+  it('S7 negative: with `gh` entirely down, a merged non-daemon park is retained (ancestry needs merged-PR head corroboration) and the pass never throws', async () => {
     const slug = 'merged-gh-down';
     await seedParkedFeature(slug, { merged: true, record: true, sourceRef: 'acme/repo#7' });
 
@@ -660,9 +671,11 @@ describe('parked-feature reconciliation acceptance (S2/S3): the sweep reconciles
       }),
     ).resolves.toBeDefined();
 
-    expect(await worktreeExists(slug)).toBe(false);
-    expect(await branchExists(slug)).toBe(false);
-    expect(await isOperatorParked(projectRoot, slug)).toBe(false);
+    // adr-2026-08-01 D9 under D8: the record is never consulted for a
+    // non-daemon branch, and without gh no merged-PR head can corroborate it.
+    expect(await worktreeExists(slug)).toBe(true);
+    expect(await branchExists(slug)).toBe(true);
+    expect(await isOperatorParked(projectRoot, slug)).toBe(true);
     expect(requestRecordRepair).not.toHaveBeenCalled();
   });
 });
@@ -868,6 +881,8 @@ describe('parked-feature reconciliation acceptance (S5/S4): the operator verb is
   it('S5/S4 negative (§3d re-verification): a branch that gained a commit AFTER classification is refused at the point of deletion — no force path', async () => {
     const slug = 'raced-branch';
     await seedParkedFeature(slug, { merged: true, record: true });
+    const mergedHead = await branchSha(slug);
+    if (!mergedHead) throw new Error('expected merged branch');
 
     // The adversarial input the real call site actually sees: the slug looked
     // merged a moment ago, and then real work landed on the branch.
@@ -882,7 +897,7 @@ describe('parked-feature reconciliation acceptance (S5/S4): the operator verb is
         cwd: projectRoot,
         out: (l) => out.push(l),
         runGit: realGit,
-        runGh: ghWithMergedPr(slug, 'https://example.test/pr/1'),
+        runGh: fakeGh(() => JSON.stringify([{ headRefOid: mergedHead }])),
       },
     );
 
@@ -891,7 +906,7 @@ describe('parked-feature reconciliation acceptance (S5/S4): the operator verb is
     expect(await branchExists(slug)).toBe(true);
     expect(await branchSha(slug)).toBe(shaAfterRace);
     expect(await isOperatorParked(projectRoot, slug)).toBe(true);
-    expect(out.join('\n')).toContain('ancestry-check-failed');
+    expect(out.join('\n')).toContain('unmerged-commits');
     expect(out.join('\n')).not.toMatch(/--force|force path/i);
   });
 
@@ -999,24 +1014,42 @@ describe('parked-feature reconciliation acceptance (rem-adr-006): the production
     const repairBranch = `shipment-repair/1060/${slug}`;
     const repairPr = 'https://github.com/acme/repo/pull/2000';
     await seedParkedFeature(slug, { merged: true, record: false });
+    // Repair publication is an owned feature mutation. Seed the committed
+    // owner evidence on main and a machine-scoped matching identity; the
+    // local bare remote remains only the injected terminal Git transport.
+    await writeRepoFile(`.docs/intake/${slug}.md`, 'Owner: test-owner\n');
+    await git(['add', '-A']);
+    await git(['commit', '-q', '-m', `chore: stamp ${slug} owner`]);
+    await git(['push', '-q', 'origin', 'main']);
+    await mkdir(join(projectRoot, '.ai-conductor'), { recursive: true });
+    await writeFile(join(projectRoot, '.ai-conductor', 'config.yml'), 'spec_owner: test-owner\n');
+    vi.stubEnv('HOME', projectRoot);
 
     // Actions supplies GITHUB_REPOSITORY; a long-running daemon does not, so
     // the adapter must resolve the repository from `gh` itself.
     vi.stubEnv('GITHUB_REPOSITORY', '');
 
     const ghCalls: string[][] = [];
-    const gh: GhRunner = async (args, opts) => {
+    let repairCreated = false;
+    const gh: GhRunner = async (args) => {
       ghCalls.push(args);
       const json = (value: unknown) => ({ stdout: JSON.stringify(value) });
       const has = (flag: string, value: string) => args[args.indexOf(flag) + 1] === value;
 
+      if (args[0] === 'api' && args[1] === 'user') return { stdout: 'test-owner\n' };
       if (args[0] === 'repo' && args[1] === 'view') return json({ nameWithOwner: 'acme/repo' });
       if (args[0] === 'pr' && args[1] === 'list' && args.includes('--state') && has('--state', 'merged')) {
-        return json([{ url: implementationPr }]);
+        // The merged head equals the branch tip, corroborating its ancestry (adr-2026-08-01 D9).
+        return json([{ url: implementationPr, headRefOid: await git(['rev-parse', `refs/heads/feature/${slug}`]) }]);
       }
-      if (args[0] === 'pr' && args[1] === 'list') return json([]); // no open repair PR yet
+      if (args[0] === 'pr' && args[1] === 'list') {
+        return json(repairCreated ? [{ url: repairPr }] : []);
+      }
       if (args[0] === 'pr' && args[1] === 'view' && args[2] === implementationPr) {
-        if (has('--json', 'mergedAt')) return json({ mergedAt: '2026-07-27T10:11:12Z' });
+        if (has('--json', 'mergedAt,mergeCommit')) {
+          // The merge landed on main without the record (record: false).
+          return json({ mergedAt: '2026-07-27T10:11:12Z', mergeCommit: { oid: await git(['rev-parse', 'origin/main']) } });
+        }
         return json({
           url: implementationPr,
           body: `Implements \`.docs/plans/${slug}.md\``,
@@ -1025,9 +1058,12 @@ describe('parked-feature reconciliation acceptance (rem-adr-006): the production
         });
       }
       if (args[0] === 'pr' && args[1] === 'view' && args[2] === repairPr) {
-        return json({ url: repairPr, headRefOid: await git(['rev-parse', 'HEAD'], opts.cwd) });
+        return json({ url: repairPr, headRefOid: await git(['rev-parse', `refs/heads/${repairBranch}`], originDir) });
       }
-      if (args[0] === 'pr' && args[1] === 'create') return { stdout: `${repairPr}\n` };
+      if (args[0] === 'pr' && args[1] === 'create') {
+        repairCreated = true;
+        return { stdout: `${repairPr}\n` };
+      }
       // The repair branch does not exist on the remote yet.
       if (args[0] === 'api' && args[1]?.startsWith('repos/')) throw new Error('gh: HTTP 404');
       if (args[0] === 'api') return { stdout: '' }; // status POST
@@ -1036,13 +1072,25 @@ describe('parked-feature reconciliation acceptance (rem-adr-006): the production
 
     const { detect, dispatch } = await loadReconcileVerb();
     const out: string[] = [];
+    const guardedGit: GitRunner = async (args, opts) => {
+      if (args.join(' ') === 'config --get remote.origin.url' || args.join(' ') === 'remote get-url --push origin') {
+        return { stdout: 'https://github.com/acme/repo.git\n' };
+      }
+      if (args.join(' ') === 'symbolic-ref refs/remotes/origin/HEAD') {
+        return { stdout: 'refs/remotes/origin/main\n' };
+      }
+      return realGit(args, opts);
+    };
     const code = await dispatch(
       detect(['node', 'conduct', 'daemon', 'reconcile-parked', slug]) as { kind: string; slug: string },
-      { cwd: projectRoot, out: (line) => out.push(line), runGit: realGit, runGh: gh },
+      { cwd: projectRoot, out: (line) => out.push(line), runGit: guardedGit, runGh: gh },
     );
 
     // Cleanup is correctly refused and deferred — the record still is not on main.
     expect(code).toBe(1);
+    // Publication never touched the live root checkout: still on main, clean.
+    expect(await git(['symbolic-ref', '--short', 'HEAD'])).toBe('main');
+    expect(await git(['status', '--porcelain', '--untracked-files=no'])).toBe('');
     expect(out.join('\n')).toContain(`Could not reconcile '${slug}': record-missing`);
     expect(await worktreeExists(slug)).toBe(true);
     expect(await branchExists(slug)).toBe(true);
@@ -1081,7 +1129,11 @@ describe('parked-feature reconciliation acceptance (rem-adr-006): the production
     const ghCalls: string[][] = [];
     const gh: GhRunner = async (args) => {
       ghCalls.push(args);
-      if (args[0] === 'pr' && args[1] === 'list') return { stdout: JSON.stringify([{ url: implementationPr }]) };
+      if (args[0] === 'pr' && args[1] === 'list') {
+        // The merged head equals the branch tip, corroborating its ancestry (adr-2026-08-01 D9).
+        const headRefOid = await git(['rev-parse', `refs/heads/feature/${slug}`]);
+        return { stdout: JSON.stringify([{ url: implementationPr, headRefOid }]) };
+      }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergedAt')) {
         return { stdout: JSON.stringify({ mergedAt: '2026-07-27T10:11:12Z' }) };
       }
@@ -1125,6 +1177,7 @@ describe('parked-feature reconciliation acceptance (rem-adr-006): the production
 // GitHub's `gh` boundary is replaced with a deterministic fake.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Covers: S8.1, task:11
 describe('park-reconciliation refusal observability acceptance (#1114)', () => {
   it('S2: the operator verb names every commit that an unmerged-commits refusal protects', async () => {
     const slug = 'wip-backup-refusal';
@@ -1170,7 +1223,7 @@ describe('park-reconciliation refusal observability acceptance (#1114)', () => {
     expect(printed).not.toMatch(/--force|force path/i);
   });
 
-  it('S3/S4: the sweep counts refusal causes and re-logs only when the refusal mix changes', async () => {
+  it('S3/S4: parked candidates preserve the empty refusal tally until the enumerated path changes it', async () => {
     const noProofSlug = 'refused-no-proof';
     const aheadSlug = 'refused-ahead';
     const behindSlug = 'refused-behind';
@@ -1215,33 +1268,31 @@ describe('park-reconciliation refusal observability acceptance (#1114)', () => {
       log: (line) => logs.push(line),
     });
 
+    // Non-daemon parked branches never read the shipped-record listing
+    // (adr-2026-08-01 D8), so an unmerged park is never classified merged and
+    // never reaches the helper.
     const first = await runSweep();
-    expect(first.counts.refused).toBe(3);
-    expect(first.refusedByReason).toMatchObject({
-      'no-merge-proof': 2,
-      'unmerged-commits': 1,
-    });
+    expect(first.counts.refused).toBe(0);
+    expect(first.refusedByReason).toEqual({});
     expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain('refused=3');
-    expect(logs[0]).toMatch(/no-merge-proof\D+2/);
-    expect(logs[0]).toMatch(/unmerged-commits\D+1/);
+    expect(logs[0]).toContain('refused=0');
+    expect(logs[0]).not.toContain('refusals:');
 
     reportBehindPr = true;
     const second = await runSweep();
-    expect(second.counts.refused).toBe(3);
-    expect(second.refusedByReason).toMatchObject({
-      'no-merge-proof': 1,
-      'unmerged-commits': 1,
-      'branch-behind-merged-head': 1,
-    });
-    expect(logs).toHaveLength(2);
-    expect(logs[1]).toMatch(/branch-behind-merged-head\D+1/);
+    expect(second.counts.refused).toBe(0);
+    expect(second.refusedByReason).toEqual({});
+    expect(logs).toHaveLength(1);
 
     await runSweep();
-    expect(logs).toHaveLength(2);
+    expect(logs).toHaveLength(1);
 
     await rm(join(projectRoot, '.daemon', 'parked', behindSlug));
-    await runSweep();
+    const enumerated = await runSweep();
+    expect(enumerated.counts.refused).toBe(1);
+    expect(enumerated.refusedByReason).toEqual({ 'branch-behind-merged-head': 1 });
+    expect(logs).toHaveLength(2);
+    expect(logs[1]).toMatch(/branch-behind-merged-head\D+1/);
     expect(cache.has(behindSlug)).toBe(false);
   });
 });

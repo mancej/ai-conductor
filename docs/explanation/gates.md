@@ -127,10 +127,10 @@ verdict layer, so they can be strict without disturbing the linear walk.
 | `plan` | a plan that does not cover the feature's stories, scoped to this feature's plan and stories |
 | `build` | tasks reported complete without work — task rows are re-seeded and re-derived from the plan each evaluation, so a forged row fails; a task carrying `Done when:` checks additionally must show each check true before it closes, and a check the approved plan cannot make true is reported as a plan gap rather than repaired off-plan |
 | `acceptance_specs` | acceptance specs that never ran — proof is required that this feature's specs executed *and failed*, so a collection error or a skipped spec cannot pass for RED |
-| `build_review` | an incomplete build — a container of individually opt-in rubrics (currently only `testQuality`, off by default) judged from the diff rather than self-reports; an empty rubric set is a PASS with nothing dispatched |
+| `build_review` | an incomplete build — built-in opt-in rubrics (`testQuality` and `security`, both off by default) plus opt-in installed custom review policies, judged from frozen review input rather than self-reports and through the shared decision/repair path; an empty rubric set is a PASS with nothing dispatched. See [`build_review.custom_rubrics`](../reference/configuration.md#build_reviewcustom_rubrics). |
 | `test_suite` | a stale green — the fingerprint is re-inspected every time, so the evidence file's existence can never satisfy it |
 | `manual_test` | a whitewashed retest — after a recorded FAIL, HEAD must have moved before an all-PASS attempt is accepted |
-| `prd_audit` | a partial or malformed audit report passing as complete — exactly one graded verdict row (`PASS`, `FIXABLE`, `PLAN_GAP`, or `OVER_SCOPE`) is required for every acceptance criterion across the feature's stories; a `FIXABLE` naming no plan task blocks. A cited `Plan task` is resolved against the ids the active plan actually declares — an id the plan does not carry is rejected by name, and a report whose active plan cannot be resolved at all is rejected fail-closed rather than having its citations taken on trust. A finding without an owning criterion is a unique `NC.<n>` `OVER_SCOPE` row in `## Findings without an owning criterion`; its visible-scope operator decision is valid only for the same evidence summary. Invalid or duplicate rows are rejected individually while valid siblings remain routable, but any rejected row blocks with its diagnostic. Only the `## Verdict Table` section's story rows count as verdicts, so a prior-cycle history table cannot block an all-`PASS` audit. An unresolvable or unreadable criterion set also blocks fail-closed |
+| `prd_audit` | a partial or malformed audit report passing as complete — exactly one graded verdict row (`PASS`, `FIXABLE`, `PLAN_GAP`, or `OVER_SCOPE`) is required for every acceptance criterion across the feature's stories; a `FIXABLE` naming no plan task blocks. A cited `Plan task` is resolved against the ids the active plan actually declares — an id the plan does not carry is rejected by name, and a report whose active plan cannot be resolved at all is rejected fail-closed rather than having its citations taken on trust. A finding without an owning criterion is a unique `NC.<n>` `OVER_SCOPE` row in `## Findings without an owning criterion`; its visible-scope authority binds immutable original evidence and can apply to later wording only through a fresh durable relation. Invalid or duplicate rows are rejected individually while valid siblings remain routable, but any rejected row blocks with its diagnostic. Malformed/unsupported history, missing attribution, write or lease failure, invalid provider output, stale binding, overflow, uncertain relation, and projection failure halt with the named records and recovery action; none erase valid sibling authority. Only the `## Verdict Table` section's story rows count as verdicts, so a prior-cycle history table cannot block an all-`PASS` audit. An unresolvable or unreadable criterion set also blocks fail-closed |
 | `architecture_review_as_built` | an unrecognized verdict passing by default — only an explicit approval verdict satisfies it |
 | `finish` | a publication outcome that was never coherently recorded — `.pipeline/finish-choice` is the final record, not the source of interactive intent; a `pr` outcome additionally requires the recorded PR identity and verified publication evidence |
 | `finish` (release readiness) | a configured release-disposition result that is missing, stale, malformed, or unreadable — FINISH reports the exact typed condition before dispatching prose authoring or judgment, or making a publication mutation |
@@ -424,8 +424,9 @@ exhausted-mechanical-allowance HALT when the current lap has no readable diagnos
 ### Where a `build_review` FAIL goes
 
 `build_review` no longer judges plan conformance, outcome delivery, or mechanism soundness (FR-1): the
-`scope`, `completeness`, and `rootCause` rubrics are retired, and the container ships only `testQuality`,
-off by default. A `testQuality` finding — a test that could pass against a stub of the behavior it claims
+`scope`, `completeness`, and `rootCause` rubrics are retired. The container ships built-in `testQuality` and
+`security` (both off by default) and opt-in installed custom review policies; their findings remain subject to the
+same aggregate decision and repair contract. See [`build_review.custom_rubrics`](../reference/configuration.md#build_reviewcustom_rubrics). A `testQuality` finding — a test that could pass against a stub of the behavior it claims
 to cover — is a local diff defect the builder can fix in place, so a `build_review` FAIL routes straight
 to `build`; there is no remediation-planner branch for a `build_review` FAIL. The questions the retired
 rubrics used to ask now live at SHIP:
@@ -450,7 +451,7 @@ requirements as context for intent when a PRD exists (FR-7). Each finding carrie
 | `PASS` | The shipped behavior satisfies the criterion. | Nothing — no finding is recorded. |
 | `FIXABLE` | The criterion is unmet and an existing plan task owns the repair; the finding names that task and the criterion (FR-11) or is rejected as malformed. | Appends at most one remediation lap's worth of tasks, capped at both a fixed count (default 5) and a fraction of the authored task count (default 25%), whichever is lower — both operator-configurable (FR-12). Exceeding the cap, or needing a second lap, halts for the operator listing every finding instead of appending tasks (FR-13). |
 | `PLAN_GAP` | The criterion is unmet and no plan task owns the repair. | Halts for the operator when the unmet criterion is a happy-path scenario; for a negative-path or edge scenario it is recorded in the verdict and the shipped record and the feature may ship, unless operator configuration requires a halt (FR-14). |
-| `OVER_SCOPE` | Shipped behavior goes beyond the planned implementation, judged against intent — the PRD's Goals/Non-Goals and In/Out Scope when a PRD exists, otherwise the stories plus the plan's stated outcome (FR-9). | A widening within intent is self-accepted and recorded. A widening outside intent with no user-visible effect is recorded in the verdict and the shipped record and the feature ships. Every outside-visible finding is presented in one decision block. An explicit accept clears that criterion; a refusal remains blocking and re-halts as “refused — rework required.” |
+| `OVER_SCOPE` | Shipped behavior goes beyond the planned implementation, judged against intent — the PRD's Goals/Non-Goals and In/Out Scope when a PRD exists, otherwise the stories plus the plan's stated outcome (FR-9). | A widening within intent is self-accepted and recorded. A widening outside intent with no user-visible effect is recorded in the verdict and the shipped record and the feature ships. Every outside-visible finding is presented in one decision block. An explicit accept applies only through its immutable original source/case reference and a fresh relationship. A refusal remains blocking and re-halts as “refused — rework required”; its decision block offers an explicit revision linked to that refusal, never an implicit acceptance. Legacy attributed evidence remains available for reconciliation, while malformed or unsupported legacy history stays visible and halts with recovery rather than being treated as absent. |
 
 No SHIP-phase gate — `prd_audit`, the as-built review, or `manual_test` — can send work back to `build`
 that the approved plan does not authorize; every off-plan need is a halt or a recorded, non-blocking
@@ -531,7 +532,7 @@ different engine build or edited rubric skill text is discarded (miss reasons
 `build_review_cache_discarded` event in `events.jsonl`, the daemon log, and the audit trail.
 
 Each rubric has a closed engine-owned finding vocabulary, repeated in its provider-facing skill contract:
-`testQuality` uses `test-insensitive`. The parser normalizes harmless casing and underscore variation
+`testQuality` uses `test-insensitive`; `security` uses its ten security concern kinds. The parser normalizes harmless casing and underscore variation
 before validation. A value outside the rubric's vocabulary is rejected and receives the bounded
 repair/rerun path below; it cannot become a new finding identity or burn a kickback.
 
@@ -682,9 +683,10 @@ Three things in this repo are easy to conflate and are not the same:
 
 - **Gates** block a feature's progression. This page.
 - **The integrity suite** validates the harness repo's own structure before a commit —
-  [validation](../contributing/validation.md).
-- **The release gate** is one self-host gate that happens to run the integrity suite as its first sub-check
-  — [releases](../contributing/releases.md).
+  [validation](../contributing/validation.md). The BUILD `test_suite` gate runs it with the
+  conductor test suite before SHIP.
+- **The release gate** is a self-host SHIP gate for release metadata and migration validation —
+  [releases](../contributing/releases.md).
 
 Per-step enforcement values and skip rules: [steps](../reference/steps.md). Gate-related config keys:
 [configuration](../reference/configuration.md).

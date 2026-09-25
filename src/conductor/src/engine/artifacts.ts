@@ -1,7 +1,7 @@
 import { access, lstat, mkdir, readdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { basename, dirname, isAbsolute, join, relative } from 'path';
 import type { StepName, ComplexityTier, Track } from '../types/index.js';
-import type { HarnessConfig } from '../types/config.js';
+import type { BuildReviewRubricId, HarnessConfig } from '../types/config.js';
 import type {
   VerdictFreshnessClassification,
   VerdictFreshnessOutcome,
@@ -10,6 +10,7 @@ import { slugify } from './worktree.js';
 import { parseWorkRef, formatWorkRef } from './engineer/source-ref.js';
 import type { GhRunner } from './pr-labels.js';
 import { makeProductionGh } from './pr-labels.js';
+import { runTrackerUrlRead } from './tracker-client.js';
 import {
   readFlooredBody,
   readStaleHaltBanner,
@@ -18,16 +19,33 @@ import {
 import { seedTaskStatus } from './task-seed.js';
 import type { GitRunner } from './rebase.js';
 import { makeGitRunner } from './rebase.js';
-import { gateVerdictStillValid, verdictProducedByRun } from './gate-code-validity.js';
+import {
+  gateVerdictStillValid,
+  rebaseOperationPublicationBlocker,
+  verdictProducedByRun,
+} from './gate-code-validity.js';
 import type { VerdictRunIdentity } from './gate-code-validity.js';
 import {
-  classifyOverScopeCriterion,
   overScopeRelations,
   readOverScopeDecisions,
 } from './accepted-widenings.js';
+import { AcceptedWideningDecisionStore } from './accepted-widenings.js';
+import {
+  classifyPrdWidening,
+  classifyPrdWideningProjection,
+  type PrdWideningClassification,
+} from './prd-widening-classification.js';
+import {
+  readRemediationCaseStoreFeature,
+  RemediationCaseStore,
+} from './remediation-case-store.js';
 import { resolveGateCodeValidityConfig } from './config.js';
 import { resolveBuildReviewConfig } from './resolved-config.js';
-import { resolveTaskIdsWithDiagnostics } from './task-progress.js';
+import {
+  HALT_MARKER_RELATIVE as HALT_MARKER,
+  resolveTaskIdsWithDiagnostics,
+} from './task-progress.js';
+export { HALT_MARKER };
 import { FULL_SUITE_EVIDENCE_PATH } from './full-suite-evidence.js';
 import {
   FullSuiteVerifier,
@@ -52,6 +70,7 @@ import {
   parseBuildReviewAggregate,
   type BuildReviewEffectiveVerdict,
 } from './build-review-aggregate.js';
+import { BUILD_REVIEW_RUBRIC_IDS } from './build-review-registry.js';
 import {
   resolveEffectiveBuildReviewVerdict,
   type BuildReviewEffectiveResolverDeps,
@@ -512,8 +531,6 @@ export function verdictFreshnessComparand(ctx: CompletionContext): number | unde
   if (floor === undefined) return undefined;
   return ctx.attemptStartedAt !== undefined ? floor - VERDICT_FRESHNESS_FS_TOLERANCE_MS : floor;
 }
-
-export const HALT_MARKER = '.pipeline/halt-user-input-required';
 
 /**
  * Single source of truth for deriving a plan-stem key from a plan file path.
@@ -1185,6 +1202,12 @@ export async function recordPrBodyRegenAttempt(dir: string, prUrl: string): Prom
 
 /** Context threaded through completion predicates. Optional fields fail open. */
 export interface CompletionContext {
+  /**
+   * Completion is being checked only to decide whether an existing verdict can
+   * be preserved before dispatch. Predicates must not update evidence in this
+   * mode because the upcoming dispatch still owns a failed verdict's record.
+   */
+  preserveProbe?: boolean;
   /**
    * Optional task-local observability. Completion predicates deliberately do
    * not read this: the independent build-review verdict remains authority.
@@ -2163,10 +2186,7 @@ export async function discardStaleLapBuildReviewFail(
  * fields optional — a grader may flag one, several, or (rarely) none of the
  * categories while still returning FAIL with free-form `reasons`.
  */
-export interface BuildReviewRubric {
-  /** A changed test is insensitive to the behavior it claims to cover. */
-  testQuality: boolean;
-}
+export type BuildReviewRubric = Record<BuildReviewRubricId, boolean>;
 
 /**
  * Detailed, independently actionable findings grouped by the rubric item
@@ -2195,7 +2215,7 @@ export interface BuildReviewVerdict {
   codeStamp?: string | null;
 }
 
-const BUILD_REVIEW_RUBRIC_NAMES = ['testQuality'] as const;
+const BUILD_REVIEW_RUBRIC_NAMES = BUILD_REVIEW_RUBRIC_IDS;
 
 /**
  * Flatten a verdict's legacy summaries and structured findings for every
@@ -2263,7 +2283,14 @@ export function validateBuildReviewVerdict(
   // New fan-out aggregates carry a stricter raw-results envelope in addition
   // to the legacy top-level verdict projection. A malformed envelope must not
   // be ignored merely because its compatibility fields happen to look valid.
-  if (e.aggregateVersion !== undefined && (!parseBuildReviewAggregate(e) || !deriveEffectiveBuildReviewVerdict(e))) {
+  const aggregate = e.aggregateVersion !== undefined ? parseBuildReviewAggregate(e) : undefined;
+  // Custom-only laps intentionally have no built-in effective verdict to
+  // derive here. Their current custom membership is resolved by the shared
+  // disposition resolver below; insisting on the legacy built-in reducer
+  // would make every valid custom FAIL look malformed before it can route.
+  if (e.aggregateVersion !== undefined && (!aggregate || (
+    (aggregate.currentCustomRubrics?.length ?? 0) === 0 && !deriveEffectiveBuildReviewVerdict(e)
+  ))) {
     return { ok: false, reason: `${BUILD_REVIEW_VERDICT} aggregate is incomplete, malformed, or identity-mismatched` };
   }
   if (e.verdict !== 'PASS' && e.verdict !== 'FAIL') {
@@ -2279,8 +2306,19 @@ export function validateBuildReviewVerdict(
     };
   }
   const rubricSrc = e.rubric as Record<string, unknown>;
+  // Scalar verdicts predate the aggregate envelope and the default-off
+  // security rubric. Keep those persisted legacy PASS/FAIL artifacts readable:
+  // an omitted security flag is its historical disabled state. Aggregates are
+  // emitted by the current engine and remain exhaustive through
+  // parseBuildReviewAggregate above; testQuality was required before either
+  // format and must remain required.
+  const legacyScalarVerdict = e.aggregateVersion === undefined;
   const rubric = {} as BuildReviewRubric;
   for (const rubricName of BUILD_REVIEW_RUBRIC_NAMES) {
+    if (legacyScalarVerdict && rubricName === 'security' && rubricSrc[rubricName] === undefined) {
+      rubric[rubricName] = false;
+      continue;
+    }
     if (typeof rubricSrc[rubricName] !== 'boolean') {
       return {
         ok: false,
@@ -2318,11 +2356,29 @@ export function validateBuildReviewVerdict(
       reason: `${BUILD_REVIEW_VERDICT} "verdict" PASS requires every rubric flag to be false (failed: ${failedRubrics.join(', ')})`,
     };
   }
-  if (e.verdict === 'FAIL' && failedRubrics.length === 0) {
+  const customFailure = aggregate?.verdict === 'FAIL' && (aggregate.currentCustomRubrics ?? []).some((rubricName) => {
+    const result = aggregate.customResults?.[rubricName]?.result;
+    return result?.kind === 'infrastructure-failure' || (result?.kind === 'judged' && result.findings.length > 0);
+  });
+  if (e.verdict === 'FAIL' && failedRubrics.length === 0 && !customFailure) {
     return {
       ok: false,
       reason: `${BUILD_REVIEW_VERDICT} "verdict" FAIL requires at least one rubric flag to be true`,
     };
+  }
+  if (findings !== undefined) {
+    for (const rubricName of failedRubrics) {
+      const hasScopeIncompleteFault = Array.isArray(e.scopeIncomplete) && e.scopeIncomplete.some(
+        (fault) => typeof fault === 'object' && fault !== null &&
+          (fault as Record<string, unknown>).rubric === rubricName,
+      );
+      if ((findings[rubricName]?.length ?? 0) === 0 && !hasScopeIncompleteFault) {
+        return {
+          ok: false,
+          reason: `${BUILD_REVIEW_VERDICT} "findings.${rubricName}" must be non-empty when ${rubricName} is named in failedRubrics`,
+        };
+      }
+    }
   }
 
   const result: {
@@ -3096,7 +3152,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     if (failRows.length > 0) {
       // Record the whitewash-guard evidence: the sha this FAIL was observed at.
       // A later FAIL-free file is only accepted once HEAD moves past it.
-      if (headSha) {
+      if (headSha && !ctx.preserveProbe) {
         await writeFile(
           markerPath,
           JSON.stringify(
@@ -3140,7 +3196,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
         const freshMarker =
           ctx.sessionStartedAt === undefined ||
           (typeof marker.observedAt === 'number' && marker.observedAt >= ctx.sessionStartedAt);
-        if (!freshMarker) {
+        if (!freshMarker && !ctx.preserveProbe) {
           await rm(markerPath, { force: true }).catch(() => {});
         } else if (marker.headSha === headSha) {
           return {
@@ -3150,7 +3206,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
               'moved since the recorded FAIL — no new commits means no fix (whitewash guard). ' +
               'Implement and commit the fix, then re-run manual-test',
           };
-        } else {
+        } else if (!ctx.preserveProbe) {
           await rm(markerPath, { force: true }).catch(() => {});
         }
       }
@@ -3162,7 +3218,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
     // point on the fresh-flip path, but merging is defensive) rather than
     // clobbering fields the guard depends on. Best-effort — never blocks
     // returning done:true.
-    if (headSha) {
+    if (headSha && !ctx.preserveProbe) {
       let existing: ManualTestFailEvidence = {};
       try {
         existing = JSON.parse(await readFile(markerPath, 'utf-8')) as ManualTestFailEvidence;
@@ -3230,8 +3286,9 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
               for (const f of preCheckFiles) {
                 const report = await readFile(f, 'utf-8');
                 const parsed = parsePrdAuditReport(report, preActivePlan);
-                const preRelations = overScopeRelations(report);
-                const preDecisions = (await readOverScopeDecisions(dir)).decisions;
+                const classifications = parsed.ok
+                  ? await classifyPrdAuditWideningProjection(dir, report, parsed.value.findings)
+                  : new Map<string, PrdWideningClassification>();
                 if (
                   (parsed.ok
                     ? parsed.value.rejectedRows.length > 0 || parsed.value.findings.some(
@@ -3239,7 +3296,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
                           finding.grade !== 'PASS' &&
                           !(
                             finding.grade === 'OVER_SCOPE' &&
-                            ['accepted', 'not-blocking'].includes(classifyOverScopeCriterion(finding.criterion, finding.evidence, preRelations, preDecisions))
+                            ['accepted', 'not-blocking'].includes(classifications.get(finding.criterion)?.kind ?? 'unresolved')
                           ),
                       )
                     : findUnalignedFrRows(report, preActivePlan).length > 0) ||
@@ -3322,18 +3379,21 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
       // ship: the gate re-selected prd_audit forever because acceptance was
       // invisible here (#1854).
       const reportText = await readFile(f, 'utf-8');
-      const relations = overScopeRelations(reportText);
-      const decisions = (await readOverScopeDecisions(dir)).decisions;
+      const classifications = await classifyPrdAuditWideningProjection(dir, reportText, parsed.value.findings);
       const blocking = parsed.value.findings.filter(
         (finding) =>
           finding.grade !== 'PASS' &&
           !(
             finding.grade === 'OVER_SCOPE' &&
-            ['accepted', 'not-blocking'].includes(classifyOverScopeCriterion(finding.criterion, finding.evidence, relations, decisions))
+            ['accepted', 'not-blocking'].includes(classifications.get(finding.criterion)?.kind ?? 'unresolved')
           ),
       );
       if (blocking.length > 0) {
-        const shown = blocking.slice(0, 3).map((finding) => `${finding.criterion} (${finding.grade})`).join('; ');
+        const shown = blocking.slice(0, 3).map((finding) => {
+          const classification = classifications.get(finding.criterion);
+          const suffix = classification?.kind === 'unresolved' ? ` [${classification.reason}]` : '';
+          return `${finding.criterion} (${finding.grade})${suffix}`;
+        }).join('; ');
         const more = blocking.length > 3 ? ` (+${blocking.length - 3} more)` : '';
         blockingReason = `prd-audit found blocking criterion grades: ${shown}${more} — close the gap (BUILD) or amend the PRD (DECIDE), then re-audit`;
         break;
@@ -3726,6 +3786,14 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
   // dropped because pr_url from a prior feature in the same worktree could
   // satisfy the gate spuriously.
   finish: async (dir, ctx): Promise<CompletionResult> => {
+    // The rebase transition is cross-file by design.  Do not let a manually
+    // present finish marker publish while its durable operation says applying
+    // (or its explicitly affected gates remain unresolved), including after a
+    // fresh process has restarted and no in-memory rebase outcome remains.
+    const rebaseBlocker = await rebaseOperationPublicationBlocker(dir);
+    if (rebaseBlocker) {
+      return { done: false, reason: rebaseBlocker, missing: 'other' };
+    }
     const choicePath = join(dir, FINISH_CHOICE_MARKER);
     let choice: string;
     try {
@@ -3921,7 +3989,7 @@ export const CUSTOM_COMPLETION_PREDICATES: Partial<
       // completing. Fail-open on any gh error: network unavailability never blocks
       // a ship.
       try {
-        const { stdout } = await ghRunner(['pr', 'view', prUrl, '--json', 'isDraft'], { cwd: dir });
+        const stdout = await runTrackerUrlRead(ghRunner, dir, 'pull-request', prUrl, ['pr', 'view', prUrl, '--json', 'isDraft']);
         const parsed = JSON.parse(stdout || '{}') as { isDraft?: unknown };
         const isDraft = Boolean(parsed.isDraft);
         if (isDraft) {
@@ -5008,6 +5076,84 @@ export interface PrdGapClassification {
 }
 
 /**
+ * Read the two durable PRD-widening stores once, then project every current
+ * report finding through the same freshness-aware authority resolver used by
+ * routing and completion.  A broken store is evidence of a broken store, not
+ * an empty history that could accidentally make a report clean.
+ */
+export async function classifyPrdAuditWideningProjection(
+  dir: string,
+  reportText: string,
+  findings: readonly PrdAuditFinding[],
+): Promise<ReadonlyMap<string, PrdWideningClassification>> {
+  const relations = overScopeRelations(reportText);
+  const visible = findings.filter((finding) =>
+    finding.grade === 'OVER_SCOPE' && relations.get(finding.criterion) === 'outside-visible',
+  );
+  let decisions: readonly import('./accepted-widenings.js').AcceptedWideningDecision[] = [];
+  let cases: readonly import('./remediation-case-store.js').RemediationCasePrdWideningRecord[] = [];
+  let evidenceFault: Extract<PrdWideningClassification, { readonly kind: 'unresolved' }>['reason'] | undefined;
+
+  // Internal/non-visible scope observations require no reconciliation. Avoid
+  // treating an absent historical store as a fault for those rows alone.
+  if (visible.length > 0) {
+    const featureRead = await readRemediationCaseStoreFeature(dir);
+    if (!featureRead.ok) {
+      evidenceFault = 'corrupt-case-store';
+    } else if (featureRead.feature === undefined) {
+      // Criterion-owned legacy authority never used a summary as identity.
+      // Keep it readable during the v1→v2 migration, but deliberately do not
+      // manufacture NC authority from it.
+      decisions = (await readOverScopeDecisions(dir)).decisions
+        .filter((decision) => !/^NC\.\d+$/i.test(decision.criterion))
+        .map((decision, index) => ({
+          id: `legacy-criterion-${index + 1}`,
+          criterion: decision.criterion,
+          authority: decision.decision,
+          rationale: decision.rationale,
+          operator: decision.operator,
+          revision: index + 1,
+        }));
+    } else {
+      const caseStore = new RemediationCaseStore(dir, featureRead.feature);
+      const caseRead = await caseStore.read();
+      if (!caseRead.ok) {
+        evidenceFault = 'corrupt-case-store';
+      } else {
+        cases = caseRead.state.version === 'v2' ? caseRead.state.prdWideningCases : [];
+        const decisionStore = new AcceptedWideningDecisionStore(dir, {
+          version: 1,
+          repository: featureRead.feature.repository,
+          feature: featureRead.feature.feature,
+        });
+        const decisionRead = await decisionStore.read();
+        if (decisionRead.kind === 'valid') {
+          decisions = decisionRead.state.decisions;
+        } else if (decisionRead.kind !== 'absent') {
+          evidenceFault = 'corrupt-decision-store';
+        }
+      }
+    }
+  }
+
+  const projected = new Map(classifyPrdWideningProjection({
+    findings,
+    decisions,
+    cases,
+    ...(evidenceFault ? { evidenceFault } : {}),
+  }));
+  // Intent relation is raw reviewer classification, not authority. A row the
+  // reviewer explicitly marked non-visible stays non-blocking, while every
+  // visible row above must have durable freshness evidence.
+  for (const finding of findings) {
+    if (finding.grade === 'OVER_SCOPE' && relations.get(finding.criterion) !== 'outside-visible') {
+      projected.set(finding.criterion, { kind: 'not-blocking', reason: 'non-over-scope' });
+    }
+  }
+  return projected;
+}
+
+/**
  * Classify the blocking rows of the fresh PRD-audit report(s) for this session
  * so the daemon can decide whether to self-heal (impl-only → BUILD) or halt
  * (any product/plan gap → human DECIDE). Only reports written this session are
@@ -5018,13 +5164,16 @@ export async function classifyPrdAuditGaps(
   sessionStartedAt: number | undefined,
   expectedRunId?: string,
   config?: Pick<HarnessConfig, 'gate_code_validity'>,
+  featureDesc?: string,
 ): Promise<PrdGapClassification> {
   const files = await findArtifactFiles(dir, 'prd_audit');
-  const decisions = (await readOverScopeDecisions(dir)).decisions;
   const identity = await verdictProducedByRun(dir, 'prd_audit', expectedRunId, config);
   // Routing decides self-heal vs HALT off these rows, so it reads them under
   // the same citation authority the gate scored them with (adr-2026-08-30 D1).
-  const activePlan = await readActivePlanText(dir);
+  // The feature slug is what resolves the plan in a multi-plan corpus with no
+  // recorded activePlanPath; without it every citing row is rejected as
+  // unresolvable and a valid audit routes to a needs-decide halt.
+  const activePlan = await readActivePlanText(dir, undefined, featureDesc);
   const blocking: UnalignedFrRow[] = [];
   for (const f of files) {
     if (identity.state === 'stale-run-identity') continue;
@@ -5044,15 +5193,29 @@ export async function classifyPrdAuditGaps(
     // intent relation never made it blocking, is not a gap this routing should
     // act on. Reading only the fresh rows made an accepted widening re-route
     // the next lap exactly as it did before the operator decided (ADR D8).
-    const relations = overScopeRelations(content);
-    const findingSummaries = new Map(
-      parsed.ok ? parsed.value.findings.map((finding) => [finding.criterion, finding.evidence]) : [],
-    );
+    const classifications = parsed.ok
+      ? await classifyPrdAuditWideningProjection(dir, content, parsed.value.findings)
+      : new Map<string, PrdWideningClassification>();
+    if (parsed.ok) {
+      const unresolvedWidenings = parsed.value.findings.filter((finding) => {
+        if (finding.grade !== 'OVER_SCOPE') return false;
+        const classification = classifications.get(finding.criterion);
+        return classification?.kind === 'refused' || classification?.kind === 'unresolved';
+      });
+      if (unresolvedWidenings.length > 0) {
+        const summary = unresolvedWidenings.slice(0, 5).map((finding) => {
+          const classification = classifications.get(finding.criterion)!;
+          return `${finding.criterion} (${classification.kind === 'unresolved' ? classification.reason : 'refused'})`;
+        }).join('; ');
+        return { kind: 'needs-decide', summary: `PRD widening evidence blocks routing: ${summary}` };
+      }
+    }
     const settled = new Set(
-      [...relations.keys()].filter((criterion) =>
-        ['accepted', 'not-blocking'].includes(
-          classifyOverScopeCriterion(criterion, findingSummaries.get(criterion) ?? '', relations, decisions),
-        )),
+      parsed.ok
+        ? parsed.value.findings
+          .filter((finding) => ['accepted', 'not-blocking'].includes(classifications.get(finding.criterion)?.kind ?? 'unresolved'))
+          .map((finding) => finding.criterion)
+        : [],
     );
     blocking.push(...findUnalignedFrRowsWithClass(content, settled, activePlan));
   }

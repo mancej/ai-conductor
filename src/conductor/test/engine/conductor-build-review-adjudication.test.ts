@@ -16,9 +16,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CompletionContext } from '../../src/engine/artifacts.js';
 import type { StepRunner, StepRunResult, StepRunOptions } from '../../src/engine/conductor.js';
 import type { chargeBuildReviewEffectInLedger } from '../../src/engine/kickback-ledger.js';
-import { joinBuildReviewRubricOutcomes } from '../../src/engine/build-review-aggregate.js';
+import { joinBuildReviewRubricOutcomes, projectBuildReviewAggregateSources } from '../../src/engine/build-review-aggregate.js';
+import { buildReviewAdjudicationSourceId } from '../../src/engine/build-review-adjudication-context.js';
 import { parseBuildReviewLapId, type BuildReviewFinding } from '../../src/engine/build-review-domain.js';
 import { canonicalizeBuildReviewFindingIdentity } from '../../src/engine/build-review-finding-identity.js';
+import { stampBuildReviewCustomJudgedResult } from '../../src/engine/build-review-finding-identity.js';
 import * as remediationCaseReconciler from '../../src/engine/remediation-case-reconciler.js';
 import { ALL_STEPS } from '../../src/engine/steps.js';
 import { writeState } from '../../src/engine/state.js';
@@ -30,6 +32,7 @@ import { Conductor } from '../test-conductor.js';
 const LAP_ID = parseBuildReviewLapId('lap-adjudication')!;
 const SNAPSHOT = 'sha256:snapshot';
 const HASH = `sha256:${'b'.repeat(64)}`;
+const CUSTOM_DIGEST = `sha256:${'c'.repeat(64)}`;
 
 const FINDING: BuildReviewFinding = {
   concernKind: 'test-insensitive',
@@ -63,6 +66,47 @@ function passAggregate(): unknown {
       },
     },
   });
+}
+
+function customAggregate() {
+  const declaration = {
+    version: 'v1' as const, rubricId: 'portable', semanticSkill: 'portable-policy',
+    question: 'Does this preserve the portable policy boundary?', source: 'project' as const, resources: [],
+  };
+  const sourceRegion = {
+    path: 'src/portable.ts', startLine: 4, endLine: 8, contentHash: HASH, display: 'portable boundary',
+  };
+  const result = stampBuildReviewCustomJudgedResult({
+    kind: 'custom-findings', version: 'v1', findings: [{
+      concernId: 'portable-boundary-gap', summary: 'The changed portable boundary lacks its required proof.',
+      evidenceLocations: ['src/portable.ts:4'], sourceRegions: [sourceRegion], confidence: 91,
+    }],
+  }, {
+    rubric: 'portable', lapId: LAP_ID, declaration,
+    policy: { version: 'v1', bundleDigest: CUSTOM_DIGEST },
+    candidate: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'medium' },
+    reviewedInput: { version: 'v1', contentDigest: CUSTOM_DIGEST },
+  }, { sourceRegions: [sourceRegion] })!;
+  return joinBuildReviewRubricOutcomes({
+    lapId: LAP_ID, snapshotDigest: SNAPSHOT,
+    results: {
+      testQuality: {
+        kind: 'judged', rubric: 'testQuality', lapId: LAP_ID, snapshotDigest: SNAPSHOT,
+        contractVersion: 'v3', findings: [], verdict: 'PASS',
+      },
+    },
+    customResults: {
+      portable: {
+        descriptor: {
+          version: 'v1', semanticSkill: 'portable-policy', declaration,
+          installation: { source: 'project' }, effectivePolicy: result.policy,
+          reviewedInput: result.reviewedInput, producer: result.candidate,
+        },
+        result,
+      },
+    },
+    currentCustomRubrics: ['portable'],
+  } as never);
 }
 
 /** A valid judged lap whose only blocker is retained scope incompleteness. */
@@ -107,6 +151,25 @@ function deferralJudgement(): unknown {
   };
 }
 
+function customActionJudgement(sourceId: string): unknown {
+  return {
+    mode: 'case-v2', domain: 'build_review',
+    sourceOutcomes: [{ sourceId, outcome: 'acted', caseRef: 'portable-case' }],
+    cases: [{
+      caseRef: 'portable-case', disposition: 'act', priority: 'high', confidence: 'high',
+      rationale: 'The admitted task repairs the portable policy boundary.',
+      effect: { kind: 'action', route: 'build', tasks: [{
+        title: 'Repair the portable policy boundary.', admittedTaskIds: ['32'],
+        admissionRationale: 'Task 32 owns the shared custom outcome.',
+      }] },
+    }],
+    consistency: {
+      verdict: 'consistent', sourceIds: [sourceId], caseRefs: ['portable-case'],
+      rationale: 'One admitted repair covers the complete custom source set.',
+    },
+  };
+}
+
 const roots: string[] = [];
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -139,6 +202,10 @@ interface FixtureOptions {
   /** Models the effective-verdict projection of sub-floor findings. */
   readonly suppressedFindingIds?: readonly string[];
   readonly onLifecycleEvent?: (event: ConductorEvent) => void;
+  /** A real custom aggregate must route through the case-v2 production branch. */
+  readonly custom?: boolean;
+  /** A feature-owned creation capability is available unless this fake denies it. */
+  readonly featureCreationAuthorized?: boolean;
 }
 
 async function fixture(options: FixtureOptions = {}) {
@@ -146,12 +213,17 @@ async function fixture(options: FixtureOptions = {}) {
   roots.push(projectRoot);
   const feature = { version: 'v1' as const, repository: projectRoot, feature: 'adjudicated-feature' };
   await mkdir(join(projectRoot, '.pipeline'), { recursive: true });
-  await writeFile(join(projectRoot, '.pipeline/task-status.json'), JSON.stringify({ tasks: [{ id: '1', status: 'completed' }] }), 'utf8');
+  await mkdir(join(projectRoot, '.docs', 'plans'), { recursive: true });
+  await writeFile(join(projectRoot, '.docs', 'plans', 'feature.md'), '# Plan\n\n### Task 32: shared outcome\n**Files:** src/portable.ts\n', 'utf8');
+  await writeFile(join(projectRoot, '.pipeline/task-status.json'), JSON.stringify({ tasks: [{ id: '1', status: 'completed' }, { id: '32', status: 'in_progress' }] }), 'utf8');
 
   await options.seedPipeline?.(projectRoot);
 
   const statePath = join(projectRoot, '.pipeline', 'state.json');
-  const state: Record<string, unknown> = { complexity_tier: 'M', run_started_at: 1 };
+  const state: Record<string, unknown> = {
+    complexity_tier: 'M', run_started_at: 1,
+    feature_desc: 'adjudicated-feature', worktree_branch: 'feature/adjudicated-feature',
+  };
   for (const step of ALL_STEPS) if (step.name !== 'build_review') state[step.name] = 'done';
   if (options.startFrom === 'build') state.build_review = 'done';
   if (options.buildPending) state.build = 'pending';
@@ -160,7 +232,7 @@ async function fixture(options: FixtureOptions = {}) {
   const mixed = options.infrastructure && options.infrastructure !== 'none';
   const scopeIncomplete = options.scopeIncomplete !== undefined;
   const clean = options.rawVerdict === 'PASS';
-  const raw = clean ? passAggregate() : scopeIncomplete ? scopeIncompleteAggregate() : aggregate(mixed ? 'mixed' : 'judged');
+  const raw = clean ? passAggregate() : options.custom ? customAggregate() : scopeIncomplete ? scopeIncompleteAggregate() : aggregate(mixed ? 'mixed' : 'judged');
 
   const dispatched: StepName[] = [];
   const artifactMtimes = new Map<string, number>();
@@ -222,9 +294,10 @@ async function fixture(options: FixtureOptions = {}) {
 
   const events = new ConductorEventEmitter();
   const kickbacks: Array<{ from: string; to: string }> = [];
+  const kickbackEvidence: string[] = [];
   const lifecycle: ConductorEvent[] = [];
   const loopHalts: ConductorEvent[] = [];
-  events.on('kickback', (event) => { if (event.type === 'kickback') kickbacks.push({ from: event.from, to: event.to }); });
+  events.on('kickback', (event) => { if (event.type === 'kickback') { kickbacks.push({ from: event.from, to: event.to }); kickbackEvidence.push(event.evidence ?? ''); } });
   events.on('loop_halt', (event) => { loopHalts.push(event); });
   for (const type of [
     'remediation_adjudication_started', 'remediation_adjudication_completed', 'remediation_adjudication_failed',
@@ -250,10 +323,25 @@ async function fixture(options: FixtureOptions = {}) {
       build_review: {
         adjudication: { enabled: options.adjudicationEnabled ?? true },
         rubrics: { testQuality: { enabled: true, min_confidence: 70 } },
+        ...(options.custom ? { custom_rubrics: {
+          portable: { enabled: true, skill: 'portable-policy', question: 'Does this preserve the portable policy boundary?', source: 'project' },
+        } } : {}),
       },
     },
     buildReviewEffectiveResolver: resolver,
     buildReviewChargeEffect: options.chargeEffect,
+    resolveFeatureCreationMutation: async () => options.featureCreationAuthorized === false ? undefined : ({
+      provenance: {
+        repository: 'acme/conductor', defaultBranch: 'origin/main', specBranch: 'feature/adjudicated-feature',
+        featureMarker: '.docs/intake/adjudicated-feature.md', publication: 'initial',
+      },
+      dependencies: {
+        resolveMachineOwner: async () => ({ resolved: true as const, id: 'alice' }),
+        provenanceDiscovery: {
+          readCommittedRecords: async () => [{ path: '.docs/intake/adjudicated-feature.md', content: 'Owner: alice\n' }],
+        },
+      },
+    }),
     gh,
   } as never);
 
@@ -266,7 +354,7 @@ async function fixture(options: FixtureOptions = {}) {
   });
 
   return {
-    projectRoot, feature, dispatched, retryReasons, kickbacks, lifecycle, loopHalts, ghCalls, resolver,
+    projectRoot, feature, dispatched, retryReasons, kickbacks, kickbackEvidence, lifecycle, loopHalts, ghCalls, resolver,
     remediateDispatches: () => remediateDispatches, artifactMtimes,
     readJson: async (relative: string): Promise<unknown> =>
       JSON.parse(await readFile(join(projectRoot, relative), 'utf8')) as unknown,
@@ -284,7 +372,7 @@ describe('engine/conductor — build_review post-join adjudication wiring', () =
     expect(run.kickbacks).toEqual([]);
     expect((await run.state()).build_review).toBe('done');
     expect(vi.mocked(run.resolver).mock.calls.map((call) => call[2])).toContainEqual(expect.objectContaining({
-      minConfidence: { testQuality: 70 },
+      minConfidence: { testQuality: 70, security: 0 },
     }));
   });
 
@@ -305,6 +393,64 @@ describe('engine/conductor — build_review post-join adjudication wiring', () =
     expect(run.retryReasons.get('build')).toContain('test/example.test.ts:8 — assert the rejection path');
     // BUILD attempt evidence is stamped before provider work, durably.
     expect(order.attemptedCaseIds).toHaveLength(1);
+  });
+
+  it('selects case-v2 for a custom source and releases only its shared authorized action after settlement', async () => {
+    const customSource = projectBuildReviewAggregateSources(customAggregate())![0]!;
+    const run = await fixture({
+      custom: true,
+      judgement: customActionJudgement(buildReviewAdjudicationSourceId(customSource)),
+    });
+
+    // This is the actual Conductor prompt boundary: case-v2 is derived from
+    // the assembled custom context, not a test-only judgement fixture.
+    expect(run.retryReasons.get('remediate')).toContain('write case-v2 remediation output');
+    // The shared outcome first validates/settles the v2 graph, then exposes
+    // its one admitted action as the durable BUILD work order.
+    expect(run.dispatched).toContain('build');
+    await expect(run.readJson('.pipeline/remediation-cases.json')).resolves.toMatchObject({
+      cases: [expect.objectContaining({ disposition: 'act', effect: expect.objectContaining({ kind: 'action', status: 'applied' }) })],
+    });
+    await expect(run.readJson('.pipeline/build-review-work-order.json')).resolves.toMatchObject({
+      cases: [expect.objectContaining({ tasks: [expect.objectContaining({ admittedTaskIds: ['32'] })] })],
+    });
+  });
+
+  it('names every structured decision stop — case, owner, sources, rationale — in the needs-human halt', async () => {
+    const customSource = projectBuildReviewAggregateSources(customAggregate())![0]!;
+    const sourceId = buildReviewAdjudicationSourceId(customSource);
+    const run = await fixture({
+      custom: true,
+      judgement: {
+        mode: 'case-v2', domain: 'build_review',
+        sourceOutcomes: [{ sourceId, outcome: 'escalate', caseRef: 'plan-stop' }],
+        cases: [{
+          caseRef: 'plan-stop', disposition: 'escalate', priority: 'high', confidence: 'high',
+          rationale: 'The approved plan needs an owner decision before repair.',
+          effect: { kind: 'none' }, escalation: { owner: 'plan' },
+        }],
+        consistency: {
+          verdict: 'blocked', sourceIds: [sourceId], caseRefs: ['plan-stop'],
+          rationale: 'The source cannot be repaired under the current approved plan.',
+        },
+      },
+    });
+
+    expect(run.dispatched).not.toContain('build');
+    const halt = await run.haltMarker();
+    expect(halt).toMatch(new RegExp(
+      `decision stop \\S+ \\(owner: plan; sources: ${sourceId}\\): The source cannot be repaired under the current approved plan\\.`,
+    ));
+    expect(run.loopHalts).toEqual([expect.objectContaining({ reason: expect.stringContaining('owner: plan') })]);
+  });
+
+  it('carries a remaining infrastructure fault into the admitted-repair kickback and BUILD hint', async () => {
+    const run = await fixture({ reportUncoveredInfrastructure: true });
+
+    expect(run.kickbacks).toEqual([{ from: 'build_review', to: 'build' }]);
+    expect(run.kickbackEvidence[0]).toContain('review infrastructure faults remain uncovered');
+    const clean = await fixture();
+    expect(clean.kickbackEvidence[0]).not.toContain('review infrastructure faults remain uncovered');
   });
 
   it.each([
@@ -447,15 +593,27 @@ describe('engine/conductor — build_review post-join adjudication wiring', () =
   it('files a deferred case through the production tracker and intake dependencies', async () => {
     const run = await fixture({ judgement: deferralJudgement() });
 
-    // Done-when 4: exact marker lookup precedes create, and both run from the
-    // real dispatch — not from an injected coordinator fixture.
+    // The real Conductor composition supplies authorized-feature creation to
+    // fileIntakeIssue. The transaction returns #77, then both labels target
+    // only that returned identity — no coordinator-local filing fake is used.
     expect(run.ghCalls.some((args) => args[0] === 'issue' && args[1] === 'list' && args.includes('--state') && args.includes('all'))).toBe(true);
     expect(run.ghCalls.some((args) => args[0] === 'issue' && args[1] === 'create')).toBe(true);
+    expect(run.ghCalls.filter((args) => args.some((arg) => arg === 'repos/acme/conductor/issues/77/labels'))).toEqual([
+      expect.arrayContaining(['labels[]=priority: low']),
+      expect.arrayContaining(['labels[]=size: M']),
+    ]);
     const cases = await run.readJson('.pipeline/remediation-cases.json') as { cases: Array<{ effect: { status: string; issueUrl?: string } }> };
     expect(cases.cases[0]!.effect).toMatchObject({ status: 'applied', issueUrl: 'https://github.com/acme/conductor/issues/77' });
     // A finalized non-action outcome performs no BUILD navigation.
     expect(run.dispatched).not.toContain('build');
     expect(run.kickbacks).toEqual([]);
+  });
+
+  it('does not file a deferred issue when current feature provenance cannot authorize creation', async () => {
+    const run = await fixture({ judgement: deferralJudgement(), featureCreationAuthorized: false });
+
+    expect(run.ghCalls.some((args) => args[0] === 'issue' && args[1] === 'create')).toBe(false);
+    expect(await run.haltMarker()).toContain('build_review adjudication halted:');
   });
 
   it('lets an exactly covered infrastructure branch settle instead of pinning the mechanical lane', async () => {

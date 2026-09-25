@@ -47,6 +47,7 @@ import {
   conflictedFiles,
   writeHalt,
 } from '../../src/engine/rebase.js';
+import { translateAfterRebase } from '../../src/engine/rebase-translate.js';
 
 const execFile = promisify(execFileCb);
 
@@ -109,6 +110,72 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
     expect((await g(['log', '--format=%s', 'main..HEAD'])).stdout).toContain('feat: change a');
   });
 
+  it('translates evidence citations after a conflict-resolved rebase completes', async () => {
+    const originalHead = (await g(['rev-parse', 'HEAD'])).stdout.trim();
+    const onto = (await g(['rev-parse', 'main'])).stdout.trim();
+    const { git, pre } = await intoConflict();
+    const translated: Array<[string, string, string]> = [];
+
+    const outcome = await resolveRebaseConflicts(git, repo, pre, async () => {
+      await writeFile(join(repo, 'a.ts'), 'merged\n');
+      await g(['add', 'a.ts']);
+      await gc(['rebase', '--continue']);
+      return { resolved: true };
+    }, 3, {
+      translateAfterRebase: async (_git, _root, resolvedOnto, origHead, head) => {
+        translated.push([resolvedOnto, origHead, head]);
+      },
+    });
+
+    expect(outcome.kind).toBe('changed');
+    expect(translated).toEqual([[onto, originalHead, (await g(['rev-parse', 'HEAD'])).stdout.trim()]]);
+  });
+
+  it('persists patch-id rewrite correspondence after resolver completion', async () => {
+    // This commit replays cleanly after the resolver handles a.ts, giving the
+    // translation seam one stable patch-id pair even though the conflict
+    // resolution itself intentionally lands in residue.
+    await writeFile(join(repo, 'b.ts'), 'feature-only\n');
+    await g(['add', 'b.ts']);
+    await g(['commit', '-q', '-m', 'feat: add b']);
+    const originalB = (await g(['rev-parse', 'HEAD'])).stdout.trim();
+    const { git, pre } = await intoConflict();
+
+    const outcome = await resolveRebaseConflicts(git, repo, pre, async () => {
+      await writeFile(join(repo, 'a.ts'), 'merged\n');
+      await g(['add', 'a.ts']);
+      await gc(['rebase', '--continue']);
+      return { resolved: true };
+    }, 3, { translateAfterRebase });
+
+    expect(outcome.kind).toBe('changed');
+    const rewrites = JSON.parse(await readFile(join(repo, '.pipeline', 'rebase-rewrites.json'), 'utf-8')) as Record<string, string>;
+    expect(rewrites[originalB]).toMatch(/^[0-9a-f]{40}$/);
+    expect(rewrites[originalB]).not.toBe(originalB);
+  });
+
+  it('retains the pre-replay P/B/O identities when ORIG_HEAD moves before resolver continuation', async () => {
+    const preRebaseHead = (await g(['rev-parse', 'HEAD'])).stdout.trim();
+    const mergeBase = (await g(['merge-base', preRebaseHead, 'main'])).stdout.trim();
+    const target = (await g(['rev-parse', 'main'])).stdout.trim();
+    const { git, pre } = await intoConflict();
+
+    // ORIG_HEAD is mutable recovery state, not replay authority. Move it after
+    // performRebase has paused so the resolver must use the captured identity.
+    await g(['update-ref', 'ORIG_HEAD', target]);
+    const outcome = await resolveRebaseConflicts(git, repo, pre, async () => {
+      await writeFile(join(repo, 'a.ts'), 'merged\n');
+      await g(['add', 'a.ts']);
+      await gc(['rebase', '--continue']);
+      return { resolved: true };
+    }, 3);
+
+    expect(outcome).toMatchObject({
+      kind: 'changed',
+      replay: { preRebaseHead, mergeBase, target, completedHead: expect.stringMatching(/^[0-9a-f]{40}$/) },
+    });
+  });
+
   it('FR-6: an explicit cannot-resolve signal short-circuits to HALT after one attempt', async () => {
     const { git, pre } = await intoConflict();
     let calls = 0;
@@ -125,6 +192,18 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
       expect(outcome.reason).toContain('human needed');
       expect(outcome.resumeShape).toBeUndefined();
     }
+  });
+
+  it('setup exhaustion stops after one resolver pass without converting to an ordinary conflict halt', async () => {
+    const { git, pre } = await intoConflict();
+    let calls = 0;
+    const outcome = await resolveRebaseConflicts(git, repo, pre, async () => {
+      calls += 1;
+      return { resolved: false, reason: 'redacted', providerSetupExhaustion: { candidates: [] } } as never;
+    }, 3);
+
+    expect(calls).toBe(1);
+    expect(outcome.kind).toBe('setup_stop');
   });
 
   it('FR-5/FR-3: a resolver that never actually completes is retried exactly N times, then HALTs', async () => {
@@ -178,7 +257,10 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
       return { resolved: true };
     };
 
-    const outcome = await resolveRebaseConflicts(git, repo, pre, resolver, 3);
+    let translated = false;
+    const outcome = await resolveRebaseConflicts(git, repo, pre, resolver, 3, {
+      translateAfterRebase: async () => { translated = true; },
+    });
 
     expect(calls).toBe(1);
     expect(outcome.kind).toBe('conflict_halt');
@@ -188,6 +270,7 @@ describe('engine/rebase — gated resolution loop (real git, fake resolver)', ()
     // sanity: the branch WOULD have looked "current" (the trap FR-9 guards against)
     expect((await g(['rev-list', '--count', 'HEAD..main'])).stdout.trim()).toBe('0');
     expect((await g(['log', '--format=%s', 'main..HEAD'])).stdout).not.toContain('feat: change a');
+    expect(translated).toBe(false);
   });
 
   it('FR-7: cap of 0 disables resolution — resolver is never called, HALT passes through', async () => {
@@ -329,27 +412,14 @@ describe('engine/rebase — resolution reclassification: docs-only → noop', ()
       return { resolved: true };
     }, 3);
 
-    expect(outcome).toMatchObject({ kind: 'noop' });
-    if (outcome.kind === 'changed' || outcome.kind === 'noop') {
-      expect(outcome.allChangedPaths).toBeUndefined();
-    }
-
-    // Contrast: the same resolution with a derivable pre-advance base carries
-    // the complete delta — the undefined above is attribution degrading
-    // gracefully, not a field the resolver never populates.
-    await g(['reset', '-q', '--hard', preSha]);
-    const rePre = await performRebase(realGit, repo, 'main');
-    expect(rePre.kind).toBe('conflict_halt');
-    const attributed = await resolveRebaseConflicts(realGit, repo, rePre, async () => {
-      await writeFile(join(repo, 'docs/notes.md'), 'merged notes again\n');
-      await g(['add', 'docs/notes.md']);
-      await gc(['rebase', '--continue']);
-      return { resolved: true };
-    }, 3);
-    expect(attributed).toMatchObject({ kind: 'noop', allChangedPaths: ['docs/notes.md'] });
+    // The pre-advance base only feeds `featureSurface`; the tree delta
+    // (preTree..HEAD, preTree = the captured replay seed) is still computable, so the resolution still
+    // classifies (docs-only → noop) and never degrades into a halt.
+    expect(outcome).toMatchObject({ kind: 'noop', allChangedPaths: ['docs/notes.md'] });
+    expect(preSha).not.toBe((await g(['rev-parse', 'HEAD'])).stdout.trim());
   });
 
-  it('keeps replayed paths for invalidation while carrying the complete base advance separately', async () => {
+  it('classifies the true tree delta (preTree..HEAD) and carries the feature surface, like a clean rebase', async () => {
     const deltaRepo = await mkdtemp(join(tmpdir(), 'rebase-resolution-complete-delta-'));
     const deltaGit = (args: string[]) => execFile('git', args, { cwd: deltaRepo });
     const deltaGc = (args: string[]) =>
@@ -384,16 +454,16 @@ describe('engine/rebase — resolution reclassification: docs-only → noop', ()
         return { resolved: true };
       }, 3);
 
+      // D = preTree..HEAD (preTree = seed.preRebaseHead): the base advance plus the resolution. The
+      // feature's untouched own file is NOT in the delta — it is in F.
       expect(outcome).toMatchObject({
         kind: 'changed',
-        changedCodePaths: ['conflict.ts', 'feature-only.ts'],
+        changedCodePaths: ['base-only.ts', 'conflict.ts'],
         allChangedPaths: ['base-only.ts', 'conflict.ts'],
+        featureSurface: ['conflict.ts', 'feature-only.ts'],
       });
       if (outcome.kind === 'changed') {
-        expect(outcome.changedCodePaths).not.toContain('base-only.ts');
-      }
-      if (outcome.kind === 'changed' || outcome.kind === 'noop') {
-        expect(outcome.allChangedPaths).not.toContain('feature-only.ts');
+        expect(outcome.changedCodePaths).not.toContain('feature-only.ts');
       }
     } finally {
       await rm(deltaRepo, { recursive: true, force: true });

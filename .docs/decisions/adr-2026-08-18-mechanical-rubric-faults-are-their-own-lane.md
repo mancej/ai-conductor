@@ -246,6 +246,78 @@ standalone CLI writes through `adr-2026-08-13` §5's existing external same-sche
 A/B). No new event file, no new ledger, no sidecar. `build_review_rubric_infrastructure_failure`
 already exists and is reused; additive fields follow `adr-2026-07-26-event-sink-registry-exhaustiveness`.
 
+> **Amended 2026-09-18 by #2582:** the lane assumed every mechanical fault might clear on a re-run.
+> An oversized rubric projection cannot: the same frozen snapshot produces the same bytes on every
+> lap, so retrying consumed all three shared faults on `enforce-ownership-across-all-harness-github-operat`
+> (promptBytes 1,308,560 and 1,346,093 on consecutive laps) and halted with no diagnostic the
+> operator could act on.
+>
+> **D2.1 — `projection-oversized` is a closed cause of its own.** The coordinator gains the branch
+> reason `projection-oversized`, mapped to a new `BuildReviewInfrastructureFailureReason` member of
+> the same name; the total closed mapping of D2 is extended, not bypassed. It is raised at the
+> existing projection check in the coordinator, before any provider dispatch, when the serialized
+> projection exceeds `build_review.rubrics.<id>.max_projection_bytes` (a provider-agnostic byte
+> bound with a shipped default; never a model token limit). `detail` carries the measured and
+> permitted byte counts.
+>
+> **D3.1 — A deterministic fault is charged once and never retried.** `projection-oversized` is
+> deterministic over the lap's frozen inputs, so D3's "publish nothing, re-run" rule does not
+> apply to it. The lap publishes its aggregate with the infrastructure result, does not bump the
+> mechanical-fault counter of D4, and routes directly to D5's `needs-human` HALT naming the rubric,
+> the measured bytes, and the bound. D6's reduced-coverage record remains the operator's attributed
+> way past it; nothing here accepts a finding or manufactures a PASS. Transient causes keep D3/D4
+> unchanged.
+>
+> **D10.1 — The oversize rides the existing spine.** The occurrence is emitted on the existing
+> `build_review_rubric_infrastructure_failure` event with additive optional `measuredBytes` and
+> `limitBytes` fields; `build_review_rubric_prompt` keeps reporting `promptBytes` for admitted
+> dispatches. No new event, ledger, or sidecar.
+
+> **Amended 2026-09-22 by #2384:** D2 requires a total closed mapping from branch reason to cause
+> and says an unmapped reason is a contract defect caught at authoring time. Dispatch through the
+> provider's native structured output (adr-2026-09-07-durable-prd-widening-decision-reconciliation
+> D6.1) introduces two reasons the lane must name.
+>
+> **D2.2 — Two closed causes for native-schema dispatch.** `native-schema-unsupported` is the cause
+> when no admitted provider candidate declares native structured-output capability for the lap; it
+> is deterministic for the lap's candidate set and, like `projection-oversized` (D3.1), is charged
+> once and never retried within the lap. `invalid-structured-result` is the cause when the terminal
+> structured result is absent, is not an object, or is rejected by the descriptor's parser; it is
+> retryable under D4's bound, and the rejection carried on the fault names the field and the form
+> it requires. Both settle the branch `absent`, publish no aggregate, charge no kickback, and tick no
+> convergence cap. The prose-scrape causes that named "no parseable JSON object" have no remaining
+> producer for build_review and are removed from the mapping in the same change, so the mapping stays
+> total.
+
+> **Amended 2026-09-24 by #2735:** adr-2026-09-10-portable-build-review-policy D5.1–D5.5 replace
+> custom-policy OS containment with each provider's read-only review mode plus an engine integrity
+> digest. That retires the containment `preflight-failed` producer and introduces two reasons the
+> lane must name. D2's total closed mapping is extended, not bypassed.
+>
+> **D2.3 — Two closed causes for read-only review.**
+> - `read-only-review-unavailable` is the cause when a custom-policy lap member has no candidate
+>   whose read-only review mode is available on the host. `detail` names the platform and each
+>   refused candidate's reason.
+> - `review-input-mutated` is the cause when the lap's before and after integrity digests differ.
+>   `detail` names the changed inputs, bounded. It settles every member of that lap, because a
+>   change cannot be attributed to one member.
+>
+> Both join the custom infrastructure-failure set and settle their branches `absent`.
+>
+> **D3.2 — One is deterministic, one is retryable.** `read-only-review-unavailable` is deterministic
+> for the host and the lap's candidate set, like `projection-oversized` (D3.1) and
+> `native-schema-unsupported` (D2.2). It is charged once, never retried within the lap, and routes
+> directly to D5's `needs-human` HALT, whose body names the platform. `review-input-mutated` is
+> retryable under D4's bound. Neither provider's read-only mode leaves a write path, so a mutation
+> most likely comes from outside the reviewers (an operator updating the installed policy, or a
+> foreign process touching the lap's private frozen view). The lap publishes no aggregate under D3, and the re-run materializes a fresh frozen
+> view. D6's reduced-coverage record remains the operator's attributed way past either cause;
+> nothing here accepts a finding or manufactures a PASS.
+>
+> **D10.2 — Both ride the existing spine.** Each occurrence is emitted on the existing
+> `build_review_rubric_infrastructure_failure` event with its closed `cause`. The platform and the
+> changed-input list are carried as additive optional fields. No new event, ledger, or sidecar.
+
 ## Alternatives considered
 
 - **Amend `adr-2026-08-13` so `accept` clears an exhausted mechanical fault** (the single-verb form of

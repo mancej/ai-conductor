@@ -88,6 +88,38 @@ pass a gate."
    already best-effort/non-throwing; the sweep re-evaluates the gate every pass, so a transient
    fetch or `gh` failure defers a reap rather than losing one, and never deletes on unknown state.
 
+> **Amended 2026-09-14 by jstoup111/ai-conductor#1510 (spec `reclaim-merged-feature-worktrees-without-depending`):** the registry-driven reap in Decision 2
+> stopped reclaiming once the watch registry stopped covering worktrees (never enrolled, trimmed
+> at its cap, or pruned on `NOTFOUND`); an enumeration-fed automatic path is added beside it.
+>
+> 8. **Automatic reclamation over enumerated candidates goes through the single-slug helper.**
+>    The parked-feature reconciliation sweep enumerates the git-registered worktrees under
+>    `.worktrees/` and feeds `reconcileMergedPark` one explicit slug at a time, under
+>    `adr-2026-08-01` Decisions 6–8. Decision 6's single-slug operator verb is unchanged: the
+>    enumeration is the candidate source, never the deletion unit, and no glob or computed set
+>    reaches a removal primitive. The path is gated by `reclaim_merged_worktrees` (boolean,
+>    default `true`), with the same semantics as `reconcile_parked_auto_cleanup`: it changes who
+>    initiates, never what is checked.
+>
+> 9. **Every enumerated candidate that is not reclaimed is retained with a named reason on the
+>    event spine.** In-flight (the sweep context's `isFeatureInFlight`), `engineer-*` and
+>    `resolve-*` prefixes, nested or otherwise invalid slugs, a live `.pipeline/HALT`, and every
+>    helper refusal retain the worktree; the reason is emitted as `worktree_reclaim_retained`, a
+>    reclaim as `worktree_reclaim_reclaimed`, and a removal error as `worktree_reclaim_failed`.
+>    An unreadable worktree or ref listing retains every candidate for that pass. An unreadable
+>    shipped-record listing retains only the record-gated candidates (`feat/daemon-*` branches and
+>    branchless parked slugs); per adr-2026-08-01 D8 a non-daemon candidate never reads or depends
+>    on that listing (operator decision 2026-09-18: D8 takes precedence). The
+>    daemon log line is a rendering of the event, never a parallel write.
+>    Event classification (operator decision 2026-09-22, spec
+>    `daemon-reclaim-sweep-deletes-a-worktree-that-holds`, superseding the split above): every
+>    refusal returned by the single-slug helper — including `no-merge-proof` and `dirty-worktree` —
+>    is emitted as `worktree_reclaim_failed` carrying its `refusal`, as adr-2026-08-01 D3 and D11
+>    already assume. `worktree_reclaim_retained` is reserved for candidates the sweep never hands
+>    to the helper: in-flight, excluded prefixes, invalid slugs, a live `.pipeline/HALT`, an
+>    unreadable listing, or no merge classification. A removal error is a helper refusal and stays
+>    on `worktree_reclaim_failed`.
+
 ## Relationship to adjacent approved decisions
 
 - **`adr-2026-07-03-committed-shipped-record-dispatch-dedup`** — unchanged and relied upon. This ADR

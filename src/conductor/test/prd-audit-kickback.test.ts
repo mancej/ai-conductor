@@ -1,10 +1,26 @@
-// Covers: S5.1, S5.2, S5.3, S5.4
+// Covers: task:1, S5.1, S5.2, S5.3, S5.4
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execa } from 'execa';
+
+vi.mock('../src/engine/build-review-effective.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/engine/build-review-effective.js')>(),
+  resolveBuildReviewFeatureIdentity: vi.fn(async () => ({
+    version: 'v1' as const,
+    repository: '/fixture/repository',
+    feature: 'prd-audit-kickback',
+  })),
+}));
+
+// Pre-audit reconciliation needs a machine-scoped operator whenever a fixture
+// contains a cleared decision. Individual no-owner cases override this seam.
+vi.mock('../src/engine/owner-gate/machine-identity.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/engine/owner-gate/machine-identity.js')>(),
+  readMachineOwnerConfig: vi.fn(async () => ({ spec_owner: 'fixture-operator' })),
+}));
 
 import {
   Conductor,
@@ -17,6 +33,7 @@ import {
   type StepRunner,
 } from '../src/engine/conductor.js';
 import {
+  AcceptedWideningDecisionStore,
   classifyOverScopeCriterion,
   overScopeRelations,
   parseClearedOverScopeDecisions,
@@ -25,6 +42,7 @@ import {
   renderOverScopeDecisionBlock,
 } from '../src/engine/accepted-widenings.js';
 import { parsePrdAuditReport } from '../src/engine/artifacts.js';
+import { prdWideningSourceId } from '../src/engine/prd-widening-context.js';
 import { readGrowth, readKickbackLedger } from '../src/engine/kickback-ledger.js';
 import { ALL_STEPS } from '../src/engine/steps.js';
 import { readState, writeState } from '../src/engine/state.js';
@@ -608,10 +626,10 @@ describe('prd_audit kickback', () => {
     });
   });
 
-  it('carries harvest defects and recorded decisions out of a halted over-scope route', async () => {
-    // ADR D7: a defect the operator's edit produced must reach the next halt
-    // body, not only the spine. ADR D8: recorded decisions project into the
-    // verdict artifact even when the route halts on a refusal.
+  it('preserves migrated sibling decisions while routing a current refusal', async () => {
+    // Legacy decisions are migrated at the pre-audit entry boundary. A clear
+    // that names a different historical finding remains durable but inert;
+    // routing only projects the current refusal into the verdict artifact.
     const root = await mkdtemp(join(tmpdir(), 'over-scope-halt-route-'));
     dirs.push(root);
     await mkdir(join(root, '.pipeline'), { recursive: true });
@@ -636,7 +654,7 @@ describe('prd_audit kickback', () => {
         decidedAt: '2026-08-24T00:00:00.000Z',
       }],
     }));
-    // An entry naming a criterion the halt never offered is a named defect.
+    // This is a valid pre-offer legacy clear, not a v2 offer reference.
     await writeFile(join(root, '.pipeline', 'HALT.cleared'), [
       '```json over-scope-decisions',
       '[{"criterion":"S9.9","summary":"x","decision":"accept","rationale":"x"}]',
@@ -654,6 +672,11 @@ describe('prd_audit kickback', () => {
       maxRetries: 1,
     });
 
+    const recovery = await (conductor as unknown as {
+      preparePrdWideningBeforeAudit: () => Promise<string | undefined>;
+    }).preparePrdWideningBeforeAudit();
+    expect(recovery).toBeUndefined();
+
     const route = await (conductor as unknown as {
       routeCurrentPrdAuditOverScope: () => Promise<{
         kind: string;
@@ -664,9 +687,7 @@ describe('prd_audit kickback', () => {
 
     expect(route.kind).toBe('halt');
     expect(route.refused).toEqual([expect.objectContaining({ criterion: 'S3.1' })]);
-    expect(route.defects).toEqual(
-      expect.arrayContaining([expect.objectContaining({ kind: 'unknown-criterion', criterion: 'S9.9' })]),
-    );
+    expect(route.defects).toBeUndefined();
 
     const report = await readFile(join(root, '.pipeline', 'prd-audit.md'), 'utf8');
     expect(report).toContain('## Recorded Findings');
@@ -904,6 +925,27 @@ describe('prd_audit kickback', () => {
           await writeFile(join(root, '.pipeline', 'prd-audit.md'), report);
           if (report.includes('S13.4')) {
             await writeFile(join(root, '.pipeline', 's13.4-probe-file'), 'keep this review finding\n');
+          }
+        } else if (step === 'remediate') {
+          const cases = await readFile(join(root, '.pipeline', 'remediation-cases.json'), 'utf8')
+            .then((raw) => JSON.parse(raw) as { prdWideningCases?: Array<{ id: string }> })
+            .catch(() => undefined);
+          const caseId = cases?.prdWideningCases?.[0]?.id;
+          if (caseId) {
+            return {
+              success: true,
+              finalStructuredResult: {
+                version: 'v1',
+                results: [{
+                  sourceId: prdWideningSourceId({
+                    criterion: 'NC.1', grade: 'OVER_SCOPE',
+                    evidence: 'A visible behavior exists outside the approved plan.', prdIds: [],
+                  }),
+                  kind: 'same-case', caseId,
+                  reason: 'The current report names the original accepted behavior.',
+                }],
+              },
+            };
           }
         } else if (step === 'architecture_review_as_built') {
           await writeFile(
@@ -1731,6 +1773,78 @@ describe('prd_audit kickback', () => {
     });
   });
 
+  it('halts needs-human when an as-built finding cites an undeclared dotted ADR decision', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'as-built-unresolvable-dotted-clause-'));
+    dirs.push(root);
+    const planPath = join(root, '.docs', 'plans', 'feature.md');
+    const adrStem = 'adr-2026-09-18-declared-remediation-decisions';
+    await Promise.all([
+      mkdir(join(root, '.docs', 'plans'), { recursive: true }),
+      mkdir(join(root, '.docs', 'decisions'), { recursive: true }),
+      mkdir(join(root, '.pipeline'), { recursive: true }),
+    ]);
+    await writeFile(planPath, '### Task 1: Existing approved work\n');
+    await writeFile(join(root, '.docs', 'decisions', `${adrStem}.md`), [
+      '# ADR: Declared remediation decisions',
+      '**Status:** APPROVED',
+      '',
+      '## Decision',
+      '',
+      '**D1 — First.**',
+      '**D2 — Second.**',
+      '**D3 — Third.**',
+      '**D4 — Fourth.**',
+    ].join('\n'));
+    await writeFile(join(root, '.pipeline', 'engine-state.json'), JSON.stringify({ activePlanPath: planPath }));
+    await writeFile(join(root, '.pipeline', 'architecture-review-as-built.md'), [
+      'Verdict: BLOCKED',
+      '',
+      '## Blocking Findings',
+      '| Finding | Class | Governing clause | Summary |',
+      '| --- | --- | --- | --- |',
+      `| AB-1 | REMEDIABLE | ${adrStem} D9.1 | Resolve the missing authority |`,
+    ].join('\n'));
+    const run = vi.fn(async () => {
+      await writeFile(join(root, '.pipeline', 'remediation.json'), JSON.stringify({
+        dispositions: [{
+          id: 'AB-1', disposition: 'build', category: null,
+          rationale: 'Resolve the missing authority.',
+          tasks: [{ id: 'unresolved-task', title: 'Do not append this task' }],
+        }],
+      }));
+      return { success: true };
+    });
+    const conductor = new Conductor({
+      stateFilePath: join(root, '.pipeline', 'conduct-state.json'),
+      stepRunner: { run }, events: new ConductorEventEmitter(), projectRoot: root,
+      mode: 'auto', daemon: true, verifyArtifacts: false, maxRetries: 1,
+      config: { architecture_review_as_built: { remediation: { enabled: true } } } as never,
+    });
+
+    const outcome = await (conductor as unknown as {
+      planRemediation: (state: ConductState, steps: typeof ALL_STEPS, dispatchContext: string, hintSource: unknown) => Promise<{ kind: string; detail?: string; haltClass?: string }>;
+    }).planRemediation(
+      { session_started_at: Date.now() - 1_000, feature_desc: 'feature' } as ConductState,
+      ALL_STEPS,
+      'as-built blocked',
+      {
+        source: 'as-built',
+        evidence: [{
+          gate: 'architecture_review_as_built',
+          evidenceFile: '.pipeline/architecture-review-as-built.md',
+        }],
+      },
+    );
+
+    expect(outcome).toMatchObject({
+      kind: 'halt',
+      haltClass: 'needs-human',
+      detail: expect.stringContaining(`AB-1: ${adrStem} D9.1`),
+    });
+    expect(run).toHaveBeenCalledOnce();
+    await expect(readFile(planPath, 'utf8')).resolves.toBe('### Task 1: Existing approved work\n');
+  });
+
   it('uses gate-specific configured lap caps without changing the generic cap', () => {
     expect(
       remediationLapCapForGate('prd_audit', { prd_audit: { max_remediation_laps: 1 } } as never, 0),
@@ -2139,15 +2253,22 @@ describe('prd_audit kickback', () => {
         await rm(join(root, '.pipeline', 'HALT'));
         await rm(join(root, '.pipeline', 'HALT.class'));
       }, { root: first.root });
-      const decisions = await readOverScopeDecisions(second.root);
+      const decisions = await new AcceptedWideningDecisionStore(second.root, {
+        version: 1,
+        repository: '/fixture/repository',
+        feature: 'prd-audit-kickback',
+      }).read();
 
-      expect(decisions.decisions).toEqual([expect.objectContaining({
+      expect(decisions).toMatchObject({ kind: 'valid', state: { decisions: [expect.objectContaining({
         criterion: 'NC.1',
-        summary,
-        decision: 'accept',
+        authority: 'accept',
         rationale: 'Approved for this feature.',
         operator: 'operator@example.test',
-      })]);
+        originalSource: {
+          id: prdWideningSourceId({ criterion: 'NC.1', grade: 'OVER_SCOPE', evidence: summary, prdIds: [] }),
+          snapshot: summary,
+        },
+      })] } });
       expect(second.gateBlocks).not.toContainEqual(expect.objectContaining({ step: 'prd_audit' }));
       expect(second.state.ok && second.state.value.prd_audit).toBe('done');
     } finally {
@@ -2274,6 +2395,91 @@ describe('prd_audit kickback', () => {
       .resolves.toBeNull();
     await expect(resolveAsBuiltGoverningClause(root, plan, `${adrStem} decision 10`))
       .resolves.toBeNull();
+  });
+
+  it('resolves fractional subclauses against a D-heading ADR decision', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'as-built-clause-d-heading-fractional-'));
+    dirs.push(root);
+    const planPath = join(root, '.docs', 'plans', 'feature.md');
+    const adrStem = 'adr-2026-09-18-d-heading-fractional-architecture';
+    await Promise.all([
+      mkdir(join(root, '.docs', 'plans'), { recursive: true }),
+      mkdir(join(root, '.docs', 'decisions'), { recursive: true }),
+    ]);
+    await writeFile(planPath, '### Task 1: Existing approved work\n');
+    await writeFile(join(root, '.docs', 'decisions', `${adrStem}.md`), [
+      '# ADR: Fractional D-heading architecture',
+      '**Status:** APPROVED',
+      '',
+      '## Decision',
+      '',
+      '**D5 — Engine-minted run identity.** The engine binds an identity per dispatch.',
+      '',
+      '## Consequences',
+      '',
+      '- Something else entirely.',
+    ].join('\n'));
+
+    const plan = await readFile(planPath, 'utf8');
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${adrStem} D5`))
+      .resolves.toEqual({ kind: 'adr', clause: `${adrStem} D5` });
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${adrStem} decision 5`))
+      .resolves.toEqual({ kind: 'adr', clause: `${adrStem} decision 5` });
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${adrStem} D5.2`))
+      .resolves.toEqual({ kind: 'adr', clause: `${adrStem} D5.2` });
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${adrStem} decision 5.2`))
+      .resolves.toEqual({ kind: 'adr', clause: `${adrStem} decision 5.2` });
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${adrStem} + 5.2`))
+      .resolves.toEqual({ kind: 'adr', clause: `${adrStem} + 5.2` });
+  });
+
+  it('keeps undeclared, malformed, draft, and task-shaped dotted cites fail closed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'as-built-clause-dotted-negative-'));
+    dirs.push(root);
+    const planPath = join(root, '.docs', 'plans', 'feature.md');
+    const declaredStem = 'adr-2026-09-18-declared-decisions';
+    const numericStem = 'adr-2026-09-18-numeric-decision';
+    const draftStem = 'adr-2026-09-18-draft-decision';
+    await Promise.all([
+      mkdir(join(root, '.docs', 'plans'), { recursive: true }),
+      mkdir(join(root, '.docs', 'decisions'), { recursive: true }),
+    ]);
+    await writeFile(planPath, '### Task 5.2: Existing approved work\n');
+    await writeFile(join(root, '.docs', 'decisions', `${declaredStem}.md`), [
+      '# ADR: Declared decisions',
+      '**Status:** APPROVED',
+      '',
+      '## Decision',
+      '',
+      '**D1 — First.**',
+      '**D2 — Second.**',
+      '**D3 — Third.**',
+      '**D4 — Fourth.**',
+    ].join('\n'));
+    await writeFile(join(root, '.docs', 'decisions', `${numericStem}.md`), [
+      '# ADR: Numeric decision',
+      '**Status:** APPROVED',
+      '',
+      '## Decision',
+      '',
+      '**D5 — Fifth.**',
+    ].join('\n'));
+    await writeFile(join(root, '.docs', 'decisions', `${draftStem}.md`), [
+      '# ADR: Draft decision',
+      '**Status:** DRAFT',
+      '',
+      '## Decision',
+      '',
+      '**D5 — Fifth.**',
+    ].join('\n'));
+
+    const plan = await readFile(planPath, 'utf8');
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${declaredStem} D9.1`)).resolves.toBeNull();
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${numericStem} D5.a`)).resolves.toBeNull();
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${numericStem} D5.`)).resolves.toBeNull();
+    await expect(resolveAsBuiltGoverningClause(root, plan, `${draftStem} D5.2`)).resolves.toBeNull();
+    await expect(resolveAsBuiltGoverningClause(root, plan, 'Task 5.2'))
+      .resolves.toEqual({ kind: 'plan-task', clause: 'Task 5.2', parentTask: '5.2' });
   });
 
   it('fails closed when an ADR omits the cited decision number', async () => {

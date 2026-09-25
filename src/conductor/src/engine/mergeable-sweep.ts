@@ -23,17 +23,19 @@ import {
   GhRunner,
   makeProductionGh,
   makeProductionGit,
-  ensureLabel,
   addLabel,
   removeLabel,
-  prMergeState,
   isMergeable,
   upsertComment,
   type PrMergeState,
+  type PrRunner,
 } from './pr-labels.js';
+import { createGithubTrackerClient, type TrackerClient } from './tracker-client.js';
 import type { ConductorEvent } from '../types/events.js';
+import type { GithubOperationRunner } from './github-operations.js';
 import type { FeatureWorktree } from './daemon-runner.js';
 import { shippedRecordOnMain } from './shipped-record-on-main.js';
+import type { CiFixOutcome } from './ci-fix.js';
 
 // ── Task 21: exhaustion escalation ──────────────────────────────────────────
 
@@ -73,6 +75,34 @@ export interface WatchEntry {
   ciFixAttempts?: number;
   lastCiFixAt?: string;
   ciFailureDetected?: boolean;
+  escalationCause?: 'conflict-resolution';
+  labelClearAttempts?: number;
+}
+
+/**
+ * Retire a conflict-resolution remediation label only after GitHub reports a
+ * safe, readable mergeable state. The returned entry is the single source of
+ * truth for the next sweep tick, including bounded retry bookkeeping.
+ */
+export async function maybeClearConflictLabel(
+  entry: WatchEntry,
+  state: PrMergeState,
+  gh: PrRunner,
+  log?: (message: string) => void,
+): Promise<WatchEntry> {
+  if (entry.escalationCause !== 'conflict-resolution') return entry;
+  const clear = (): WatchEntry => {
+    const { escalationCause: _cause, labelClearAttempts: _attempts, ...cleared } = entry;
+    return cleared;
+  };
+  if (!state.labels.includes('needs-remediation')) return clear();
+  if (state.mergeable !== 'MERGEABLE' || state.hasHaltBodyMarker || state.readFailure) return entry;
+  if ((entry.labelClearAttempts ?? 0) >= 3) {
+    log?.(`[mergeable-sweep] label clear retry cap reached for ${entry.prUrl}`);
+    return clear();
+  }
+  await removeLabel(gh, entry.repoCwd, entry.prUrl, 'needs-remediation', log);
+  return { ...entry, labelClearAttempts: (entry.labelClearAttempts ?? 0) + 1 };
 }
 
 const WATCH_FILE = '.daemon/mergeable-watch.jsonl';
@@ -172,6 +202,8 @@ export async function readWatch(projectRoot: string): Promise<WatchEntry[]> {
               ...(typeof raw.ciFailureDetected === 'boolean' && {
                 ciFailureDetected: raw.ciFailureDetected,
               }),
+              ...(raw.escalationCause === 'conflict-resolution' && { escalationCause: 'conflict-resolution' as const }),
+              ...(typeof raw.labelClearAttempts === 'number' && { labelClearAttempts: raw.labelClearAttempts }),
             };
             return [entry];
           }
@@ -191,6 +223,7 @@ export async function readWatch(projectRoot: string): Promise<WatchEntry[]> {
  */
 export async function rewriteWatch(projectRoot: string, entries: WatchEntry[]): Promise<void> {
   try {
+    await mkdir(join(projectRoot, '.daemon'), { recursive: true });
     const content =
       entries.length > 0 ? entries.map((e) => JSON.stringify(e)).join('\n') + '\n' : '';
     await writeFile(join(projectRoot, WATCH_FILE), content);
@@ -228,7 +261,7 @@ export interface AutoresolveDispatchOpts {
    * (AC3) — the git work itself happens inside this callback.
    * Returns the outcome kind so the sweep can reset the counter on success.
    */
-  dispatch: (entry: WatchEntry) => Promise<{ kind: 'refreshed' | 'escalated' } | void>;
+  dispatch: (entry: WatchEntry) => Promise<{ kind: 'refreshed' | 'escalated' | 'setup-stop' } | void>;
   /** Clock override for tests; defaults to `new Date()`. */
   now?: () => Date;
 }
@@ -260,7 +293,12 @@ export interface CiFixDispatchOpts {
    * (AC3) — the git work itself happens inside this callback.
    * Returns the outcome kind so the sweep can reset the counter on success.
    */
-  dispatch: (entry: WatchEntry) => Promise<{ kind: 'green-verified' } | void>;
+  dispatch: (
+    entry: WatchEntry,
+    state: PrMergeState,
+  ) => Promise<CiFixOutcome | { kind: 'green-verified' | 'needs-human' } | void>;
+  /** Best-effort observation for selected-state failures before dispatch. */
+  diagnostic?: (entry: WatchEntry, state: PrMergeState) => void | Promise<void>;
   /** Clock override for tests; defaults to `new Date()`. */
   now?: () => Date;
 }
@@ -269,6 +307,10 @@ export interface SweepOpts {
   projectRoot: string;
   log?: (msg: string) => void;
   runGh?: GhRunner;
+  /** Typed PR-state reader; raw gh remains scoped to legacy label mutations. */
+  tracker?: Pick<TrackerClient, 'readPullRequestMergeState'>;
+  /** Reads use `runGh`; writes require this fresh, feature-scoped runner. */
+  operations?: GithubOperationRunner | ((entry: WatchEntry) => GithubOperationRunner | undefined);
   /** Task 17: optional autoresolve dispatch, run once per tick after the label pass. */
   autoresolve?: AutoresolveDispatchOpts;
   /** Task 10: optional CI fix dispatch, run once per tick after the label pass. */
@@ -292,6 +334,18 @@ export interface SweepOpts {
   onEvent?: (event: ConductorEvent) => void;
 }
 
+function runnerForEntry(
+  gh: GhRunner,
+  entry: WatchEntry,
+  operations: SweepOpts['operations'],
+): GhRunner | (GhRunner & GithubOperationRunner) {
+  const operationRunner = typeof operations === 'function' ? operations(entry) : operations;
+  if (!operationRunner) return gh;
+  // Bind a fresh read wrapper for this entry so its target-bound mutation
+  // runner cannot be reused by a later entry in the same sweep.
+  return Object.assign(gh.bind(undefined), operationRunner);
+}
+
 /**
  * For each tracked PR: evaluate merge state then update the `mergeable` label
  * according to the decision tree; prune closed/merged PRs. Never throws (FR-15).
@@ -300,6 +354,8 @@ export async function sweepMergeableLabels({
   projectRoot,
   log,
   runGh,
+  tracker,
+  operations,
   autoresolve,
   ciFix,
   teardownWorktree,
@@ -308,6 +364,7 @@ export async function sweepMergeableLabels({
   onEvent,
 }: SweepOpts): Promise<void> {
   const gh = runGh ?? makeProductionGh();
+  const prStateTracker = tracker ?? createGithubTrackerClient(gh);
   const git = makeProductionGit();
   const probe =
     shippedRecordProbe ??
@@ -330,12 +387,13 @@ export async function sweepMergeableLabels({
 
     for (const entry of entries) {
       try {
-        const state = await prMergeState(gh, entry.repoCwd, entry.prUrl, log);
+        const entryGh = runnerForEntry(gh, entry, operations);
+        const state = await prStateTracker.readPullRequestMergeState(entry.prUrl, entry.repoCwd, log);
 
         // GitHub checks are authoritative for CI state. Retire the redundant
         // custom label whenever a reconciliation read finds it on a PR.
         if (state.labels.includes('ci-failed')) {
-          await removeLabel(gh, entry.repoCwd, entry.prUrl, 'ci-failed', log);
+          await removeLabel(entryGh, entry.repoCwd, entry.prUrl, 'ci-failed', log);
         }
 
         // MERGED and CLOSED may both represent a completed merge: only a
@@ -405,6 +463,9 @@ export async function sweepMergeableLabels({
         // FR-15: UNKNOWN state (transient read/fetch error) → log + skip this
         // iteration; keep the entry so it is retried on the next sweep cycle.
         if (state.state === 'UNKNOWN') {
+          if ((state.readFailure || state.contextFailure) && ciFix?.enabled) {
+            try { await ciFix.diagnostic?.(entry, state); } catch { /* observational */ }
+          }
           log?.(`[mergeable-sweep] skipping ${entry.prUrl} (could not read state)`);
           logDisposition(
             log,
@@ -437,6 +498,11 @@ export async function sweepMergeableLabels({
           }
         }
 
+        // A conflict-resolution label becomes stale once GitHub reports the PR
+        // mergeable again. Legacy/unattributed labels remain sticky.
+        const idx = survivors.findIndex((s) => s.prUrl === entry.prUrl);
+        if (idx >= 0) survivors[idx] = await maybeClearConflictLabel(entry, state, entryGh, log);
+
         // FR-12: if the PR carries `needs-remediation`, ensure `mergeable` is absent.
         let hasRemediation = state.labels.includes('needs-remediation');
 
@@ -454,7 +520,7 @@ export async function sweepMergeableLabels({
           // detection read above and this point in the sweep. Racing an
           // escalation comment onto an already-resolved PR is pure noise, so
           // prune the entry and skip the label/comment/event work entirely.
-          const freshState = await prMergeState(gh, entry.repoCwd, entry.prUrl, log);
+          const freshState = await prStateTracker.readPullRequestMergeState(entry.prUrl, entry.repoCwd, log);
           if (
             freshState.state === 'MERGED' ||
             freshState.state === 'CLOSED' ||
@@ -473,14 +539,13 @@ export async function sweepMergeableLabels({
           // escalation comment call throws — a hard failure here must never
           // leave the PR silently unlabeled, and must never crash the sweep.
           try {
-            await ensureLabel(gh, entry.repoCwd, 'needs-remediation', 'B60205', log);
-            await addLabel(gh, entry.repoCwd, entry.prUrl, 'needs-remediation', log);
+            await addLabel(entryGh, entry.repoCwd, entry.prUrl, 'needs-remediation', log);
           } catch (err) {
             log?.(`[mergeable-sweep] needs-remediation label error for ${entry.prUrl}: ${err}`);
           }
           try {
             await upsertComment(
-              gh,
+              entryGh,
               entry.repoCwd,
               entry.prUrl,
               CI_EXHAUSTION_MARKER,
@@ -503,7 +568,7 @@ export async function sweepMergeableLabels({
 
         if (hasRemediation) {
           if (state.labels.includes('mergeable')) {
-            await removeLabel(gh, entry.repoCwd, entry.prUrl, 'mergeable', log);
+            await removeLabel(entryGh, entry.repoCwd, entry.prUrl, 'mergeable', log);
           }
         } else {
           // Task 10 (AC1): track failed PRs for the post-label-pass
@@ -558,13 +623,12 @@ export async function sweepMergeableLabels({
         if (!hasRemediation) {
           if (isMergeable(state)) {
             if (!state.labels.includes('mergeable')) {
-              await ensureLabel(gh, entry.repoCwd, 'mergeable', '0E8A16', log);
-              await addLabel(gh, entry.repoCwd, entry.prUrl, 'mergeable', log);
+              await addLabel(entryGh, entry.repoCwd, entry.prUrl, 'mergeable', log);
             }
           } else {
             // FR-11 / C2: remove `mergeable` only when currently present.
             if (state.labels.includes('mergeable')) {
-              await removeLabel(gh, entry.repoCwd, entry.prUrl, 'mergeable', log);
+              await removeLabel(entryGh, entry.repoCwd, entry.prUrl, 'mergeable', log);
             }
           }
         }
@@ -590,6 +654,7 @@ export async function sweepMergeableLabels({
     if (autoresolve?.enabled) {
       let dispatched = false;
       for (const { entry, state } of conflictingCandidates) {
+        const entryGh = runnerForEntry(gh, entry, operations);
         const elig = await autoresolve.isEligible(entry, state);
         if (!elig.eligible) continue;
 
@@ -612,6 +677,23 @@ export async function sweepMergeableLabels({
         const dispatchResult = await autoresolve.dispatch(updated);
         if (dispatchResult?.kind === 'refreshed') {
           survivors[idx] = { ...updated, resolveAttempts: 0 };
+        } else if (dispatchResult?.kind === 'escalated') {
+          survivors[idx] = { ...updated, escalationCause: 'conflict-resolution' };
+        } else if (dispatchResult?.kind === 'setup-stop') {
+          survivors[idx] = { ...updated, resolveAttempts: entry.resolveAttempts ?? 0 };
+          try {
+            await addLabel(entryGh, entry.repoCwd, entry.prUrl, 'needs-remediation', log);
+            await upsertComment(
+              entryGh,
+              entry.repoCwd,
+              entry.prUrl,
+              '<!-- conductor:rebase-setup -->',
+              '## Rebase resolution paused\n\nProvider setup was unavailable before a resolver was invoked. Complete the provider recovery action, remove `needs-remediation`, then retry.',
+              log,
+            );
+          } catch (err) {
+            log?.(`[mergeable-sweep] rebase setup-recovery marker error for ${entry.prUrl}: ${err}`);
+          }
         }
       }
     }
@@ -625,6 +707,7 @@ export async function sweepMergeableLabels({
     if (ciFix?.enabled) {
       let dispatched = false;
       for (const { entry, state } of failedCandidates) {
+        const entryGh = runnerForEntry(gh, entry, operations);
         const elig = await ciFix.isEligible(entry, state);
         if (!elig.eligible) continue;
 
@@ -635,19 +718,50 @@ export async function sweepMergeableLabels({
 
         dispatched = true;
         const now = ciFix.now ? ciFix.now() : new Date();
+        const idx = survivors.findIndex((s) => s.prUrl === entry.prUrl);
+        // The label pass may have set ciFailureDetected since this candidate
+        // was collected. Reserve from that current survivor so a later refund
+        // cannot discard the observed failure transition.
+        const current = idx >= 0 ? survivors[idx] : entry;
         const updated: WatchEntry = {
-          ...entry,
-          ciFixAttempts: (entry.ciFixAttempts ?? 0) + 1,
+          ...current,
+          ciFixAttempts: (current.ciFixAttempts ?? 0) + 1,
           lastCiFixAt: now.toISOString(),
           ciFailureDetected: true,
         };
-        const idx = survivors.findIndex((s) => s.prUrl === entry.prUrl);
         if (idx >= 0) survivors[idx] = updated;
 
         try {
-          const dispatchResult = await ciFix.dispatch(updated);
-          if (dispatchResult?.kind === 'green-verified') {
-            survivors[idx] = { ...updated, ciFixAttempts: 0 };
+          const dispatchResult = await ciFix.dispatch(updated, state);
+          // Only an affirmative pre-provider refusal can restore the exact
+          // reservation. A local publication is not GitHub green; remote green
+          // is reconciled by the normal state transition on a later sweep.
+          if (dispatchResult?.kind === 'needs-human') {
+            survivors[idx] = { ...updated, ciFixAttempts: entry.ciFixAttempts ?? 0 };
+            try {
+              await addLabel(entryGh, entry.repoCwd, entry.prUrl, 'needs-remediation', log);
+              await upsertComment(
+                entryGh,
+                entry.repoCwd,
+                entry.prUrl,
+                '<!-- conductor:ci-fix-setup -->',
+                '## CI repair paused\n\nProvider setup was unavailable before a repair provider was invoked. Complete the provider recovery action, remove `needs-remediation`, then retry.',
+                log,
+              );
+            } catch (err) {
+              log?.(`[mergeable-sweep] ciFix setup-recovery marker error for ${entry.prUrl}: ${err}`);
+            }
+          } else if (dispatchResult?.kind === 'not-started' || dispatchResult?.kind === 'branch-gone') {
+            survivors[idx] = {
+              // Preserve the state transition from the label pass (notably a
+              // newly detected CI failure), while refunding only the fields
+              // this reservation changed.
+              ...current,
+              ciFixAttempts: entry.ciFixAttempts,
+              ...(entry.lastCiFixAt === undefined
+                ? { lastCiFixAt: undefined }
+                : { lastCiFixAt: entry.lastCiFixAt }),
+            };
           }
         } catch (err) {
           // Task 11: dispatch error is logged but not propagated (AC1b)

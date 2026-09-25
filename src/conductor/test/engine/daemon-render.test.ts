@@ -1,4 +1,4 @@
-// Covers: task:2, task:3, task:4, task:6
+// Covers: task:2, task:3, task:4, task:6, task:7, task:23
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 // pure-formatting test doesn't pull a live process dependency.
 vi.mock('execa', () => ({ execa: vi.fn() }));
 
-import { renderDaemonEvent } from '../../src/daemon-cli.js';
+import { renderDaemonEvent, resetRenderedReclaimRetentions } from '../../src/daemon-cli.js';
 import { renderedEventTypes } from '../../src/engine/event-sinks.js';
 import type { ConductorEvent } from '../../src/types/index.js';
 
@@ -25,6 +25,7 @@ function lines(event: ConductorEvent): string[] {
 const originalLevel = chalk.level;
 afterEach(() => {
   chalk.level = originalLevel;
+  resetRenderedReclaimRetentions();
 });
 
 describe('renderDaemonEvent', () => {
@@ -71,6 +72,19 @@ describe('renderDaemonEvent', () => {
       requested: 'stale',
       intent: 'restage ship tail after build kickback',
     })).toEqual(['· ✋ manual_test status write refused: skipped → stale (restage ship tail after build kickback)']);
+  });
+
+  it('renders an ownership refusal with the same reason and remedy as the terminal', () => {
+    expect(lines({
+      type: 'github_operation_refused',
+      operator: 'alice',
+      target: { repository: 'acme/owned', kind: 'issue', number: 17 },
+      operation: 'issue.comment.create',
+      reason: 'other-owner',
+      remedy: 'ask-resource-owner',
+    })).toEqual([
+      '· ✋ GitHub operation refused: issue.comment.create on acme/owned#17 (other-owner); remedy: ask-resource-owner',
+    ]);
   });
 
   it('renders every confidence-suppressed build-review finding alongside the outer verdict', () => {
@@ -126,6 +140,24 @@ describe('renderDaemonEvent', () => {
     ]);
   });
 
+  it('renders declined attempt and member attempt operator park boundaries', () => {
+    expect([
+      lines({
+        type: 'operator_park_boundary',
+        featureSlug: 'serial-feature',
+        boundary: { kind: 'attempt', step: 'build', attempt: 2 },
+      }),
+      lines({
+        type: 'operator_park_boundary',
+        featureSlug: 'group-feature',
+        boundary: { kind: 'attempt', step: 'build', attempt: 1, member: 'manual_test' },
+      }),
+    ]).toEqual([
+      ['· ⏸ operator park[serial-feature]: declined attempt 2 for step build'],
+      ['· ⏸ operator park[group-feature]: declined attempt 1 for group step build member manual_test'],
+    ]);
+  });
+
   it('renders step_retry with reason and progress delta', () => {
     const output = lines({
       type: 'step_retry',
@@ -142,6 +174,20 @@ describe('renderDaemonEvent', () => {
     expect(line).toContain('2/3');
     expect(line).toContain('5/11 tasks pending/not completed: 3, 6');
     expect(line).toContain('3→5 tasks');
+  });
+
+  it('renders step_retry with its progress allowance', () => {
+    const output = lines({
+      type: 'step_retry',
+      step: 'build',
+      attempt: 2,
+      maxAttempts: 3,
+      reason: 'tasks remain',
+      progressAttempt: 2,
+      progressAttemptCeiling: 30,
+    });
+
+    expect(output[0]).toContain('2/3 (progress allowance: attempt 2 of 30)');
   });
 
   it('renders step_retry without progress delta and collapses multi-line reason', () => {
@@ -269,6 +315,18 @@ describe('renderDaemonEvent', () => {
     } as ConductorEvent)).toEqual(['· ↩ FINISH publication: route to BUILD']);
   });
 
+  it('renders structured release-readiness blockers with their code and unsatisfied steps', () => {
+    expect(lines({
+      type: 'finish_publication_blocked',
+      condition: {
+        code: 'release_readiness_missing',
+        steps: ['compliance-gate', 'notes-gate'],
+      },
+    })).toEqual([
+      '· ✋ FINISH publication blocked: release_readiness_missing (steps: compliance-gate, notes-gate)',
+    ]);
+  });
+
   it('renders a mergeable skip distinctly from an already-current branch', () => {
     expect(lines({ type: 'rebase_noop' })).toEqual([]);
     // The skip line names the ref, its sha and its kind: a line that says only
@@ -314,6 +372,86 @@ describe('renderDaemonEvent', () => {
         phase: 'exhausted',
       }),
     ).toEqual(['· ✋ ci_failed[myorg/myrepo]: phase=exhausted attempts=2 checks=[build]']);
+  });
+
+  it('renders reclaimed and failed worktree reclamation outcomes but not retained outcomes', () => {
+    expect(lines({
+      type: 'worktree_reclaim_reclaimed',
+      slug: 'merged-feature',
+      branch: 'feat/daemon-merged-feature',
+      proof: 'ancestry',
+    })).toHaveLength(1);
+    expect(lines({
+      type: 'worktree_reclaim_reclaimed',
+      slug: 'branchless-parked-feature',
+    })).toHaveLength(1);
+    expect(lines({
+      type: 'worktree_reclaim_failed',
+      slug: 'merged-feature',
+      branch: 'feat/daemon-merged-feature',
+      refusal: 'branch-delete-failed',
+    })).toEqual(['· ✗ worktree reclaim failed merged-feature (feat/daemon-merged-feature; branch-delete-failed)']);
+    expect(lines({
+      type: 'worktree_reclaim_retained',
+      slug: 'active-feature',
+      reason: 'in-flight',
+    })).toEqual([]);
+  });
+
+  it.each([
+    'no-merge-proof',
+    'unmerged-commits',
+    'branch-behind-merged-head',
+    'dirty-worktree',
+    'in-flight',
+    'record-missing',
+    'ancestry-check-failed',
+  ])('renders a %s refusal as a retained worktree, not a failed reclaim', (refusal) => {
+    expect(lines({
+      type: 'worktree_reclaim_failed',
+      slug: 'kept-feature',
+      branch: 'hotfix/kept-feature',
+      refusal,
+    })).toEqual([`· ↷ worktree retained kept-feature (hotfix/kept-feature; ${refusal})`]);
+  });
+
+  it.each(['worktree-remove-failed', 'branch-delete-failed', 'unpark-failed'])(
+    'renders a %s refusal as a failed reclaim on every sweep',
+    (refusal) => {
+      const event: ConductorEvent = { type: 'worktree_reclaim_failed', slug: 'broken', branch: 'fix/broken', refusal };
+      expect([...lines(event), ...lines(event)]).toEqual([
+        `· ✗ worktree reclaim failed broken (fix/broken; ${refusal})`,
+        `· ✗ worktree reclaim failed broken (fix/broken; ${refusal})`,
+      ]);
+    },
+  );
+
+  it('renders a retained worktree once per slug until its reason changes or it is reclaimed', () => {
+    const retained = (slug: string, refusal: string): ConductorEvent =>
+      ({ type: 'worktree_reclaim_failed', slug, branch: `fix/${slug}`, refusal });
+
+    const rendered = [
+      // Sweep 1
+      ...lines(retained('open-pr', 'no-merge-proof')),
+      ...lines(retained('dirty', 'dirty-worktree')),
+      // Sweep 2: identical dispositions
+      ...lines(retained('open-pr', 'no-merge-proof')),
+      ...lines(retained('dirty', 'dirty-worktree')),
+      // Sweep 3: one reason changes
+      ...lines(retained('open-pr', 'no-merge-proof')),
+      ...lines(retained('dirty', 'unmerged-commits')),
+      // A reclaim clears memory; a recreated worktree of that slug renders again.
+      ...lines({ type: 'worktree_reclaim_reclaimed', slug: 'open-pr', branch: 'fix/open-pr', proof: 'merged-pr-head' }),
+      ...lines(retained('open-pr', 'no-merge-proof')),
+    ];
+
+    expect(rendered).toEqual([
+      '· ↷ worktree retained open-pr (fix/open-pr; no-merge-proof)',
+      '· ↷ worktree retained dirty (fix/dirty; dirty-worktree)',
+      '· ↷ worktree retained dirty (fix/dirty; unmerged-commits)',
+      '· ✓ worktree reclaimed open-pr (fix/open-pr; merged-pr-head)',
+      '· ↷ worktree retained open-pr (fix/open-pr; no-merge-proof)',
+    ]);
   });
 
   it('renders sealed-artifact remediation redirects with their gap and artifact', () => {
@@ -511,6 +649,38 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
     expect(stale[0]).toContain('fresh: false');
   });
 
+  it('renders custom-policy selection and failures with their routing context', () => {
+    expect(lines({
+      type: 'build_review_policy_resolved',
+      rubric: 'security',
+      lapId: 'lap-12345678',
+      provider: 'codex',
+      source: 'plugin',
+      pluginId: 'acme:review',
+      bundleDigest: 'digest',
+    })[0]).toContain('security policy resolved: codex plugin/acme:review');
+    expect(lines({
+      type: 'build_review_policy_failed',
+      rubric: 'security',
+      lapId: 'lap-12345678',
+      provider: 'codex',
+      stage: 'containment',
+      reason: 'bubblewrap unavailable',
+    })[0]).toContain('security policy containment failed: bubblewrap unavailable');
+  });
+
+  it('renders each durable decision stop of a settled adjudication with its owner and case', () => {
+    const rendered = lines({
+      type: 'remediation_adjudication_completed', domain: 'build_review', lapId: 'lap-12345678',
+      caseIds: ['case-1'], effectIds: [],
+      decisionStops: [{ caseId: 'case-1', owner: 'architecture', sourceIds: ['security:f1'], rationale: 'The repairs contradict the approved boundary.' }],
+    }).join('\n');
+    expect(rendered).toContain('decision stop');
+    expect(rendered).toContain('case-1');
+    expect(rendered).toContain('architecture');
+    expect(rendered).toContain('The repairs contradict the approved boundary.');
+  });
+
   it('renders the patch-equivalent filtered-commit count alongside the base freshness summary', () => {
     expect(lines({
       type: 'build_review_base',
@@ -631,6 +801,19 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
       { type: 'finish_publication_transition', phase: 'started', transition: 'ready_pr' },
       { type: 'finish_publication_blocked', condition: 'release_readiness_missing' },
       { type: 'finish_publication_disposition', disposition: 'complete' },
+      {
+        type: 'worktree_reclaim_reclaimed',
+        slug: 'merged-feature',
+        branch: 'feat/daemon-merged-feature',
+        proof: 'ancestry',
+      },
+      { type: 'worktree_reclaim_retained', slug: 'active-feature', reason: 'in-flight' },
+      {
+        type: 'worktree_reclaim_failed',
+        slug: 'merged-feature',
+        branch: 'feat/daemon-merged-feature',
+        refusal: 'branch-delete-failed',
+      },
     ];
 
     const renderingTypes = new Set(
@@ -670,6 +853,8 @@ describe('renderDaemonEvent distinctness and completeness guards', () => {
       'finish_publication_transition',
       'finish_publication_blocked',
       'finish_publication_disposition',
+      'worktree_reclaim_reclaimed',
+      'worktree_reclaim_failed',
     ]);
 
     expect(renderingTypes).toEqual(expected);

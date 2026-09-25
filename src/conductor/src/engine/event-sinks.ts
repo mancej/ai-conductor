@@ -28,6 +28,9 @@ export const EVENT_SINKS = {
   engineer_run_settled: { render: false, persist: true, audit: false, otel: false },
   engineer_worktree_retired: { render: false, persist: true, audit: false, otel: false },
   daemon_backlog_snapshot: { render: false, persist: true, audit: false, otel: true, otelTrace: false },
+  daemon_memory_sample: { render: false, persist: true, audit: false, otel: false, otelTrace: false },
+  daemon_heap_dump_written: { render: false, persist: true, audit: false, otel: false, otelTrace: false },
+  daemon_exited: { render: false, persist: true, audit: false, otel: false, otelTrace: false },
   feature_dispatch_started: { render: false, persist: true, audit: false, otel: true, otelTrace: false },
   feature_dispatch_ended: { render: false, persist: true, audit: false, otel: true, otelTrace: false },
   feature_shipped: { render: false, persist: true, audit: false, otel: true, otelTrace: false },
@@ -36,6 +39,7 @@ export const EVENT_SINKS = {
   // path carries this occurrence to a live renderer. Persist-only keeps this
   // registry a description of production rather than an aspiration.
   intake_inbound_sanitized: { render: false, persist: true, audit: false, otel: false },
+  land_gate_rejected: { render: false, persist: true, audit: false, otel: false },
   operator_rewind: { render: true, persist: true, audit: true, otel: false },
   setup_repair: { render: true, persist: true, audit: false, otel: false },
   project_setup: { render: true, persist: true, audit: false, otel: false },
@@ -46,11 +50,15 @@ export const EVENT_SINKS = {
   config_deprecated_key: { render: false, persist: true, audit: false, otel: false },
   contained_live_checkout_drift: { render: true, persist: true, audit: false, otel: false },
   self_host_containment_verdict: { render: true, persist: true, audit: false, otel: false },
+  self_host_boundary_fingerprint: { render: true, persist: true, audit: false, otel: false },
+  self_host_dispatch_admission: { render: true, persist: true, audit: false, otel: false },
   build_review_rubric_started: { render: true, persist: true, audit: false, otel: false },
+  build_review_policy_resolved: { render: true, persist: true, audit: true, otel: false },
+  build_review_policy_failed: { render: true, persist: true, audit: true, otel: false },
   build_review_rubric_prompt: { render: false, persist: true, audit: false, otel: false },
   build_review_rubric_result: { render: true, persist: true, audit: false, otel: false },
   build_review_rubric_skipped: { render: true, persist: true, audit: false, otel: false },
-  build_review_cache_hit: { render: true, persist: true, audit: false, otel: false },
+  build_review_cache_hit: { render: true, persist: true, audit: true, otel: false },
   build_review_scope_summary: { render: false, persist: true, audit: false, otel: false },
   // adr-2026-08-21 D5: discards are attributable in the daemon log, the
   // ledger, and the audit trail by rubric and cause.
@@ -74,6 +82,7 @@ export const EVENT_SINKS = {
   remediation_adjudication_failed: { render: false, persist: true, audit: false, otel: false },
   remediation_case_reconciled: { render: false, persist: true, audit: false, otel: false },
   remediation_case_refuted: { render: true, persist: true, audit: true, otel: false },
+  prd_widening_reconciled: { render: false, persist: true, audit: false, otel: false },
   remediation_effect_reserved: { render: false, persist: true, audit: false, otel: false },
   remediation_effect_applied: { render: false, persist: true, audit: false, otel: false },
   remediation_effect_failed: { render: false, persist: true, audit: false, otel: false },
@@ -83,8 +92,12 @@ export const EVENT_SINKS = {
   containment_check_unresolved: { render: false, persist: true, audit: false, otel: false },
   step_completed: { render: true, persist: true, audit: true, otel: true },
   step_failed: { render: true, persist: true, audit: false, otel: true },
-  step_refused: { render: true, persist: true, audit: true, otel: false },
+  step_interrupted: { render: true, persist: true, audit: false, otel: true },
+  step_refused: { render: true, persist: true, audit: true, otel: true },
   step_status_write_refused: { render: true, persist: true, audit: true, otel: false },
+  // Ownership denials remain visible and durable through the one event spine;
+  // the event excludes payloads and request bodies by construction.
+  github_operation_refused: { render: true, persist: true, audit: false, otel: false },
   provider_attempt: { render: true, persist: true, audit: false, otel: true },
   // Per-interval progress would flood .daemon/daemon.log; daemon status reads the ledger directly.
   provider_stream_progress: { render: false, persist: true, audit: false, otel: false },
@@ -135,10 +148,10 @@ export const EVENT_SINKS = {
   parallel_started: { render: true, persist: true, audit: false, otel: false },
   parallel_completed: { render: true, persist: true, audit: false, otel: false },
   parallel_failure: { render: false, persist: true, audit: false, otel: false },
-  group_member_step: { render: false, persist: false, audit: false, otel: false },
+  group_member_step: { render: false, persist: true, audit: false, otel: true },
   // A gate's verdict must outlive the run so recovery can reconstruct it from the ledger.
   gate_verdict: { render: true, persist: true, audit: true, otel: true },
-  test_suite_verification: { render: false, persist: true, audit: false, otel: false },
+  test_suite_verification: { render: true, persist: true, audit: false, otel: false },
   build_member_evidence_reused: { render: true, persist: true, audit: false, otel: false },
   build_member_evidence_recomputed: { render: true, persist: true, audit: false, otel: false },
   kickback: { render: true, persist: true, audit: true, otel: true },
@@ -157,7 +170,10 @@ export const EVENT_SINKS = {
   rebase_gate_preserved: { render: false, persist: true, audit: false, otel: false },
   rebase_gate_invalidated: { render: false, persist: true, audit: false, otel: false },
   rebase_conflict_halt: { render: true, persist: true, audit: false, otel: false },
-  rebase_citation_residue: { render: false, persist: false, audit: false, otel: false },
+  rebase_untracked_quarantined: { render: false, persist: true, audit: false, otel: false },
+  repair_boundary_translated: { render: false, persist: true, audit: false, otel: false },
+  rebase_citation_residue: { render: false, persist: true, audit: false, otel: false },
+  rebase_supersession_verdict: { render: false, persist: true, audit: false, otel: false },
   rebase_resolution_attempt: { render: false, persist: false, audit: false, otel: false },
   rebase_resolution_succeeded: { render: false, persist: false, audit: false, otel: false },
   rebase_resolution_failed: { render: false, persist: false, audit: false, otel: false },
@@ -170,8 +186,12 @@ export const EVENT_SINKS = {
   halt_cleared: { render: false, persist: false, audit: true, otel: false },
   kickback_budget_adjustment_authorized: { render: false, persist: true, audit: true, otel: false },
   ci_failed: { render: true, persist: false, audit: false, otel: false },
+  ci_repair_diagnostic: { render: true, persist: true, audit: false, otel: false },
   attribution_divergence: { render: false, persist: true, audit: false, otel: false },
   acceptance_red: { render: false, persist: true, audit: false, otel: false },
+  worktree_reclaim_reclaimed: { render: true, persist: true, audit: false, otel: false },
+  worktree_reclaim_retained: { render: false, persist: true, audit: false, otel: false },
+  worktree_reclaim_failed: { render: true, persist: true, audit: false, otel: false },
 } as const satisfies Record<ConductorEvent['type'], SinkDeclaration>;
 
 export type OtelEventType = {

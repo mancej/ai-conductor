@@ -189,7 +189,7 @@ it('composes one ordered provider context across the interactive run after regis
       modelOverride: 'opts.model',
       effortOverride: 'opts.effort',
       onAttempt:
-        "(step, attempt) =>\n      events.emit({ type: 'provider_attempt', step, ...attempt })",
+        "(step, { executionContext, ...attempt }) =>\n      events.emit({\n        type: 'provider_attempt', step, ...attempt,\n        ...(executionContext ? { executionContext } : {}),\n      })",
       warn: '(_message, transition) => events.emit(transition)',
       withCandidateSafety: 'createCandidateSafetyBoundary()',
     },
@@ -279,8 +279,8 @@ it('composes isolated provider execution state for every daemon feature after on
     daemonSource.indexOf('// Run the full resolution pipeline'),
   );
   const ciBody = daemonSource.slice(
-    daemonSource.indexOf('const ciFixDispatcher'),
-    daemonSource.indexOf('const outcome = await runCiFix'),
+    daemonSource.indexOf('const dispatchCiFix = createDaemonCiFixDispatch'),
+    daemonSource.indexOf('const outcome = await dispatchCiFix'),
   );
 
   expect({
@@ -1197,6 +1197,13 @@ it('binds every production step-resolution call to the policy owned by its execu
         scope: 'dispatchAttributionVerifier',
         argumentCount: 5,
         policyProvenance: 'option:modelPolicy:ProviderModelPolicy',
+      },
+      {
+        file: 'engine/conductor.ts',
+        scope: 'reconcileCurrentPrdWidening',
+        argumentCount: 5,
+        policyProvenance:
+          'step-resolver:Conductor.modelPolicyForStep:ProviderModelPolicy',
       },
       {
         file: 'engine/conductor.ts',

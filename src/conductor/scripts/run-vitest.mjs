@@ -1,11 +1,9 @@
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { installVitestTmpRoot } from './vitest-temp.mjs';
 
-// Keep the root short because tsx creates an IPC socket below it and macOS
-// limits Unix-domain socket paths to 103 bytes.
-const runRoot = realpathSync(mkdtempSync(join(tmpdir(), 'ac-v-')));
+const installation = installVitestTmpRoot({ fresh: true });
+const runRoot = installation.root;
 const child = spawn('vitest', process.argv.slice(2), {
   env: {
     ...process.env,
@@ -27,7 +25,7 @@ const { code, signal } = await new Promise((resolve, reject) => {
     signal: exitSignal,
   }));
 }).finally(() => {
-  rmSync(runRoot, { recursive: true, force: true });
+  if (installation.ownsRoot) rmSync(runRoot, { recursive: true, force: true });
 });
 
 if (signal !== null) {

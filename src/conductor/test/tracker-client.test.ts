@@ -11,8 +11,13 @@ import {
   makeProductionGh,
   assertRealExecAllowed,
   createGithubTrackerClient,
+  DEFAULT_ASSIGNED_ISSUES_LIMIT,
+  runTrackerRead,
   type GhRunner,
+  type GithubMutationExecutionContext,
 } from '../src/engine/tracker-client.js';
+import { decodeGithubOperationRequest } from '../src/engine/github-operations.js';
+import { requestExplicitGithubOperationApproval } from '../src/engine/github-operation-approval.js';
 
 describe('tracker-client: canonical GhRunner + guarded makeProductionGh', () => {
   it('typechecks GhRunner, makeProductionGh, assertRealExecAllowed imports', () => {
@@ -32,6 +37,31 @@ describe('tracker-client: canonical GhRunner + guarded makeProductionGh', () => 
       /AI_CONDUCTOR_NO_REAL_EXEC|real .*(gh|exec).* blocked/i,
     );
     expect(execFileSpy).not.toHaveBeenCalled();
+  });
+
+  it('forwards caller timeout and capture limits to the process boundary without changing defaults', async () => {
+    const noRealExec = process.env.AI_CONDUCTOR_NO_REAL_EXEC;
+    delete process.env.AI_CONDUCTOR_NO_REAL_EXEC;
+    vi.mocked(execFileSpy).mockImplementationOnce(((
+      _file: string,
+      _args: readonly string[] | null | undefined,
+      _options: unknown,
+      callback: ((error: unknown, stdout: unknown, stderr: unknown) => void) | undefined,
+    ) => {
+      callback?.(null, 'ok', '');
+      return undefined as never;
+    }) as unknown as typeof execFileSpy);
+
+    try {
+      await expect(makeProductionGh()(['run', 'view', '7'], {
+        cwd: '/repo', timeout: 10_000, maxBuffer: 65_536,
+      })).resolves.toMatchObject({ stdout: expect.any(String) });
+      expect(execFileSpy).toHaveBeenLastCalledWith('gh', ['run', 'view', '7'], {
+        cwd: '/repo', timeout: 10_000, maxBuffer: 65_536,
+      }, expect.any(Function));
+    } finally {
+      process.env.AI_CONDUCTOR_NO_REAL_EXEC = noRealExec;
+    }
   });
 });
 
@@ -135,10 +165,38 @@ function failingRunner(opts: { code?: number; stderr: string; message?: string }
   return { runner, calls };
 }
 
+function ownedMutation(): GithubMutationExecutionContext {
+  return {
+    provenance: {
+      repository: 'owner/repo',
+      defaultBranch: 'main',
+      specBranch: 'spec/fixture',
+      featureMarker: '.docs/specs/fixture.md',
+      publication: 'initial',
+    },
+    dependencies: {
+      resolveMachineOwner: async () => ({ resolved: true, id: 'alice' }),
+      provenanceDiscovery: {
+        readCommittedRecords: async () => [{
+          path: '.docs/specs/fixture.md',
+          content: 'Owner: alice\n',
+        }],
+      },
+    },
+  };
+}
+
+function ownedClient(runner: GhRunner) {
+  return createGithubTrackerClient(runner, {
+    mutation: ownedMutation(),
+    repository: 'owner/repo',
+  });
+}
+
 describe('createGithubTrackerClient — loud error semantics', () => {
   it('closeIssue: non-zero exit rejection carries argv and stderr', async () => {
     const { runner } = failingRunner({ code: 1, stderr: 'gh: some failure occurred' });
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await expect(client.closeIssue('owner/repo', '12', '.')).rejects.toMatchObject({
       message: expect.stringContaining('gh: some failure occurred'),
@@ -192,6 +250,19 @@ describe('createGithubTrackerClient — loud error semantics', () => {
 });
 
 describe('createGithubTrackerClient — read ops argv parity', () => {
+  it('reads a PR head ref and forwards bounded failed-log options through the canonical runner', async () => {
+    const { runner, calls } = fakeRunner(JSON.stringify({ headRefName: 'feature/repair' }));
+    const client = createGithubTrackerClient(runner);
+    await expect(client.getPullRequestHeadRef('https://github.com/acme/repo/pull/7', '/worktree')).resolves.toBe('feature/repair');
+    expect(calls[0]).toEqual({ args: ['pr', 'view', 'https://github.com/acme/repo/pull/7', '--json', 'headRefName'], opts: { cwd: '/worktree' } });
+
+    const logRunner: GhRunner = async (args, opts) => {
+      calls.push({ args, opts });
+      return { stdout: 'failed log' };
+    };
+    await expect(createGithubTrackerClient(logRunner).viewWorkflowRunFailedLog('acme/repo', '41', '/worktree', { timeout: 10_000, maxBuffer: 65_536 })).resolves.toBe('failed log');
+    expect(calls.at(-1)).toEqual({ args: ['run', 'view', '41', '--repo', 'acme/repo', '--log-failed'], opts: { cwd: '/worktree', timeout: 10_000, maxBuffer: 65_536 } });
+  });
   it('getIssueLabels: matches backlog-priority.ts:335 `gh api repos/<owner>/<repo>/issues/<n>`', async () => {
     const { runner, calls } = fakeRunner(
       JSON.stringify({ labels: [{ name: 'bug' }, { name: 'p1' }] }),
@@ -255,7 +326,7 @@ describe('createGithubTrackerClient — read ops argv parity', () => {
     expect(state).toBe('CLOSED');
   });
 
-  it('listAssignedIssues: matches github-issues.ts assignee-scoped poll argv', async () => {
+  it('listAssignedIssues: requests the exported maximum in the assignee-scoped poll argv', async () => {
     const { runner, calls } = fakeRunner(
       JSON.stringify([{ number: 1, title: 't', body: 'b', labels: [] }]),
     );
@@ -274,6 +345,8 @@ describe('createGithubTrackerClient — read ops argv parity', () => {
           'open',
           '--json',
           'number,title,body,labels',
+          '--limit',
+          String(DEFAULT_ASSIGNED_ISSUES_LIMIT),
           '-R',
           'owner/repo',
         ],
@@ -282,12 +355,78 @@ describe('createGithubTrackerClient — read ops argv parity', () => {
     ]);
     expect(issues).toEqual([{ number: 1, title: 't', body: 'b', labels: [] }]);
   });
+
+  it('listAssignedIssues: substitutes an explicit maximum', async () => {
+    const { runner, calls } = fakeRunner('[]');
+    const client = createGithubTrackerClient(runner);
+
+    await client.listAssignedIssues('owner/repo', '/repo/path', 45);
+
+    expect(calls[0]?.args).toContain('--limit');
+    expect(calls[0]?.args[calls[0]?.args.indexOf('--limit') + 1]).toBe('45');
+  });
+});
+
+describe('runTrackerRead — closed argv binding', () => {
+  it.each([
+    ['issue edit', ['issue', 'edit', '7', '-R', 'acme/repo']],
+    ['API PATCH', ['api', '-X', 'PATCH', 'repos/acme/repo/issues/7']],
+    ['API field flag', ['api', 'repos/acme/repo/issues/7', '-f', 'title=changed']],
+    ['API --field flag', ['api', 'repos/acme/repo/issues/7/labels', '--field', 'labels[]=x']],
+    ['API --raw-field flag', ['api', 'repos/acme/repo/issues/7', '--raw-field', 'title=changed']],
+    ['API --input body', ['api', 'repos/acme/repo/issues/7', '--input', '-']],
+    ['API org endpoint', ['api', 'orgs/acme/repos', '--jq', '.[].name']],
+    ['API user endpoint', ['api', 'user']],
+    ['API graphql endpoint', ['api', 'graphql', '-f', 'query=x']],
+    ['API endpoint after a flag', ['api', '--jq', '.state', 'repos/acme/repo/issues/7']],
+  ])('refuses %s before the GhRunner receives it', async (_name, args) => {
+    const { runner, calls } = fakeRunner('{}');
+
+    await expect(runTrackerRead(
+      runner, '/worktree', 'issue.read', 'acme/repo', { kind: 'issue', number: 7 }, args,
+    )).rejects.toMatchObject({ operation: 'issue.read', reason: 'invalid-target' });
+
+    expect(calls).toEqual([]);
+  });
+
+  it('refuses a declared read whose repository flag targets another repository', async () => {
+    const { runner, calls } = fakeRunner('{}');
+
+    await expect(runTrackerRead(
+      runner, '/worktree', 'issue.read', 'acme/repo', { kind: 'issue', number: 7 },
+      ['issue', 'view', '7', '-R', 'other/repo'],
+    )).rejects.toMatchObject({ operation: 'issue.read', reason: 'invalid-target' });
+
+    expect(calls).toEqual([]);
+  });
+
+  it('refuses a declared read whose API path targets another repository', async () => {
+    const { runner, calls } = fakeRunner('{}');
+
+    await expect(runTrackerRead(
+      runner, '/worktree', 'issue.read', 'acme/repo', { kind: 'issue', number: 7 },
+      ['api', 'repos/other/repo/issues/7'],
+    )).rejects.toMatchObject({ operation: 'issue.read', reason: 'invalid-target' });
+
+    expect(calls).toEqual([]);
+  });
+
+  it('forwards a matching registered read argv unchanged', async () => {
+    const { runner, calls } = fakeRunner('{"state":"OPEN"}');
+    const args = ['issue', 'view', '7', '-R', 'acme/repo'];
+
+    await expect(runTrackerRead(
+      runner, '/worktree', 'issue.read', 'acme/repo', { kind: 'issue', number: 7 }, args,
+    )).resolves.toBe('{"state":"OPEN"}');
+
+    expect(calls).toEqual([{ args, opts: { cwd: '/worktree' } }]);
+  });
 });
 
 describe('createGithubTrackerClient — write ops argv parity', () => {
   it('commentOnIssue: matches github-issues.ts:302 `gh issue comment <n> -R <repo> --body <body>`', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await client.commentOnIssue('owner/repo', 42, 'hello', '.');
 
@@ -301,33 +440,34 @@ describe('createGithubTrackerClient — write ops argv parity', () => {
 
   it('createIssue: matches file-issue.ts:135 `gh issue create --title <t> --body <b> [--repo <r>]`', async () => {
     const { runner, calls } = fakeRunner('https://github.com/owner/repo/issues/9\n');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     const url = await client.createIssue({ title: 'T', body: 'B', repo: 'owner/repo' }, '.');
 
     expect(calls).toEqual([
       {
-        args: ['issue', 'create', '--title', 'T', '--body', 'B', '--repo', 'owner/repo'],
+        args: ['issue', 'create', '-R', 'owner/repo', '--title', 'T', '--body', 'B'],
         opts: { cwd: '.' },
       },
     ]);
     expect(url).toBe('https://github.com/owner/repo/issues/9');
   });
 
-  it('createIssue: omits --repo when not provided', async () => {
+  it('createIssue: requires a canonical repository instead of inheriting a cwd target', async () => {
     const { runner, calls } = fakeRunner('https://github.com/owner/repo/issues/9\n');
     const client = createGithubTrackerClient(runner);
 
-    await client.createIssue({ title: 'T', body: 'B' }, '.');
+    await expect(client.createIssue({ title: 'T', body: 'B' }, '.')).rejects.toMatchObject({
+      operation: 'issue.create',
+      reason: 'invalid-target',
+    });
 
-    expect(calls).toEqual([
-      { args: ['issue', 'create', '--title', 'T', '--body', 'B'], opts: { cwd: '.' } },
-    ]);
+    expect(calls).toEqual([]);
   });
 
   it('addIssueLabel: matches pr-labels.ts restAddLabelArgs REST POST shape', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await client.addIssueLabel('owner/repo', 42, 'engineer:handled', '.');
 
@@ -341,7 +481,7 @@ describe('createGithubTrackerClient — write ops argv parity', () => {
 
   it('closeIssue: matches halt-issues-cli.ts closeIssue `gh issue close <ref>` cross-repo targeting', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await client.closeIssue('owner/repo', '12', '.');
 
@@ -352,7 +492,7 @@ describe('createGithubTrackerClient — write ops argv parity', () => {
 
   it('upsertIssueBody: matches halt-issues-cli.ts upsertIssueBody `gh issue edit <ref> --body <body>` cross-repo targeting', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await client.upsertIssueBody('owner/repo', '12', 'new body', '.');
 
@@ -363,18 +503,18 @@ describe('createGithubTrackerClient — write ops argv parity', () => {
 
   it('upsertIssueComment: matches halt-issues-cli.ts upsertIssueComment `gh issue comment <ref> --body <body>` cross-repo targeting', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await client.upsertIssueComment('owner/repo', '12', 'a comment', '.');
 
     expect(calls).toEqual([
-      { args: ['issue', 'comment', '12', '--body', 'a comment', '-R', 'owner/repo'], opts: { cwd: '.' } },
+      { args: ['issue', 'comment', '12', '-R', 'owner/repo', '--body', 'a comment'], opts: { cwd: '.' } },
     ]);
   });
 
   it('viewPullRequest: matches github-issues.ts maybeReopen `gh pr view <url> --json state,mergedAt`', async () => {
     const { runner, calls } = fakeRunner('{"state":"CLOSED","mergedAt":null}');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     const result = await client.viewPullRequest('https://github.com/o/r/pull/9', '.');
 
@@ -386,7 +526,20 @@ describe('createGithubTrackerClient — write ops argv parity', () => {
 
   it('createLabel: matches github-issues.ts report() `gh label create <name> -R <repo>`', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const decoded = decodeGithubOperationRequest({
+      operation: 'label-definition.create',
+      repository: 'owner/repo',
+      resource: { kind: 'label-definition', name: 'engineer:handled' },
+      context: { actor: 'tracker-client' },
+      payload: { name: 'engineer:handled' },
+    });
+    if (decoded.kind !== 'accepted') throw new Error('fixture request must decode');
+    const approval = await requestExplicitGithubOperationApproval(decoded.request, {
+      mode: 'interactive',
+      confirm: async () => true,
+    });
+    if (approval.kind !== 'approved') throw new Error('fixture approval must succeed');
+    const client = createGithubTrackerClient(runner, { shared: { approval: approval.capability } });
 
     await client.createLabel('owner/repo', 'engineer:handled', '.');
 
@@ -397,7 +550,7 @@ describe('createGithubTrackerClient — write ops argv parity', () => {
 
   it('removeIssueLabel: matches pr-labels.ts restRemoveLabelArgs REST DELETE shape', async () => {
     const { runner, calls } = fakeRunner('');
-    const client = createGithubTrackerClient(runner);
+    const client = ownedClient(runner);
 
     await client.removeIssueLabel('owner/repo', 42, 'engineer:handled', '.');
 

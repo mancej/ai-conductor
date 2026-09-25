@@ -35,8 +35,9 @@ already exists, and returns `false` silently on any failure without touching eit
 `templates/project-config.yml.template`. For an existing Git repository, run
 `ai-conductor config init`; it writes the same template when the file is absent, reports success
 without changing bytes when the file already exists, and refuses a non-Git directory. The missing-file
-error names this command as its remedy. `bin/install` and `bin/migrate` continue to write only the
-user file.
+error names this command as its remedy. Its `--test-suite-command <command>` option records a
+non-empty, single-line aggregate command in the generated `test_suite` block without executing it.
+`bin/install` and `bin/migrate` continue to write only the user file.
 
 ## Rate card (`.ai-conductor/rate-card.json`)
 
@@ -163,7 +164,7 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 
 ## Key index
 
-44 top-level keys are allow-listed (plus one retired, no-op key — `wiring`, see
+53 top-level keys are allow-listed (plus one retired, no-op key — `wiring`, see
 [build_review](#build_review)). Everything else fails the load.
 
 | Key | Type | Default | Section |
@@ -192,6 +193,9 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 | `rebase_resolution_attempts` | number | `3` | [rebase_resolution_attempts](#rebase_resolution_attempts) |
 | `validation_concurrency` | number | `4` | [validation_concurrency](#validation_concurrency) |
 | `daemon_concurrency` | number | `1` | [daemon_concurrency](#daemon_concurrency) |
+| `daemon_heap_limit_mb` | number | `4096` | [daemon_heap_limit_mb](#daemon_heap_limit_mb) |
+| `daemon_heap_dump_threshold_mb` | number | `3072` | [Daemon heap dump threshold](#daemon-heap-dump-threshold) |
+| `daemon_heap_dump_retention` | number | `3` | [Daemon heap dump threshold](#daemon-heap-dump-threshold) |
 | `harness_self_host` | object | see section | [harness_self_host](#harness_self_host) |
 | `model_fallback_ladder` | string[] | provider policy | [model_fallback_ladder](#model_fallback_ladder) |
 | `auto_restart_on_stale_engine` | boolean | `false` | [auto_restart_on_stale_engine](#auto_restart_on_stale_engine) |
@@ -205,11 +209,13 @@ and the `build_review` and `ci_watch` normalizers (`:52,898-927,929-961`).
 | `ci_watch` | object | `{ enabled: true }` | [ci_watch](#ci_watch) |
 | `build_progress_halt` | object | see section | [build_progress_halt](#build_progress_halt) |
 | `retry_routing` | object | `{ enabled: true }` | [retry_routing](#retry_routing) |
+| `coverage_binding` | object | `{ judge: { enabled: false, batch_size: 8 } }` | [coverage_binding](#coverage_binding) |
 | `kickback_escalation` | object | `{ enabled: true }` | [kickback_escalation](#kickback_escalation) |
 | `cumulative_kickback_bound` | object | `{ enabled: true }` | [cumulative_kickback_bound](#cumulative_kickback_bound) |
 | `gate_code_validity` | object | `{ enabled: true }` | [gate_code_validity](#gate_code_validity) |
 | `daemon_verbose` | boolean | `false` | [daemon_verbose](#daemon_verbose) |
 | `reconcile_parked_auto_cleanup` | boolean | `true` | [reconcile_parked_auto_cleanup](#reconcile_parked_auto_cleanup) |
+| `reclaim_merged_worktrees` | boolean | `true` | [reclaim_merged_worktrees](#reclaim_merged_worktrees) |
 | `provider_preparation_timeout_minutes` | number | `5` | [provider_preparation_timeout_minutes](#provider_preparation_timeout_minutes) |
 | `teardown_timeout_seconds` | number | `120` | [teardown_timeout_seconds](#teardown_timeout_seconds) |
 | `dispatch_start_timeout_seconds` | number | `120` | [dispatch_start_timeout_seconds](#dispatch_start_timeout_seconds) |
@@ -430,6 +436,13 @@ Six fields are custom-step-only:
 `llm_provider` use the same semantics as for built-in steps. A custom step's own enforcement controls
 whether it may be disabled or conditional: advisory is allowed; gating and structural are rejected.
 
+The YAML key is the step's lifecycle identity; the `skill` path supplies its invocation identity. At
+dispatch, the engine reads the configured `SKILL.md` frontmatter `name` and invokes that name using the
+selected host's native syntax: Claude Code uses `/name`; Codex uses `$name`. The two names may differ,
+which lets a configuration key describe its place in a workflow without requiring a same-named skill.
+If the configured file or its `name` field is unavailable when dispatch begins, the custom step fails
+with a diagnostic instead of falling back to the YAML key.
+
 The derived `StepDefinition` (`steps.ts:595-609`) sets `label = name`, inherits `phase` from the `after`
 target, sets `prerequisites = [after]`, `skippableForTiers = []`, `isCheckpoint = false`, and takes
 `loopGate` from the target step. A custom step inserted after a loop-gate step therefore joins the
@@ -594,10 +607,14 @@ The project-owned aggregate verification command run by the pre-SHIP `test_suite
 
 | Key | Type | Required | Validation | Default |
 | --- | --- | --- | --- | --- |
-| `test_suite.command` | string | Yes, unless `test_suite.scoped_command` is configured | Non-empty after trim (`config.ts:1217-1221`) | — |
+| `test_suite.command` | string | Yes, unless `test_suite.commands` or `test_suite.scoped_command` is configured | Non-empty after trim. Mutually exclusive with `test_suite.commands`. | — |
+| `test_suite.commands` | object[] | Yes, unless `test_suite.command` or `test_suite.scoped_command` is configured | Non-empty ordered list. Each entry requires `command` and may set `working_directory` and `timeout_seconds`; unknown entry keys are rejected. Entries run serially and stop at the first failure. | — |
+| `test_suite.commands[].command` | string | Yes | Non-empty after trim. | — |
+| `test_suite.commands[].working_directory` | string | No | Relative project-root-contained directory. Overrides `test_suite.working_directory` for that entry. | shared setting, then project root |
+| `test_suite.commands[].timeout_seconds` | number | No | Finite and `> 0`. Overrides `test_suite.timeout_seconds` for that entry. | shared setting, then 1800 s |
 | `test_suite.scoped_command` | string | No | Non-empty after trim and must contain `{selectors}`. `ai-conductor scoped-run <selectors...>` replaces that placeholder with the selected tests; it never falls back to `command`. (`config.ts:1223-1236`) | none; scoped runs are unavailable |
-| `test_suite.working_directory` | string | No | Must be relative and resolve inside the project root. Absolute paths, `..` escapes, and symlinks whose realpath escapes the root are hard errors. A non-ENOENT/ENOTDIR realpath error fails closed (`config.ts:1239-1262`). Applies to both the aggregate `command` and `scoped_command`; `ai-conductor scoped-run` rebases project-root-relative selectors onto it | project root |
-| `test_suite.timeout_seconds` | number | No | Finite and `> 0` (`config.ts:1264-1274`) | 1800 s (`DEFAULT_FULL_SUITE_TIMEOUT_MS`, `src/conductor/src/engine/full-suite-executor.ts:7`) |
+| `test_suite.working_directory` | string | No | Must be relative and resolve inside the project root. Absolute paths, `..` escapes, and symlinks whose realpath escapes the root are hard errors. Applies to scalar aggregate and scoped commands, and is the shared fallback for list entries; `ai-conductor scoped-run` rebases project-root-relative selectors onto it. | project root |
+| `test_suite.timeout_seconds` | number | No | Finite and `> 0`. Shared fallback for list entries. | 1800 s (`DEFAULT_FULL_SUITE_TIMEOUT_MS`, `src/conductor/src/engine/full-suite-executor.ts`) |
 | `test_suite.inputs` | string[] | No | Array of strings (`config.ts:1276-1287`) | none |
 | `test_suite.environment` | string[] | No | Array of strings | none |
 | `test_suite.verification.mode` | `aggregate` \| `scoped` | No | `scoped` requires `test_suite.scoped_command`; unknown modes are rejected | `aggregate` |
@@ -608,8 +625,10 @@ fingerprint (`src/conductor/src/engine/full-suite-fingerprint.ts:209-228`) so th
 invalidates cached verification with reason `environment_changed`, and each is redacted from verifier
 output. See [environment](environment.md).
 
-The block must configure at least one of `command` or `scoped_command`. `command` is still required for
-the aggregate pre-SHIP gate. Omitting the block entirely is a gating failure at SHIP: the verifier returns
+The block must configure at least one of `command`, `commands`, or `scoped_command`. Aggregate verification
+requires either `command` or `commands`; a scalar command and command list cannot be combined. A list keeps
+its declared order, runs every entry only when all earlier entries succeed, and records the failed entry and
+unexecuted remainder when it stops. Omitting the block entirely is a gating failure at SHIP: the verifier returns
 `{ status: 'FAILED', reason: 'missing_config' }` (`src/conductor/src/engine/full-suite-verifier.ts:717-724`)
 and the run HALTs. The gate itself is described in [gates](../explanation/gates.md).
 
@@ -716,6 +735,20 @@ Production visualizers continue exporting traces with their per-run meter disabl
 The `conductor.step.duration` and `conductor.pipeline.closeout.duration` histograms use explicit
 duration buckets through 8 hours; quantiles saturate above that largest finite bucket boundary.
 
+Each started execution that reaches a terminal event contributes one
+`conductor.step.outcomes` counter point. Its `outcome` is `success`, `failure`, `interrupted`, or
+`refusal`; interruption and refusal are terminal states, not successful work or provider failures.
+For a configured validation-group member, the `step` attribute identifies the member as
+`configured:<url-encoded-parent-group>/<url-encoded-member>` rather than collapsing it into the
+group policy step. Its duration ends when that member settles, so sibling and group-join delay do
+not inflate the member's duration. The same member label is used for its duration, retry, dispatch,
+and terminal-outcome metrics.
+
+Build-review rubric and coverage-binding provider attempts carry the execution identity of their
+owning lifecycle step, including provider preparation and settlement events. Their auxiliary member
+labels remain available for dispatch attribution; these calls update the owning step span rather
+than opening separate rubric spans. Context-free callers retain legacy name-based correlation.
+
 Daemon exports include backlog count and oldest state-residence age by `state`, busy and free slots,
 in-flight features, liveness, active dispatch blockers, discovery duration, and build stalls by
 `reason`. `conductor.daemon.inflight` is the only `conductor.daemon.*` instrument with a `feature`
@@ -733,6 +766,15 @@ terminal paths.
 The `conductor.run.outcomes` counter increments once when an opened root run reaches one of those
 terminal paths. Its `outcome` attribute uses the same `complete`, `halted`, and `terminated` taxonomy,
 so dashboards can chart terminal runs without deriving counts from trace-query metrics.
+
+All nine D14 instruments carry an optional raw `tier` label when the producing event
+resolved one: `conductor.feature.dispatches`, `conductor.feature.halts`, `conductor.run.outcomes`,
+`conductor.feature.shipped`, `conductor.feature.duration.wall`, `conductor.feature.duration.active`,
+`conductor.feature.cost`, `conductor.feature.step.cost`, and `conductor.feature.step.tokens`.
+Unresolved tiers are omitted rather than defaulted. Re-tiering creates a new cumulative series while
+the earlier tier's last value remains available. Query cumulative feature totals by both dimensions,
+for example `max by (feature, tier) (...)`; summing those cross-tier series can double-count a
+feature that was re-tiered.
 
 Dispatch metrics use the same projection as the shipped-record cost rollup. Every invoked
 `provider_attempt` contributes one `conductor.step.dispatches` point, including failed attempts; an
@@ -762,7 +804,7 @@ Prometheus commonly normalizes the instruments to `conductor_feature_cost_usd`,
 `conductor_feature_step_cost_usd`, and `conductor_feature_step_tokens`. For example:
 
 ```promql
-max by (feature) (
+max by (feature, tier) (
   last_over_time(conductor_feature_cost_usd{project=~"$project"}[$__range])
 )
 ```
@@ -921,6 +963,20 @@ Kill-switch for classifying a retry as a rerun versus a route to another step. V
 
 Consumed at `src/conductor/src/engine/conductor.ts:4149`.
 
+## coverage_binding
+
+Opt-in pre-BUILD judge that confirms each criterion claim is asserted by the cited task's Done when checks.
+
+| Key | Type | Validation | Default |
+| --- | --- | --- | --- |
+| `coverage_binding.judge.enabled` | boolean | Boolean, else hard error | `false` |
+| `coverage_binding.judge.batch_size` | integer | Positive integer, else hard error | `8` |
+
+Only `enabled` and `batch_size` are accepted under `coverage_binding.judge`. Each fresh judge
+session evaluates an ordered batch of at most `batch_size` claims; a size of `1` uses one session
+per claim. The engine validates one verdict per claim and checkpoints accepted batches, so a later
+run reuses unchanged completed judgments and evaluates only pending claims.
+
 ## gate_code_validity
 
 Kill-switch for reusing a previously passing gate verdict when its stamped code surface is unchanged,
@@ -1063,6 +1119,19 @@ Draft PRs are never dispatched for auto-resolution. A CONFLICTING draft is logge
 `skipping resolve for <url> (draft PR)` and left alone; its `mergeable` label handling is
 unchanged, and no attempt counter is burned.
 
+For a non-draft conflicting PR, the sweep may dispatch the `rebase` resolver after its
+deterministic resolver leaves conflicts. The supersession exception is available only when every
+remaining conflict path is test-only. In that narrow case the resolver may declare one or more
+replayed test-only commits superseded; the engine rejects an empty rationale, an unknown choice,
+a SHA that was not replayed, or a supersession declaration for a mixed conflict set. It then runs
+the configured suite and the existing preservation checks before the lease-protected push. Any
+resolver, guard, suite, or push failure leaves the PR unrefreshed and escalates it for remediation.
+Finish-time and re-kick rebases never enable this exception.
+
+When a `needs-remediation` label was recorded specifically for a prior merge conflict, a later
+MERGEABLE sweep removes it only if the PR has no halt-body marker. The sweep makes at most three
+removal attempts; other `needs-remediation` causes remain sticky.
+
 
 ## conflict_check
 
@@ -1092,7 +1161,8 @@ block is normalized in place; the resolved value is written back (`config.ts:111
 | `build_review.adjudication.enabled` | boolean | `true` | Strict nested rollout switch for post-join remediation adjudication |
 | `build_review.scopeContainmentEnforced` | boolean | `false` | Works |
 | `build_review.maxParallel` | integer | `4` | Must be between 1 and 4 |
-| `build_review.rubrics` | object | `testQuality` off | Closed canonical map: `testQuality` only. Every other id ever accepted — `scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`, `wiring` — is retired: it warns and is silently ignored rather than rejecting the config |
+| `build_review.rubrics` | object | `testQuality`, `security` off | Closed canonical map: `testQuality` and `security`. Every other id ever accepted — `scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`, `wiring` — is retired: it warns and is silently ignored rather than rejecting the config |
+| `build_review.custom_rubrics` | object | disabled | Opt-in installed custom review policies (maximum 32 declarations) |
 
 Normalization contract:
 
@@ -1114,21 +1184,52 @@ opting a project out of the replacement authority.
 config key is the only off switch. When disabled, the step is marked `skipped` and a `config_skip` event
 is emitted (`src/conductor/src/engine/conductor.ts:6259, 6270-6276`), resolved once per pass.
 
-`testQuality` accepts `enabled`, `llm_provider`, `model`, `effort`, `model_fallback_ladder`,
-`max_retries`, `escalate`, and `min_confidence`. `min_confidence` is an integer from 0 through 100 and
+`testQuality` and `security` accept `enabled`, `max_projection_bytes`, `llm_provider`, `model`, `effort`,
+`model_fallback_ladder`, `max_retries`, `escalate`, and `min_confidence`. `max_projection_bytes` is a
+positive integer UTF-8 byte limit for the rubric's canonical projection; it defaults to `1048576` and the
+limit itself is admitted. An oversized projection is not dispatched: the gate records
+`projection-oversized` with the measured and allowed byte counts, then halts for an operator without
+consuming the shared mechanical-fault allowance. `min_confidence` is an integer from 0 through 100 and
 defaults to `0`; scored findings below it are reported as suppressed rather than failing the gate or
 remaining actionable through `build-review findings` / `build-review accept`. Unscored findings are
-never suppressed. `testQuality` is off by default. When enabled, the engine derives a frozen,
+never suppressed. Both rubrics are off by default. When enabled, `testQuality` derives a frozen,
 feature-local typed scope from the graded diff, the active plan and stories, and established `Covers`
 bindings; it does not admit every declaration in a marked file. A production-only refactor, move, or
 rename with neither an established target nor a concrete candidate is a valid empty-scope PASS and
-dispatches neither the reviewer nor counterfactual execution. Missing markers, absent plan test paths, and
+dispatches neither the test-quality reviewer nor counterfactual execution. Enabled security review still
+runs and participates in the joined verdict. Missing markers, absent plan test paths, and
 an abstract possibility of an unknown dependency do not turn that empty scope into a coverage failure.
-Any unknown or retired rubric
-id under `build_review.rubrics` — `scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`,
-`wiring` — is accepted as a no-op with a one-time notice naming the retired setting; it never fails
-configuration loading or halts a run
-(`adr-2026-08-22-build-review-opt-in-rubric-container`).
+Under `build_review.rubrics`: Every other id ever accepted is retired: `scope`, `completeness`, `rootCause`, `causalIntegrity`, `tautology`, `wiring`.
+Any unknown rubric id is rejected as a configuration error. Each retired id above is accepted as a
+no-op with a one-time notice naming the retired setting; it never fails configuration loading or halts a run. `security` judges the whole frozen feature diff for concrete,
+changed-hunk-anchored security defects and has no test scope or counterfactual preflight.
+Both behaviors follow `adr-2026-08-22-build-review-opt-in-rubric-container`.
+
+### `build_review.custom_rubrics`
+
+Each key is a stable custom rubric id: 1-64 ASCII characters, beginning with an ASCII letter (upper- or
+lowercase), followed by letters, digits, `_`, or `-`. A build may declare at most 32 custom rubrics. A declaration requires `skill` and `question`;
+it may set `source` (`project`, `global`, or `plugin`), `resources`, and the normal provider/model/retry
+fields. Custom policies are disabled unless their declaration sets `enabled: true`, and they require
+`build_review.adjudication.enabled` so their findings pass through the shared decision and repair path.
+
+The selected skill must be installed for the actual provider candidate. Omitting `source` is accepted
+only when discovery finds one unambiguous installation; otherwise select the project, global, or
+plugin source explicitly. `resources` name policy-package material captured with the selected skill;
+they cannot grant checkout, credential, sibling-review, or network access.
+
+Selecting a custom rubric adopts its skill as a read-only review policy: its criteria and captured
+resources inform findings for the declared question, but its standalone workflow and output format do
+not replace the engine's bounded review contract or aggregate verdict.
+
+Custom review is available on Linux only after bubblewrap proves the read-only profile: the frozen
+source and policy material are readable, while the original checkout, engine evidence, and sibling
+review evidence remain protected. If that profile, an admitted declared requirement, or a runtime
+policy requirement is unavailable, the member records an unsupported-policy coverage failure before
+judging; install/enable bubblewrap or adapt the policy to the read-only role, then rerun. Reuse keys
+include the selected declaration and captured policy digest, frozen input, engine version, and actual
+provider/model/effort, so a fallback provider never borrows a preferred-provider result. Exact
+operator dispositions remain decision stops and are re-read before an effect is applied.
 
 An ambiguous changed marker association or identified changed setup/helper that affects an opted-in test
 is a concrete candidate, not an automatically in-scope test. The existing test-quality reviewer resolves
@@ -1230,10 +1331,26 @@ conclusion nor a state are not. A deferral burns no attempt — the next sweep t
 dispatches once every check has finished. When the PR state carries no check-rollup detail at all, the
 gate does not block.
 
-CI repair agents diagnose from the supplied logs and commit fixes without running tests or pushing.
-The daemon runs the configured `test_suite` verifier in the repair worktree, including its working
+CI repair uses the same selected check rollup that made the PR eligible. It supplies failed check
+names or status contexts and available detail links, then optionally adds failed-job excerpts from at
+most three distinct workflow runs. The complete repair context is capped at 24,576 UTF-8 bytes;
+omitted metadata or logs are marked. An unavailable optional log degrades the context without
+blocking repair, but an unreadable, malformed, or empty required check context defers repair and
+does not consume an attempt.
+
+Repair execution follows the effective `build` provider, model, effort, and configured fallback
+policy; it has no separate provider setting. The repair session diagnoses and commits only. The
+daemon runs the configured `test_suite` verifier in the repair worktree, including its working
 directory, timeout, and evidence policy, before publishing with lease protection. Missing or invalid
 verification configuration blocks publication; CI repair does not use `mergeable_autoresolve.suiteCommand`.
+
+The sweep reserves an attempt before dispatch. It restores that reservation only when the execution
+boundary proves that no repair session started; no-change, failed, ambiguous, and locally published
+repairs retain it. A published repair means a changed commit passed preservation checks and the
+configured verifier, then passed the lease-protected push. It is not a GitHub-green result: only a
+later observed green rollup resets the attempt and failure-detection state. Preparation and repair
+diagnostics are rendered in the daemon log and persisted as bounded, credential-safe
+`ci_repair_diagnostic` events in `.daemon/events.jsonl`.
 
 Draft PRs are never dispatched to the CI fix loop. The sweep may still reconcile their `mergeable`
 label, but logs `skipping ci-fix for <url> (draft PR)` instead of collecting them as candidates — a
@@ -1314,6 +1431,17 @@ Set to `false` to require an explicit `ai-conductor daemon reconcile-parked <slu
 cleanup) for every parked feature, even once it is merged and recorded — see
 [park a feature before you touch its git state](../guides/running-the-daemon.md#park-a-feature-before-you-touch-its-git-state).
 
+## reclaim_merged_worktrees
+
+Whether the daemon's startup and idle-tick sweep reclaims eligible, merged feature worktrees that
+are registered directly under `.worktrees/`. Optional boolean; a non-boolean is a hard error.
+Absent config resolves to `true` at validation time.
+
+Set to `false` for a report-only pass over registered worktrees. The daemon still evaluates those
+candidates and records them as retained with reason `disabled`, but does not remove their worktree
+or branch. This setting does not change `reconcile_parked_auto_cleanup`: parked features continue
+to follow that setting. See [parked-feature reconciliation](../guides/running-the-daemon.md#parked-feature-reconciliation).
+
 ## provider_preparation_timeout_minutes
 
 Active pre-spawn deadline, in minutes, for provider candidate resolution, session setup, and
@@ -1376,6 +1504,10 @@ grants no termination or lifecycle authority.
 ## spec_owner
 
 The daemon operator identity used by the owner gate. Optional string.
+
+Set it only in user configuration with `ai-conductor config set spec_owner <identity>`. The command
+rejects an empty identity before writing; `ai-conductor config read spec_owner` shows the effective
+value.
 
 **This key may live only in `~/.ai-conductor/config.yml`.** On the `source: 'project'` path the key being
 merely present — blank or not — is a hard rejection naming the file and the fix
@@ -1474,6 +1606,32 @@ effective daemon concurrency above `1` before build dispatch and reports
 `LEGACY_NO_PROVIDER_EXECUTION_CONCURRENCY_REFUSAL`. That compatibility-path refusal is not a clamp
 on the daemon's normal worker pool.
 
+## daemon_heap_limit_mb
+
+Sets the V8 old-space heap cap for a continuous daemon. It defaults to `4096` MB and is passed to
+the daemon pane as `NODE_OPTIONS=--max-old-space-size=<n>` before the launcher command:
+
+```yaml
+daemon_heap_limit_mb: 6144
+```
+
+Only integers in `[256, ∞)` are valid. Invalid values stop `ai-conductor daemon start` and
+`ai-conductor daemon restart` before tmux launches or respawns a daemon.
+
+## Daemon heap dump threshold
+
+The daemon writes one heap snapshot per lifetime when a boundary memory sample's RSS reaches
+`daemon_heap_dump_threshold_mb` (default `3072`). Snapshots are stored under `.daemon/heap/`, and
+at most `daemon_heap_dump_retention` (default `3`) are kept; the oldest is removed first:
+
+```yaml
+daemon_heap_dump_threshold_mb: 2048
+daemon_heap_dump_retention: 5
+```
+
+Both must be integers in `[1, ∞)`. Keep the threshold below `daemon_heap_limit_mb` so the snapshot
+lands before the heap cap stops the daemon.
+
 ## stale_claim_window_hours
 
 Controls how long a `claimed` engineer-intake ledger entry may remain unfinished before it is
@@ -1515,7 +1673,10 @@ steps:
         effort: xhigh
 
 test_suite:
-  command: npm test
+  commands:
+    - command: npm test
+      working_directory: src/conductor
+    - command: bash test/test_harness_integrity.sh
   scoped_command: npx vitest run {selectors}
   working_directory: .
   timeout_seconds: 1800

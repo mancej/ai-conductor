@@ -6,6 +6,7 @@ otel:
   endpoint: http://localhost:4318
   attributes:
     verification.marker: a6227ff34d1a221e
+    team.name: jamesstoup
 
 # Auto-reconciliation of parked features, explicitly enabled (operator order,
 # 2026-07-30, matches the documented default but pinned here so it survives
@@ -74,7 +75,8 @@ build_review:
   # default remains false, so consumer repositories must opt in explicitly.
   scopeContainmentEnforced: true
   rubrics:
-    # test-quality is the only rubric this container dispatches. The rubrics it
+    # test-quality and security are the rubrics this container dispatches. The
+    # rubrics it
     # replaced — scope, completeness, rootCause, tautology — are retired and
     # unregistered: prd_audit now owns scope-as-intent grading with bounded
     # remediation, and the as-built architecture review owns design conformance,
@@ -86,16 +88,33 @@ build_review:
       enabled: true
       llm_provider: claude
       model: opus
-      effort: high
+      effort: low
+    # Security judges the whole frozen feature diff for concrete, changed-hunk-
+    # anchored defects (#2568). Judgement-heavy like testQuality, so it takes the
+    # same Claude opus routing. Enabled 2026-09-18.
+    security:
+      enabled: true
+      llm_provider: claude
+      model: opus
+      effort: low
+      # Findings the reviewer scores below 60 are suppressed, not kicked back:
+      # low-confidence security findings (35-55) cost a 30-minute lap and a
+      # kickback charge each while rarely surviving a second look.
+      min_confidence: 60
 
-# Native pre-SHIP aggregate verification. The project-owned npm script runs
-# Vitest's test/**/*.test.ts inclusion, covering ordinary and acceptance tests
-# in one operation. Harness integrity remains a separate self-host gate.
+# Native pre-SHIP aggregate verification. The ordered commands run the conductor
+# test suite and this repository's harness-integrity suite in one BUILD gate.
 test_suite:
-  command: npm test
+  commands:
+    - command: npm test
+      working_directory: src/conductor
+    - command: test/test_harness_integrity.sh
+      working_directory: .
   # The detached counterfactual checkout materializes this ignored dependency
   # installation at its root before the scoped command runs.
   scoped_command: './node_modules/.bin/vitest run {selectors}'
+  # Ordered aggregate entries each choose their own directory; scoped runs use
+  # this shared fallback to reach the conductor package's Vitest binary.
   working_directory: src/conductor
   timeout_seconds: 1800
   # One full-suite run per feature, then hold that PASS across small laps.
@@ -143,6 +162,12 @@ llm_provider: [codex, claude]
 
 conflict_check:
   adr_corpus: repo_wide
+
+# Require the pre-BUILD coverage-binding judge for self-host features. The
+# shipped default remains false, so consumer repositories opt in separately.
+coverage_binding:
+  judge:
+    enabled: true
 
 # Remediation append allowance. The effective cap is
 # min(max_appended_tasks, floor(authored_count * max_appended_ratio)), so BOTH

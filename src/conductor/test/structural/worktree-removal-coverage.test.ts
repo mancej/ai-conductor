@@ -29,6 +29,10 @@ const WORKTREE_REMOVAL_EXEMPTIONS = [
   {
     module: 'engine/engineer/retention.ts',
     reason: 'Removes Engineer worktrees that never run project setup, so no project teardown is owed.',
+    },
+    {
+    module: 'engine/shipment-evidence-cli.ts',
+    reason: 'Removes only its own detached tmpdir repair worktree; never provisions a feature worktree.',
   },
   {
     module: 'engine/worktree.ts',
@@ -216,6 +220,7 @@ describe('structural: worktree-removal coverage', () => {
       'engine/engineer/retention.ts',
       'engine/engineer/worktree-authoring.ts',
       'engine/park-reconciliation.ts',
+      'engine/shipment-evidence-cli.ts',
       'engine/worktree-shared.ts',
       'engine/worktree.ts',
     ]);
@@ -313,6 +318,10 @@ describe('structural: worktree-removal coverage', () => {
       {
         module: 'engine/engineer/retention.ts',
         reason: 'Removes Engineer worktrees that never run project setup, so no project teardown is owed.',
+        },
+        {
+        module: 'engine/shipment-evidence-cli.ts',
+        reason: 'Removes only its own detached tmpdir repair worktree; never provisions a feature worktree.',
       },
       {
         module: 'engine/worktree.ts',

@@ -1,6 +1,6 @@
 // Covers: task:12
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile, readFile, access } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile as execFileCb } from 'node:child_process';
@@ -854,6 +854,9 @@ describe('engine/daemon-rekick — real primitives (isolated repo)', () => {
     await git('add', '.');
     await git('commit', '-m', 'branch');
     await git('checkout', 'main');
+    await writeFile(join(dir, 'generated.txt'), 'base generated\n');
+    await git('add', 'generated.txt');
+    await git('commit', '-m', 'base generated');
     await writeFile(join(dir, 'src/feature.ts'), 'export const v = 2; // base\n');
     await git('add', '.');
     await git('commit', '-m', 'base');
@@ -1107,6 +1110,55 @@ describe('engine/daemon-rekick — resumeRebaseFirst (FR-12)', () => {
     expect(inProgress).toBe(true);
   });
 
+  it('play-forward untracked-collision refusal writes the never-started recovery note', async () => {
+    await initConflictRepo();
+    await writeFile(join(dir, 'generated.txt'), 'untracked generated\n');
+    expect(await git('status', '--porcelain')).toContain('?? generated.txt');
+    const hook = join(dir, '.git/hooks/pre-rebase');
+    await writeFile(hook, `#!/bin/sh\nprintf '%s\\n' 'error: The following untracked working tree files would be overwritten by checkout:' >&2\nprintf '\\tgenerated.txt\\n' >&2\nprintf '%s\\n' 'Please move or remove them before you switch branches.' >&2\nexit 1\n`);
+    await chmod(hook, 0o755);
+    await writeSentinel();
+
+    await expect(resumeRebaseFirst({
+      worktreePath: dir, localBase: 'main', events, ranManualTest: false,
+    })).resolves.toBe('halted');
+
+    const halt = await readFile(join(dir, HALT_MARKER), 'utf8');
+    expect(halt).toContain('rebase did not start — parked for human recovery');
+    expect(halt).toContain('generated.txt');
+    expect(halt).toContain('No git rebase is in progress; do not run git rebase --continue.');
+  });
+
+  it('a re-conflict whose resolver reports setup-only exhaustion → halted, rebase left paused, never stamped done', async () => {
+    await initConflictRepo();
+
+    await writeSentinel();
+    const res = await resumeRebaseFirst({
+      worktreePath: dir,
+      localBase: 'main',
+      events,
+      ranManualTest: false,
+      resolveAttempts: 2,
+      resolveConflict: async () => ({
+        resolved: false,
+        reason: 'no provider',
+        providerSetupExhaustion: true,
+      } as unknown as Awaited<ReturnType<NonNullable<Parameters<typeof resumeRebaseFirst>[0]['resolveConflict']>>>),
+    });
+    expect(res).toBe('halted');
+    expect(await fileExists(join(dir, HALT_MARKER))).toBe(true);
+    expect(await readFile(join(dir, HALT_MARKER), 'utf8')).toContain('provider setup unavailable');
+    const inProgress =
+      (await fileExists(join(dir, '.git/rebase-merge'))) ||
+      (await fileExists(join(dir, '.git/rebase-apply')));
+    expect(inProgress).toBe(true);
+    const statePath = join(dir, '.pipeline', 'conduct-state.json');
+    const state = (await fileExists(statePath))
+      ? (JSON.parse(await readFile(statePath, 'utf8')) as { rebase?: string })
+      : {};
+    expect(state.rebase).not.toBe('done');
+  });
+
   it('a stale seal before rebase halts as a seal error without claiming a rebase conflict', async () => {
     await initFeatureRepo();
     await mkdir(join(dir, '.docs/plans'), { recursive: true });
@@ -1227,13 +1279,12 @@ describe('engine/daemon-rekick — resumeRebaseFirst (FR-12)', () => {
     expect(halt).not.toContain('git rebase --continue');
   });
 
-  // Task 12: Rekick call site ships capability-absent (fail-closed).
-  // When a play-forward rebase touches code paths, the gates whose surface the
-  // delta hits (build, manual_test) get unconditionally invalidated kickback
-  // verdicts WITHOUT preVerify capability, preserving fail-closed default.
+  // A completed replay carries the explicit selective decision.  It may
+  // re-open affected review gates, but never rewinds completed authoring or
+  // BUILD merely because they precede a pending verification gate.
   // build_review is surface-scoped ('feature-codetest') and a foreign-only
   // delta preserves it.
-  it('play-forward rebase with changed code paths → unconditionally fail-closed (no preVerify)', async () => {
+  it('play-forward rebase with changed code paths keeps BUILD out of the selective review transition', async () => {
     await initTestRepo(dir);
     await git('config', 'commit.gpgsign', 'false');
     await mkdir(join(dir, 'src'), { recursive: true });
@@ -1271,21 +1322,20 @@ describe('engine/daemon-rekick — resumeRebaseFirst (FR-12)', () => {
     expect(res).toBe('rebased');
     expect(await fileExists(join(dir, REKICK_SENTINEL))).toBe(false);
 
-    // Crucial assertion: verdicts are UNCONDITIONALLY kicked back (fail-closed),
-    // NOT reverified via preVerify capability. The rekick call site deliberately
-    // omits preVerify, per ADR.
+    // BUILD is not a review surface and this fixture has no completed-BUILD
+    // authority to recover.  The rebase must not invent a BUILD kickback just
+    // because a downstream review needs verification.
     const build = await readVerdict(dir, 'build');
-    expect(build?.satisfied).toBe(false);
-    expect(build?.kickback?.from).toBe('rebase');
-    // Verify no preVerify-based reverification marker
-    expect(build?.reason).not.toContain('re-verified mechanically');
+    expect(build).toBeNull();
 
     // build_review is 'feature-codetest': the base advance added
     // src/base-code.ts, foreign to this feature's surface, so the diff it
     // graded is unchanged and its verdict is preserved. Fail-closed still
     // governs the gates whose surface the delta actually hits (build,
     // manual_test below).
-    expect(await readVerdict(dir, 'build_review')).toBeNull();
+    // A surface miss is only a preservation candidate. Without a durable
+    // original PASS it must reopen rather than manufacture review authority.
+    expect((await readVerdict(dir, 'build_review'))?.satisfied).toBe(false);
 
     const manualTest = await readVerdict(dir, 'manual_test');
     expect(manualTest?.satisfied).toBe(false);
@@ -1835,7 +1885,7 @@ describe('engine/daemon-rekick — #436: pre-loop rebase must stamp state.rebase
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('clean play-forward rebase: gate verdict and conduct-state.rebase must agree (RED — state.rebase never stamped)', async () => {
+  it('halts a clean play-forward rebase when recorded completed BUILD evidence is unavailable', async () => {
     await initFeatureRepo();
     await writeInitialConductState();
 
@@ -1853,23 +1903,11 @@ describe('engine/daemon-rekick — #436: pre-loop rebase must stamp state.rebase
       events,
       ranManualTest: true,
     });
-    expect(res).toBe('rebased');
-
-    // The gate verdict IS recorded — this mirrors what runRebaseStep writes
-    // via applyRebaseVerdicts and is expected to pass today.
-    const gateVerdict = await readVerdict(dir, 'rebase');
-    expect(gateVerdict?.satisfied).toBe(true);
-
-    // conduct-state.json's `rebase` field should be stamped 'done' — exactly
-    // as runRebaseStep's fall-through to saveStepStatus(..., 'rebase',
-    // 'done') would do for the SAME successful outcome inside the gate loop.
-    // THIS IS THE RED ASSERTION: resumeRebaseFirst never writes
-    // conduct-state.json, so `rebase` stays unset here, diverging silently
-    // from the gate verdict that says the rebase is satisfied.
-    const stateResult = await readState(join(dir, STATE_PATH_REL));
-    expect(stateResult.ok).toBe(true);
-    const state = stateResult.ok ? stateResult.value : {};
-    expect(state.rebase).toBe('done');
+    expect(res).toBe('halted');
+    await expect(readFile(join(dir, HALT_MARKER), 'utf8')).resolves.toContain(
+      'completed BUILD evidence is unavailable after rebase',
+    );
+    expect((await readVerdict(dir, 'rebase'))).toBeNull();
   });
 
   // Negative path: a conflicted pre-loop rebase must NOT stamp state.rebase.
@@ -1934,6 +1972,57 @@ describe('engine/daemon-rekick — #436: pre-loop rebase must stamp state.rebase
 
     // Sanity: unaffected fields from before the re-kick are left untouched.
     expect(state.build).toBe('done');
+  });
+
+  it('refuses setup-only play-forward resolution once and preserves the paused-rebase recovery', async () => {
+    await initTestRepo(dir);
+    await git('config', 'commit.gpgsign', 'false');
+    await mkdir(join(dir, 'src'), { recursive: true });
+    await writeFile(join(dir, 'src/feature.ts'), 'export const v = 0;\n');
+    await git('add', '.');
+    await git('commit', '-m', 'init');
+    await git('checkout', '-b', 'feature/foo');
+    await writeFile(join(dir, 'src/feature.ts'), 'export const v = 1; // branch\n');
+    await git('add', '.');
+    await git('commit', '-m', 'branch');
+    await git('checkout', 'main');
+    await writeFile(join(dir, 'src/feature.ts'), 'export const v = 2; // base\n');
+    await git('add', '.');
+    await git('commit', '-m', 'base');
+    await git('checkout', 'feature/foo');
+    await writeInitialConductState();
+    await writeSentinel();
+
+    let calls = 0;
+    const refusals: ConductorEvent[] = [];
+    events.on('step_refused', (event) => {
+      refusals.push(event);
+    });
+    const result = await resumeRebaseFirst({
+      worktreePath: dir,
+      localBase: 'main',
+      events,
+      ranManualTest: false,
+      resolveAttempts: 3,
+      resolveConflict: async () => {
+        calls += 1;
+        return {
+          resolved: false,
+          reason: 'provider setup unavailable',
+          providerSetupExhaustion: { candidates: [] },
+        } as never;
+      },
+    });
+
+    expect(result).toBe('halted');
+    expect(calls).toBe(1);
+    const stateResult = await readState(join(dir, STATE_PATH_REL));
+    expect(stateResult.ok).toBe(true);
+    expect(stateResult.ok && stateResult.value.rebase).toBe('refused');
+    expect((await readVerdict(dir, 'rebase'))?.satisfied).toBe(false);
+    await expect(readFile(join(dir, HALT_MARKER), 'utf8')).resolves.toContain('git rebase --continue');
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({ step: 'rebase', kind: 'needs-human' });
   });
 });
 
@@ -2424,27 +2513,17 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
 
     expect(res).toBe('rebased');
     expect(invalidated).toEqual([
+      { type: 'rebase_gate_invalidated', gate: 'coverage_binding', matchedPaths: [] },
+      { type: 'rebase_gate_invalidated', gate: 'build_review', matchedPaths: [] },
       { type: 'rebase_gate_invalidated', gate: 'test_suite', matchedPaths: ['src/sibling.ts'] },
       { type: 'rebase_gate_invalidated', gate: 'manual_test', matchedPaths: ['src/sibling.ts'] },
+      { type: 'rebase_gate_invalidated', gate: 'prd_audit', matchedPaths: [] },
+      { type: 'rebase_gate_invalidated', gate: 'architecture_review_as_built', matchedPaths: [] },
     ]);
-    expect(preserved.map(({ gate, surface, deltaConsidered, basis }) => ({
-      gate, surface, deltaConsidered, basis,
-    }))).toEqual([
-      {
-        gate: 'coverage_binding',
-        surface: ['<all runtime source>'],
-        deltaConsidered: ['src/sibling.ts'],
-        basis: undefined,
-      },
-      { gate: 'build_review', surface: ['src/task-1.ts'], deltaConsidered: [], basis: undefined },
-      {
-        gate: 'prd_audit',
-        surface: ['<all runtime source>'],
-        deltaConsidered: ['src/sibling.ts'],
-        basis: undefined,
-      },
-      { gate: 'architecture_review_as_built', surface: ['src/task-1.ts'], deltaConsidered: [], basis: undefined },
-    ]);
+    // The applied decision invalidates these gates because their prior passes
+    // are not applicable in this fixture; candidate preservation must never
+    // be emitted alongside that actual invalidation.
+    expect(preserved).toEqual([]);
     expect(reverified).toEqual([
       expect.objectContaining({ type: 'rebase_gate_reverified', step: 'build', skippedDispatch: true }),
     ]);
@@ -2453,6 +2532,13 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
     expect(judgedGates.size).toBe(invalidated.length + preserved.length);
     expect(new Set(invalidated.map(({ gate }) => gate)).size).toBe(invalidated.length);
     expect(new Set(preserved.map(({ gate }) => gate)).size).toBe(preserved.length);
+    const applied = (await readVerdict(dir, 'rebase'))?.rebaseOperation;
+    expect(new Set(invalidated.map(({ gate }) => gate))).toEqual(
+      new Set((applied?.transition.invalidated ?? []).filter((gate) => gate !== 'build')),
+    );
+    expect(new Set(preserved.map(({ gate }) => gate))).toEqual(
+      new Set(applied?.transition.preserved ?? []),
+    );
   });
 
   it('inspects a budget-preserved test suite once and carries its basis into the preserved event', async () => {
@@ -2507,10 +2593,10 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
     // which is outside the feature's surface and so cannot change the diff
     // build_review graded. Its verdict survives rather than paying for another
     // LLM re-grade.
-    expect(await readVerdict(dir, 'build_review')).toBeNull();
+    expect((await readVerdict(dir, 'build_review'))?.satisfied).toBe(false);
   });
 
-  it('kicks the build gate back when a plan task has no Task: trailer (fail-closed)', async () => {
+  it('does not reopen BUILD when a non-completed plan has no Task: trailer', async () => {
     await initFeatureRepo(['1', '2'], ['1']);
     await advanceBaseWithCode();
 
@@ -2523,11 +2609,10 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
 
     expect(res).toBe('rebased');
     const build = await readVerdict(dir, 'build');
-    expect(build?.satisfied).toBe(false);
-    expect(build?.kickback?.from).toBe('rebase');
+    expect(build).toBeNull();
   });
 
-  it('kicks the build gate back when the pre-verify throws (fail-closed)', async () => {
+  it('does not reopen BUILD when non-completed pre-verification throws', async () => {
     await initFeatureRepo(['1', '2'], ['1', '2']);
     await advanceBaseWithCode();
 
@@ -2542,8 +2627,28 @@ describe('engine/daemon-rekick — post-rebase build pre-verify (adr-2026-07-08)
     });
 
     const build = await readVerdict(dir, 'build');
-    expect(build?.satisfied).toBe(false);
-    expect(build?.kickback?.from).toBe('rebase');
+    expect(build).toBeNull();
+  });
+
+  it('halts when completed BUILD pre-verification throws instead of treating the error as missing legacy state', async () => {
+    await initFeatureRepo(['1', '2'], ['1', '2']);
+    await advanceBaseWithCode();
+    const statePath = join(dir, '.pipeline', 'conduct-state.json');
+    const state = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>;
+    await writeFile(statePath, JSON.stringify({ ...state, build: 'done' }, null, 2));
+
+    const result = await resumeRebaseFirst({
+      worktreePath: dir,
+      localBase: 'main',
+      events,
+      ranManualTest: false,
+      preVerify: async () => { throw new Error('unreadable completed evidence'); },
+    });
+
+    expect(result).toBe('halted');
+    await expect(readFile(join(dir, '.pipeline', 'HALT'), 'utf8')).resolves.toContain(
+      'completed BUILD evidence is unavailable after rebase: unreadable completed evidence',
+    );
   });
 });
 

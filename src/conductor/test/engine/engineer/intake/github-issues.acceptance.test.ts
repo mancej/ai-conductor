@@ -1,7 +1,7 @@
 // Acceptance: github-issues adapter — capture + write-back + re-eligibility
 // (FR-26/27/28/34/35/36/37/38/39/40; Stories 2,3,4,9,10,11,12,14,15).
 // RED until intake/github-issues.ts exists. All gh access via injected fake (no network).
-// Covers: S6.1, task:10
+// Covers: S6.1, task:1, task:2, task:10
 // Covers: S6.4, task:10
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -44,6 +44,7 @@ afterEach(async () => {
 });
 
 async function makeAdapter(state: FakeGhState, repos: Array<{ name: string; path: string }>) {
+  await Promise.all(repos.map(({ path }) => mkdir(path, { recursive: true })));
   const { createGithubIssuesAdapter } = await loadAdapter();
   const { createLedger } = await loadLedger();
   const { gh } = makeFakeGh(state);
@@ -55,6 +56,7 @@ async function makeAdapter(state: FakeGhState, repos: Array<{ name: string; path
     ledger,
     now: clock.now,
     newId: clock.id,
+    resolveActor: async () => ({ resolved: true as const, id: 'alice' }),
   });
   return { adapter, ledger };
 }
@@ -190,6 +192,21 @@ describe('FR-26 poll assigned issues across registered repos', () => {
     expect(await adapter.poll()).toEqual([]);
     expect(calls.length).toBe(0);
   });
+
+  it('captures all 45 assigned issues beyond the CLI default and does not duplicate them on a re-poll', async () => {
+    const state = baseState();
+    state.issuesByRepo = {
+      'o/a': Array.from({ length: 45 }, (_, index) => ({
+        repo: 'o/a', number: index + 1, title: `Issue ${index + 1}`, body: 'body',
+      })),
+    };
+    const { adapter } = await makeAdapter(state, [{ name: 'o/a', path: join(dir, 'a') }]);
+
+    const first = await adapter.poll();
+    expect(first).toHaveLength(45);
+    expect(new Set(first.map((envelope: any) => envelope.sourceRef))).toHaveLength(45);
+    expect(await adapter.poll()).toEqual([]);
+  });
 });
 
 describe('FR-28 empty issue rejected at capture', () => {
@@ -231,6 +248,65 @@ describe('FR-27 degrade on auth/availability failure', () => {
   });
 });
 
+describe('registered repository path availability during poll', () => {
+  it('polls live registrations while skipping only the absent registration', async () => {
+    const state = baseState();
+    state.issuesByRepo = {
+      'o/live': [{ repo: 'o/live', number: 1, title: 'Live issue', body: 'body' }],
+    };
+    const logs: string[] = [];
+    const livePath = join(dir, 'live');
+    await mkdir(livePath, { recursive: true });
+    const { createGithubIssuesAdapter } = await loadAdapter();
+    const { createLedger } = await loadLedger();
+    const { gh } = makeFakeGh(state);
+    const adapter = createGithubIssuesAdapter({
+      gh,
+      registry: fakeRegistry([
+        { name: 'o/live', path: livePath },
+        { name: 'o/absent', path: join(dir, 'absent') },
+      ]),
+      ledger: createLedger(join(dir, 'ledger.json')),
+      log: (message: string) => logs.push(message),
+    });
+
+    const envelopes = await adapter.poll();
+
+    expect({ sourceRefs: envelopes.map((envelope: any) => envelope.sourceRef), logs }).toEqual({
+      sourceRefs: ['o/live#1'],
+      logs: [`github-issues: skipping o/absent: missing path ${join(dir, 'absent')}`],
+    });
+  });
+
+  it('keeps an issue-listing failure distinct from a missing registration path', async () => {
+    const state = baseState();
+    state.failRepos = new Set(['o/failing']);
+    const logs: string[] = [];
+    const { createGithubIssuesAdapter } = await loadAdapter();
+    const { createLedger } = await loadLedger();
+    const { gh } = makeFakeGh(state);
+    const adapter = createGithubIssuesAdapter({
+      gh,
+      registry: fakeRegistry([{ name: 'o/failing', path: join(dir, 'failing') }]),
+      ledger: createLedger(join(dir, 'ledger.json')),
+      log: (message: string) => logs.push(message),
+    });
+    await mkdir(join(dir, 'failing'), { recursive: true });
+
+    const envelopes = await adapter.poll();
+
+    expect({
+      sourceRefs: envelopes.map((envelope: any) => envelope.sourceRef),
+      hasPollFailure: logs.some((line) => line.includes('github-issues: poll failed for o/failing')),
+      hasMissingPath: logs.some((line) => line.includes('missing path')),
+    }).toEqual({
+      sourceRefs: [],
+      hasPollFailure: true,
+      hasMissingPath: false,
+    });
+  });
+});
+
 describe('FR-34/35 idempotent pull (ledger + label skip)', () => {
   it('does not re-capture an issue already in the ledger', async () => {
     const state = baseState();
@@ -260,6 +336,7 @@ describe('FR-36/38 write-back comments + label, idempotent', () => {
       gh,
       registry: fakeRegistry([{ name: 'o/a', path: join(dir, 'a') }]),
       ledger: createLedger(join(dir, 'ledger.json')),
+      resolveActor: async () => ({ resolved: true as const, id: 'alice' }),
     });
     await adapter.report('o/a#1', 'routed', { repo: 'o/target' });
     await adapter.report('o/a#1', 'done', { prUrl: 'https://x/pr/9' });
@@ -277,6 +354,7 @@ describe('FR-36/38 write-back comments + label, idempotent', () => {
       gh,
       registry: fakeRegistry([{ name: 'o/a', path: join(dir, 'a') }]),
       ledger: createLedger(join(dir, 'ledger.json')),
+      resolveActor: async () => ({ resolved: true as const, id: 'alice' }),
     });
     await adapter.report('o/a#1', 'done', { prUrl: 'https://x/pr/9' });
     await adapter.report('o/a#1', 'done', { prUrl: 'https://x/pr/9' });
@@ -296,6 +374,7 @@ describe('FR-37 write-back is non-fatal', () => {
       gh: failingGh,
       registry: fakeRegistry([{ name: 'o/a', path: join(dir, 'a') }]),
       ledger: createLedger(join(dir, 'ledger.json')),
+      resolveActor: async () => ({ resolved: true as const, id: 'alice' }),
     });
     await expect(adapter.report('o/a#1', 'done', { prUrl: 'https://x/pr/9' })).resolves.not.toThrow();
   });
@@ -307,10 +386,14 @@ describe('FR-39/40 re-eligibility + churn guard', () => {
     state.issuesByRepo = {
       'o/a': [{ repo: 'o/a', number: 1, title: 'A', body: 'a', labels: ['engineer:handled'] }],
     };
-    state.prs = { 'https://x/pr/9': { url: 'https://x/pr/9', state: 'CLOSED', mergedAt: null } };
+    state.prs = {
+      'https://github.com/o/a/pull/9': {
+        url: 'https://github.com/o/a/pull/9', state: 'CLOSED', mergedAt: null,
+      },
+    };
     const { adapter, ledger } = await makeAdapter(state, [{ name: 'o/a', path: join(dir, 'a') }]);
     await ledger.record({ source: 'github-issues', sourceRef: 'o/a#1' });
-    await ledger.transition('github-issues', 'o/a#1', 'done', { prUrl: 'https://x/pr/9' });
+    await ledger.transition('github-issues', 'o/a#1', 'done', { prUrl: 'https://github.com/o/a/pull/9' });
     const envs = await adapter.poll();
     expect(envs.map((e: any) => e.sourceRef)).toContain('o/a#1');
   });
@@ -321,11 +404,13 @@ describe('FR-39/40 re-eligibility + churn guard', () => {
       'o/a': [{ repo: 'o/a', number: 1, title: 'A', body: 'a', labels: ['engineer:handled'] }],
     };
     state.prs = {
-      'https://x/pr/9': { url: 'https://x/pr/9', state: 'MERGED', mergedAt: '2026-06-27T01:00:00Z' },
+      'https://github.com/o/a/pull/9': {
+        url: 'https://github.com/o/a/pull/9', state: 'MERGED', mergedAt: '2026-06-27T01:00:00Z',
+      },
     };
     const { adapter, ledger } = await makeAdapter(state, [{ name: 'o/a', path: join(dir, 'a') }]);
     await ledger.record({ source: 'github-issues', sourceRef: 'o/a#1' });
-    await ledger.transition('github-issues', 'o/a#1', 'done', { prUrl: 'https://x/pr/9' });
+    await ledger.transition('github-issues', 'o/a#1', 'done', { prUrl: 'https://github.com/o/a/pull/9' });
     expect(await adapter.poll()).toEqual([]);
   });
 });
@@ -350,14 +435,15 @@ describe('inbound issue text remains sanitized through poll → claim → worktr
     expect(await filesContaining(engineerDir, rawDirective)).toEqual([]);
   });
 
-  it('does not stage an outcomes file when the sanitized issue has no Desired outcome section', async () => {
+  it('stages a zero-bullet outcomes layer when the sanitized issue has no Desired outcome section', async () => {
     const { worktreePath } = await pollClaimAndCreateWorktree(
       ['## Observed', 'Neutral evidence only.', '', '## Hypotheses', '- A possible cause.'].join('\n'),
       'Investigate neutral evidence',
     );
 
-    await expect(
-      readFile(join(worktreePath, '.pipeline', 'intake-outcomes.md'), 'utf8'),
-    ).rejects.toMatchObject({ code: 'ENOENT' });
+    const staged = await readFile(join(worktreePath, '.pipeline', 'intake-outcomes.md'), 'utf8');
+    expect(staged).toMatch(
+      /^Source-Ref: owner\/repo#12\n\n<<< INBOUND sourceRef=owner\/repo#12 digest=[a-f0-9]{64} >>>\n## Desired outcome\n\n<<< END INBOUND >>>\n$/,
+    );
   });
 });

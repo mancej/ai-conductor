@@ -74,8 +74,12 @@ export interface UnattendedPublicationIntentInput {
 
 type PublicationEvidence = {
   implementationEvidence: 'valid' | 'invalid' | 'indeterminate';
+  /** Present only when the implementation-evidence observation is invalid. */
+  unsatisfiedImplementationEvidenceMembers?: UnsatisfiedImplementationEvidenceMembers;
   shipEvidence: 'valid' | 'invalid' | 'indeterminate';
   releaseReadiness: 'valid' | 'missing' | 'invalid' | 'indeterminate';
+  /** Present when the release-readiness observer identifies blocked prerequisite steps. */
+  unsatisfiedReleaseReadinessSteps?: readonly string[];
   branchPushed: 'valid' | 'missing' | 'invalid' | 'indeterminate';
   shippedRecord: 'valid' | 'missing' | 'invalid' | 'indeterminate';
   outcomeRecord: 'valid' | 'missing' | 'invalid' | 'indeterminate';
@@ -115,12 +119,28 @@ export type PublicationEvidenceObservation =
   | 'malformed'
   | 'unavailable';
 
+export type ImplementationEvidenceMember = 'build_review' | 'test_suite';
+export type UnsatisfiedImplementationEvidenceMembers =
+  | readonly ['build_review']
+  | readonly ['test_suite']
+  | readonly ['build_review', 'test_suite'];
+
+/** The implementation-evidence observer retains the failed members as data. */
+export type ImplementationEvidenceObservation =
+  | { state: 'present' }
+  | { state: 'missing'; unsatisfiedMembers: UnsatisfiedImplementationEvidenceMembers };
+
 export type PushEvidenceObservation =
   | 'pushed'
   | 'unpushed'
   | 'stale'
   | 'malformed'
   | 'unavailable';
+
+/** Release readiness may retain the prerequisite keys that prevented publication. */
+export type ReleaseReadinessObservation =
+  | PublicationEvidenceObservation
+  | { observation: PublicationEvidenceObservation; steps: readonly string[] };
 
 /** GitHub's authoritative view of the one PR eligible for this feature. */
 export type PullRequestObservation =
@@ -146,7 +166,7 @@ export type PullRequestObservation =
  */
 export interface PublicationObservationPorts {
   filesystem: {
-    observeImplementationEvidence(): Promise<PublicationEvidenceObservation>;
+    observeImplementationEvidence(): Promise<ImplementationEvidenceObservation>;
     observeShipEvidence(): Promise<PublicationEvidenceObservation>;
     observeOutcomeRecord(): Promise<PublicationEvidenceObservation>;
   };
@@ -160,7 +180,7 @@ export interface PublicationObservationPorts {
     observeShippedRecord(): Promise<PublicationEvidenceObservation>;
   };
   releaseReadiness: {
-    observeReleaseReadiness(): Promise<PublicationEvidenceObservation>;
+    observeReleaseReadiness(): Promise<ReleaseReadinessObservation>;
   };
 }
 
@@ -191,7 +211,7 @@ export async function observePublicationSnapshot(
     releaseReadiness,
   } = input.ports;
 
-  const implementationEvidence = mapRequiredEvidence(
+  const implementationEvidence = mapImplementationEvidence(
     await safelyObserve(filesystem.observeImplementationEvidence),
   );
   const shipEvidence = mapRequiredEvidence(await safelyObserve(filesystem.observeShipEvidence));
@@ -206,9 +226,9 @@ export async function observePublicationSnapshot(
   return {
     mode: input.mode,
     intent: input.intent,
-    implementationEvidence,
+    ...implementationEvidence,
     shipEvidence,
-    releaseReadiness: readiness,
+    ...readiness,
     branchPushed,
     pr,
     shippedRecord: shipped,
@@ -239,6 +259,17 @@ function mapRequiredEvidence(
   }
 }
 
+function mapImplementationEvidence(
+  observation: ImplementationEvidenceObservation | 'unavailable',
+): Pick<PublicationEvidence, 'implementationEvidence' | 'unsatisfiedImplementationEvidenceMembers'> {
+  if (observation === 'unavailable') return { implementationEvidence: 'indeterminate' };
+  if (observation.state === 'present') return { implementationEvidence: 'valid' };
+  return {
+    implementationEvidence: 'invalid',
+    unsatisfiedImplementationEvidenceMembers: observation.unsatisfiedMembers,
+  };
+}
+
 function mapOptionalEvidence(
   observation: PublicationEvidenceObservation | 'unavailable',
 ): PublicationEvidence['shippedRecord'] {
@@ -256,9 +287,14 @@ function mapOptionalEvidence(
 }
 
 function mapReleaseReadiness(
-  observation: PublicationEvidenceObservation | 'unavailable',
-): PublicationEvidence['releaseReadiness'] {
-  return mapOptionalEvidence(observation);
+  result: ReleaseReadinessObservation | 'unavailable',
+): Pick<PublicationEvidence, 'releaseReadiness' | 'unsatisfiedReleaseReadinessSteps'> {
+  const observation = typeof result === 'object' ? result.observation : result;
+  const steps = typeof result === 'object' ? result.steps : undefined;
+  return {
+    releaseReadiness: mapOptionalEvidence(observation),
+    ...(steps === undefined ? {} : { unsatisfiedReleaseReadinessSteps: steps }),
+  };
 }
 
 function mapPushEvidence(
@@ -469,7 +505,11 @@ export type PublicationDisposition =
       detail?: string;
     }
   | { kind: 'publication_retry'; condition: PublicationCondition }
-  | { kind: 'implementation_invalid'; evidence: string }
+  | {
+      kind: 'implementation_invalid';
+      evidence: string;
+      unsatisfiedMembers?: UnsatisfiedImplementationEvidenceMembers;
+    }
   | { kind: 'human_required'; reason: HumanRequiredReason; detail?: string };
 
 /** The only actions the conductor may take for a typed FINISH result. */
@@ -478,7 +518,11 @@ export type FinishPublicationRoute =
   | { kind: 'progress_finish'; transition: PublicationTransition }
   | { kind: 'revision_progress_finish'; transition: 'author_pr_prose'; detail?: string }
   | { kind: 'retry_finish'; reason: string; detail?: string }
-  | { kind: 'retry_build'; evidence: string }
+  | {
+      kind: 'retry_build';
+      evidence: string;
+      unsatisfiedMembers: UnsatisfiedImplementationEvidenceMembers;
+    }
   | { kind: 'halt'; reason: string };
 
 const PUBLICATION_CONDITIONS = {
@@ -731,9 +775,16 @@ export function routeFinishPublicationDisposition(
         ...(disposition.detail === undefined ? {} : { detail: disposition.detail }),
       };
     case 'implementation_invalid':
+      if (disposition.unsatisfiedMembers === undefined) {
+        return {
+          kind: 'halt',
+          reason: 'Unknown or contradictory FINISH publication disposition; human review required.',
+        };
+      }
       return {
         kind: 'retry_build',
         evidence: disposition.evidence,
+        unsatisfiedMembers: disposition.unsatisfiedMembers,
       };
     case 'human_required':
       return { kind: 'halt', reason: renderHumanRequiredHaltReason(disposition) };
@@ -783,9 +834,10 @@ function isExactDisposition(
       );
     case 'implementation_invalid':
       return (
-        hasOnly('kind', 'evidence') &&
+        hasOnly('kind', 'evidence', 'unsatisfiedMembers') &&
         typeof value.evidence === 'string' &&
-        value.evidence.trim().length > 0
+        value.evidence.trim().length > 0 &&
+        isUnsatisfiedImplementationEvidenceMembers(value.unsatisfiedMembers)
       );
     case 'human_required':
       return (
@@ -827,9 +879,51 @@ function isPublicationCondition(value: unknown): value is PublicationCondition {
   return (
     typeof condition.message === 'string' &&
     typeof condition.nextAction === 'string' &&
-    expected?.message === condition.message &&
+    expected !== undefined &&
+    isPublicationConditionMessage(condition, expected) &&
     expected.nextAction === condition.nextAction &&
-    Object.keys(condition).length === 3
+    (condition.code === 'implementation_evidence_invalid'
+      ? Object.keys(condition).length === 4 &&
+        isUnsatisfiedImplementationEvidenceMembers(condition.unsatisfiedMembers)
+      : isReleaseReadinessCondition(condition.code)
+        ? (Object.keys(condition).length === 3 || Object.keys(condition).length === 4) &&
+          (condition.steps === undefined || isReleaseReadinessSteps(condition.steps))
+        : Object.keys(condition).length === 3)
+  );
+}
+
+function isReleaseReadinessCondition(code: unknown): code is Extract<PublicationCondition['code'], `release_readiness_${string}`> {
+  return code === 'release_readiness_missing' || code === 'release_readiness_invalid' || code === 'release_readiness_indeterminate';
+}
+
+function isReleaseReadinessSteps(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((step) => typeof step === 'string');
+}
+
+function isPublicationConditionMessage(
+  condition: Record<string, unknown>,
+  expected: { message: string } | undefined,
+): boolean {
+  if (typeof condition.message !== 'string' || expected === undefined) return false;
+  if (!isReleaseReadinessCondition(condition.code)) return condition.message === expected.message;
+  return condition.message === releaseReadinessMessage(expected.message, condition.steps);
+}
+
+function releaseReadinessMessage(message: string, steps: unknown): string {
+  return isReleaseReadinessSteps(steps) && steps.length > 0
+    ? `${message} Unsatisfied steps: ${steps.join(', ')}.`
+    : message;
+}
+
+function isUnsatisfiedImplementationEvidenceMembers(
+  value: unknown,
+): value is UnsatisfiedImplementationEvidenceMembers {
+  return (
+    Array.isArray(value) &&
+    (
+      (value.length === 1 && (value[0] === 'build_review' || value[0] === 'test_suite')) ||
+      (value.length === 2 && value[0] === 'build_review' && value[1] === 'test_suite')
+    )
   );
 }
 
@@ -849,6 +943,7 @@ export type PublicationCondition =
       code: 'implementation_evidence_invalid';
       message: 'Implementation evidence is invalid. Re-run the BUILD verification, then retry FINISH.';
       nextAction: 'rerun_build_verification';
+      unsatisfiedMembers: UnsatisfiedImplementationEvidenceMembers;
     }
   | {
       code: 'implementation_evidence_indeterminate';
@@ -867,18 +962,21 @@ export type PublicationCondition =
     }
   | {
       code: 'release_readiness_missing';
-      message: 'Release readiness is missing. Publish a valid release readiness result, then retry FINISH.';
+      message: string;
       nextAction: 'publish_release_readiness';
+      steps?: readonly string[];
     }
   | {
       code: 'release_readiness_invalid';
-      message: 'Release readiness is invalid. Restore a valid release readiness result, then retry FINISH.';
+      message: string;
       nextAction: 'restore_release_readiness';
+      steps?: readonly string[];
     }
   | {
       code: 'release_readiness_indeterminate';
-      message: 'Release readiness could not be determined. Restore the readiness observer, then retry FINISH.';
+      message: string;
       nextAction: 'restore_release_readiness_observation';
+      steps?: readonly string[];
     };
 
 /** Exhaustive routing for every condition emitted by FINISH observation. */
@@ -918,7 +1016,7 @@ export type PublicationPreflightResult =
  * stable, actionable condition and never asks a judgment provider to infer
  * deterministic repository or release state.
  */
-function preflightFinishPublication(
+export function preflightFinishPublication(
   snapshot: PublicationSnapshot,
 ): PublicationPreflightResult {
   const validation = validatePublicationSnapshot(snapshot);
@@ -944,12 +1042,24 @@ function preflightFinishPublication(
   }
 
   if (snapshot.implementationEvidence === 'invalid') {
+    const unsatisfiedMembers = snapshot.unsatisfiedImplementationEvidenceMembers;
+    if (unsatisfiedMembers === undefined) {
+      return {
+        kind: 'blocked',
+        condition: {
+          code: 'implementation_evidence_indeterminate',
+          message: 'Implementation evidence could not be determined. Restore the implementation evidence observer, then retry FINISH.',
+          nextAction: 'restore_implementation_observation',
+        },
+      };
+    }
     return {
       kind: 'blocked',
       condition: {
         code: 'implementation_evidence_invalid',
         message: 'Implementation evidence is invalid. Re-run the BUILD verification, then retry FINISH.',
         nextAction: 'rerun_build_verification',
+        unsatisfiedMembers,
       },
     };
   }
@@ -988,8 +1098,14 @@ function preflightFinishPublication(
       kind: 'blocked',
       condition: {
         code: 'release_readiness_missing',
-        message: 'Release readiness is missing. Publish a valid release readiness result, then retry FINISH.',
+        message: releaseReadinessMessage(
+          'Release readiness is missing. Publish a valid release readiness result, then retry FINISH.',
+          snapshot.unsatisfiedReleaseReadinessSteps,
+        ),
         nextAction: 'publish_release_readiness',
+        ...(snapshot.unsatisfiedReleaseReadinessSteps === undefined
+          ? {}
+          : { steps: snapshot.unsatisfiedReleaseReadinessSteps }),
       },
     };
   }
@@ -998,8 +1114,14 @@ function preflightFinishPublication(
       kind: 'blocked',
       condition: {
         code: 'release_readiness_invalid',
-        message: 'Release readiness is invalid. Restore a valid release readiness result, then retry FINISH.',
+        message: releaseReadinessMessage(
+          'Release readiness is invalid. Restore a valid release readiness result, then retry FINISH.',
+          snapshot.unsatisfiedReleaseReadinessSteps,
+        ),
         nextAction: 'restore_release_readiness',
+        ...(snapshot.unsatisfiedReleaseReadinessSteps === undefined
+          ? {}
+          : { steps: snapshot.unsatisfiedReleaseReadinessSteps }),
       },
     };
   }
@@ -1008,8 +1130,14 @@ function preflightFinishPublication(
       kind: 'blocked',
       condition: {
         code: 'release_readiness_indeterminate',
-        message: 'Release readiness could not be determined. Restore the readiness observer, then retry FINISH.',
+        message: releaseReadinessMessage(
+          'Release readiness could not be determined. Restore the readiness observer, then retry FINISH.',
+          snapshot.unsatisfiedReleaseReadinessSteps,
+        ),
         nextAction: 'restore_release_readiness_observation',
+        ...(snapshot.unsatisfiedReleaseReadinessSteps === undefined
+          ? {}
+          : { steps: snapshot.unsatisfiedReleaseReadinessSteps }),
       },
     };
   }
@@ -1181,7 +1309,11 @@ export type AdvanceFinishPublicationResult =
   | { kind: 'complete' }
   | { kind: 'advanced'; transition: PublicationTransition }
   | { kind: 'publication_revision_progress'; transition: 'author_pr_prose'; detail?: string }
-  | { kind: 'implementation_invalid'; evidence: string }
+  | {
+      kind: 'implementation_invalid';
+      evidence: string;
+      unsatisfiedMembers: UnsatisfiedImplementationEvidenceMembers;
+    }
   | { kind: 'publication_retry'; condition: PublicationCondition }
   | {
       kind: 'publication_retry';
@@ -1527,12 +1659,15 @@ async function advanceFinishPublicationUnreconciled(
   if (preflight.kind === 'blocked') {
     await emitPublicationEvent(input.emit, {
       type: 'finish_publication_blocked',
-      condition: preflight.condition.code,
+      condition: 'steps' in preflight.condition && preflight.condition.steps !== undefined
+        ? { code: preflight.condition.code, steps: preflight.condition.steps }
+        : preflight.condition.code,
     });
     if (preflight.condition.code === 'implementation_evidence_invalid') {
       return {
         kind: 'implementation_invalid',
         evidence: `${preflight.condition.code}: ${preflight.condition.message}`,
+        unsatisfiedMembers: preflight.condition.unsatisfiedMembers,
       };
     }
     return { kind: 'publication_retry', condition: preflight.condition };

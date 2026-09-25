@@ -1,4 +1,4 @@
-// Covers: task:7, task:19, task:rem-as-built-rem-ab2-4, task:rem-as-built-rem-ab4-1
+// Covers: task:7, task:19, task:35, task:rem-as-built-rem-ab2-4, task:rem-as-built-rem-ab4-1
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -103,6 +103,68 @@ describe('remediation case effects', () => {
     expect(read.ok && read.state.cases[0]?.effect).toEqual({ id: 'effect-1', kind: 'action', status: 'applied', workOrderId: 'order-1' });
   });
 
+  it('publishes only current admitted acts with their custom source links and admission rationale', async () => {
+    const store = await storeWith({ version: 'v1', feature, cases: [
+      {
+        id: 'case-custom-merged', domain: 'build_review', disposition: 'act', priority: 'high', rationale: 'The compatible repair covers both policies.', confidence: 'high', resolution: 'open',
+        sources: [
+          { sourceId: 'custom:policy-a:finding-1', outcome: 'acted', recordedAt: '2026-09-11T00:00:00.000Z' },
+          { sourceId: 'custom:policy-b:finding-2', outcome: 'merged', recordedAt: '2026-09-11T00:00:00.000Z' },
+        ],
+        effect: { id: 'effect-custom-merged', kind: 'action', status: 'reserved' },
+      },
+      {
+        id: 'case-escalated', domain: 'build_review', disposition: 'escalate', priority: 'critical', rationale: 'Owner decision is required.', confidence: 'high', resolution: 'open',
+        sources: [{ sourceId: 'custom:policy-c:finding-3', outcome: 'escalate', recordedAt: '2026-09-11T00:00:00.000Z' }],
+        escalation: { owner: 'architecture' }, effect: { kind: 'none' },
+      },
+      {
+        id: 'case-deferred', domain: 'build_review', disposition: 'defer', priority: 'low', rationale: 'Future work.', confidence: 'high', resolution: 'open',
+        sources: [{ sourceId: 'custom:policy-d:finding-4', outcome: 'deferred', recordedAt: '2026-09-11T00:00:00.000Z' }],
+        effect: { id: 'effect-deferred', kind: 'deferral', status: 'reserved' },
+      },
+    ] });
+    const publishWorkOrder = vi.fn().mockResolvedValue({ ok: true, workOrder: {} });
+    const chargeEffect = vi.fn().mockResolvedValue({ status: 'charged', exhausted: false, cumulativeExhausted: false, entry: { count: 1, cumulative: 1 } });
+
+    await expect(applyBuildReviewActionEffects({
+      projectRoot: root, feature, store,
+      tasksByCaseId: new Map([
+        ['case-custom-merged', [{
+          title: 'Preserve both policy contracts at the implementation boundary',
+          admittedTaskIds: ['35'],
+          admissionRationale: 'Task 35 owns the admitted consistent repair publication boundary.',
+        }]],
+        ['case-escalated', [{ title: 'Never publish a decision stop' }]],
+        ['case-deferred', [{ title: 'Never publish a deferral' }]],
+      ]),
+      chargeInput: { treeHash: 'tree', resolvedCount: 0, reason: 'case-custom-merged' },
+      workOrderId: () => 'order-custom-merged', publishWorkOrder, chargeEffect,
+    })).resolves.toMatchObject({ ok: true, status: 'applied', effectId: 'effect-custom-merged' });
+
+    // Exactly one repair route is charged, for the one admitted act, within
+    // the remaining allowance; sibling non-action cases charge nothing.
+    expect(chargeEffect).toHaveBeenCalledTimes(1);
+    expect(chargeEffect).toHaveBeenCalledWith(root, 'effect-custom-merged', expect.anything());
+
+    expect(publishWorkOrder).toHaveBeenCalledWith(root, expect.objectContaining({
+      effectId: 'effect-custom-merged',
+      cases: [{
+        caseId: 'case-custom-merged',
+        priority: 'high',
+        sources: [
+          { sourceId: 'custom:policy-a:finding-1', outcome: 'acted', recordedAt: '2026-09-11T00:00:00.000Z' },
+          { sourceId: 'custom:policy-b:finding-2', outcome: 'merged', recordedAt: '2026-09-11T00:00:00.000Z' },
+        ],
+        tasks: [{
+          title: 'Preserve both policy contracts at the implementation boundary',
+          admittedTaskIds: ['35'],
+          admissionRationale: 'Task 35 owns the admitted consistent repair publication boundary.',
+        }],
+      }],
+    }));
+  });
+
   it('records failed action effects without writing the active plan when the charge is exhausted', async () => {
     const store = await storeWith({ version: 'v1', feature, cases: [{
       id: 'case-1', domain: 'build_review', disposition: 'act', priority: 'high', rationale: 'repair', confidence: 'high', resolution: 'open',
@@ -200,8 +262,7 @@ describe('remediation case effects', () => {
       effect: { id: 'effect-refuted', kind: 'deferral', status: 'reserved' },
       refutation: { claim: 'The finding is false.', assertions: [{ assertion: 'The behavior exists.', verdict: 'refuted', evidence: [{ path: 'test/evidence.ts', excerpt: 'evidence' }] }] },
     }] });
-    const createIssue = vi.fn().mockResolvedValue('https://github.test/acme/repo/issues/43');
-    const intakeTracker = { createIssue } as unknown as TrackerClient;
+    const createIssue = vi.fn();
     const effect = {
       kind: 'deferral' as const,
       title: 'Deferred refutation',
@@ -215,7 +276,24 @@ describe('remediation case effects', () => {
       tracker: { findIssueByEffectMarker: vi.fn().mockResolvedValue(null) } as never,
       fileIssue: async ({ title, body, priority }) => fileIntakeIssue(
         { title, body, priority, repo: 'acme/repo' },
-        { tracker: intakeTracker, gh: async () => ({ stdout: '{}' }), cwd: root },
+        {
+          creation: {
+            authority: {
+              resolveActor: async () => ({ resolved: true as const, id: 'alice' }),
+              intent: { kind: 'explicit-intake' as const, repository: 'acme/repo' },
+            },
+            operations: {
+              run: async (request) => {
+                if (request.operation === 'issue.create') {
+                  const payload = request.payload as { title: string; body: string };
+                  createIssue({ title: payload.title, body: payload.body, repo: request.target.repository });
+                  return { created: { repository: 'acme/repo', kind: 'issue' as const, number: 43 } };
+                }
+                return {};
+              },
+            },
+          },
+        },
       ),
     })).resolves.toMatchObject({ ok: true, status: 'applied', effectId: 'effect-refuted' });
 
@@ -224,10 +302,10 @@ describe('remediation case effects', () => {
       title: 'Deferred refutation',
       body: sanitizeIntakeText(rendered).text,
       repo: 'acme/repo',
-    }, root);
+    });
     expect(createIssue.mock.calls[0]![0].body).toContain(remediationEffectMarker('effect-refuted'));
     await expect(store.read()).resolves.toMatchObject({ ok: true, state: { cases: [expect.objectContaining({
-      disposition: 'refute', effect: { id: 'effect-refuted', kind: 'deferral', status: 'applied', issueUrl: 'https://github.test/acme/repo/issues/43' },
+      disposition: 'refute', effect: { id: 'effect-refuted', kind: 'deferral', status: 'applied', issueUrl: 'https://github.com/acme/repo/issues/43' },
     })] } });
   });
 

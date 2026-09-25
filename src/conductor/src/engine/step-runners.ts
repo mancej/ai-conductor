@@ -1,6 +1,9 @@
-import { writeFile, access, readFile, mkdir, rename, rm, symlink } from 'node:fs/promises';
+import { writeFile, access, readFile, readdir, mkdir, rename, rm, symlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
 import { basename, dirname, join, relative } from 'node:path';
+import { homedir } from 'node:os';
+import { execa } from 'execa';
 import { fileURLToPath } from 'node:url';
 import type {
   InvokeOptions,
@@ -10,8 +13,11 @@ import type {
   ProviderStreamObservation,
 } from '../execution/llm-provider.js';
 import { ModelAvailability } from './model-availability.js';
+import { redactSafetyText } from './safety-diagnostics.js';
 import type { WorktreeLifecycleQueue } from './worktree.js';
-import type { StepName, ConductState, ComplexityTier, RunMode } from '../types/index.js';
+import type { StepName, ConductState, ComplexityTier, ExecutionContext, RunMode } from '../types/index.js';
+import { admitBuildReviewCustomSourceRegions } from './build-review-source-region-admission.js';
+import { BuildReviewScopeSource } from './build-review-scope-source.js';
 import type { HarnessConfig, EffortLevel, BuildReviewRubricId } from '../types/config.js';
 import { prdAuditScopeProjection } from './conductor.js';
 import type {
@@ -37,6 +43,7 @@ import {
   type Signal,
 } from './complexity.js';
 import type { ResolutionContext, ResolutionAttempt, SetupFailureContext, SetupFailureAttempt, CiFailureContext, CiFailureAttempt } from './rebase.js';
+import type { CiRepairDiagnosticReason } from '../types/events.js';
 import { makeGitRunner, type GitRunner } from './rebase.js';
 import {
   resolveFeaturePlanPath,
@@ -44,16 +51,18 @@ import {
   BUILD_REVIEW_VERDICT,
 } from './artifacts.js';
 import {
-  claimDigest,
-  parseJudgePayload,
+  parseJudgeBatchPayload,
   readCoverageBindingEnvelope,
+  writeCoverageBindingCodeStamp,
   writeCoverageBindingEnvelope,
   type CoverageBindingEnvelopeEntry,
+  type CoverageBindingEnvelopeFilesystem,
 } from './coverage-binding-envelope.js';
 import { assembleCoverageBindingClaims } from './coverage-binding-inputs.js';
+import { planCoverageBindingBatches } from './coverage-binding-batches.js';
 import { engineContentStamp } from './engine-version-id.js';
 import { resolveHarnessRoot } from './install-freshness.js';
-import { BUILD_REVIEW_RUBRIC_IDS, getBuildReviewRubricDescriptor } from './build-review-registry.js';
+import { BUILD_REVIEW_RUBRIC_IDS, fingerprintBuildReviewRubricPolicy, getBuildReviewRubricDescriptor } from './build-review-registry.js';
 import { currentCommitSha } from './project-prelude.js';
 import { resolveGateCodeValidityConfig } from './config.js';
 import {
@@ -69,23 +78,59 @@ import {
   renderContainmentFloorReport,
   type ContainmentFloorReport,
 } from './per-task-commit-floor.js';
-import { resolveBuildReviewConfig, type ResolvedBuildReviewRubricPolicy } from './resolved-config.js';
+import {
+  DEFAULT_TEST_QUALITY_MAX_PROJECTION_BYTES,
+  resolveBuildReviewConfig,
+  type ResolvedBuildReviewRubricPolicy,
+} from './resolved-config.js';
+import type { ResolvedBuildReviewCatalogEntry, ResolvedBuildReviewCustomCatalogEntry } from './resolved-config.js';
+import { fingerprintBuildReviewPolicyDeclaration, type InstalledReviewSkill } from './build-review-policy.js';
+import { resolveInstalledReviewPolicyCatalog, ReviewPolicyCatalogError } from './build-review-policy-resolver.js';
+import { renderRubricContractShape, type RubricContractDescriptor } from './build-review-contract.js';
+import { captureInstalledReviewPolicyBundle, resolveReviewPolicyPackageReference, type CapturedReviewPolicyBundle } from './build-review-policy-bundle.js';
+import {
+  evaluateBuildReviewPolicyPreflight,
+  parseBuildReviewPolicyRuntimeUnsupportedResponse,
+  renderBuildReviewPolicyContract,
+  renderBuildReviewPolicyUnsupportedDiagnostic,
+} from './build-review-policy-contract.js';
+import {
+  classifyBuildReviewPolicyIncompatibility,
+  type BuildReviewLapId,
+} from './build-review-domain.js';
+import { discoverClaudeReviewPolicies, type ClaudeMetadataCommand, type ClaudeReviewPolicyFilesystem } from './build-review-policy-claude.js';
+import { createCodexAppServerTransport, listCodexInstalledReviewSkills, type CodexAppServerTransport } from './build-review-policy-codex.js';
+import { buildReviewFrozenInputPaths, prepareBuildReviewContainment, prepareBuildReviewEvidencePaths, renderBuildReviewFrozenInputScope, writeReviewHostStateSentinel } from './build-review-containment.js';
+import { acquireReviewScratchHome } from './self-host/provider-scratch.js';
+import { copySelectedCodexLogin } from '../execution/codex-self-host-auth.js';
+import { stampBuildReviewCustomJudgedResult } from './build-review-finding-identity.js';
 import {
   coordinateBuildReviewRubrics,
+  emitBuildReviewCacheDiscard,
   type BuildReviewCoordinationEngineIdentity,
   type BuildReviewRubricSkillDigest,
-  describeBuildReviewDispatchedResultRejection,
   buildReviewCandidateScopeResolutionContext,
   stampBuildReviewDispatchedCandidate,
   validateBuildReviewDispatchedResult,
   type BuildReviewDispatchableRubric,
 } from './build-review-coordinator.js';
 import type { ConductorEventEmitter } from '../ui/events.js';
-import { readBuildReviewCacheEntry, writeBuildReviewCacheEntry } from './build-review-cache.js';
-import { readBuildReviewBranchArtifact, writeBuildReviewBranchArtifact } from './build-review-artifacts.js';
-import { joinBuildReviewRubricOutcomes } from './build-review-aggregate.js';
+import { classifyBuildReviewCacheLookup, readBuildReviewCacheEntry, tryWriteBuildReviewCacheEntry, writeBuildReviewCacheEntry, type BuildReviewCacheSemanticIdentity } from './build-review-cache.js';
+import {
+  parseBuildReviewCustomArtifactMember,
+  buildReviewRubricPromptPath,
+  readBuildReviewBranchArtifact,
+  writeBuildReviewBranchArtifact,
+  type BuildReviewBranchProvenance,
+  type BuildReviewCustomArtifactMember,
+} from './build-review-artifacts.js';
+import { joinBuildReviewRubricOutcomes, type BuildReviewAggregate } from './build-review-aggregate.js';
 import { BuildReviewDispositionStore } from './build-review-dispositions.js';
-import { resolveEffectiveBuildReviewVerdict } from './build-review-effective.js';
+import {
+  buildReviewConfidenceFloors,
+  resolveEffectiveBuildReviewVerdict,
+  type BuildReviewEffectiveResolution,
+} from './build-review-effective.js';
 import { persistBuildReviewSuppressions, projectBuildReviewSuppressionEntries } from './build-review-suppression-history.js';
 import {
   bumpMechanicalFaultsInLedger,
@@ -95,14 +140,17 @@ import {
 import {
   deriveBuildReviewInfrastructureFailureReason,
   deriveBuildReviewScopeIncompleteFault,
+  buildReviewFindingReferenceContext,
+  diagnoseBuildReviewCustomReviewerPayloadRejection,
+  diagnoseBuildReviewJudgedResultRejection,
   makeBuildReviewDispatchFailure,
   parseBuildReviewLapId,
   parseBuildReviewRubricResult,
+  renderBuildReviewJudgedResultRejection,
   renderBuildReviewUnresolvedSkillRemedy,
-  renderBuildReviewProviderPayloadShape,
   type BuildReviewRubricResult,
 } from './build-review-domain.js';
-import type { BuildReviewRubricProjection } from './build-review-projections.js';
+import { buildReviewRubricPromptView, type BuildReviewRubricProjection } from './build-review-projections.js';
 import { boundedHeadTailExcerpt, classifyTautologyPaths, deriveRemovalMaintenanceSelectors, materializeTautologyPreflight, type TautologyScopedRunResult } from './build-review-test-quality-preflight.js';
 import {
   defaultBuildReviewScopedLauncher,
@@ -118,6 +166,7 @@ import type {
   ProviderSessionStore,
 } from './provider-session.js';
 import {
+  buildProviderAttemptMetadata,
   executeProviderCandidates,
   executeAuxiliaryProviderCandidates,
   type ExecuteProviderCandidatesInput,
@@ -125,6 +174,7 @@ import {
   type ProviderExecutionContext,
   type WithCandidateSafety,
 } from './provider-execution.js';
+import { runAuxiliaryGroupBranches } from './group-core.js';
 import {
   ProviderRuntimeSet,
 } from './provider-runtime.js';
@@ -135,6 +185,7 @@ import {
   renderAuxiliarySkillInvocation,
   STEP_SKILL_INVOCATIONS,
 } from './skill-invocation.js';
+import { resolveCustomStepSkill } from './skill-resolver.js';
 import {
   createHeartbeatPulse,
 } from './step-heartbeat.js';
@@ -452,7 +503,10 @@ export function parseRebaseResolutionOutput(output: string): ResolutionAttempt {
       ) {
         const obj = parsed as Record<string, unknown>;
         if (obj.resolved === true) {
-          return { resolved: true };
+          return {
+            resolved: true,
+            ...('verdict' in obj ? { verdict: obj.verdict as ResolutionAttempt['verdict'] } : {}),
+          };
         }
         const reason =
           typeof obj.reason === 'string' && obj.reason.length > 0
@@ -522,9 +576,36 @@ export interface StepRunnerOptions {
   /** Shared raw-aggregate/disposition join. Tests inject a bounded fake store. */
   buildReviewEffectiveResolver?: typeof resolveEffectiveBuildReviewVerdict;
   /** Test seam for a missing or malformed current-lap branch artifact. */
-  buildReviewArtifactReader?: typeof readBuildReviewBranchArtifact;
+  buildReviewArtifactReader?: (
+    projectRoot: string,
+    rubric: string,
+    lapId: BuildReviewLapId,
+    snapshotDigest: string,
+    fs: import('./build-review-artifacts.js').BuildReviewArtifactFilesystem,
+  ) => Promise<unknown>;
+  /** Candidate-local installed-policy catalog. Tests supply a faithful host fake. */
+  buildReviewPolicyCatalog?: (input: {
+    readonly provider: string;
+    readonly entry: ResolvedBuildReviewCatalogEntry;
+    /** The policy reference this candidate resolves; discovery reads no other standalone skill. */
+    readonly skill: string;
+    readonly preparedEnv?: NodeJS.ProcessEnv;
+    readonly preparedExecutable?: string;
+    /** Leading arguments of the prepared invocation (for example a containment wrap). */
+    readonly preparedArgs?: readonly string[];
+    /** The provider home preparation replaced, mapped explicitly for installed-catalog discovery. */
+    readonly originalCatalogHome?: string;
+    /** Owning candidate's cancellation joined with its deadline; aborts in-flight discovery. */
+    readonly signal?: AbortSignal;
+    /** Owning candidate's absolute deadline, in epoch milliseconds. */
+    readonly deadlineAt?: number;
+  }) => Promise<readonly InstalledReviewSkill[]>;
+  /** Candidate-local package capture seam; production retains the filesystem capture. */
+  buildReviewPolicyCapture?: typeof captureInstalledReviewPolicyBundle;
   /** Shared event spine for engine-owned build-review occurrences. */
   events?: ConductorEventEmitter;
+  /** Test-only envelope filesystem seam for coverage-binding checkpoints. */
+  coverageBindingFilesystem?: CoverageBindingEnvelopeFilesystem;
   /** Provider-aware session authority. Omitted by legacy scalar callers. */
   sessionStore?: ProviderSessionStore;
   /** Registry key for the captured provider when sessionStore is present. */
@@ -552,6 +633,77 @@ export interface StepRunnerOptions {
   heartbeatWatchdog?: { pollIntervalMs?: number; now?: () => number };
 }
 
+/**
+ * Production catalog composition intentionally lives at the runner boundary:
+ * discovery occurs in the selected candidate's prepared environment, never in
+ * the parent process that happens to start the conductor.
+ */
+export function productionBuildReviewPolicyCatalog(
+  projectDir: string,
+  deps: {
+    readonly codexTransport?: CodexAppServerTransport;
+    readonly claudeCommand?: ClaudeMetadataCommand;
+    readonly claudeFilesystem?: ClaudeReviewPolicyFilesystem;
+  } = {},
+): NonNullable<StepRunnerOptions['buildReviewPolicyCatalog']> {
+  const codexTransport = deps.codexTransport ?? createCodexAppServerTransport();
+  return async ({ provider, skill, preparedEnv, preparedExecutable, preparedArgs, originalCatalogHome, signal }) => {
+    const env = preparedEnv ?? process.env;
+    if (provider !== 'claude' && provider !== 'codex') {
+      throw new Error(`Build-review custom policies are unsupported for provider ${provider}`);
+    }
+    const homeVariable = provider === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME';
+    const discover = (home: string, catalogEnv: NodeJS.ProcessEnv, includeProject: boolean): Promise<readonly InstalledReviewSkill[]> => provider === 'claude'
+      ? discoverClaudeReviewPolicies({
+          candidate: {
+            cwd: projectDir,
+            env: catalogEnv,
+            projectSkillRoots: includeProject ? [join(projectDir, '.claude', 'skills'), join(projectDir, '.agents', 'skills')] : [],
+            userSkillRoots: [join(home, 'skills')],
+            skill,
+            ...(signal === undefined ? {} : { signal }),
+          },
+          ...(deps.claudeCommand === undefined ? {} : { command: deps.claudeCommand }),
+          ...(deps.claudeFilesystem === undefined ? {} : { filesystem: deps.claudeFilesystem }),
+        })
+      : listCodexInstalledReviewSkills(codexTransport, {
+          cwd: projectDir,
+          home,
+          env: catalogEnv,
+          ...(preparedExecutable === undefined ? {} : { executable: preparedExecutable }),
+          ...(preparedArgs === undefined ? {} : { executableArgs: preparedArgs }),
+          ...(signal === undefined ? {} : { signal }),
+        });
+    const preparedHome = env[homeVariable] ?? join(homedir(), provider === 'claude' ? '.claude' : '.codex');
+    const prepared = await discover(preparedHome, env, true);
+    // Self-host preparation replaces the provider home. The operator's
+    // installed global and plugin catalogs are reachable only through the
+    // root preparation mapped explicitly; nothing here consults the engine's
+    // ambient home.  What preparation placed in the candidate home keeps
+    // precedence, because that is the definition the candidate would load.
+    if (originalCatalogHome === undefined || originalCatalogHome === preparedHome) return prepared;
+    const key = (skill: InstalledReviewSkill) => `${skill.source}\0${skill.plugin?.id ?? ''}\0${skill.semanticName}`;
+    const preparedKeys = new Set(prepared.map(key));
+    const original = await discover(originalCatalogHome, { ...env, [homeVariable]: originalCatalogHome }, false);
+    return [...prepared, ...original.filter((skill) => skill.source !== 'project' && !preparedKeys.has(key(skill)))];
+  };
+}
+
+/** The command a review member launches, so containment proves the mounts that command gets. */
+function reviewLaunchCommand(
+  provider: 'claude' | 'codex',
+  prepared: { readonly executable: string; readonly args: readonly string[] } | undefined,
+): { readonly executable: string; readonly args: readonly string[] } {
+  if (prepared !== undefined) return { executable: prepared.executable, args: prepared.args };
+  return { executable: provider === 'codex' ? process.env.CODEX_EXECUTABLE ?? 'codex' : 'claude', args: [] };
+}
+
+/** Capabilities belong to the prepared provider role, never the policy declaration. */
+function establishedBuildReviewTools(provider: 'claude' | 'codex'): readonly string[] {
+  // Both supported read-only profiles expose git for frozen-input inspection.
+  return provider === 'claude' || provider === 'codex' ? ['git'] : [];
+}
+
 type ProviderAwareSkillOneShotStep = 'complexity' | 'remediate' | 'rebase';
 type ProviderAwareFreeFormOneShotStep =
   | 'worktree'
@@ -576,30 +728,51 @@ type ProviderAwareOneShotRequest =
     });
 
 
-/**
- * Extracts the judged-result JSON object from a rubric session's output.
- * Sessions intermittently wrap the JSON in prose or markdown fences; a strict
- * whole-output parse turned that wrapping into `invalid-provider-result`
- * infrastructure failures. Parsing tries the raw output first, then a fenced
- * block, then the outermost balanced object. Returns undefined when no
- * candidate parses — validation of the parsed shape stays with the caller.
- */
-/** Byte cap for the previous-output excerpt embedded in a rubric repair prompt. */
-export const RUBRIC_REPAIR_PROMPT_EXCERPT_CAP_BYTES = 8_192;
 /** Byte cap for the raw-output diagnostic detail on a final rubric shape failure. */
 export const RUBRIC_FAILURE_DETAIL_CAP_BYTES = 2_048;
 
-export function extractJudgedResultCandidate(output: string): unknown {
-  const candidates: string[] = [output.trim()];
-  const fence = output.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
-  if (fence) candidates.push(fence[1].trim());
-  const first = output.indexOf('{');
-  const last = output.lastIndexOf('}');
-  if (first !== -1 && last > first) candidates.push(output.slice(first, last + 1));
-  for (const candidate of candidates) {
-    try { return JSON.parse(candidate); } catch { /* try next shape */ }
+export type RubricContractDispatch<Output = unknown> =
+  /** `prepared` is the exact value the descriptor parser judged (stamped for built-ins), retained so a rejection is diagnosed on it and never on the raw provider payload. */
+  | { readonly kind: 'structured'; readonly invocation: InvokeResult; readonly prepared: unknown; readonly parsed: Output | undefined }
+  | { readonly kind: 'root-rejection'; readonly invocation: InvokeResult; readonly rejection: { readonly field: 'root'; readonly problem: 'a structured result is required' } }
+  | { readonly kind: 'provider-failure'; readonly invocation: InvokeResult };
+
+type RubricContractInvokeOptions = Omit<InvokeOptions, 'sessionId' | 'resume' | 'model' | 'effort' | 'nativeSchema'>;
+
+/**
+ * The invocation a rubric cache hit stands in for. It carries the cached
+ * verdict as `finalStructuredResult`, because `dispatchRubricContract` judges
+ * only the structured result and root-rejects an invocation without one.
+ */
+export function cachedRubricInvocation(result: unknown): InvokeResult {
+  return { success: true, exitCode: 0, output: JSON.stringify(result), finalStructuredResult: result, providerInvocationSkipped: true };
+}
+
+/** Native-schema invocation boundary shared by built-in and custom rubrics. */
+export async function dispatchRubricContract<Output>(input: {
+  readonly descriptor: Pick<RubricContractDescriptor<unknown, unknown, Output>, 'output'>;
+  readonly options: RubricContractInvokeOptions;
+  readonly invoke: (options: RubricContractInvokeOptions & Pick<InvokeOptions, 'nativeSchema'>) => Promise<InvokeResult>;
+  /** Built-in payloads are stamped before their descriptor parser accepts them. */
+  readonly prepareStructured?: (value: Record<string, unknown>) => unknown;
+}): Promise<RubricContractDispatch<Output>> {
+  const invocation = await input.invoke({ ...input.options, nativeSchema: input.descriptor.output.jsonSchema });
+  if (invocation.structuredResultFailure !== undefined) {
+    return { kind: 'root-rejection', invocation, rejection: { field: 'root', problem: 'a structured result is required' } };
   }
-  return undefined;
+  if (!invocation.success) return { kind: 'provider-failure', invocation };
+  const structuredResult = invocation.finalStructuredResult;
+  if (structuredResult === null || typeof structuredResult !== 'object' || Array.isArray(structuredResult)) {
+    return { kind: 'root-rejection', invocation, rejection: { field: 'root', problem: 'a structured result is required' } };
+  }
+  const raw = structuredResult as Record<string, unknown>;
+  const prepared = input.prepareStructured?.(raw) ?? raw;
+  return {
+    kind: 'structured',
+    invocation,
+    prepared,
+    parsed: input.descriptor.output.parse(prepared),
+  };
 }
 
 export class DefaultStepRunner implements StepRunner {
@@ -626,11 +799,16 @@ export class DefaultStepRunner implements StepRunner {
   private gitRunner: GitRunner;
   private planPathOverride?: string;
   private buildReviewInputOptions?: BuildReviewInputOptions;
+  /** Fixtures with a synthetic Git runner cannot create detached worktrees. */
+  private readonly usesInjectedBuildReviewGit: boolean;
   private buildReviewScopedLauncher: BuildReviewScopedLauncher;
   private buildReviewCoordinator?: StepRunnerOptions['buildReviewCoordinator'];
   private buildReviewEffectiveResolver: typeof resolveEffectiveBuildReviewVerdict;
-  private buildReviewArtifactReader: typeof readBuildReviewBranchArtifact;
+  private buildReviewArtifactReader: NonNullable<StepRunnerOptions['buildReviewArtifactReader']>;
+  private buildReviewPolicyCatalog?: StepRunnerOptions['buildReviewPolicyCatalog'];
+  private buildReviewPolicyCapture: typeof captureInstalledReviewPolicyBundle;
   private events?: ConductorEventEmitter;
+  private coverageBindingFilesystem?: CoverageBindingEnvelopeFilesystem;
   private sessionStore?: ProviderSessionStore;
   private readonly runId: string;
   private providerKey: string;
@@ -685,6 +863,7 @@ export class DefaultStepRunner implements StepRunner {
       this.log,
     );
     this.gitRunner = options?.gitRunner ?? makeGitRunner(this.projectDir);
+    this.usesInjectedBuildReviewGit = options?.gitRunner !== undefined;
     this.worktreeLifecycle = options?.worktreeLifecycle;
     this.planPathOverride = options?.planPath;
     this.buildReviewInputOptions = options?.buildReviewInputOptions;
@@ -692,7 +871,11 @@ export class DefaultStepRunner implements StepRunner {
     this.buildReviewCoordinator = options?.buildReviewCoordinator;
     this.buildReviewEffectiveResolver = options?.buildReviewEffectiveResolver ?? resolveEffectiveBuildReviewVerdict;
     this.buildReviewArtifactReader = options?.buildReviewArtifactReader ?? readBuildReviewBranchArtifact;
+    this.buildReviewPolicyCatalog = options?.buildReviewPolicyCatalog
+      ?? productionBuildReviewPolicyCatalog(this.projectDir);
+    this.buildReviewPolicyCapture = options?.buildReviewPolicyCapture ?? captureInstalledReviewPolicyBundle;
     this.events = options?.events;
+    this.coverageBindingFilesystem = options?.coverageBindingFilesystem;
     this.sessionStore =
       options?.sessionStore ?? options?.providerExecution?.sessions;
     this.providerKey = options?.providerKey ?? 'claude';
@@ -794,10 +977,10 @@ export class DefaultStepRunner implements StepRunner {
     // conductor session (see runBuildReview() for the resolveRebaseConflict
     // fresh-uuid/resume:false pattern).
     if (step === 'build_review') {
-      return this.runBuildReview(state.complexity_tier);
+      return this.runBuildReview(state.complexity_tier, opts?.executionContext);
     }
     if (step === 'coverage_binding') {
-      return this.runCoverageBinding(state);
+      return this.runCoverageBinding(state, opts?.executionContext);
     }
 
     // Lazy-init: check marker file on first run
@@ -819,9 +1002,21 @@ export class DefaultStepRunner implements StepRunner {
     )
       ? STEP_SKILL_INVOCATIONS[step]
       : undefined;
+    const configuredSkillPath = this.config?.steps?.[step]?.skill;
+    const customSkill = skillInvocation || configuredSkillPath === undefined
+      ? undefined
+      : resolveCustomStepSkill(step, configuredSkillPath, this.projectDir);
+    if (typeof customSkill !== 'string' && customSkill !== undefined) {
+      return {
+        success: false,
+        output: `Cannot dispatch custom step ${customSkill.stepKey}: configured skill ${customSkill.configuredPath} is ${customSkill.kind}.`,
+      };
+    }
     const prompt = skillInvocation
       ? renderSkillInvocation(skillInvocation, this.providerKey)
-      : `/${step}`;
+      : customSkill === undefined
+        ? `/${step}`
+        : renderAuxiliarySkillInvocation(customSkill, this.providerKey);
     // Concurrent-group branch dispatch (group-core.ts): opts.sessionId, when
     // present, overrides the runner's shared this.sessionId so the branch
     // never touches (reads or mutates) the main conductor session — see
@@ -870,6 +1065,7 @@ export class DefaultStepRunner implements StepRunner {
       opts?.finishProsePass,
       opts?.revisionGuidance,
       state.complexity_tier,
+      opts?.prdWideningReviewContext,
     );
 
     // Every dispatch reaches the provider through invoke(). `interactive`
@@ -879,19 +1075,32 @@ export class DefaultStepRunner implements StepRunner {
       if (this.providerRuntimes && branchSessionId === undefined) {
         if (step === 'remediate') {
           try {
+            const reconciliation = opts?.remediationRequest;
+            const reconciliationInput = reconciliation === undefined
+              ? undefined
+              : `PRD WIDENING RECONCILIATION INPUT (engine-owned):\n${reconciliation.projection}`;
             const result = await this.executeProviderAwareSkillOneShot(
               step,
               {
-                prompt,
-                systemPrompt,
+                // executeProviderAwareSkillOneShot prepends the selected
+                // provider's skill invocation for a schema request. Keep the
+                // supplied projection separate so that command appears once.
+                prompt: reconciliationInput ?? prompt,
+                systemPrompt: reconciliation
+                  ? `${systemPrompt}\n\nJudge only semantic same/different/uncertain relations. Do not grant authority or create BUILD work.`
+                  : systemPrompt,
                 cwd: this.projectDir,
                 dangerouslySkipPermissions: true,
+                ...(reconciliation ? { nativeSchema: reconciliation.nativeSchema } : {}),
               },
               state.complexity_tier,
               opts,
             );
             if (result) {
               this.callCount++;
+              if (reconciliation && result.success && result.finalStructuredResult === undefined) {
+                return { success: false, output: 'PRD widening reconciliation returned no native structured result.' };
+              }
               return this.toStepRunResult(step, result);
             }
           } catch (error) {
@@ -911,9 +1120,20 @@ export class DefaultStepRunner implements StepRunner {
           prompt,
           systemPrompt,
           false,
+          undefined,
+          customSkill,
         );
       }
-      return this.runAutonomous(step, prompt, resume, systemPrompt, resolved, branchSessionId);
+      return this.runAutonomous(
+        step,
+        prompt,
+        resume,
+        systemPrompt,
+        resolved,
+        branchSessionId,
+        state.complexity_tier,
+        opts?.executionContext,
+      );
     }
 
     // Open a REPL when the step is designed for user conversation AND we're
@@ -942,6 +1162,7 @@ export class DefaultStepRunner implements StepRunner {
         systemPrompt,
         true,
         interactive,
+        customSkill,
       );
     }
 
@@ -960,7 +1181,7 @@ export class DefaultStepRunner implements StepRunner {
       : this.createProviderStreamConsumer(step, this.providerKey);
 
     try {
-      await this.provider.invoke({
+      const result = await this.provider.invoke({
         prompt,
         sessionId: branchSessionId ?? this.sessionId,
         resume,
@@ -978,6 +1199,14 @@ export class DefaultStepRunner implements StepRunner {
         effort: resolved.effort,
         ...(streamConsumer ? { streamConsumer } : {}),
       });
+      await this.emitScalarProviderAttempt(
+        step,
+        result,
+        effectiveModel,
+        resolved.effort,
+        state.complexity_tier,
+        opts?.executionContext,
+      );
       this.callCount++;
 
       if (branchSessionId === undefined) {
@@ -1012,6 +1241,7 @@ export class DefaultStepRunner implements StepRunner {
     systemPrompt: string,
     streaming: boolean,
     interactive = false,
+    customSkill?: string,
     invocationKind: 'skill' | 'free-form' = 'skill',
   ): Promise<StepRunResult> {
     const sessions = opts?.providerSessions ?? this.sessionStore;
@@ -1046,6 +1276,12 @@ export class DefaultStepRunner implements StepRunner {
             tier: state.complexity_tier,
             attempt: opts?.attempt ?? 1,
             runId: this.runId,
+            nativeSchemaScratch: {
+              worktreeRoot: this.projectDir,
+              repository: this.projectDir,
+              featureSlug: this.featureDesc || basename(this.projectDir),
+            },
+            executionContext: opts?.executionContext,
             escalate: opts?.escalate ?? true,
             modelOverride: opts?.modelOverride ?? this.modelOverride,
             effortOverride: opts?.effortOverride ?? this.effortOverride,
@@ -1056,22 +1292,22 @@ export class DefaultStepRunner implements StepRunner {
             onAttempt: this.providerAttempt,
             warn: this.providerWarn,
             options,
-            ...(invocationKind === 'skill' && Object.prototype.hasOwnProperty.call(
+            ...(invocationKind === 'skill' && (Object.prototype.hasOwnProperty.call(
               STEP_SKILL_INVOCATIONS,
               step,
-            )
+            ) || customSkill !== undefined)
               ? {
                   optionsForCandidate: (candidateKey: string) => ({
                     ...options,
-                    prompt: renderSkillInvocation(
-                      STEP_SKILL_INVOCATIONS[step]!,
-                      candidateKey,
-                    ),
+                    prompt: customSkill === undefined
+                      ? renderSkillInvocation(STEP_SKILL_INVOCATIONS[step]!, candidateKey)
+                      : renderAuxiliarySkillInvocation(customSkill, candidateKey),
                   }),
                 }
               : {}),
           }),
         opts?.runId,
+        opts?.executionContext,
       );
       const verifiedResult = safety?.verify(result) ?? result;
       this.callCount++;
@@ -1138,6 +1374,12 @@ export class DefaultStepRunner implements StepRunner {
           tier: request.tier,
           attempt: request.dispatch?.attempt ?? 1,
           runId: this.runId,
+          nativeSchemaScratch: {
+            worktreeRoot: this.projectDir,
+            repository: this.projectDir,
+            featureSlug: this.featureDesc || basename(this.projectDir),
+          },
+          executionContext: request.dispatch?.executionContext,
           escalate: request.dispatch?.escalate ?? true,
           modelOverride: request.dispatch?.modelOverride ?? this.modelOverride,
           effortOverride: request.dispatch?.effortOverride ?? this.effortOverride,
@@ -1152,15 +1394,15 @@ export class DefaultStepRunner implements StepRunner {
             ? {
                 optionsForCandidate: (candidateKey: string) => ({
                   ...options,
-                  prompt: renderSkillInvocation(
-                    STEP_SKILL_INVOCATIONS[request.step]!,
-                    candidateKey,
-                  ),
+                  prompt: options.nativeSchema === undefined
+                    ? renderSkillInvocation(STEP_SKILL_INVOCATIONS[request.step]!, candidateKey)
+                    : `${renderSkillInvocation(STEP_SKILL_INVOCATIONS[request.step]!, candidateKey)}\n\n${options.prompt}`,
                 }),
               }
             : {}),
         }),
       request.dispatch?.runId,
+      request.dispatch?.executionContext,
     );
     return safety?.verify(result) ?? result;
   }
@@ -1177,6 +1419,7 @@ export class DefaultStepRunner implements StepRunner {
       options: ExecuteProviderCandidatesInput['options'],
     ) => Promise<ProviderExecutionResult>,
     dispatchRunId?: string,
+    executionContext?: ExecutionContext,
   ): Promise<ProviderExecutionResult> {
     const pulse = createHeartbeatPulse(this.projectDir, step);
     const providerStreamIntervalMs = resolveProviderStreamMinIntervalMs(this.config);
@@ -1205,7 +1448,10 @@ export class DefaultStepRunner implements StepRunner {
       preparationTimeoutMinutes: resolveProviderPreparationTimeoutMinutes(this.config),
       timer: this.providerLifecycleTimer,
       onLifecycleEvent: (event) => {
-        void this.providerAttempt?.(event.step, event);
+        void this.providerAttempt?.(
+          event.step,
+          executionContext ? { ...event, executionContext } : event,
+        );
       },
       recovery: {
         projectRoot: this.projectDir,
@@ -1294,7 +1540,22 @@ export class DefaultStepRunner implements StepRunner {
       ...(result.observedIntervals
         ? { observedIntervals: result.observedIntervals }
         : {}),
+      ...(result.providerSetupExhaustion
+        ? { providerSetupExhaustion: result.providerSetupExhaustion }
+        : {}),
     };
+  }
+
+  /** Translate untrusted provider output into the closed root-bus vocabulary. */
+  private ciFailureReason(result: Pick<InvokeResult, 'output' | 'commandUnresolved' | 'permissionDenied' | 'providerUnavailable' | 'executionDisposition'>): CiRepairDiagnosticReason {
+    const text = `${result.output ?? ''}`.toLowerCase();
+    if (result.commandUnresolved) return 'flag-invalid';
+    if (result.permissionDenied || /permission|forbidden|\b403\b/.test(text)) return 'permission';
+    if (/auth|unauthor|\b401\b/.test(text)) return 'auth';
+    if (/timeout|timed out/.test(text)) return 'timeout';
+    if (result.providerUnavailable) return 'provider-unavailable';
+    if (/spawn|enoent|environment/.test(text)) return 'spawn-env';
+    return result.executionDisposition === 'not-started' ? 'readiness-degraded' : 'unknown';
   }
 
   private createProviderStreamConsumer(
@@ -1345,6 +1606,9 @@ export class DefaultStepRunner implements StepRunner {
     return {
       success: result.success,
       ...(result.output ? { output: result.output } : {}),
+      ...(result.finalStructuredResult === undefined
+        ? {}
+        : { finalStructuredResult: result.finalStructuredResult }),
       ...(publicationDisposition !== undefined ? { publicationDisposition } : {}),
       ...(result.authFailure ? { authFailure: true } : {}),
       ...(result.commandUnresolved
@@ -1356,6 +1620,9 @@ export class DefaultStepRunner implements StepRunner {
           }
         : {}),
       ...(result.permissionDenied ? { permissionDenied: true } : {}),
+      ...(result.providerSetupExhaustion
+        ? { providerSetupExhaustion: result.providerSetupExhaustion }
+        : {}),
       ...(result.rateLimited
         ? {
             rateLimited: true,
@@ -1391,6 +1658,8 @@ export class DefaultStepRunner implements StepRunner {
     systemPrompt: string,
     resolved: ResolvedStepConfig,
     branchSessionId?: string,
+    tier?: ComplexityTier,
+    executionContext?: ExecutionContext,
   ): Promise<StepRunResult> {
     // Resolve to a live model up front (skipping any already known-dead
     // model in this process) so a single ladder-covered invocation doesn't
@@ -1426,6 +1695,14 @@ export class DefaultStepRunner implements StepRunner {
       const { v4: uuidv4 } = await import('uuid');
       return { sessionId: uuidv4(), resume: false };
     });
+    await this.emitScalarProviderAttempt(
+      step,
+      result,
+      attemptedModels.at(-1) || effectiveModel,
+      resolved.effort,
+      tier,
+      executionContext,
+    );
     this.callCount++;
     const observedIntervals = result.observedIntervals
       ? { observedIntervals: result.observedIntervals }
@@ -1550,6 +1827,33 @@ export class DefaultStepRunner implements StepRunner {
     };
   }
 
+  /** Emits scalar-provider telemetry without retaining invocation state on the runner. */
+  private async emitScalarProviderAttempt(
+    step: StepName,
+    result: InvokeResult,
+    model: string,
+    effort: EffortLevel,
+    tier: ComplexityTier | undefined,
+    executionContext: ExecutionContext | undefined,
+  ): Promise<void> {
+    try {
+      await this.providerAttempt?.(
+        step,
+        buildProviderAttemptMetadata({
+          providerKey: this.providerKey,
+          executionContext,
+          result,
+          preferredProvider: this.providerKey,
+          resolvedModel: model,
+          resolvedEffort: effort,
+          tier,
+        }),
+      );
+    } catch {
+      // Attempt metadata is observational and must not alter scalar dispatch.
+    }
+  }
+
   async resetSession(step?: StepName, providerKey = this.providerKey): Promise<void> {
     if (this.sessionStore && step !== undefined) {
       await this.sessionStore.beginStep(step);
@@ -1599,6 +1903,7 @@ export class DefaultStepRunner implements StepRunner {
         '',
         true,
         true,
+        undefined,
         'free-form',
       );
       return;
@@ -1718,9 +2023,16 @@ export class DefaultStepRunner implements StepRunner {
       'captured source intent and upstream intent before continuing. At the first semantic ' +
       'ambiguity, HALT this attempt and return a false result with the missing decision; ' +
       'do not replace that workflow with a condensed procedure.\n' +
-      'Your FINAL output line MUST be exactly one of:\n' +
-      '{"resolved": true}\n' +
-      '{"resolved": false, "reason": "<explanation>"}';
+      (ctx.supersessionJudgement
+        ? 'Sweep Test-Only Judgement is in force. A successful final JSON must include verdict: { choice: "superseded" | "merged" | "source", rationale: string, superseded: string[] }.\n'
+        : '') +
+      (ctx.supersessionJudgement
+        ? 'Your FINAL output line MUST be exactly one of:\n' +
+          '{"resolved": true, "verdict": {"choice":"superseded"|"merged"|"source","rationale":"<explanation>","superseded":["<replayed-sha>"]}}\n' +
+          '{"resolved": false, "reason": "<explanation>"}'
+        : 'Your FINAL output line MUST be exactly one of:\n' +
+          '{"resolved": true}\n' +
+          '{"resolved": false, "reason": "<explanation>"}');
 
     const providerResult = await this.executeProviderAwareSkillOneShot(
       'rebase',
@@ -1873,7 +2185,12 @@ export class DefaultStepRunner implements StepRunner {
     });
     if (providerResult) {
       return {
-        attempted: true,
+        kind: providerResult.success
+          ? 'session-completed'
+          : providerResult.executionDisposition === 'not-started'
+            ? 'not-started'
+            : 'failed',
+        reason: this.ciFailureReason(providerResult),
         ...this.providerAttribution(providerResult),
       };
     }
@@ -1886,7 +2203,7 @@ export class DefaultStepRunner implements StepRunner {
 
     // Walk the fallback ladder so the CI-failure resolver is not blocked by
     // one model's unavailability.
-    await this.modelAvailability.invokeWithLadder(this.provider, {
+    const result = await this.modelAvailability.invokeWithLadder(this.provider, {
       prompt,
       sessionId,
       resume: false,
@@ -1897,9 +2214,11 @@ export class DefaultStepRunner implements StepRunner {
       cwd: ctx.worktreePath,
     }, async () => ({ sessionId: uuidv4(), resume: false }));
 
-    // Always report attempted: true — the success of the fix is determined by
-    // whether CI subsequently passes.
-    return { attempted: true };
+    return {
+      kind: result.success ? 'session-completed' : result.executionDisposition === 'not-started' ? 'not-started' : 'failed',
+      reason: this.ciFailureReason(result),
+      preferredProvider: this.providerKey,
+    };
   }
 
   /**
@@ -1959,8 +2278,9 @@ export class DefaultStepRunner implements StepRunner {
    * once per build_review dispatch and injected into the coordinator: the
    * 12-hex engine content stamp (or the `dev` sentinel for an unpublished
    * run) plus a `sha256:` digest over the raw bytes of each registered
-   * rubric's installed SKILL.md under the harness root. An unreadable skill
-   * resolves as unavailable — the coordinator fails that rubric closed.
+   * rubric's installed SKILL.md under the harness root. This map is legacy
+   * coordinator-only evidence; candidate paths load the actual installed
+   * policy. engineStamp remains the per-run stamp on both paths.
    */
   private async resolveBuildReviewEngineIdentity(): Promise<BuildReviewCoordinationEngineIdentity> {
     const engineStamp = engineContentStamp(dirname(fileURLToPath(import.meta.url)));
@@ -2003,6 +2323,27 @@ export class DefaultStepRunner implements StepRunner {
     inputs: BuildReviewFrozenInputs,
     config: ReturnType<typeof resolveBuildReviewConfig>,
     tier: ConductState['complexity_tier'],
+    executionContext?: ExecutionContext,
+  ): Promise<StepRunResult> {
+    try {
+      return await this.runRubricBuildReviewInner(inputs, config, tier, executionContext);
+    } finally {
+      // A custom lap owns one source view for every catalog member. Some
+      // built-in paths settle before dispatch (for example a deterministic
+      // preflight refusal), so its own candidate callback never runs. Close
+      // every member here after the complete lap outcome is known; repeated
+      // member settlement is deliberately idempotent in the materialization.
+      await Promise.all(config.catalog.map(async (entry) => {
+        await inputs.sourceMaterialization?.settle(entry.id);
+      }));
+    }
+  }
+
+  private async runRubricBuildReviewInner(
+    inputs: BuildReviewFrozenInputs,
+    config: ReturnType<typeof resolveBuildReviewConfig>,
+    tier: ConductState['complexity_tier'],
+    executionContext?: ExecutionContext,
   ): Promise<StepRunResult> {
     const lapId = parseBuildReviewLapId(`lap-${inputs.sourceSnapshot.headSha}`);
     if (!lapId) return { success: false, output: 'build_review could not create a valid rubric lap identity' };
@@ -2015,19 +2356,62 @@ export class DefaultStepRunner implements StepRunner {
 
     const engineIdentity = await this.resolveBuildReviewEngineIdentity();
 
+    // Custom policies are loaded only inside the prepared provider candidate.
+    // The fixed coordinator still owns the legacy testQuality branch; dynamic
+    // artifact/aggregate persistence is deliberately introduced by its own
+    // later boundary.  This narrow branch establishes the config -> actual
+    // candidate judgement hand-off without borrowing a host installation.
+    const customEntries = config.catalog.filter(
+      (entry): entry is ResolvedBuildReviewCustomCatalogEntry => entry.kind === 'custom',
+    );
+    let customResults: Readonly<Record<string, BuildReviewCustomArtifactMember>> | undefined;
+    if (customEntries.length > 0) {
+      const outcomes = await runAuxiliaryGroupBranches(
+        customEntries.map((entry) => ({ memberId: entry.id, policy: entry })),
+        config.maxParallel,
+        async (_id, entry) => this.dispatchInstalledBuildReviewPolicy(entry, inputs, lapId, tier),
+      );
+      if (outcomes.some((outcome) => !outcome.success)) {
+        return {
+          success: false,
+          output: outcomes.filter((outcome) => !outcome.success).map((outcome) => outcome.output).join('\n'),
+        };
+      }
+      const members = outcomes.map((outcome) => [outcome.id, outcome.member] as const);
+      if (members.some((member) => member[1] === undefined)) {
+        return { success: false, output: 'build_review custom policy produced no durable result' };
+      }
+      customResults = Object.freeze(Object.fromEntries(members) as Record<string, BuildReviewCustomArtifactMember>);
+      await this.emitBuildReviewCustomMemberResults(lapId, customResults);
+      // A custom-only lap still has a complete aggregate.  Do not use one
+      // built-in's enabled flag as a proxy for the complete catalog: security
+      // (and every future built-in) must share this lap's frozen input and
+      // candidate path whenever it is enabled beside a custom policy.
+      if (!config.catalog.some((entry) => entry.kind === 'builtin')) {
+        return this.publishCustomOnlyBuildReview({
+          lapId,
+          inputs,
+          customResults,
+          currentCustomRubrics: customEntries.map((entry) => entry.id),
+          config,
+        });
+      }
+    }
+
     const coordination = await coordinateBuildReviewRubrics({
       config,
       inputs,
       lapId,
       engineIdentity,
+      useCandidateCache: true,
       preflight: async () => this.runTautologyPreflight(inputs),
-      readCache: async (branch) => readBuildReviewCacheEntry(this.projectDir, branch.rubric, {
-        readFile: async (path) => readFile(path, 'utf-8'),
+      readCache: async (branch, _projection, _policyFingerprint, semanticIdentity) => readBuildReviewCacheEntry(this.projectDir, branch.rubric, {
+        readFile: async (path) => readFile(path, 'utf-8'), readdir,
         mkdir: async (path) => { await mkdir(path, { recursive: true }); },
         writeFile,
         rename,
-      }),
-      dispatchModel: async (branch, projection) => this.dispatchBuildReviewRubric(branch, projection, tier),
+      }, semanticIdentity),
+      dispatchModel: async (branch, projection) => this.dispatchBuildReviewRubric(branch, projection, tier, executionContext, inputs, engineIdentity),
       writeArtifact: async (artifact) => writeBuildReviewBranchArtifact(this.projectDir, artifact, {
         readFile: async (path) => readFile(path, 'utf-8'),
         mkdir: async (path) => { await mkdir(path, { recursive: true }); },
@@ -2055,7 +2439,7 @@ export class DefaultStepRunner implements StepRunner {
 
     const results = Object.fromEntries(await Promise.all(coordination.branches.map(async (branch) => {
       if (branch.kind === 'cache-hit' || branch.kind === 'dispatched') {
-        const artifact = await this.buildReviewArtifactReader(
+        const rawArtifact = await this.buildReviewArtifactReader(
           this.projectDir,
           branch.rubric,
           lapId,
@@ -2067,6 +2451,10 @@ export class DefaultStepRunner implements StepRunner {
             rename,
           },
         );
+        const artifact = rawArtifact as import('./build-review-artifacts.js').BuildReviewBranchArtifact | undefined;
+        if (rawArtifact !== undefined && (typeof rawArtifact !== 'object' || rawArtifact === null || !artifact)) {
+          return [branch.rubric, { kind: 'malformed' as const, rubric: branch.rubric }];
+        }
         if (artifact && !parseBuildReviewRubricResult(artifact.result)) {
           return [branch.rubric, { kind: 'malformed' as const, rubric: branch.rubric }];
         }
@@ -2084,6 +2472,8 @@ export class DefaultStepRunner implements StepRunner {
             rubric: branch.rubric,
             reason: deriveBuildReviewInfrastructureFailureReason({ reason: branch.reason }),
             detail: branch.detail === undefined ? branch.reason : `${branch.reason}: ${branch.detail}`,
+            ...(branch.providerSetupExhaustion ? { providerSetupExhaustion: branch.providerSetupExhaustion } : {}),
+            ...(branch.rejection ? { rejection: branch.rejection } : {}),
           }];
     }))) as Record<BuildReviewRubricResult['rubric'], BuildReviewRubricResult | {
       readonly kind: 'malformed';
@@ -2115,13 +2505,17 @@ export class DefaultStepRunner implements StepRunner {
     const scopeIncompleteFault = Object.values(validResults).flatMap((result) =>
       result.kind === 'judged' ? [deriveBuildReviewScopeIncompleteFault(result)] : [],
     ).find((fault): fault is NonNullable<typeof fault> => fault !== undefined);
-    const infrastructureFailure = Object.values(validResults).find((result): result is Extract<BuildReviewRubricResult, { kind: 'infrastructure-failure' }> =>
+    const lapResults = [
+      ...Object.values(validResults),
+      ...Object.values(customResults ?? {}).map((member) => member.result),
+    ];
+    const infrastructureFailure = lapResults.find((result): result is Extract<BuildReviewRubricResult, { kind: 'infrastructure-failure' }> =>
       result.kind === 'infrastructure-failure',
     );
     // A semantically valid indeterminate candidate is a non-judgment fault,
-    // not a malformed result. It consumes the existing durable allowance but
-    // never gets an in-session repair turn, and its judged findings remain in
-    // the branch artifact for the terminal aggregate.
+    // not a malformed result. It consumes the existing durable allowance and
+    // its judged findings remain in the branch artifact for the terminal
+    // aggregate.
     if (scopeIncompleteFault) {
       const mechanicalFaults = await bumpMechanicalFaultsInLedger(this.projectDir, 'build_review', {
         rubric: scopeIncompleteFault.rubric,
@@ -2138,10 +2532,17 @@ export class DefaultStepRunner implements StepRunner {
       }
     }
     if (infrastructureFailure) {
-      const hasJudgedFinding = Object.values(validResults).some(
+      if (infrastructureFailure.providerSetupExhaustion) {
+        return {
+          success: false,
+          output: `build_review infrastructure failure in ${infrastructureFailure.rubric} (${infrastructureFailure.reason}): ${infrastructureFailure.detail}`,
+          providerSetupExhaustion: infrastructureFailure.providerSetupExhaustion,
+        };
+      }
+      const hasJudgedFinding = lapResults.some(
         (result) => result.kind === 'judged' && result.findings.length > 0,
       );
-      if (!hasJudgedFinding) {
+      if (!hasJudgedFinding && infrastructureFailure.reason !== 'projection-oversized') {
         const mechanicalFaults = await bumpMechanicalFaultsInLedger(this.projectDir, 'build_review', {
           rubric: infrastructureFailure.rubric,
           reason: infrastructureFailure.reason,
@@ -2155,6 +2556,10 @@ export class DefaultStepRunner implements StepRunner {
             currentLapMechanicalFault: true,
           };
         }
+        if (infrastructureFailure.reason === 'invalid-structured-result' || infrastructureFailure.reason === 'native-schema-unsupported') {
+          const reason = `build_review mechanical fault allowance exhausted for ${infrastructureFailure.rubric} (${infrastructureFailure.reason}): ${infrastructureFailure.detail}`;
+          return { success: false, output: reason, refusal: { kind: 'needs-human', reason } };
+        }
       }
     }
 
@@ -2162,58 +2567,33 @@ export class DefaultStepRunner implements StepRunner {
       lapId,
       snapshotDigest: inputs.sourceSnapshot.digest,
       results: validResults,
+      ...(customResults === undefined ? {} : {
+        customResults,
+        currentCustomRubrics: customEntries.map((entry) => entry.id),
+      }),
     });
     const aggregatePath = join(effectivePipelineDir, 'build-review.json');
+    const effective = await this.buildReviewEffectiveResolver(this.projectDir, aggregate, {
+      emit: (event) => this.events?.emit(event),
+      minConfidence: buildReviewConfidenceFloors(config),
+    });
+    const stampedAggregate = effective.ok && effective.reducedCoverageEvidence !== undefined
+      ? { ...aggregate, reducedCoverageEvidence: effective.reducedCoverageEvidence }
+      : aggregate;
     const publication = await new BuildReviewDispositionStore(this.projectDir).withLease(async () => {
       await mkdir(effectivePipelineDir, { recursive: true });
       const temporaryPath = `${aggregatePath}.${randomUUID()}.tmp`;
-      await writeFile(temporaryPath, `${JSON.stringify(aggregate, null, 2)}\n`, 'utf-8');
+      await writeFile(temporaryPath, `${JSON.stringify(stampedAggregate, null, 2)}\n`, 'utf-8');
       await rename(temporaryPath, aggregatePath);
     });
     if (!publication.ok) {
       return { success: false, output: `build_review aggregate publication failed: ${publication.message}` };
     }
-    const effective = await this.buildReviewEffectiveResolver(this.projectDir, aggregate, {
-      emit: (event) => this.events?.emit(event),
-      minConfidence: Object.fromEntries(Object.entries(config.rubrics).map(([id, policy]) => [id, policy.min_confidence])),
-    });
-    // adr-2026-08-29 D4.6: one projection of this lap's sub-floor findings,
-    // shared by the visibility event (D4.5) and the durable-history seam below.
-    const suppressionEntries = effective.ok
-      ? projectBuildReviewSuppressionEntries({
-          aggregate,
-          suppressedFindingIds: effective.effective.suppressedFindingIds ?? [],
-          floors: Object.fromEntries(Object.entries(config.rubrics).map(([id, policy]) => [id, policy.min_confidence])),
-        })
-      : [];
-    await this.events?.emit({
-      type: 'build_review_outer_verdict',
-      lapId,
-      rawVerdict: aggregate.verdict,
-      effectiveVerdict: effective.ok ? effective.effective.verdict : 'FAIL',
-      ...(suppressionEntries.length > 0
-        ? { suppressedFindings: suppressionEntries.map(({ findingId, rubric, confidence, floor }) => ({ findingId, rubric, confidence, floor })) }
-        : {}),
-    });
+    // adr-2026-08-29 D4.6: the one projection of this lap's sub-floor findings
+    // is shared by the visibility event (D4.5) and the durable-history seam below.
+    const suppressionEntries = await this.emitBuildReviewOuterVerdict(lapId, aggregate, effective, config);
     if (!effective.ok) {
       return { success: false, output: `${JSON.stringify(aggregate)}\n\nbuild_review disposition resolution failed: ${effective.reason}` };
-    }
-    // The effective resolver is the only live join of current-lap mechanical
-    // faults and durable operator decisions.  Persist its shared rendering on
-    // the aggregate itself so the lap evidence and shipped-record projection
-    // cannot drift into independently formatted views.
-    if (effective.reducedCoverageEvidence !== undefined) {
-      const stampedAggregate = { ...aggregate, reducedCoverageEvidence: effective.reducedCoverageEvidence };
-      try {
-        const temporaryPath = `${aggregatePath}.${randomUUID()}.tmp`;
-        await writeFile(temporaryPath, `${JSON.stringify(stampedAggregate, null, 2)}\n`, 'utf-8');
-        await rename(temporaryPath, aggregatePath);
-      } catch (error) {
-        return {
-          success: false,
-          output: `build_review reduced-coverage evidence publication failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
     }
     // adr-2026-08-29 D4.6: durable suppression history is written HERE, before
     // the pass/fail fork below, because D4.4 keeps a fully suppressed lap out
@@ -2228,11 +2608,19 @@ export class DefaultStepRunner implements StepRunner {
     if (!persistedSuppressions.ok) {
       return { success: false, output: `build_review suppression history persistence failed: ${persistedSuppressions.reason}` };
     }
+    if (infrastructureFailure?.reason === 'projection-oversized' &&
+      effective.effective.uncoveredInfrastructureFailureRubrics.includes(infrastructureFailure.rubric)) {
+      const measurements = /measured=(\d+)\s+bytes\s+limit=(\d+)\s+bytes/.exec(infrastructureFailure.detail);
+      const reason = measurements
+        ? `build_review requires human action: ${infrastructureFailure.rubric} projection-oversized (measured ${measurements[1]} bytes; limit ${measurements[2]} bytes).`
+        : `build_review requires human action: ${infrastructureFailure.rubric} projection-oversized.`;
+      return { success: false, output: reason, refusal: { kind: 'needs-human', reason } };
+    }
     if (effective.effective.verdict === 'PASS') await this.stampBuildReviewVerdict();
     // A judged finding is a completed review, even when another rubric had a
     // mechanical fault. Let the conductor route that semantic failure through
     // its ordinary kickback budget; only a pure mechanical lap retries here.
-    const hasJudgedFinding = Object.values(aggregate.results).some(
+    const hasJudgedFinding = lapResults.some(
       (result) => result.kind === 'judged' && result.findings.length > 0,
     );
     return {
@@ -2244,21 +2632,725 @@ export class DefaultStepRunner implements StepRunner {
     };
   }
 
+  /**
+   * Resolve, capture, and deliver one installed policy from the environment
+   * prepared for its actual provider candidate.  The operation deliberately
+   * returns a failed candidate result for policy load errors: those errors are
+   * review coverage failures, never a reason to select another installation.
+   */
+  private async dispatchInstalledBuildReviewPolicy(
+    entry: ResolvedBuildReviewCustomCatalogEntry,
+    inputs: BuildReviewFrozenInputs,
+    lapId: BuildReviewLapId,
+    tier: ConductState['complexity_tier'],
+  ): Promise<{ readonly id: string; readonly success: boolean; readonly output: string; readonly member?: BuildReviewCustomArtifactMember }> {
+    const declaration = {
+      version: 'v1' as const, rubricId: entry.id, semanticSkill: entry.skill,
+      question: entry.question,
+      ...(entry.source === undefined ? {} : { source: entry.source as 'project' | 'global' | 'plugin' }),
+      resources: entry.resources,
+    };
+    const failedMember = (reason: import('./build-review-artifacts.js').BuildReviewCustomInfrastructureFailureReason, detail: string): BuildReviewCustomArtifactMember => ({
+      declaration,
+      result: { kind: 'infrastructure-failure', rubric: entry.id, reason, detail },
+    });
+    if (!this.providerRuntimes || !this.sessionStore || !this.buildReviewPolicyCatalog) {
+      const output = `build_review custom policy ${entry.id} requires a candidate policy catalog adapter`;
+      return { id: entry.id, success: true, output, member: failedMember('policy-load-failed', output) };
+    }
+    const source = inputs.sourceMaterialization?.contextFor(entry.id).source;
+    if (!source && !this.usesInjectedBuildReviewGit) {
+      const output = `build_review custom policy ${entry.id} has no frozen source materialization`;
+      return { id: entry.id, success: true, output, member: failedMember('preflight-failed', output) };
+    }
+    // Custom contracts own the frozen-input projection just as built-in
+    // descriptors own theirs. Rendering its output keeps this route on the
+    // descriptor boundary without changing the established prompt bytes.
+    const projection = entry.contract.projection.build({
+      contentDigest: inputs.sourceSnapshot.contentDigest,
+      mergeBase: inputs.sourceSnapshot.mergeBase,
+      headSha: inputs.sourceSnapshot.headSha,
+      changes: inputs.sourceSnapshot.sourceChanges ?? [],
+      ...(source === undefined ? {} : { view: source }),
+    });
+    const options: Omit<InvokeOptions, 'sessionId' | 'resume' | 'model' | 'effort'> = {
+      prompt: `Build-review custom policy ${entry.id}: the candidate will supply the selected immutable policy contract before judgment. Return only the custom findings payload.`,
+      cwd: source?.headPath ?? this.projectDir,
+      // Rubric judgments must always use a machine envelope, even while the
+      // enclosing conductor is serving an interactive operator session.
+      interactive: false,
+      nativeSchema: entry.contract.output.jsonSchema,
+    };
+    let failure: { reason: import('./build-review-artifacts.js').BuildReviewCustomInfrastructureFailureReason; detail: string } = {
+      reason: 'provider-error', detail: `custom policy ${entry.id} did not produce a judgment`,
+    };
+    let cacheProvenance: Extract<BuildReviewBranchProvenance, { kind: 'cache-hit' }> | undefined;
+    let coverageFailure = false;
+    const controller = new AbortController();
+    const deadlineAt = Date.now() + (this.config?.test_suite?.timeout_seconds ?? 300) * 1_000;
+    // The outer deadline timer is registered before discovery's own timer.
+    // Preserve its cause so that an in-flight catalog operation reports a
+    // deadline rather than a generic cancellation when this timer fires first.
+    const deadlineAbortReason = 'build-review-candidate-deadline';
+    const timeout = setTimeout(() => controller.abort(deadlineAbortReason), Math.max(0, deadlineAt - Date.now()));
+    let result: ProviderExecutionResult;
+    try {
+      result = await executeAuxiliaryProviderCandidates({
+      step: 'build_review', memberId: entry.id, policy: entry.policy,
+      runtimes: this.providerRuntimes, sessions: this.sessionStore.beginBranch(`build-review:${entry.id}`),
+      config: this.config, runId: this.runId, tier,
+      nativeSchemaScratch: {
+        worktreeRoot: this.projectDir,
+        repository: this.projectDir,
+        featureSlug: this.featureDesc || basename(this.projectDir),
+      },
+      taskAttribution: this.taskAttribution,
+      withCandidateSafety: this.candidateSafetyFor('build_review')?.wrapper ?? this.withCandidateSafety,
+      prepareCandidateSelfHost: this.providerExecutionContext?.prepareCandidateSelfHost ?? this.prepareCandidateSelfHost,
+      onAttempt: this.providerAttempt, warn: this.providerWarn, options,
+      abortSignal: controller.signal, deadlineAt,
+      preparedCandidateOperation: async (context) => {
+        const emitPolicyFailure = async (
+          stage: 'catalog' | 'capture' | 'preflight' | 'containment' | 'runtime',
+          reason: string,
+          candidate = context.candidate,
+        ) => this.events?.emit({
+          type: 'build_review_policy_failed', rubric: entry.id, lapId,
+          provider: candidate.providerKey, stage, reason,
+          provenance: { inputDigest: inputs.sourceSnapshot.contentDigest, candidate: {
+            provider: candidate.providerKey, model: candidate.model, effort: candidate.effort ?? 'default',
+          } },
+        });
+        const catalogProvider = context.candidate.providerKey === 'claude' || context.candidate.providerKey === 'codex'
+          ? context.candidate.providerKey
+          : undefined;
+        if (!catalogProvider) {
+          coverageFailure = true;
+          failure = { reason: 'policy-load-failed', detail: `Installed build-review policy ${entry.skill} has no catalog adapter for provider ${context.candidate.providerKey}` };
+          await emitPolicyFailure('catalog', failure.detail);
+          return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+        }
+        let catalog: readonly InstalledReviewSkill[] | ReviewPolicyCatalogError;
+        let releaseDiscoveryAuthority: (() => void) | undefined;
+        try {
+          if (context.abortSignal?.aborted) throw new ReviewPolicyCatalogError(catalogProvider, 'cancelled', 'candidate cancelled before policy catalog discovery');
+          if (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt) throw new ReviewPolicyCatalogError(catalogProvider, 'timeout', 'candidate deadline elapsed before policy catalog discovery');
+          // One discovery signal: the candidate's cancellation joined with a
+          // timer for its deadline, so an in-flight request cannot outlive it.
+          const discovery = new AbortController();
+          let deadlineElapsed = false;
+          const cancelDiscovery = () => {
+            deadlineElapsed ||= context.abortSignal?.reason === deadlineAbortReason;
+            discovery.abort();
+          };
+          context.abortSignal?.addEventListener('abort', cancelDiscovery, { once: true });
+          const deadlineTimer = context.deadlineAt === undefined ? undefined : setTimeout(() => {
+            deadlineElapsed = true;
+            discovery.abort();
+          }, Math.max(0, context.deadlineAt - Date.now()));
+          releaseDiscoveryAuthority = () => {
+            if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+            context.abortSignal?.removeEventListener('abort', cancelDiscovery);
+          };
+          context.onTeardown(async () => releaseDiscoveryAuthority?.());
+          const request = this.buildReviewPolicyCatalog!({
+            provider: context.candidate.providerKey,
+            entry,
+            skill: entry.skill,
+            ...(context.prepared === undefined ? {} : { preparedEnv: context.prepared.env }),
+            ...(context.prepared === undefined ? {} : { preparedExecutable: context.prepared.executable, preparedArgs: context.prepared.args }),
+            ...(context.prepared?.originalCatalogHome === undefined ? {} : { originalCatalogHome: context.prepared.originalCatalogHome }),
+            signal: discovery.signal,
+            ...(context.deadlineAt === undefined ? {} : { deadlineAt: context.deadlineAt }),
+          });
+          // The owning candidate does not wait on a host that ignores the signal.
+          const aborted = new Promise<never>((_resolve, reject) => {
+            const refuse = () => reject(new Error('policy catalog discovery aborted'));
+            if (discovery.signal.aborted) refuse();
+            else discovery.signal.addEventListener('abort', refuse, { once: true });
+          });
+          request.catch(() => undefined);
+          aborted.catch(() => undefined);
+          try {
+            catalog = await Promise.race([request, aborted]);
+          } catch (error) {
+            // Whatever the host threw on abort, the owning authority names the reason.
+            if (!discovery.signal.aborted) throw error;
+            throw deadlineElapsed || (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt)
+              ? new ReviewPolicyCatalogError(catalogProvider, 'timeout', 'candidate deadline elapsed during policy catalog discovery')
+              : new ReviewPolicyCatalogError(catalogProvider, 'cancelled', 'candidate cancelled during policy catalog discovery');
+          }
+        } catch (error) {
+          catalog = error instanceof ReviewPolicyCatalogError
+            ? error
+            : new ReviewPolicyCatalogError(catalogProvider, 'error', error instanceof Error ? error.message : String(error));
+        } finally {
+          releaseDiscoveryAuthority?.();
+        }
+        const resolved = resolveInstalledReviewPolicyCatalog({
+          skill: entry.skill,
+          ...(entry.source === undefined ? {} : { source: entry.source as InstalledReviewSkill['source'] }),
+        }, catalog);
+        if (resolved.kind === 'failure') {
+          const resolutionDetail = 'origins' in resolved.failure && resolved.failure.origins !== undefined
+            ? `conflicting installed sources: ${resolved.failure.origins.join(', ')}; choose one source explicitly`
+            : 'source' in resolved.failure && resolved.failure.source !== undefined
+              ? `requested source: ${resolved.failure.source}`
+              : 'message' in resolved.failure
+                ? resolved.failure.message
+                : 'no source was selected';
+          const detail = `Installed build-review policy ${entry.skill} is unavailable: ${resolved.failure.code}; ${resolutionDetail}`;
+          failure = { reason: 'policy-load-failed', detail };
+          coverageFailure = true;
+          await emitPolicyFailure('catalog', detail);
+          return { kind: 'failure' as const, result: {
+            success: false, exitCode: 1,
+            output: failure.detail,
+          } };
+        }
+        const policy = {
+          ...resolved.policy,
+          declaredDependencies: [...new Set([...resolved.policy.declaredDependencies, ...entry.resources])],
+        };
+        let bundle: CapturedReviewPolicyBundle;
+        try {
+          bundle = await this.buildReviewPolicyCapture(policy, {
+            materialParent: join(this.projectDir, '.pipeline', 'build-review', 'policy-material'),
+          });
+        } catch (error) {
+          coverageFailure = true;
+          failure = { reason: 'policy-load-failed', detail: `Installed build-review policy ${entry.skill} could not be loaded: ${error instanceof Error ? error.message : String(error)}` };
+          await emitPolicyFailure('capture', failure.detail);
+          return { kind: 'failure' as const, result: {
+            success: false, exitCode: 1,
+            output: failure.detail,
+          } };
+        }
+        const candidateEngine = await this.resolveBuildReviewEngineIdentity();
+        const policyProvenance = {
+          inputDigest: inputs.sourceSnapshot.contentDigest,
+          candidate: { provider: context.candidate.providerKey, model: context.candidate.model, effort: context.candidate.effort ?? 'default' },
+          ...(policy.plugin === undefined ? {} : { plugin: policy.plugin }),
+        };
+        const policyFingerprint = fingerprintBuildReviewPolicyDeclaration({ rubric: entry.id, skill: entry.skill, question: entry.question, ...(entry.source === undefined ? {} : { source: entry.source as 'project' | 'global' | 'plugin' }), resources: entry.resources });
+        const semanticIdentityFor = (model: string): BuildReviewCacheSemanticIdentity => ({
+          declarationFingerprint: policyFingerprint, effectiveBundleDigest: bundle.digest,
+          contractVersion: entry.contract.output.version as BuildReviewCacheSemanticIdentity['contractVersion'],
+          projectionVersion: entry.contract.projection.version as BuildReviewCacheSemanticIdentity['projectionVersion'],
+          semanticInputDigest: inputs.sourceSnapshot.contentDigest, executionPolicyFingerprint: fingerprintBuildReviewRubricPolicy(entry.policy),
+          engineStamp: candidateEngine.engineStamp, provider: context.candidate.providerKey, model, effort: context.candidate.effort ?? 'default',
+        });
+        const provider = context.candidate.providerKey === 'claude' || context.candidate.providerKey === 'codex'
+          ? context.candidate.providerKey
+          : undefined;
+        if (!provider) {
+          coverageFailure = true;
+          failure = { reason: 'preflight-failed', detail: `Installed build-review policy ${entry.skill} has no read-only profile for provider ${context.candidate.providerKey}` };
+          await emitPolicyFailure('preflight', failure.detail);
+          return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+        }
+        const preflight = evaluateBuildReviewPolicyPreflight({
+          profile: {
+            provider,
+            admittedActions: ['read-frozen-input', 'read-policy-material'],
+            admittedCapabilities: ['frozen-input', 'policy-material'],
+            admittedTools: establishedBuildReviewTools(provider),
+            // Bundle capture independently establishes the readable package resources.
+            admittedDependencies: bundle.manifest.map((file) => file.relativePath),
+          },
+          requirements: [
+            { kind: 'action', action: 'read-frozen-input' },
+            { kind: 'action', action: 'read-policy-material' },
+            ...(policy.requiredTools ?? []).map((tool) => ({ kind: 'tool' as const, tool })),
+            ...policy.declaredDependencies.map((dependency) => ({ kind: 'dependency' as const, dependency: resolveReviewPolicyPackageReference(dependency), source: 'host' as const })),
+          ],
+        });
+        if (preflight.kind !== 'admitted') {
+          coverageFailure = true;
+          const classification = classifyBuildReviewPolicyIncompatibility(preflight);
+          failure = { reason: classification.kind === 'infrastructure-failure' ? classification.reason : 'preflight-failed', detail: renderBuildReviewPolicyUnsupportedDiagnostic(preflight) };
+          await emitPolicyFailure('preflight', failure.detail);
+          return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+        }
+        // The prepared-candidate callback is the only route that can bind a
+        // frozen cwd and proved access profile to this actual provider.
+        let reviewAccess: InvokeOptions['reviewAccess'];
+        if (source) {
+          const cachedLoginSource = provider === 'codex' && context.prepared?.env.CODEX_HOME !== undefined && context.prepared.env.CODEX_API_KEY === undefined
+            ? join(context.prepared.env.CODEX_HOME, 'auth.json')
+            : undefined;
+          const scratchLease = await acquireReviewScratchHome({
+            worktreeRoot: this.projectDir, runId: this.runId, attempt: 0, provider, memberId: entry.id,
+            ...(cachedLoginSource === undefined ? {} : {
+              seed: async (home) => { await copySelectedCodexLogin({ source: cachedLoginSource, homeDir: join(home, 'codex-home') }); },
+            }),
+          });
+          context.onTeardown(() => scratchLease.release());
+          const scratch = scratchLease.home;
+          const evidencePaths = await prepareBuildReviewEvidencePaths(this.projectDir);
+          const hostStateProbe = await writeReviewHostStateSentinel();
+          context.onTeardown(() => rm(hostStateProbe, { force: true }));
+          const containment = await prepareBuildReviewContainment({
+            provider,
+            launch: reviewLaunchCommand(provider, context.prepared),
+            paths: {
+              ...buildReviewFrozenInputPaths(source), policyMaterial: bundle.materialPath,
+              originalCheckout: this.projectDir, originalInstallation: policy.packageRoot,
+              ...evidencePaths, scratch,
+              installationWriteProbe: join(policy.packageRoot, '.build-review-write-probe'),
+              scratchWriteProbe: join(scratch, '.build-review-write-probe'),
+              hostStateProbe,
+            },
+            runProcess: async (executable, args) => {
+              const result = await execa(executable, args, { reject: false });
+              return { exitCode: result.exitCode ?? 1, stdout: result.stdout, stderr: result.stderr };
+            },
+          });
+          if (containment.kind === 'unsupported') {
+            coverageFailure = true;
+            failure = { reason: 'preflight-failed', detail: `Installed build-review policy ${entry.skill} cannot establish read-only containment: ${containment.reason}. Recovery: ${containment.recovery}.` };
+            await emitPolicyFailure('containment', containment.reason);
+            return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+          }
+          reviewAccess = containment;
+        }
+        let cacheHit = false;
+        const dispatched = await dispatchRubricContract({
+          descriptor: entry.contract,
+          options: {
+            prompt: `${renderBuildReviewPolicyContract({
+            bundle, question: entry.question, contract: entry.contract,
+            scope: renderBuildReviewFrozenInputScope({
+              ...projection,
+            }),
+            })}\n\n${renderAuxiliarySkillInvocation(entry.skill, context.candidate.providerKey)}`,
+            cwd: source?.headPath ?? this.projectDir,
+            ...(reviewAccess === undefined ? {} : { reviewAccess }),
+          },
+          invoke: (options) => context.invoke(options, async (rung, invoke) => {
+          const semanticIdentity = semanticIdentityFor(rung.model);
+          const cached = await readBuildReviewCacheEntry(this.projectDir, entry.id, { readFile: async (path) => readFile(path, 'utf-8'), readdir, mkdir: async (path) => { await mkdir(path, { recursive: true }); }, writeFile, rename }, semanticIdentity);
+          const cache = classifyBuildReviewCacheLookup(cached, {
+            rubric: entry.id,
+            contractVersion: entry.contract.output.version as BuildReviewCacheSemanticIdentity['contractVersion'],
+            projectionVersion: entry.contract.projection.version as BuildReviewCacheSemanticIdentity['projectionVersion'],
+            projectionDigest: inputs.sourceSnapshot.contentDigest,
+            policyFingerprint, engineIdentity: { engineStamp: candidateEngine.engineStamp, skillDigest: bundle.digest }, semanticIdentity, lapId, snapshotDigest: inputs.sourceSnapshot.digest,
+          });
+          await emitBuildReviewCacheDiscard(async (event) => { await this.events?.emit(event); }, cache, entry.id, lapId, candidateEngine.engineStamp);
+          if (cache.kind === 'hit' && 'result' in cache.hit.result && parseBuildReviewCustomArtifactMember(cache.hit.result)) {
+            cacheHit = true;
+            cacheProvenance = cache.hit.provenance;
+            await this.events?.emit({ type: 'build_review_cache_hit', rubric: entry.id, lapId, customReuse: {
+              source: policy.source, bundleDigest: bundle.digest, ...policyProvenance,
+              originalLapId: cache.hit.provenance.cachedLapId, originalSnapshotDigest: cache.hit.provenance.cachedSnapshotDigest,
+            } });
+            return cachedRubricInvocation(cache.hit.result);
+          }
+          return invoke();
+          }),
+        });
+        const invoked = dispatched.invocation;
+        if (cacheHit) return { kind: 'hit' as const, result: invoked };
+        if (!invoked.success && dispatched.kind !== 'root-rejection') {
+          coverageFailure = true;
+          failure = {
+            reason: invoked.nativeSchemaUnsupported ? 'native-schema-unsupported' : 'provider-error',
+            detail: invoked.output ?? `Installed build-review policy ${entry.skill} provider failed`,
+          };
+          if (invoked.nativeSchemaUnsupported) {
+            await this.events?.emit({
+              type: 'build_review_rubric_infrastructure_failure', rubric: entry.id, lapId,
+              reason: 'native-schema-unsupported', cause: 'native-schema-unsupported', excerpt: failure.detail,
+            });
+          }
+          await emitPolicyFailure('runtime', failure.detail);
+          return { kind: 'failure' as const, result: invoked };
+        }
+        const actualModel = context.invokedModel() ?? context.candidate.model;
+        const actualSemanticIdentity = semanticIdentityFor(actualModel);
+        const actualPolicyProvenance = {
+          ...policyProvenance,
+          candidate: { provider: context.candidate.providerKey, model: actualModel, effort: context.candidate.effort ?? 'default' },
+        };
+        await this.events?.emit({
+          type: 'build_review_policy_resolved', rubric: entry.id, lapId,
+          provider: context.candidate.providerKey, source: policy.source,
+          ...(policy.plugin === undefined ? {} : { pluginId: policy.plugin.id }),
+          bundleDigest: bundle.digest,
+          provenance: actualPolicyProvenance,
+        });
+        const settleCustomStructuredRejection = async (
+          value: unknown,
+          references?: Parameters<typeof diagnoseBuildReviewCustomReviewerPayloadRejection>[1],
+          detail?: string,
+        ) => {
+          const rejection = diagnoseBuildReviewCustomReviewerPayloadRejection(value, references);
+          coverageFailure = true;
+          failure = {
+            reason: 'invalid-structured-result',
+            detail: [renderBuildReviewJudgedResultRejection(rejection), detail].filter(Boolean).join('; '),
+          };
+          await this.events?.emit({
+            type: 'build_review_rubric_infrastructure_failure', rubric: entry.id, lapId,
+            reason: 'invalid-structured-result', cause: 'invalid-structured-result', rejection, excerpt: failure.detail,
+          });
+          await emitPolicyFailure('runtime', failure.detail, { ...context.candidate, model: actualModel });
+          return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+        };
+        if (dispatched.kind === 'root-rejection') {
+          return settleCustomStructuredRejection(invoked.finalStructuredResult);
+        }
+        const parsed = dispatched.kind === 'structured' ? dispatched.parsed : undefined;
+        const runtimeUnsupported = parseBuildReviewPolicyRuntimeUnsupportedResponse(parsed, provider);
+        if (runtimeUnsupported) {
+          const classification = classifyBuildReviewPolicyIncompatibility(runtimeUnsupported);
+          if (classification.kind === 'unsupported-policy') {
+            return {
+              kind: 'judged' as const,
+              result: {
+                ...invoked,
+                output: JSON.stringify({ declaration, result: { kind: 'unsupported-policy', rubric: entry.id, requirement: classification.requirement } }),
+              },
+            };
+          }
+          coverageFailure = true;
+          failure = { reason: classification.reason, detail: renderBuildReviewPolicyUnsupportedDiagnostic(runtimeUnsupported) };
+          await emitPolicyFailure('runtime', failure.detail, { ...context.candidate, model: actualModel });
+          return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+        }
+        if (!parsed || parsed.kind !== 'custom-findings') {
+          // unsupported-policy is a valid member of the native schema, but it
+          // cannot produce a finding artifact. Keep it explicit in its detail
+          // rather than laundering it into a preflight failure.
+          if (parsed?.kind === 'unsupported-policy') {
+            coverageFailure = true;
+            failure = { reason: 'invalid-structured-result', detail: `unsupported-policy: ${parsed.requirement}` };
+            await this.events?.emit({
+              type: 'build_review_rubric_infrastructure_failure', rubric: entry.id, lapId,
+              reason: 'invalid-structured-result', cause: 'invalid-structured-result', excerpt: failure.detail,
+            });
+            await emitPolicyFailure('runtime', failure.detail, { ...context.candidate, model: actualModel });
+            return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+          }
+          return settleCustomStructuredRejection(invoked.finalStructuredResult);
+        }
+        // The admitted reference set is derived by the engine from the frozen
+        // baseline/head commits: each claimed region is re-read and re-hashed
+        // from pinned blobs before the identity stamper may bind it.
+        const frozenBlobs = new BuildReviewScopeSource(this.gitRunner, inputs.sourceSnapshot.headSha);
+        const admission = await admitBuildReviewCustomSourceRegions(
+          parsed.findings.flatMap((finding) => finding.sourceRegions),
+          inputs.sourceSnapshot.sourceChanges ?? [],
+          { read: (side, path) => frozenBlobs.readAtOptional(side === 'head' ? inputs.sourceSnapshot.headSha : inputs.sourceSnapshot.mergeBase, path) },
+        );
+        if (admission.kind === 'rejected') {
+          return settleCustomStructuredRejection(invoked.finalStructuredResult, { sourceRegions: [] }, admission.detail);
+        }
+        const sourceRegions = admission.sourceRegions;
+        const stamped = stampBuildReviewCustomJudgedResult(parsed, {
+          rubric: entry.id,
+          lapId,
+          declaration: {
+            version: 'v1', rubricId: entry.id, semanticSkill: entry.skill,
+            question: entry.question,
+            ...(entry.source === undefined ? {} : { source: entry.source as 'project' | 'global' | 'plugin' }),
+            resources: entry.resources,
+          },
+          policy: { version: 'v1', bundleDigest: bundle.digest },
+          candidate: {
+            provider: context.candidate.providerKey,
+            model: actualModel,
+            effort: context.candidate.effort ?? 'default',
+          },
+          reviewedInput: { version: 'v1', contentDigest: inputs.sourceSnapshot.contentDigest },
+        }, { sourceRegions });
+        // The custom descriptor is the production identity boundary too.  Its
+        // canonicalizer rehydrates the engine stamp, so an invalid or drifted
+        // stamped identity cannot be persisted merely because parsing passed.
+        const stampedIdentities = stamped?.findings.map((finding) => entry.contract.identity.canonicalize(finding));
+        if (!stamped || !stampedIdentities || stampedIdentities.some((identity) => identity === undefined)) {
+          coverageFailure = true;
+          failure = { reason: 'malformed-artifact', detail: 'Installed build-review policy returned findings that could not be stamped against the frozen input' };
+          await emitPolicyFailure('runtime', failure.detail, { ...context.candidate, model: actualModel });
+          return { kind: 'failure' as const, result: {
+            success: false, exitCode: 1,
+            output: failure.detail,
+          } };
+        }
+        const member: BuildReviewCustomArtifactMember = {
+          descriptor: {
+            version: 'v1', semanticSkill: entry.skill,
+            declaration: stamped.declaration,
+            installation: {
+              source: policy.source,
+              ...(policy.plugin === undefined ? {} : { plugin: policy.plugin }),
+            },
+          effectivePolicy: stamped.policy,
+            // No `criteria`: a captured package file is reviewer instruction
+            // text (and, for a plugin, sibling skills too), not an adjudication
+            // criterion. The adjudicator falls back to the short declared
+            // `resources` references; the bundle digest binds every byte.
+            reviewedInput: stamped.reviewedInput,
+            producer: stamped.candidate,
+          },
+          result: stamped,
+        };
+        const cacheWrite = await tryWriteBuildReviewCacheEntry(this.projectDir, {
+            version: 2, rubric: entry.id,
+            contractVersion: entry.contract.output.version as BuildReviewCacheSemanticIdentity['contractVersion'],
+            projectionVersion: entry.contract.projection.version as BuildReviewCacheSemanticIdentity['projectionVersion'],
+            projectionDigest: inputs.sourceSnapshot.contentDigest,
+            policyFingerprint, engineIdentity: { engineStamp: candidateEngine.engineStamp, skillDigest: bundle.digest }, semanticIdentity: actualSemanticIdentity, result: member,
+          }, { readFile: async (path) => readFile(path, 'utf-8'), mkdir: async (path) => { await mkdir(path, { recursive: true }); }, writeFile, rename });
+        if (!cacheWrite.ok) {
+          coverageFailure = true;
+          failure = { reason: 'artifact-write-failed', detail: `Installed build-review policy ${entry.skill} could not persist its cache: ${cacheWrite.error instanceof Error ? cacheWrite.error.message : String(cacheWrite.error)}` };
+          await emitPolicyFailure('runtime', failure.detail, { ...context.candidate, model: actualModel });
+          return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: failure.detail } };
+        }
+        return { kind: 'judged' as const, result: {
+          ...invoked,
+          output: JSON.stringify(member),
+        } };
+      },
+      });
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
+    await inputs.sourceMaterialization?.settle(entry.id);
+    this.callCount++;
+    const member = result.success ? (() => {
+      try { return parseBuildReviewCustomArtifactMember(JSON.parse(result.output)); } catch { return undefined; }
+    })() : undefined;
+    const durableMember = member ?? (coverageFailure ? failedMember(failure.reason, failure.detail) : undefined);
+    if (durableMember !== undefined) {
+      try {
+        const artifactProvenance: BuildReviewBranchProvenance = cacheProvenance ?? { kind: 'fresh' };
+        await writeBuildReviewBranchArtifact(this.projectDir, {
+          rubric: entry.id,
+          lapId,
+          snapshotDigest: inputs.sourceSnapshot.digest,
+          result: durableMember.result,
+          provenance: artifactProvenance,
+          ...(durableMember.descriptor === undefined ? {} : { descriptor: durableMember.descriptor }),
+          ...(durableMember.declaration === undefined ? {} : { declaration: durableMember.declaration }),
+          ...(cacheProvenance === undefined ? {} : {
+            reuse: { sourceLapId: cacheProvenance.cachedLapId, sourceSnapshotDigest: cacheProvenance.cachedSnapshotDigest },
+          }),
+        }, {
+          readFile: async (path) => readFile(path, 'utf-8'),
+          mkdir: async (path) => { await mkdir(path, { recursive: true }); }, writeFile, rename,
+        });
+      } catch (error) {
+        return { id: entry.id, success: false, output: `Installed build-review policy ${entry.skill} could not persist its branch artifact: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    if (!result.success) {
+      if (!coverageFailure) return { id: entry.id, success: false, output: result.output ?? failure.detail };
+      return { id: entry.id, success: true, output: result.output ?? failure.detail, member: failedMember(failure.reason, failure.detail) };
+    }
+    return {
+      id: entry.id,
+      success: result.success && member !== undefined,
+      output: member === undefined && result.success
+        ? `Installed build-review policy ${entry.skill} produced an invalid durable result`
+        : result.output,
+      ...(member === undefined ? {} : { member }),
+    };
+  }
+
+  /** Publish a complete aggregate when custom policies are the only members. */
+  private async publishCustomOnlyBuildReview(input: {
+    readonly lapId: BuildReviewLapId;
+    readonly inputs: BuildReviewFrozenInputs;
+    readonly customResults: Readonly<Record<string, BuildReviewCustomArtifactMember>>;
+    readonly currentCustomRubrics: readonly string[];
+    readonly config: ReturnType<typeof resolveBuildReviewConfig>;
+  }): Promise<StepRunResult> {
+    const aggregate = joinBuildReviewRubricOutcomes({
+      lapId: input.lapId,
+      snapshotDigest: input.inputs.sourceSnapshot.digest,
+      results: { testQuality: { kind: 'skipped', rubric: 'testQuality', reason: 'disabled' } },
+      customResults: input.customResults,
+      currentCustomRubrics: input.currentCustomRubrics,
+    });
+    // An infrastructure-only lap belongs to the mechanical retry lane: below
+    // the allowance no aggregate, effective resolution, or verdict may exist,
+    // so completion stays absent and no semantic route can observe the lap.
+    const lapResults = Object.values(input.customResults).map((member) => member.result);
+    const infrastructureFailure = lapResults.find((result): result is Extract<BuildReviewRubricResult, { kind: 'infrastructure-failure' }> =>
+      result.kind === 'infrastructure-failure',
+    );
+    const hasFinding = lapResults.some((result) => result.kind === 'judged' && result.findings.length > 0);
+    if (infrastructureFailure && !hasFinding) {
+      const mechanicalFaults = await bumpMechanicalFaultsInLedger(this.projectDir, 'build_review', {
+        rubric: infrastructureFailure.rubric,
+        reason: infrastructureFailure.reason,
+        detail: infrastructureFailure.detail,
+        lapId: input.lapId,
+      });
+      if (mechanicalFaults.mechanicalFaults! < MAX_MECHANICAL_FAULTS_BUILD_REVIEW) {
+        return {
+          success: false,
+          output: `build_review mechanical fault in ${infrastructureFailure.rubric} (${infrastructureFailure.reason}): ${infrastructureFailure.detail}`,
+          currentLapMechanicalFault: true,
+        };
+      }
+      // Native-schema refusals and rejected structured payloads never become
+      // semantic coverage merely because their bounded retry allowance is
+      // exhausted.  Match the mixed-rubric settlement: stop dispatching,
+      // publish no aggregate, and leave the operator the named recovery.
+      if (infrastructureFailure.reason === 'invalid-structured-result' || infrastructureFailure.reason === 'native-schema-unsupported') {
+        const reason = `build_review mechanical fault allowance exhausted for ${infrastructureFailure.rubric} (${infrastructureFailure.reason}): ${infrastructureFailure.detail}`;
+        return { success: false, output: reason, refusal: { kind: 'needs-human', reason } };
+      }
+    }
+    const pipelineDir = this.pipelineDir ?? join(this.projectDir, '.pipeline');
+    const aggregatePath = join(pipelineDir, 'build-review.json');
+    // adr-2026-08-18 D9: effective state resolves BEFORE publication so a
+    // reduced-coverage lap's evidence is stamped into the one aggregate that
+    // is persisted; an unrenderable record fails resolution, so no PASS can
+    // be published without it.
+    const effective = await this.buildReviewEffectiveResolver(this.projectDir, aggregate, {
+      emit: (event) => this.events?.emit(event),
+      minConfidence: buildReviewConfidenceFloors(input.config),
+    });
+    const stampedAggregate = effective.ok && effective.reducedCoverageEvidence !== undefined
+      ? { ...aggregate, reducedCoverageEvidence: effective.reducedCoverageEvidence }
+      : aggregate;
+    try {
+      await mkdir(pipelineDir, { recursive: true });
+      const temporaryPath = `${aggregatePath}.${randomUUID()}.tmp`;
+      await writeFile(temporaryPath, `${JSON.stringify(stampedAggregate, null, 2)}\n`, 'utf-8');
+      await rename(temporaryPath, aggregatePath);
+    } catch (error) {
+      return { success: false, output: `build_review aggregate publication failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    // adr-2026-08-29 D4.6: one projection feeds both the visibility event and
+    // the durable-history seam below.
+    const suppressionEntries = await this.emitBuildReviewOuterVerdict(input.lapId, aggregate, effective, input.config);
+    if (!effective.ok) {
+      // A failed custom policy has already crossed its authoritative boundary:
+      // preserve its typed, candidate-local diagnostic even when the later
+      // feature-scoped disposition reader is unavailable.  Otherwise an
+      // ambiguous/missing catalog is incorrectly reported as an unrelated
+      // disposition-identity fault, violating the terminal loading contract.
+      const policyFailure = Object.values(input.customResults).find((member) =>
+        member.result.kind === 'infrastructure-failure',
+      );
+      if (policyFailure?.result.kind === 'infrastructure-failure') {
+        return { success: false, output: `${JSON.stringify(aggregate)}\n\n${policyFailure.result.detail}` };
+      }
+      return { success: false, output: `build_review disposition resolution failed: ${effective.reason}` };
+    }
+    // Written before the pass/fail fork: a fully suppressed lap is an effective
+    // PASS that never reaches the adjudication coordinator (D4.4), and the
+    // seam is the same idempotent single writer the mixed path uses.
+    const persistedSuppressions = await persistBuildReviewSuppressions({
+      projectRoot: this.projectDir,
+      feature: effective.feature,
+      suppressions: suppressionEntries,
+    });
+    if (!persistedSuppressions.ok) {
+      return { success: false, output: `build_review suppression history persistence failed: ${persistedSuppressions.reason}` };
+    }
+    if (effective.effective.verdict === 'PASS') await this.stampBuildReviewVerdict();
+    return {
+      success: effective.effective.verdict === 'PASS' || hasFinding,
+      output: JSON.stringify(aggregate),
+      ...(infrastructureFailure === undefined || hasFinding ? {} : { currentLapMechanicalFault: true }),
+    };
+  }
+
+  /** Emits exactly one validated custom judgement per current-lap member. */
+  private async emitBuildReviewCustomMemberResults(
+    lapId: BuildReviewLapId,
+    customResults: Readonly<Record<string, BuildReviewCustomArtifactMember>>,
+  ): Promise<void> {
+    for (const member of Object.values(customResults)) {
+      if (member.result.kind !== 'judged') continue;
+      await this.events?.emit({
+        type: 'build_review_rubric_result',
+        rubric: member.result.declaration.rubricId,
+        lapId,
+        verdict: member.result.verdict,
+      });
+    }
+  }
+
+  /** Shares the verdict occurrence and suppression projection across lap shapes. */
+  private async emitBuildReviewOuterVerdict(
+    lapId: BuildReviewLapId,
+    aggregate: BuildReviewAggregate,
+    effective: BuildReviewEffectiveResolution,
+    config: ReturnType<typeof resolveBuildReviewConfig>,
+  ): Promise<ReturnType<typeof projectBuildReviewSuppressionEntries>> {
+    // adr-2026-08-29 D4.6: one projection of this lap's sub-floor findings,
+    // shared by the visibility event (D4.5) and the durable-history seam.
+    const suppressionEntries = effective.ok
+      ? projectBuildReviewSuppressionEntries({
+          aggregate,
+          suppressedFindingIds: effective.effective.suppressedFindingIds ?? [],
+          floors: buildReviewConfidenceFloors(config),
+        })
+      : [];
+    await this.events?.emit({
+      type: 'build_review_outer_verdict',
+      lapId,
+      rawVerdict: aggregate.verdict,
+      effectiveVerdict: effective.ok ? effective.effective.verdict : 'FAIL',
+      ...(suppressionEntries.length > 0
+        ? { suppressedFindings: suppressionEntries.map(({ findingId, rubric, confidence, floor }) => ({ findingId, rubric, confidence, floor })) }
+        : {}),
+    });
+    return suppressionEntries;
+  }
+
   private async dispatchBuildReviewRubric(
     branch: BuildReviewDispatchableRubric,
     projection: BuildReviewRubricProjection,
     tier?: ConductState['complexity_tier'],
+    executionContext?: ExecutionContext,
+    inputs?: BuildReviewFrozenInputs,
+    engineIdentity?: BuildReviewCoordinationEngineIdentity,
   ): Promise<unknown> {
-    const label: Record<BuildReviewDispatchableRubric['rubric'], string> = { testQuality: 'Test Quality' };
-    const contractShape = renderBuildReviewProviderPayloadShape(branch.rubric);
-    const scopeResolutionContext = buildReviewCandidateScopeResolutionContext(projection);
+    const materialized = inputs?.sourceMaterialization?.contextFor(branch.rubric).source;
+    const candidateIdentity = (candidate: { providerKey: string; model: string; effort?: string }, effectiveBundleDigest?: string): BuildReviewCacheSemanticIdentity | undefined => {
+      const skillDigest = engineIdentity?.skillDigests[branch.rubric];
+      const digest = effectiveBundleDigest ?? (skillDigest?.kind === 'resolved' ? skillDigest.digest : undefined);
+      if (!engineIdentity || !digest) return undefined;
+      return {
+        declarationFingerprint: `sha256:${createHash('sha256').update(JSON.stringify({ rubric: branch.rubric, contractVersion: projection.contractVersion, projectionVersion: projection.projectionVersion })).digest('hex')}`,
+        effectiveBundleDigest: digest,
+        contractVersion: projection.contractVersion,
+        projectionVersion: projection.projectionVersion,
+        semanticInputDigest: projection.digest,
+        executionPolicyFingerprint: fingerprintBuildReviewRubricPolicy(branch.policy),
+        engineStamp: engineIdentity.engineStamp,
+        provider: candidate.providerKey,
+        model: candidate.model,
+        effort: candidate.effort ?? 'default',
+      };
+    };
+    const label: Record<BuildReviewDispatchableRubric['rubric'], string> = {
+      testQuality: 'Test Quality',
+      security: 'Security',
+    };
+    const contractShape = renderRubricContractShape(getBuildReviewRubricDescriptor(branch.rubric).contract);
     const rubricPrompt = [
         `Build Review ${label[branch.rubric]} rubric.`,
         'You are running inside the feature worktree. The closed projection below identifies the implementation diff BY REFERENCE instead of embedding it: changedFiles lists each changed file\'s path, change kind, and hunk line ranges (oldStart,oldCount -> newStart,newCount) from the graded diff. Read the working-tree files and run git yourself for any content you need — for example `git diff <mergeBase>..HEAD -- <path>` for one file\'s diff, or `git show <mergeBase>:<path>` for its pre-change form — using the mergeBase and headSha fields of the projection. Judge only the referenced changes; treat the projection as the complete list of what changed.',
-        `Return only the provider payload shape below: \`findings\` is an array; \`scopeResolutions\` has exactly one entry per supplied candidate (or [] when no candidates); and \`counterfactualSensitivity\` is optional. The engine stamps the judged envelope identity afterward. Every finding must include a non-empty actionable summary and one or more concrete evidenceLocations in path:line or path:line:column form.`,
-        `Candidate-resolution authority (use only these ids, regions, and obligations):\n${JSON.stringify(scopeResolutionContext)}`,
-        `Your final message MUST end with a JSON object of exactly this shape (an empty findings array means no concern; anchor values follow the schema below exactly — content-region fields (\`changedTest\`, \`locus\`) are structured \`{path, contentHash, display}\` objects and every other anchor value is a plain string, all nested under \`anchor\` — never flattened to the finding's top level and never renamed):\n${contractShape}`,
-        JSON.stringify(projection),
+        'Return only the provider payload defined by the schema below. The engine stamps the judged envelope identity afterward.',
+        ...(branch.rubric === 'testQuality'
+          ? [
+              'For each testScope.evidence record, re-read its region at the pinned ref instead of the mutable working tree: use `git show <mergeBase>:<path>` for a base-side region or `git show <headSha>:<path>` for a head-side region, and verify `contentHash` as sha256 of the raw bytes from `byteRegion.start` (inclusive) to `byteRegion.end` (exclusive) of that exact output. `byteRegion` is in UTF-8 bytes; `region`, `startLine`, and `endLine` are character positions for identity and orientation only and must not be used as byte offsets. The evidence record for a candidate is the one whose `id` equals its `candidateId`. A hash-mismatched or unreadable region is not judged; return its fallback candidate as `indeterminate` with a non-empty `missingEvidenceReason`.',
+              `Candidate-resolution authority (use only these ids, regions, and obligations):\n${JSON.stringify(buildReviewCandidateScopeResolutionContext(projection))}`,
+            ]
+          : []),
+        `Your final message MUST end with one JSON object matching this schema:\n${contractShape}`,
+        JSON.stringify(buildReviewRubricPromptView(projection)),
       ].join('\n\n');
     // Regression visibility for prompt bloat (#projection-size): record the
     // serialized rubric-prompt byte size on the event spine, per dispatch.
@@ -2268,42 +3360,87 @@ export class DefaultStepRunner implements StepRunner {
       lapId: projection.lapId,
       promptBytes: Buffer.byteLength(rubricPrompt, 'utf8'),
     });
+    // Offline eval input (#1612): the frozen prompt is otherwise lost, since
+    // only its digest is cached. Best-effort — a failed write never fails review.
+    const promptPath = buildReviewRubricPromptPath(this.projectDir, projection.lapId, branch.rubric);
+    await mkdir(dirname(promptPath), { recursive: true })
+      .then(() => writeFile(promptPath, rubricPrompt, 'utf8'))
+      .catch(() => undefined);
+    let cacheWriteFailureDetail: string | undefined;
     const invokeOnce = async (prompt: string): Promise<{
       success: boolean;
       output?: string;
+      finalStructuredResult?: unknown;
+      structuredResultFailure?: 'missing' | 'malformed';
       commandUnresolved?: boolean;
       commandUnresolvedName?: string;
+      nativeSchemaUnsupported?: true;
+      providerSetupExhaustion?: ProviderExecutionResult['providerSetupExhaustion'];
     }> => {
       const preserveInvocationFailure = (result: {
         success: boolean;
         output?: string;
+        finalStructuredResult?: unknown;
+        structuredResultFailure?: 'missing' | 'malformed';
         commandUnresolved?: boolean;
         commandUnresolvedName?: string;
+        nativeSchemaUnsupported?: true;
+        providerSetupExhaustion?: ProviderExecutionResult['providerSetupExhaustion'];
       }) => ({
         success: result.success,
         ...(typeof result.output === 'string' ? { output: result.output } : {}),
+        ...(result.finalStructuredResult === undefined ? {} : { finalStructuredResult: result.finalStructuredResult }),
+        ...(result.structuredResultFailure === undefined ? {} : { structuredResultFailure: result.structuredResultFailure }),
         ...(result.commandUnresolved ? {
           commandUnresolved: true,
           ...(result.commandUnresolvedName ? { commandUnresolvedName: result.commandUnresolvedName } : {}),
         } : {}),
+        ...(result.nativeSchemaUnsupported ? { nativeSchemaUnsupported: true as const } : {}),
+        ...(result.providerSetupExhaustion
+          ? { providerSetupExhaustion: result.providerSetupExhaustion }
+          : {}),
       });
       if (this.providerRuntimes && this.sessionStore) {
+        const configuredCandidates = Array.isArray(branch.policy.llm_provider)
+          ? branch.policy.llm_provider
+          : [branch.policy.llm_provider];
+        const schemaCapableCandidates = configuredCandidates.filter(
+          (provider) => this.providerRuntimes!.nativeSchemaCapabilityFor(provider)?.nativeOutputSchema === true,
+        );
+        if (schemaCapableCandidates.length === 0) {
+          return {
+            success: false,
+            nativeSchemaUnsupported: true,
+            output: `build_review rubric ${branch.rubric} cannot enforce its native output schema: candidate set [${configuredCandidates.join(', ')}] has no provider declaring nativeSchemaCapability.nativeOutputSchema. Recovery action: select or update one of these providers to declare nativeSchemaCapability.nativeOutputSchema and return InvokeResult.finalStructuredResult.`,
+          };
+        }
         const safety = this.candidateSafetyFor('build_review');
-        const result = await this.dispatchProviderWithLifecycleSupervision(
+        const controller = new AbortController();
+        const deadlineAt = Date.now() + (this.config?.test_suite?.timeout_seconds ?? 300) * 1_000;
+        const timeout = setTimeout(() => controller.abort(), Math.max(0, deadlineAt - Date.now()));
+        let result: ProviderExecutionResult;
+        try {
+          result = await this.dispatchProviderWithLifecycleSupervision(
           'build_review',
           this.withFeatureDiagnosticLog({
             prompt,
-            cwd: this.projectDir,
+            cwd: materialized?.headPath ?? this.projectDir,
             dangerouslySkipPermissions: true,
           }),
           (options) => executeAuxiliaryProviderCandidates({
             step: 'build_review',
+            executionContext,
             memberId: branch.rubric,
-            policy: branch.policy,
+            policy: { ...branch.policy, llm_provider: schemaCapableCandidates },
             runtimes: this.providerRuntimes!,
             sessions: this.sessionStore!.beginBranch(`build-review:${branch.rubric}`),
             config: this.config,
             runId: this.runId,
+            nativeSchemaScratch: {
+              worktreeRoot: this.projectDir,
+              repository: this.projectDir,
+              featureSlug: this.featureDesc || basename(this.projectDir),
+            },
             taskAttribution: this.taskAttribution,
             tier,
             withCandidateSafety: safety?.wrapper ?? this.withCandidateSafety,
@@ -2311,95 +3448,278 @@ export class DefaultStepRunner implements StepRunner {
               this.providerExecutionContext?.prepareCandidateSelfHost ?? this.prepareCandidateSelfHost,
             onAttempt: this.providerAttempt,
             warn: this.providerWarn,
-            options,
+            abortSignal: controller.signal,
+            deadlineAt,
+            options: {
+              ...options,
+              // A rubric result is a provider-native structured payload, never
+              // an operator REPL response. Keep this explicit rather than
+              // inheriting the enclosing conductor mode.
+              interactive: false,
+              nativeSchema: getBuildReviewRubricDescriptor(branch.rubric).contract.output.jsonSchema,
+            },
             optionsForCandidate: (providerKey) => ({
               ...options,
+              nativeSchema: getBuildReviewRubricDescriptor(branch.rubric).contract.output.jsonSchema,
               prompt: `${renderAuxiliarySkillInvocation(branch.skillName, providerKey)}\n\n${prompt}`,
             }),
+            preparedCandidateOperation: async (context) => {
+              // Direct rubric-dispatch callers retain the historic lifecycle:
+              // they have no frozen inputs or run-level engine identity from
+              // which a candidate-bound cache key could be derived.
+              if (!inputs || !engineIdentity) {
+                const dispatched = await dispatchRubricContract({
+                  descriptor: getBuildReviewRubricDescriptor(branch.rubric).contract,
+                  prepareStructured: (value) => stampBuildReviewDispatchedCandidate(value, branch.rubric, projection),
+                  options: {
+                    prompt: `${renderAuxiliarySkillInvocation(branch.skillName, context.candidate.providerKey)}\n\n${prompt}`,
+                    cwd: materialized?.headPath ?? this.projectDir,
+                    dangerouslySkipPermissions: true,
+                    interactive: false,
+                  },
+                  invoke: (options) => context.invoke(options),
+                });
+                return {
+                  kind: 'judged' as const,
+                  result: dispatched.kind === 'structured'
+                    ? { ...dispatched.invocation, finalStructuredResult: dispatched.parsed }
+                    : dispatched.invocation,
+                };
+              }
+              // Built-ins use the same candidate-local installed definition
+              // contract as custom policies. The old harness-root digest was
+              // only an approximation of what the provider actually loaded.
+              const builtinEntry = { id: branch.rubric, kind: 'builtin' as const, policy: branch.policy };
+              let builtinPolicy: InstalledReviewSkill;
+              let builtinBundle: CapturedReviewPolicyBundle;
+              try {
+                const catalog = await this.buildReviewPolicyCatalog!({
+                  provider: context.candidate.providerKey,
+                  entry: builtinEntry,
+                  skill: branch.skillName,
+                  ...(context.prepared === undefined ? {} : { preparedEnv: context.prepared.env }),
+                  ...(context.prepared === undefined ? {} : { preparedExecutable: context.prepared.executable, preparedArgs: context.prepared.args }),
+            ...(context.prepared?.originalCatalogHome === undefined ? {} : { originalCatalogHome: context.prepared.originalCatalogHome }),
+                  ...(context.abortSignal === undefined ? {} : { signal: context.abortSignal }),
+                  ...(context.deadlineAt === undefined ? {} : { deadlineAt: context.deadlineAt }),
+                });
+                const resolved = resolveInstalledReviewPolicyCatalog({ skill: branch.skillName }, catalog);
+                if (resolved.kind === 'failure') throw new Error(`installed ${branch.skillName} policy is unavailable: ${resolved.failure.code}`);
+                builtinPolicy = resolved.policy;
+                builtinBundle = await this.buildReviewPolicyCapture(builtinPolicy, {
+                  materialParent: join(this.projectDir, '.pipeline', 'build-review', 'policy-material'),
+                });
+              } catch (error) {
+                return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: `build_review candidate policy load failed: ${error instanceof Error ? error.message : String(error)}` } };
+              }
+              const containmentProvider = context.candidate.providerKey === 'claude' || context.candidate.providerKey === 'codex'
+                ? context.candidate.providerKey : undefined;
+              let reviewAccess: InvokeOptions['reviewAccess'];
+              if (materialized && containmentProvider) {
+                const cachedLoginSource = containmentProvider === 'codex' && context.prepared?.env.CODEX_HOME !== undefined && context.prepared.env.CODEX_API_KEY === undefined
+                  ? join(context.prepared.env.CODEX_HOME, 'auth.json')
+                  : undefined;
+                const scratchLease = await acquireReviewScratchHome({
+                  worktreeRoot: this.projectDir, runId: this.runId, attempt: 0, provider: containmentProvider, memberId: branch.rubric,
+                  ...(cachedLoginSource === undefined ? {} : {
+                    seed: async (home) => { await copySelectedCodexLogin({ source: cachedLoginSource, homeDir: join(home, 'codex-home') }); },
+                  }),
+                });
+                context.onTeardown(() => scratchLease.release());
+                const scratch = scratchLease.home;
+                const evidencePaths = await prepareBuildReviewEvidencePaths(this.projectDir);
+                const hostStateProbe = await writeReviewHostStateSentinel();
+          context.onTeardown(() => rm(hostStateProbe, { force: true }));
+                const containment = await prepareBuildReviewContainment({ provider: containmentProvider, launch: reviewLaunchCommand(containmentProvider, context.prepared), paths: {
+                  hostStateProbe,
+                  ...buildReviewFrozenInputPaths(materialized), policyMaterial: builtinBundle.materialPath, originalCheckout: this.projectDir, originalInstallation: builtinPolicy.packageRoot,
+                  ...evidencePaths, scratch,
+                  installationWriteProbe: join(builtinPolicy.packageRoot, '.build-review-write-probe'),
+                  scratchWriteProbe: join(scratch, '.build-review-write-probe'),
+                }, runProcess: async (executable, args) => { const result = await execa(executable, args, { reject: false }); return { exitCode: result.exitCode ?? 1, stdout: result.stdout, stderr: result.stderr }; } });
+                if (containment.kind === 'unsupported') return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: `build_review cannot establish built-in read-only containment: ${containment.reason}` } };
+                reviewAccess = containment;
+              }
+              let cacheHit = false;
+              const dispatched = await dispatchRubricContract({
+                descriptor: getBuildReviewRubricDescriptor(branch.rubric).contract,
+                prepareStructured: (value) => stampBuildReviewDispatchedCandidate(value, branch.rubric, projection),
+                options: {
+                cwd: materialized?.headPath ?? this.projectDir,
+                // Built-in peers of a custom-policy lap inspect the same frozen
+                // baseline/head input the custom reviewers are bound to.
+                prompt: `${builtinBundle.manifest.filter((file) => isUtf8(file.bytes)).map((file) => file.bytes.toString('utf8')).join('\n\n')}\n\n${rubricPrompt}${materialized === undefined ? '' : `\n\n${renderBuildReviewFrozenInputScope({
+                  contentDigest: inputs.sourceSnapshot.contentDigest, mergeBase: inputs.sourceSnapshot.mergeBase, headSha: inputs.sourceSnapshot.headSha,
+                  changes: inputs.sourceSnapshot.sourceChanges ?? [], view: materialized,
+                })}`}`,
+                ...(reviewAccess === undefined ? {} : { reviewAccess }),
+                interactive: false,
+                },
+                invoke: (options) => context.invoke(options, async (rung, invoke) => {
+                const semanticIdentity = candidateIdentity(rung, builtinBundle.digest);
+                if (!semanticIdentity) return { success: false, exitCode: 1, output: 'build_review candidate cache identity is unavailable' };
+                const cached = await readBuildReviewCacheEntry(this.projectDir, branch.rubric, {
+                  readFile: async (path) => readFile(path, 'utf-8'), readdir, mkdir: async (path) => { await mkdir(path, { recursive: true }); }, writeFile, rename,
+                }, semanticIdentity);
+                const cache = classifyBuildReviewCacheLookup(cached, {
+                  rubric: branch.rubric, contractVersion: projection.contractVersion, projectionVersion: projection.projectionVersion,
+                  projectionDigest: projection.digest, policyFingerprint: fingerprintBuildReviewRubricPolicy(branch.policy),
+                  engineIdentity: { engineStamp: engineIdentity.engineStamp, skillDigest: builtinBundle.digest }, semanticIdentity,
+                  lapId: projection.lapId, snapshotDigest: projection.snapshotDigest,
+                });
+                await emitBuildReviewCacheDiscard(async (event) => { await this.events?.emit(event); }, cache, branch.rubric, projection.lapId, engineIdentity.engineStamp);
+                if (cache.kind === 'hit' && validateBuildReviewDispatchedResult(cache.hit.result, branch.rubric, projection)) {
+                  cacheHit = true;
+                  await this.events?.emit({ type: 'build_review_cache_hit', rubric: branch.rubric, lapId: projection.lapId });
+                  return cachedRubricInvocation(cache.hit.result);
+                }
+                return invoke();
+                }),
+              });
+              const invoked = dispatched.invocation;
+              if (cacheHit) {
+                await inputs?.sourceMaterialization?.settle(branch.rubric);
+                return { kind: 'hit' as const, result: invoked };
+              }
+              if (!invoked.success && dispatched.kind !== 'root-rejection') {
+                await inputs?.sourceMaterialization?.settle(branch.rubric);
+                return { kind: 'judged' as const, result: invoked };
+              }
+              const candidate = dispatched.kind === 'structured' ? dispatched.parsed : undefined;
+              const judged = candidate === undefined ? undefined : validateBuildReviewDispatchedResult(candidate, branch.rubric, projection);
+              if (judged) {
+                const semanticIdentity = candidateIdentity({ ...context.candidate, model: context.invokedModel() ?? context.candidate.model }, builtinBundle.digest);
+                if (!semanticIdentity) return { kind: 'failure' as const, result: { success: false, exitCode: 1, output: 'build_review candidate cache identity is unavailable' } };
+                const cacheWrite = await tryWriteBuildReviewCacheEntry(this.projectDir, {
+                version: 2, rubric: branch.rubric, contractVersion: projection.contractVersion, projectionVersion: projection.projectionVersion,
+                projectionDigest: projection.digest, policyFingerprint: fingerprintBuildReviewRubricPolicy(branch.policy),
+                engineIdentity: { engineStamp: engineIdentity.engineStamp, skillDigest: builtinBundle.digest }, semanticIdentity, result: judged,
+                }, { readFile: async (path) => readFile(path, 'utf-8'), readdir, mkdir: async (path) => { await mkdir(path, { recursive: true }); }, writeFile, rename });
+                if (!cacheWrite.ok) {
+                  cacheWriteFailureDetail = cacheWrite.error instanceof Error ? cacheWrite.error.message : String(cacheWrite.error);
+                  await inputs?.sourceMaterialization?.settle(branch.rubric);
+                  return {
+                    kind: 'failure' as const,
+                    result: {
+                      success: false,
+                      exitCode: 1,
+                      output: `build_review ${branch.rubric} cache-write-failed: ${cacheWriteFailureDetail}`,
+                    },
+                  };
+                }
+              }
+              await inputs?.sourceMaterialization?.settle(branch.rubric);
+              if (judged) return { kind: 'judged' as const, result: { ...invoked, output: JSON.stringify(judged), finalStructuredResult: judged } };
+              // A parser rejection is diagnosed on the same stamped value the
+              // parser judged (D6): the raw provider payload carries no
+              // engine-owned envelope fields, so diagnosing it would falsely
+              // report `kind`, `rubric`, `lapId`, `contractVersion`, and
+              // `snapshotDigest` as absent.
+              return {
+                kind: 'judged' as const,
+                result: dispatched.kind === 'structured' ? { ...invoked, finalStructuredResult: dispatched.prepared } : invoked,
+              };
+            },
           }),
-        );
+            undefined,
+            executionContext,
+          );
+        } finally {
+          clearTimeout(timeout);
+          controller.abort();
+        }
         const verified = safety?.verify(result) ?? result;
         this.callCount++;
         return preserveInvocationFailure(verified);
       }
-      const result = await this.provider.invoke({
-        prompt: `${renderAuxiliarySkillInvocation(branch.skillName, this.providerKey)}\n\n${prompt}`,
-        sessionId: randomUUID(),
-        resume: false,
-        dangerouslySkipPermissions: true,
-        cwd: this.projectDir,
-        model: branch.policy.model,
-        effort: branch.policy.effort,
+      const dispatched = await dispatchRubricContract({
+        descriptor: getBuildReviewRubricDescriptor(branch.rubric).contract,
+        prepareStructured: (value) => stampBuildReviewDispatchedCandidate(value, branch.rubric, projection),
+        options: {
+          prompt: `${renderAuxiliarySkillInvocation(branch.skillName, this.providerKey)}\n\n${prompt}`,
+          dangerouslySkipPermissions: true,
+          cwd: this.projectDir,
+          interactive: false,
+        },
+        invoke: (options) => this.provider.invoke({
+          ...options,
+          sessionId: randomUUID(),
+          resume: false,
+          model: branch.policy.model,
+          effort: branch.policy.effort,
+        }),
       });
       this.callCount++;
-      return preserveInvocationFailure(result);
+      // On rejection the stamped `prepared` value is carried forward so the
+      // outer diagnosis names the payload defect, not absent envelope fields (D6).
+      return preserveInvocationFailure(dispatched.kind === 'structured'
+        ? { ...dispatched.invocation, finalStructuredResult: dispatched.parsed ?? dispatched.prepared }
+        : dispatched.invocation);
     };
 
-    // Validate-and-repair loop (deterministic shape enforcement): a session
-    // that answered but missed the judged contract gets exactly ONE bounded
-    // repair invocation — a pure re-emit task carrying the rejection
-    // diagnosis, the exact contract shape, and a bounded excerpt of its own
-    // previous output — instead of burning the whole dispatch as an
-    // infrastructure failure. Provider-agnostic by construction: both the
-    // runtime-candidates path and the legacy provider path share invokeOnce.
     const initial = await invokeOnce(rubricPrompt);
+    if (cacheWriteFailureDetail !== undefined) {
+      return { kind: 'cache-write-failed', detail: cacheWriteFailureDetail };
+    }
+    if (initial.providerSetupExhaustion) {
+      return makeBuildReviewDispatchFailure(
+        `All configured providers were unavailable during setup: ${initial.providerSetupExhaustion.candidates.map(
+          ({ provider, reason, recoveryAction }) => `${provider}: ${redactSafetyText(reason)} Recovery: ${redactSafetyText(recoveryAction)}`,
+        ).join('; ')}`,
+        initial.providerSetupExhaustion,
+      );
+    }
     if (initial.commandUnresolved) {
       return makeBuildReviewDispatchFailure(renderBuildReviewUnresolvedSkillRemedy(
         branch.skillName,
         initial.commandUnresolvedName ?? '',
       ));
     }
-    if (!initial.success || initial.output === undefined) return undefined;
-    const validated = this.validateRubricOutput(initial.output, branch.rubric, projection);
-    if (validated.result) return validated.result;
-    const repairPrompt = [
-      `Your previous response for the Build Review ${label[branch.rubric]} rubric did not satisfy the judged-result contract: ${validated.rejection}.`,
-      `Re-emit your judgement as ONLY one JSON object — no prose, no markdown fences, no other text — of exactly this shape:\n${contractShape}`,
-      'Preserve the semantic content of your previous findings; change only the shape.',
-      `Your previous response (bounded excerpt):\n${boundedHeadTailExcerpt(initial.output, RUBRIC_REPAIR_PROMPT_EXCERPT_CAP_BYTES)}`,
-    ].join('\n\n');
-    const repair = await invokeOnce(repairPrompt);
-    if (repair.success && repair.output !== undefined) {
-      if (repair.output === initial.output) {
-        return makeBuildReviewDispatchFailure(
-          'judged-result repair was byte-identical to the rejected output; no further retry can act on the same payload',
-        );
-      }
-      const repaired = this.validateRubricOutput(repair.output, branch.rubric, projection);
-      if (repaired.result) return repaired.result;
-      return makeBuildReviewDispatchFailure(boundedHeadTailExcerpt(
-        `judged-result contract not satisfied after one repair turn: ${repaired.rejection}. Raw output excerpt: ${repair.output}`,
-        RUBRIC_FAILURE_DETAIL_CAP_BYTES,
-      ));
+    if (initial.nativeSchemaUnsupported) {
+      return makeBuildReviewDispatchFailure(
+        initial.output ?? `build_review rubric ${branch.rubric} native output schema is unsupported`,
+        undefined,
+        { cause: 'native-schema-unsupported' },
+      );
     }
-    return makeBuildReviewDispatchFailure(boundedHeadTailExcerpt(
-      `judged-result contract not satisfied: ${validated.rejection}; the repair invocation failed. Raw output excerpt: ${initial.output}`,
-      RUBRIC_FAILURE_DETAIL_CAP_BYTES,
-    ));
-  }
-
-  /** Shared accept/reject predicate for rubric outputs — identical to the coordinator's settlement check. */
-  private validateRubricOutput(
-    output: string,
-    rubric: BuildReviewDispatchableRubric['rubric'],
-    projection: BuildReviewRubricProjection,
-  ): { result?: ReturnType<typeof validateBuildReviewDispatchedResult>; rejection: string } {
-    const candidate = extractJudgedResultCandidate(output);
-    if (candidate === undefined) {
-      return { rejection: 'no parseable JSON object was found in the response' };
+    if (initial.structuredResultFailure !== undefined) {
+      const rejection = diagnoseBuildReviewJudgedResultRejection(
+        initial.finalStructuredResult,
+        branch.rubric,
+        { lapId: projection.lapId, snapshotDigest: projection.snapshotDigest },
+      );
+      return makeBuildReviewDispatchFailure('root: a structured result is required', undefined, {
+        cause: 'invalid-structured-result',
+        rejection,
+      });
     }
-    const stampedCandidate = stampBuildReviewDispatchedCandidate(candidate, rubric, projection);
-    const result = validateBuildReviewDispatchedResult(stampedCandidate, rubric, projection);
-    if (result) return { result, rejection: '' };
-    try {
-      return {
-        rejection: describeBuildReviewDispatchedResultRejection(stampedCandidate, rubric, projection),
-      };
-    } catch {
-      // Diagnosis must never turn a repairable shape failure into a thrown
-      // provider-error that burns the dispatch.
-      return { rejection: 'the result did not satisfy the judged contract' };
+    if (!initial.success && initial.output?.startsWith('Codex native schema scratch home failed:')) {
+      return makeBuildReviewDispatchFailure(initial.output ?? 'build_review provider invocation failed without a diagnostic');
     }
+    if (!initial.success) return undefined;
+    if (initial.finalStructuredResult === undefined || initial.finalStructuredResult === null || typeof initial.finalStructuredResult !== 'object' || Array.isArray(initial.finalStructuredResult)) {
+      const rejection = diagnoseBuildReviewJudgedResultRejection(
+        initial.finalStructuredResult,
+        branch.rubric,
+        { lapId: projection.lapId, snapshotDigest: projection.snapshotDigest },
+      );
+      return makeBuildReviewDispatchFailure('root: a structured result is required', undefined, {
+        cause: 'invalid-structured-result',
+        rejection,
+      });
+    }
+    const initialResult = validateBuildReviewDispatchedResult(initial.finalStructuredResult, branch.rubric, projection);
+    if (initialResult) return initialResult;
+    const rejection = diagnoseBuildReviewJudgedResultRejection(
+      initial.finalStructuredResult,
+      branch.rubric,
+      { lapId: projection.lapId, snapshotDigest: projection.snapshotDigest },
+      buildReviewFindingReferenceContext(projection),
+      buildReviewCandidateScopeResolutionContext(projection),
+    );
+    return makeBuildReviewDispatchFailure(renderBuildReviewJudgedResultRejection(rejection), undefined, {
+      cause: 'invalid-structured-result', rejection,
+    });
   }
 
   private async runTautologyPreflight(inputs: BuildReviewFrozenInputs) {
@@ -2496,24 +3816,34 @@ export class DefaultStepRunner implements StepRunner {
     });
   }
 
-  private async runCoverageBinding(state: ConductState): Promise<StepRunResult> {
-    const { judgeEnabled } = resolveCoverageBindingConfig(this.config);
-    const filesystem = {
+  private async runCoverageBinding(state: ConductState, executionContext?: ExecutionContext): Promise<StepRunResult> {
+    const { judgeEnabled, batchSize } = resolveCoverageBindingConfig(this.config);
+    const filesystem = this.coverageBindingFilesystem ?? {
       readFile: (path: string) => readFile(path, 'utf8'),
       mkdir: (path: string) => mkdir(path, { recursive: true }).then(() => undefined),
       writeFile,
       rename,
     };
     const writeEnvelope = async (
-      status: 'disabled' | 'done' | 'failed' | 'refused',
+      status: 'disabled' | 'done' | 'failed' | 'partial' | 'refused',
       entries: readonly CoverageBindingEnvelopeEntry[],
-    ) => writeCoverageBindingEnvelope(this.projectDir, {
-      version: 1,
-      slug: this.featureDesc || 'unknown-feature',
-      runId: this.runId,
-      status,
-      entries,
-    }, filesystem);
+    ) => {
+      await writeCoverageBindingEnvelope(this.projectDir, {
+        version: 1,
+        slug: this.featureDesc || 'unknown-feature',
+        runId: this.runId,
+        status,
+        entries,
+      }, filesystem);
+      // Rebase preservation needs to know which HEAD this run judged. Without
+      // a resolvable HEAD there is no stamp, and preservation stays refused.
+      if (judgedHead) {
+        await writeCoverageBindingCodeStamp(this.projectDir, { runId: this.runId, codeStamp: judgedHead }, filesystem);
+      }
+    };
+    const judgedHead = await this.gitRunner(['rev-parse', 'HEAD'])
+      .then((result) => (result.exitCode === 0 ? result.stdout.trim() : ''))
+      .catch(() => '');
 
     if (!judgeEnabled) {
       await writeEnvelope('disabled', []);
@@ -2539,12 +3869,13 @@ export class DefaultStepRunner implements StepRunner {
       planText,
     });
     const previous = await readCoverageBindingEnvelope(this.projectDir, filesystem);
-    const cached = new Map(previous?.entries.map((entry) => [entry.digest, entry]) ?? []);
-    const entries: CoverageBindingEnvelopeEntry[] = [];
+    const planned = planCoverageBindingBatches({ claims, previous, batchSize });
+    const entries: CoverageBindingEnvelopeEntry[] = [...planned.entries];
     const refused: CoverageBindingEnvelopeEntry[] = [];
     const resolved = this.resolvedConfigFor('coverage_binding');
     const auxiliaryPolicy: ResolvedBuildReviewRubricPolicy = {
       enabled: true,
+      max_projection_bytes: DEFAULT_TEST_QUALITY_MAX_PROJECTION_BYTES,
       llm_provider: this.config?.steps?.coverage_binding?.llm_provider ?? this.config?.llm_provider ?? 'claude',
       model: resolved.model,
       effort: resolved.effort,
@@ -2553,49 +3884,32 @@ export class DefaultStepRunner implements StepRunner {
       escalate: resolved.escalate,
       min_confidence: 0,
     };
-    const entryFor = (
-      claim: ReturnType<typeof assembleCoverageBindingClaims>[number],
-      digest: string,
-      verdict: CoverageBindingEnvelopeEntry['verdict'],
-      missingAssertion?: string,
-    ): CoverageBindingEnvelopeEntry => ({
-      digest,
-      criterion: claim.criterion,
-      taskIds: claim.taskIds,
-      doneWhen: claim.doneWhen,
-      verdict,
-      ...(missingAssertion === undefined ? {} : { missingAssertion }),
-    });
-
-    for (const claim of claims) {
-      const digest = claimDigest(claim);
-      if (claim.applicability === 'not-applicable') {
-        const entry = entryFor(claim, digest, 'not-applicable');
-        entries.push(entry);
-        await this.events?.emit({ type: 'coverage_binding_judged', step: 'coverage_binding', verdict: entry.verdict, digest, taskIds: [...entry.taskIds] });
-        continue;
-      }
-      const hit = cached.get(digest);
-      if (hit && hit.verdict !== 'not-applicable') {
-        const entry = entryFor(claim, digest, hit.verdict, hit.missingAssertion);
-        entries.push(entry);
-        await this.events?.emit({ type: 'coverage_binding_judged', step: 'coverage_binding', verdict: entry.verdict, digest, taskIds: [...entry.taskIds] });
-        if (entry.verdict === 'does-not-assert') refused.push(entry);
-        continue;
-      }
+    for (const entry of entries) {
+      await this.events?.emit({ type: 'coverage_binding_judged', step: 'coverage_binding', verdict: entry.verdict, digest: entry.digest, taskIds: [...entry.taskIds] });
+      if (entry.verdict === 'does-not-assert') refused.push(entry);
+    }
+    await writeEnvelope('partial', entries);
+    for (const [batchIndex, batch] of planned.batches.entries()) {
+      const batchDigests = batch.map(({ claimDigest: digest }) => digest);
+      const memberId = batchDigests[0]!;
       const prompt = [
-        'Judge only this criterion and these cited Done when checks. Do not read files, inspect a diff, or use any transcript.',
-        'Return exactly one JSON object: {"verdict":"asserts"} or {"verdict":"does-not-assert","missingAssertion":"..."}.',
-        JSON.stringify({ criterion: claim.criterion, taskIds: claim.taskIds, doneWhen: claim.doneWhen }),
+        'Judge each supplied claim independently against only its cited Done when checks. Do not read files, inspect a diff, or use any transcript.',
+        'Return exactly one JSON object with a verdicts array containing one verdict for every supplied digest.',
+        JSON.stringify({ claims: batch.map(({ claim, claimDigest: digest }) => ({
+          digest,
+          criterion: claim.criterion,
+          taskIds: claim.taskIds,
+          doneWhen: claim.doneWhen,
+        })) }),
       ].join('\n\n');
-      let result: { success: boolean; output?: string };
+      let result: { success: boolean; output?: string; providerSetupExhaustion?: ProviderExecutionResult['providerSetupExhaustion'] };
       if (this.providerRuntimes && this.sessionStore) {
         const dispatched = await this.dispatchProviderWithLifecycleSupervision(
           'coverage_binding',
           { prompt, cwd: this.projectDir, dangerouslySkipPermissions: true },
           (options) => executeAuxiliaryProviderCandidates({
-            step: 'coverage_binding', memberId: digest, policy: auxiliaryPolicy,
-            runtimes: this.providerRuntimes!, sessions: this.sessionStore!.beginBranch(`coverage-binding:${digest}`),
+            step: 'coverage_binding', memberId, policy: auxiliaryPolicy, executionContext,
+            runtimes: this.providerRuntimes!, sessions: this.sessionStore!.beginBranch(`coverage-binding:${memberId}`),
             config: this.config, runId: this.runId, taskAttribution: this.taskAttribution,
             tier: state.complexity_tier,
             withCandidateSafety: this.withCandidateSafety, prepareCandidateSelfHost: this.prepareCandidateSelfHost,
@@ -2603,9 +3917,11 @@ export class DefaultStepRunner implements StepRunner {
             options,
             optionsForCandidate: (providerKey) => ({ ...options, prompt: `${renderAuxiliarySkillInvocation('coverage-binding', providerKey)}\n\n${prompt}` }),
           }),
+          undefined,
+          executionContext,
         );
         this.callCount++;
-        result = { success: dispatched.success, output: dispatched.output };
+        result = { success: dispatched.success, output: dispatched.output, providerSetupExhaustion: dispatched.providerSetupExhaustion };
       } else {
         const dispatched = await this.provider.invoke({
           prompt: `${renderAuxiliarySkillInvocation('coverage-binding', this.providerKey)}\n\n${prompt}`,
@@ -2617,9 +3933,17 @@ export class DefaultStepRunner implements StepRunner {
       }
       if (!result.success || typeof result.output !== 'string') {
         await writeEnvelope('failed', entries);
-        return { success: false, output: result.output ?? `coverage_binding provider failed for ${digest}` };
+        const infrastructureFailure = new CoverageBindingPayloadError(
+          `provider failed for batch ${batchIndex + 1} of ${planned.batches.length}: ${result.output ?? memberId}`,
+        );
+        return {
+          success: false,
+          output: infrastructureFailure.message,
+          infrastructureFailure,
+          ...(result.providerSetupExhaustion ? { providerSetupExhaustion: result.providerSetupExhaustion } : {}),
+        };
       }
-      const parsed = parseJudgePayload(result.output);
+      const parsed = parseJudgeBatchPayload(result.output, batchDigests);
       if (!parsed.ok) {
         await writeEnvelope('failed', entries);
         const infrastructureFailure = new CoverageBindingPayloadError(parsed.reason);
@@ -2629,10 +3953,21 @@ export class DefaultStepRunner implements StepRunner {
           infrastructureFailure,
         };
       }
-      const entry = entryFor(claim, digest, parsed.value.verdict, parsed.value.missingAssertion);
-      entries.push(entry);
-      await this.events?.emit({ type: 'coverage_binding_judged', step: 'coverage_binding', verdict: entry.verdict, digest, taskIds: [...entry.taskIds] });
-      if (entry.verdict === 'does-not-assert') refused.push(entry);
+      for (const { claim, claimDigest: digest } of batch) {
+        const verdict = parsed.verdicts.get(digest)!;
+        const entry: CoverageBindingEnvelopeEntry = {
+          digest,
+          criterion: claim.criterion,
+          taskIds: claim.taskIds,
+          doneWhen: claim.doneWhen,
+          verdict: verdict.verdict,
+          ...(verdict.missingAssertion === undefined ? {} : { missingAssertion: verdict.missingAssertion }),
+        };
+        entries.push(entry);
+        await this.events?.emit({ type: 'coverage_binding_judged', step: 'coverage_binding', verdict: entry.verdict, digest, taskIds: [...entry.taskIds] });
+        if (entry.verdict === 'does-not-assert') refused.push(entry);
+      }
+      await writeEnvelope('partial', entries);
     }
 
     if (refused.length > 0) {
@@ -2650,7 +3985,7 @@ export class DefaultStepRunner implements StepRunner {
     return { success: true, output: `coverage_binding judged ${entries.length} claim(s)` };
   }
 
-  private async runBuildReview(tier?: ConductState['complexity_tier']): Promise<StepRunResult> {
+  private async runBuildReview(tier?: ConductState['complexity_tier'], executionContext?: ExecutionContext): Promise<StepRunResult> {
     // Resolve the plan for THIS feature — never the unscoped `.docs/plans/*.md`
     // sort()[last] guess (#407): with several features in flight the shared plans
     // directory holds many files, and picking the alphabetically-last one graded
@@ -2692,8 +4027,22 @@ export class DefaultStepRunner implements StepRunner {
     let containmentReport: ContainmentFloorReport | undefined;
     let inputs;
     try {
+      // A custom member changes the lap's source authority from by-reference
+      // to a detached, immutable view shared by every member in the lap.
+      const lapMembers = this.usesInjectedBuildReviewGit && this.buildReviewInputOptions?.materialization === undefined
+        ? undefined
+        : buildReviewConfig.catalog.some((entry) => entry.kind === 'custom')
+          ? buildReviewConfig.catalog.map((entry) => ({
+              id: entry.id,
+              kind: entry.kind,
+            })) as BuildReviewInputOptions['lapMembers']
+          : undefined;
       inputs = {
-        ...await assembleBuildReviewInputs(this.gitRunner, planPath, this.buildReviewInputOptions),
+        ...await assembleBuildReviewInputs(this.gitRunner, planPath, {
+          ...this.buildReviewInputOptions,
+          lapMembers,
+          materialization: this.buildReviewInputOptions?.materialization ?? { projectRoot: this.projectDir },
+        }),
       };
     } catch (err) {
       return {
@@ -2831,7 +4180,7 @@ export class DefaultStepRunner implements StepRunner {
     }
 
     return withBaseFreshness(withContainmentAdvisory(
-      await this.runRubricBuildReview(inputs, buildReviewConfig, tier),
+      await this.runRubricBuildReview(inputs, buildReviewConfig, tier, executionContext),
     ));
   }
 
@@ -2956,6 +4305,7 @@ export class DefaultStepRunner implements StepRunner {
     finishProsePass?: 'author' | 'judge',
     revisionGuidance?: string,
     tier?: ComplexityTier,
+    prdWideningReviewContext?: StepRunOptions['prdWideningReviewContext'],
   ): Promise<string> {
     const stepDef = this.stepRegistry.find((candidate) => candidate.name === step)
       ?? getStepDefinition(step);
@@ -3012,6 +4362,13 @@ export class DefaultStepRunner implements StepRunner {
         + 'trailer rationales only as OVER_SCOPE intent evidence. This evidence is immutable; do not invent '
         + 'a widening rationale.\n```json\n'
         + `${JSON.stringify(scopeEvidence, null, 2)}\n` + '```';
+      if (prdWideningReviewContext) {
+        prompt +=
+          '\n\nPRD WIDENING DECISION HISTORY (engine-rendered) — use this only as original authority '
+          + 'and evidence when judging a current finding. Report current evidence in your own words; do not '
+          + 'copy a stored summary or claim it proves the same behavior. The engine alone reconciles and routes.\n```json\n'
+          + `${JSON.stringify(prdWideningReviewContext, null, 2)}\n` + '```';
+      }
     }
 
     // Task 14: Include quarantine context if a .pipeline/QUARANTINE sentinel exists.
